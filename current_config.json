@@ -1,0 +1,85 @@
+{
+    "Service": {
+        "ServiceName": "deep-research-agent-0312",
+        "ServiceId": "47f9c9cdc2c9429f8bb31b730a5ae631",
+        "ServiceArn": "arn:aws:apprunner:us-east-1:668864905269:service/deep-research-agent-0312/47f9c9cdc2c9429f8bb31b730a5ae631",
+        "ServiceUrl": "bh3z333bky.us-east-1.awsapprunner.com",
+        "CreatedAt": "2026-06-15T17:32:26-04:00",
+        "UpdatedAt": "2026-06-15T17:32:26-04:00",
+        "Status": "RUNNING",
+        "SourceConfiguration": {
+            "ImageRepository": {
+                "ImageIdentifier": "668864905269.dkr.ecr.us-east-1.amazonaws.com/deep-research-agent-0312:latest",
+                "ImageConfiguration": {
+                    "RuntimeEnvironmentVariables": {
+                        "DOC_FOLDER": "/deps/deep_research/docs",
+                        "ENABLE_EVAL_TRACKING": "true",
+                        "EVAL_HISTORY_FILE": "/deps/deep_research/output/eval_history/server_runs.jsonl",
+                        "GRAPH_RECURSION_LIMIT": "200",
+                        "INPUT_FOLDER": "/deps/deep_research/input",
+                        "LANGCHAIN_PROJECT": "deep-research-production",
+                        "LANGCHAIN_TRACING_V2": "true",
+                        "LANGSMITH_ENDPOINT": "https://api.smith.langchain.com",
+                        "LOG_LEVEL": "INFO",
+                        "MAX_CONCURRENT_RESEARCH_UNITS": "3",
+                        "MAX_FILES_TO_READ": "20",
+                        "MAX_GLOB_DEPTH": "3",
+                        "MAX_RESEARCHER_ITERATIONS": "3",
+                        "MAX_TOTAL_SIZE_MB": "50",
+                        "MEMORY_TYPE": "memory",
+                        "MODEL_BACKOFF_MULTIPLIER": "2.0",
+                        "MODEL_INITIAL_BACKOFF": "1.0",
+                        "MODEL_MAX_BACKOFF": "60.0",
+                        "MODEL_MAX_RETRIES": "5",
+                        "MODEL_RETRY_JITTER": "true",
+                        "MODEL_RPM": "500",
+                        "MODEL_TPM": "120000",
+                        "REPORTS_OUTPUT_FOLDER": "/deps/deep_research/output",
+                        "VERIFY_SSL": "false"
+                    },
+                    "Port": "2024",
+                    "RuntimeEnvironmentSecrets": {
+                        "AWS_BEARER_TOKEN_BEDROCK": "arn:aws:secretsmanager:us-east-1:668864905269:secret:kv-deep-agents-0312-FRpNXc:AWS-BEARER-TOKEN-BEDROCK::",
+                        "AWS_BEDROCK_ENDPOINT": "arn:aws:secretsmanager:us-east-1:668864905269:secret:kv-deep-agents-0312-FRpNXc:AWS-BEDROCK-ENDPOINT::",
+                        "LANGCHAIN_API_KEY": "arn:aws:secretsmanager:us-east-1:668864905269:secret:kv-deep-agents-0312-FRpNXc:LANGCHAIN-API-KEY::",
+                        "MODEL_NAME": "arn:aws:secretsmanager:us-east-1:668864905269:secret:kv-deep-agents-0312-FRpNXc:MODEL-NAME::",
+                        "TAVILY_API_KEY": "arn:aws:secretsmanager:us-east-1:668864905269:secret:kv-deep-agents-0312-FRpNXc:TAVILY-API-KEY::",
+                        "UPLOAD_API_KEY": "arn:aws:secretsmanager:us-east-1:668864905269:secret:kv-deep-agents-0312-FRpNXc:UPLOAD-API-KEY::"
+                    }
+                },
+                "ImageRepositoryType": "ECR"
+            },
+            "AutoDeploymentsEnabled": false,
+            "AuthenticationConfiguration": {
+                "AccessRoleArn": "arn:aws:iam::668864905269:role/AppRunnerECRAccessRole-0312"
+            }
+        },
+        "InstanceConfiguration": {
+            "Cpu": "2048",
+            "Memory": "4096",
+            "InstanceRoleArn": "arn:aws:iam::668864905269:role/AppRunnerInstanceRole-0312"
+        },
+        "HealthCheckConfiguration": {
+            "Protocol": "TCP",
+            "Path": "/",
+            "Interval": 5,
+            "Timeout": 2,
+            "HealthyThreshold": 1,
+            "UnhealthyThreshold": 5
+        },
+        "AutoScalingConfigurationSummary": {
+            "AutoScalingConfigurationArn": "arn:aws:apprunner:us-east-1:668864905269:autoscalingconfiguration/DefaultConfiguration/1/00000000000000000000000000000001",
+            "AutoScalingConfigurationName": "DefaultConfiguration",
+            "AutoScalingConfigurationRevision": 1
+        },
+        "NetworkConfiguration": {
+            "EgressConfiguration": {
+                "EgressType": "DEFAULT"
+            },
+            "IngressConfiguration": {
+                "IsPubliclyAccessible": true
+            },
+            "IpAddressType": "IPV4"
+        }
+    }
+}

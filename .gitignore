@@ -1,0 +1,68 @@
+# Deep Research - .gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.pytest_cache/
+.deepeval/
+.ruff_cache/
+
+# Virtual Environment
+.venv/
+venv/
+ENV/
+env/
+.env
+.env.docker
+.env-aws.docker
+
+# IDE
+.idea/
+.vscode/
+.claude/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Configuration (keep examples, ignore actual configs)
+# config.yaml is kept for demo purposes
+!.env.example
+secrets.sh
+secrets-aws.sh
+test_azure_init.py
+test_bedrock_init.py
+test_gemini_init.py
+setup.md
+
+# Temporary files
+*.tmp
+*.bak
+.langgraph_api/
+.build_version
+
+# Project data
+docs/
+input/
+output/
+sync/
+sync-aws/
+index/

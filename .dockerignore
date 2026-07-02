@@ -1,0 +1,62 @@
+# Python bytecode and cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+sync/
+
+# Package management (uv)
+.venv
+uv.lock
+
+# Testing
+.pytest_cache/
+.deepeval/
+tests/
+*.ipynb
+docs/
+output/
+input/
+deep_research_example.egg-info/
+.langgraph_api/
+.scripts/
+
+# Development tools
+.ruff_cache/
+.DS_Store
+
+# Environment and secrets
+.env
+.env.example
+secrets*.sh
+
+# Deployment scripts
+.build_version
+build*.sh
+deploy*.sh
+env*.sh
+sync-files*.sh
+
+# Documentation
+document/
+README.md
+AGENTS.md
+CLAUDE.md
+
+# Azure deployment configs
+
+# Resources and screenshots
+resources/
+
+# Version control
+.git/
+.gitignore
+
+# Docker
+.dockerignore
+Dockerfile*

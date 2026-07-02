@@ -1,0 +1,228 @@
+{
+	"info": {
+		"_postman_id": "deep-research-upload-api-collection",
+		"name": "Deep Research Document Upload API",
+		"description": "Postman collection for testing the Document Upload API endpoints in webapp.py",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+	},
+	"variable": [
+		{
+			"key": "base_url",
+			"value": "http://localhost:8000",
+			"type": "string"
+		},
+		{
+			"key": "api_key",
+			"value": "",
+			"type": "string"
+		}
+	],
+	"item": [
+		{
+			"name": "Health Check",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "{{base_url}}/health",
+					"host": [
+						"{{base_url}}"
+					],
+					"path": [
+						"health"
+					]
+				},
+				"description": "Check API health status and get version information"
+			},
+			"response": []
+		},
+		{
+			"name": "Upload Documents",
+			"request": {
+				"auth": {
+					"type": "noauth"
+				},
+				"method": "POST",
+				"header": [
+					{
+						"key": "X-API-Key",
+						"value": "{{api_key}}",
+						"type": "text"
+					}
+				],
+				"body": {
+					"mode": "formdata",
+					"formdata": [
+						{
+							"key": "folder",
+							"value": "policy",
+							"type": "text"
+						},
+						{
+							"key": "files",
+							"type": "file",
+							"src": []
+						}
+					]
+				},
+				"url": {
+					"raw": "{{base_url}}/documents/upload",
+					"host": [
+						"{{base_url}}"
+					],
+					"path": [
+						"documents",
+						"upload"
+					]
+				},
+				"description": "Upload documents to a specified folder. Requires X-API-Key header."
+			},
+			"response": []
+		},
+		{
+			"name": "List Documents",
+			"request": {
+				"method": "GET",
+				"header": [
+					{
+						"key": "X-API-Key",
+						"value": "{{api_key}}",
+						"type": "text"
+					}
+				],
+				"url": {
+					"raw": "{{base_url}}/documents/list?folder=policy",
+					"host": [
+						"{{base_url}}"
+					],
+					"path": [
+						"documents",
+						"list"
+					],
+					"query": [
+						{
+							"key": "folder",
+							"value": "policy"
+						}
+					]
+				},
+				"description": "List all files in a specified folder. Requires X-API-Key header."
+			},
+			"response": []
+		},
+		{
+			"name": "Download Document",
+			"request": {
+				"method": "GET",
+				"header": [
+					{
+						"key": "X-API-Key",
+						"value": "{{api_key}}",
+						"type": "text"
+					}
+				],
+				"url": {
+					"raw": "{{base_url}}/documents/download/example.pdf?folder=policy",
+					"host": [
+						"{{base_url}}"
+					],
+					"path": [
+						"documents",
+						"download",
+						"example.pdf"
+					],
+					"query": [
+						{
+							"key": "folder",
+							"value": "policy"
+						}
+					]
+				},
+				"description": "Download a specific file from a folder. Requires X-API-Key header."
+			},
+			"response": []
+		},
+		{
+			"name": "Delete Document",
+			"request": {
+				"method": "DELETE",
+				"header": [
+					{
+						"key": "X-API-Key",
+						"value": "{{api_key}}",
+						"type": "text"
+					}
+				],
+				"url": {
+					"raw": "{{base_url}}/documents/example.pdf?folder=policy",
+					"host": [
+						"{{base_url}}"
+					],
+					"path": [
+						"documents",
+						"example.pdf"
+					],
+					"query": [
+						{
+							"key": "folder",
+							"value": "policy"
+						}
+					]
+				},
+				"description": "Delete a specific file from a folder. Requires X-API-Key header."
+			},
+			"response": []
+		},
+		{
+			"name": "Delete Folder Contents",
+			"request": {
+				"method": "DELETE",
+				"header": [
+					{
+						"key": "X-API-Key",
+						"value": "{{api_key}}",
+						"type": "text"
+					}
+				],
+				"url": {
+					"raw": "{{base_url}}/documents/folder/policy",
+					"host": [
+						"{{base_url}}"
+					],
+					"path": [
+						"documents",
+						"folder",
+						"policy"
+					]
+				},
+				"description": "Delete all files in a specified folder. Requires X-API-Key header."
+			},
+			"response": []
+		},
+		{
+			"name": "Storage Info",
+			"request": {
+				"method": "GET",
+				"header": [
+					{
+						"key": "X-API-Key",
+						"value": "{{api_key}}",
+						"type": "text"
+					}
+				],
+				"url": {
+					"raw": "{{base_url}}/storage/info",
+					"host": [
+						"{{base_url}}"
+					],
+					"path": [
+						"storage",
+						"info"
+					]
+				},
+				"description": "Get storage information including total, used, and free space. Requires X-API-Key header."
+			},
+			"response": []
+		}
+	]
+}

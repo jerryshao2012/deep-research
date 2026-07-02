@@ -1,0 +1,46 @@
+metrics:
+  Similarity:
+    description: "Measures how similar the response is to a human expert answer."
+    scale: "1 to 5, where 1 is worst and 5 is best."
+    goal: "3+"
+    min: 1
+    max: 5
+  Relevance:
+    description: "Measures how relevant the response is to the question and context provided."
+    scale: "0 to 100. 0-20 means the answer completely lacks confidence, 20-40 mostly lacks confidence, 40-60 is partially confident, 60-80 is mostly confident, and 80-100 has perfect confidence."
+    goal: "60+"
+    min: 0
+    max: 100
+  Coherence:
+    description: "Measures the quality of all sentences and how naturally they fit together."
+    scale: "1 to 5, where 1 is worst and 5 is best."
+    goal: "3+"
+    min: 1
+    max: 5
+  Groundedness:
+    description: "Measures how grounded the answer is against the provided context. Even if an answer seems true, it should score lower when it is not verifiable from context."
+    scale: "1 to 5, where 1 is worst and 5 is best."
+    goal: "3+"
+    min: 1
+    max: 5
+
+judge_prompt: |
+  You are evaluating a draft Golden Dataset answer for Question & Answer purposes.
+  Score the answer on four metrics and return exactly these four lines:
+  Similarity: <1-5 score>
+  Relevance: <0-100 score>
+  Coherence: <1-5 score>
+  Groundedness: <1-5 score>
+
+  Use these metric descriptions and suggested goals as best practice:
+  {metric_guidance_lines}
+  Return numbers only, with no extra commentary.
+
+  Question:
+  {question}
+
+  Draft Answer:
+  {answer}
+
+  Context:
+  {context}

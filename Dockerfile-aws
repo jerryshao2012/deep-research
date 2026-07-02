@@ -1,0 +1,44 @@
+FROM python:3.12-slim
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    git \
+    s3fs \
+    ripgrep \
+    && rm -rf /var/lib/apt/lists/*
+
+
+
+# Set up working directory
+WORKDIR /deps/deep_research
+
+# Copy the local package
+ADD . /deps/deep_research
+RUN cp /deps/deep_research/.env-aws.docker /deps/deep_research/.env
+
+# Note: Runtime directories (docs/, output/, input/) are mounted by the entrypoint:
+#   Azure: Azure File Share → /deps/deep_research/mnt
+#   AWS:   S3 bucket (via s3fs) → /deps/deep_research/mnt
+# No need to create them in the Docker image
+
+# Use standard pip install to ensure cross-architecture builds (AMD64 on ARM64) resolve wheels correctly
+RUN pip install --no-cache-dir -e .
+
+# Set the host for the dev server
+ENV HOST=0.0.0.0
+ENV PORT=2024
+ENV PYTHONUNBUFFERED=1
+
+EXPOSE 2024
+
+# Copy and set up entrypoint script
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+# Use entrypoint to setup symlinks
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+
+# Launch using langgraph dev
+CMD ["langgraph", "dev", "--host", "0.0.0.0", "--port", "2024", "--no-reload", "--no-browser"]
+
