@@ -47,6 +47,9 @@ document/
 README.md
 AGENTS.md
 CLAUDE.md
+.codex/
+.cce/
+.claude/
 
 # Azure deployment configs
 
