@@ -27,6 +27,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 logger = logging.getLogger(__name__)
 
+
 # ── Chunking ───────────────────────────────────────────────────────────────────
 
 
@@ -264,7 +265,7 @@ class BM25SearchIndex:
         }
 
     def search(
-        self, query: str, k: int = 5, *, use_prf: bool | None = None
+            self, query: str, k: int = 5, *, use_prf: bool | None = None
     ) -> list[tuple[Document, float]]:
         if use_prf is None:
             use_prf = self._prf_enabled
@@ -309,7 +310,7 @@ class BM25SearchIndex:
         return merged[:k]
 
     def _bm25_score_all(
-        self, query_terms: list[str], k: int
+            self, query_terms: list[str], k: int
     ) -> list[tuple[Document, float]]:
         qtf: dict[str, float] = {}
         for term in query_terms:
@@ -328,7 +329,7 @@ class BM25SearchIndex:
                 if tf == 0:
                     continue
                 score += q_weight * (
-                    tf * (_BM25_K1 + 1.0) / (tf + _BM25_K1 * doc_len_norm)
+                        tf * (_BM25_K1 + 1.0) / (tf + _BM25_K1 * doc_len_norm)
                 )
             if score > 0.0:
                 scores.append((doc_idx, score))
@@ -336,7 +337,7 @@ class BM25SearchIndex:
         return [(self._documents[idx], s) for idx, s in scores[:k]]
 
     def _extract_prf_terms(
-        self, top_docs: list[Document], exclude_terms: set[str], top_n: int
+            self, top_docs: list[Document], exclude_terms: set[str], top_n: int
     ) -> list[str]:
         total_docs = len(self._documents)
         prf_tf: dict[str, float] = defaultdict(float)
@@ -433,7 +434,7 @@ class HybridSearchIndex:
         return reranked
 
     def _faiss_re_rank(
-        self, query: str, candidates: list[Document], k: int
+            self, query: str, candidates: list[Document], k: int
     ) -> list[tuple[Document, float]]:
         """Re-rank candidates using FAISS semantic similarity."""
         from langchain_community.vectorstores import FAISS
@@ -477,18 +478,24 @@ class HybridSearchIndex:
     def load(cls, directory: Path) -> HybridSearchIndex | None:
         """Load a previously saved hybrid index."""
         bm25_path = directory / "index.pkl"
+        bm25 = None
+        # --- Load BM25 Index ---
         if not bm25_path.exists():
             return None
+
         try:
             with bm25_path.open("rb") as f:
                 bm25 = pickle.load(f)
             if not isinstance(bm25, BM25SearchIndex):
+                # The loaded object is not the expected type, indicating corruption or wrong save format.
                 return None
-        except Exception:
+        except (IOError, EOFError, pickle.UnpicklingError) as e:
+            logger.warning(f"Failed to load BM25 index from {bm25_path}: {e}")
+            # Cannot proceed without a valid BM25 component.
             return None
 
-        # Try loading FAISS.
         faiss_store = None
+        # --- Load FAISS Store (Optional) ---
         faiss_dir = directory / "faiss"
         if faiss_dir.exists() and (faiss_dir / "index.faiss").exists():
             try:
@@ -496,16 +503,18 @@ class HybridSearchIndex:
                 if embedding is not None:
                     from langchain_community.vectorstores import FAISS
 
+                    # Use the explicit path string for load_local
                     faiss_store = FAISS.load_local(
                         str(faiss_dir),
                         embedding,
                         allow_dangerous_deserialization=True,
                     )
-            except Exception:
+            except Exception as e:
                 logger.warning(
-                    "Failed to load FAISS index; using BM25-only", exc_info=True
+                    f"Failed to load FAISS index from {faiss_dir}: {e}. Using BM25-only."
                 )
 
+        # Initialize and return the hybrid index using loaded components.
         return cls(bm25, faiss_store)
 
     def __len__(self) -> int:
@@ -556,7 +565,7 @@ def _resolve_embedding_model():
 
 
 def build_search_index(
-    raw_dir: Path, output_index_dir: Path
+        raw_dir: Path, output_index_dir: Path
 ) -> HybridSearchIndex | None:
     """Build a hybrid BM25 + FAISS search index from raw markdown documents.
 
@@ -614,7 +623,7 @@ def build_search_index(
 
 
 def load_or_build_search_index(
-    raw_dir: Path, output_index_dir: Path
+        raw_dir: Path, output_index_dir: Path
 ) -> HybridSearchIndex | None:
     """Load an existing hybrid search index or build a new one."""
     existing = HybridSearchIndex.load(output_index_dir)
@@ -624,7 +633,7 @@ def load_or_build_search_index(
 
 
 def search_index(
-    query: str, index: HybridSearchIndex, k: int = 5
+        query: str, index: HybridSearchIndex, k: int = 5
 ) -> list[tuple[Document, float]]:
     """Search a hybrid index; returns top-k (document, relevance-score) results."""
     return index.search(query, k=k)
