@@ -1060,6 +1060,8 @@ uv sync
 python webapp.py
 ```
 
+<img width="1909" alt="LLM Wiki Query" src="./resources/LLM_Wiki_Query%202026-07-04%20at%209%2031%2011%20AM.png" />
+
 #### 2. Test the Authentication Flow
 
 ##### Method A: OAuth Authentication (Recommended)
