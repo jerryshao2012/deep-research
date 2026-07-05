@@ -257,7 +257,8 @@ for folder in "${SYNC_FOLDERS[@]}"; do
   fi
 
   # Count remote files
-  remote_count=$(echo "$remote_names" | wc -l | tr -d ' ')
+  remote_count=$(echo "$remote_names" | wc -l)
+  remote_count=${remote_count//[[:space:]]/}
 
   # ── PHASE 1: Download ──────────────────────────────────────────
   if [[ "$MODE" != "upload" ]]; then
@@ -300,7 +301,8 @@ for folder in "${SYNC_FOLDERS[@]}"; do
 done
 
 # ── Count total files in sync root ──────────────────────────────────
-TOTAL_LOCAL=$(find "$SYNC_ROOT" -type f 2>/dev/null | wc -l | tr -d ' ')
+TOTAL_LOCAL=$(find "$SYNC_ROOT" -type f 2>/dev/null | wc -l)
+TOTAL_LOCAL=${TOTAL_LOCAL//[[:space:]]/}
 
 # ── Summary ─────────────────────────────────────────────────────────
 SYNC_END_TIME=$(date +%s)
@@ -320,7 +322,8 @@ echo ""
 echo "📂 Per-folder breakdown:"
 for f in "${SYNC_FOLDERS[@]}"; do
   if [ -d "${SYNC_ROOT}/${f}" ]; then
-    cnt=$(find "${SYNC_ROOT}/${f}" -maxdepth 1 -type f 2>/dev/null | wc -l | tr -d ' ')
+    cnt=$(find "${SYNC_ROOT}/${f}" -maxdepth 1 -type f 2>/dev/null | wc -l)
+    cnt=${cnt//[[:space:]]/}
     echo "   ${f}/  (${cnt} files)"
   else
     echo "   ${f}/  (skipped)"

@@ -94,7 +94,8 @@ end_step
 start_step "API Version Management"
 echo "🔢 Incrementing API version..."
 python3 ./increment_version.py
-NEW_VERSION=$(grep -E 'API_VERSION(:\s*\w+)?\s*=\s*' webapp/config.py | grep -o '"[^"]*"' | tr -d '"')
+NEW_VERSION=$(grep -E 'API_VERSION(:\s*\w+)?\s*=\s*' webapp/config.py | grep -o '"[^"]*"')
+NEW_VERSION=${NEW_VERSION//\"/}
 echo "✅ New API version: $NEW_VERSION"
 end_step
 

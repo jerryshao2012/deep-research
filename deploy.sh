@@ -103,7 +103,8 @@ BUILD_VERSION=$(cat .build_version)
 # No direct ACR check for Docker Hub image in bash
 echo "✅ Verified image exists in ACR"
 
-NEW_VERSION=$(grep -E 'API_VERSION(:\s*\w+)?\s*=\s*' webapp/config.py | grep -o '"[^"]*"' | tr -d '"')
+NEW_VERSION=$(grep -E 'API_VERSION(:\s*\w+)?\s*=\s*' webapp/config.py | grep -o '"[^"]*"')
+NEW_VERSION=${NEW_VERSION//\"/}
 echo "ℹ️  Current API version: $NEW_VERSION"
 end_step
 

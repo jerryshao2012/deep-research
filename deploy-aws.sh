@@ -91,7 +91,8 @@ if ! aws ecr describe-images --repository-name "$ECR_REPO_NAME" --image-ids imag
 fi
 echo "✅ Verified image exists in ECR"
 
-NEW_VERSION=$(grep -E 'API_VERSION(:\s*\w+)?\s*=\s*' webapp/config.py | grep -o '"[^"]*"' | tr -d '"')
+NEW_VERSION=$(grep -E 'API_VERSION(:\s*\w+)?\s*=\s*' webapp/config.py | grep -o '"[^"]*"')
+NEW_VERSION=${NEW_VERSION//\"/}
 echo "ℹ️  Current API version: $NEW_VERSION"
 end_step
 
