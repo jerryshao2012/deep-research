@@ -11,6 +11,7 @@
 - [🛡️ Reliability & Rate Limiting](#-reliability--rate-limiting)
 - [🛡️ Rate Limit Handling](#-rate-limit-handling)
 - [Multi-Agent Complex Workflows Evaluation & Regression Tracking](#multi-agent-complex-workflows-evaluation--regression-tracking)
+  - [Iterative Report Refinement (Verification Loop)](#iterative-report-refinement-verification-loop)
 - [📖 Thread Wiki (Document RAG)](#-thread-wiki-document-rag)
 
 ## 🚀 Quickstart
@@ -77,10 +78,23 @@ export WIKI_LINT_TIMEOUT_SECONDS=60
 export WIKI_INGEST_MAX_WAIT_SECONDS=600
 
 # Evaluation Tracking (for langgraph dev server)
-# Enable automatic metrics logging during development
+# Enable automatic metrics logging during development (default: true)
 export ENABLE_EVAL_TRACKING=true
+# Set to true to log user questions in eval history (default: false — privacy-preserving)
+export EVAL_LOG_QUESTIONS=false
 # Path to JSONL file for storing operational metrics
 export EVAL_HISTORY_FILE=./output/eval_history/server_runs.jsonl
+
+# Verification Loop — Iterative Report Refinement
+# Enable post-generation adversarial verification and revision (default: true)
+export ENABLE_VERIFICATION=true
+# Max revision iterations per report — bounds cost (default: 2)
+export MAX_VERIFICATION_ROUNDS=2
+
+# Experiment Tracking — Zero-Code A/B Testing
+# Set these on different deployments to compare results in eval history
+export EXPERIMENT_ID=prompt-v2              # Optional experiment identifier
+export EXPERIMENT_VARIANT=treatment          # Optional variant label (control/treatment)
 
 # =============================================================================
 # RELIABILITY & RATE LIMITING
@@ -1944,6 +1958,38 @@ Tests verify:
 - Baseline selection (latest matching manifest).
 - Non-comparable manifest mismatches.
 - JSONL append and reload integrity.
+
+### Iterative Report Refinement (Verification Loop)
+
+The system now includes a post-generation verification loop that applies **loop engineering** (Plan → Execute → Reflect → Learn) to improve report quality:
+
+1. **Plan**: Structured research plans with explicit success criteria before delegation
+2. **Execute**: Multi-pass research with gap-filling — targeted sub-agent re-tasking for remaining gaps
+3. **Reflect**: Post-generation adversarial verification with three checks:
+   - **Citation grounding** — URL reachability and claim-source matching (reuses `citation_validator.py`)
+   - **LLM-as-judge sufficiency** — evaluates completeness, depth, and factual consistency
+   - **Adversarial gap analysis** — devil's-advocate review for missing perspectives
+4. **Learn**: Always-on eval tracking with trend analysis, CI regression gates, and A/B experiment tracking
+
+If verification finds issues, structured feedback is injected back to the model for revision (up to `MAX_VERIFICATION_ROUNDS` iterations). Configure via:
+
+```bash
+export ENABLE_VERIFICATION=true          # Enable/disable (default: true)
+export MAX_VERIFICATION_ROUNDS=2         # Max revision iterations (default: 2)
+```
+
+**Pattern learning from eval history** — analyze trends and generate improvement suggestions:
+
+```bash
+uv run python -c "
+from pathlib import Path
+from research_agent.utils.learning import analyze_eval_trends, generate_improvement_suggestions
+analysis = analyze_eval_trends(Path('./output/eval_history/'))
+print(generate_improvement_suggestions(analysis))
+"
+```
+
+**CI regression testing** — PRs that touch research agent code trigger automated regression checks via `.github/workflows/eval-regression.yml`.
 
 ### Server Operational Metrics Tracking
 

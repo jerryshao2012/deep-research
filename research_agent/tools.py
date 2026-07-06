@@ -8,13 +8,13 @@ write_file, read_docs_folder). Handles state injection and directory constraints
 import os
 import re
 from datetime import datetime
-from pathlib import Path
 from typing import Annotated, Literal
 
-from deepagents.backends.utils import create_file_data
+from deepagents.backends.utils import create_file_data, file_data_to_string
 from dotenv import load_dotenv
 from langchain_core.tools import InjectedToolArg, tool
 from langgraph.prebuilt import InjectedState
+from pathlib import Path
 
 from logger_utils import setup_logger
 from research_agent.utils.knowledge_filesystem import (
@@ -42,7 +42,7 @@ logger = setup_logger(__name__)
 
 @tool(parse_docstring=True)
 def fetch_webpage_content(
-    url: str, state: Annotated[dict, InjectedState], timeout: float = 10.0
+        url: str, state: Annotated[dict, InjectedState], timeout: float = 10.0
 ) -> str:
     """Fetch and convert webpage content to markdown.
 
@@ -66,12 +66,12 @@ def fetch_webpage_content(
 
 @tool(parse_docstring=True)
 def tavily_search(
-    query: str,
-    state: Annotated[dict, InjectedState],
-    max_results: Annotated[int, InjectedToolArg] = 1,
-    topic: Annotated[
-        Literal["general", "news", "finance"], InjectedToolArg
-    ] = "general",
+        query: str,
+        state: Annotated[dict, InjectedState],
+        max_results: Annotated[int, InjectedToolArg] = 1,
+        topic: Annotated[
+            Literal["general", "news", "finance"], InjectedToolArg
+        ] = "general",
 ) -> str:
     """Search the web for information on a given query.
 
@@ -170,9 +170,9 @@ def read_file(file_path: str, state: Annotated[dict, InjectedState]) -> str:
 
 @tool(parse_docstring=True)
 def read_docs_folder(
-    folder_path: str,
-    state: Annotated[dict, InjectedState],
-    specific_files: list[str] | None = None,
+        folder_path: str,
+        state: Annotated[dict, InjectedState],
+        specific_files: list[str] | None = None,
 ) -> str:
     """Read and extract text from supported documents in a given folder.
 
@@ -203,9 +203,9 @@ def read_docs_folder(
 
 @tool(parse_docstring=True)
 def write_file(
-    file_path: str,
-    content: str,
-    state: Annotated[dict, InjectedState],
+        file_path: str,
+        content: str,
+        state: Annotated[dict, InjectedState],
 ) -> str:
     """Write content to a file.
 
@@ -229,9 +229,118 @@ def write_file(
         r"/raw/([A-Za-z0-9._\-]+\.(?:pdf|docx|pptx|xlsx))\b", r"/\1", content
     )
 
+    # ── Normalize document sources in /final_report.md ──────────────────
+    # The model sometimes invents descriptive titles ("BMO 2025 Annual
+    # Report") instead of using the file paths from wiki/cited_response
+    # output ("/bmo_ar2025.pdf").  Scan the Sources section and replace
+    # descriptive names with matching file paths found in state.
+    normalized_path = file_path.lstrip('.') if file_path.startswith('./') else file_path
+    if normalized_path in ("final_report.md", "/final_report.md"):
+        content = _normalize_document_sources(content, state)
+
     result = write_file_impl(file_path, content)
     logger.info(f"Successfully wrote file: {file_path}")
     return result
+
+
+def _normalize_document_sources(content: str, state: dict | None) -> str:
+    """Replace descriptive document titles with file paths in Sources section.
+
+    Scans the state files dict for known document paths and cited_response
+    content to build a mapping, then rewrites source lines that use invented
+    titles (e.g. "BMO 2025 Annual Report, p. 51") to use the actual file
+    path (e.g. "/bmo_ar2025.pdf, p. 51").
+    """
+    if not state:
+        return content
+
+    files_dict = state.get("files", {}) or {}
+
+    # ── Collect known document file paths ───────────────────────────────
+    known_docs: dict[str, str] = {}  # normalized-stem → /path
+    for fpath in files_dict:
+        clean = fpath.lstrip("/")
+        if not any(
+            clean.lower().endswith(ext)
+            for ext in (".pdf", ".docx", ".pptx", ".xlsx")
+        ):
+            continue
+        stem = Path(clean).stem.lower()  # "bmo_ar2025"
+        norm = fpath if fpath.startswith("/") else f"/{fpath}"
+        known_docs[stem] = norm
+
+    if not known_docs:
+        return content
+
+    # ── Extract file-path → page mappings from cited_response files ─────
+    # cited_response content has reliable paths like "/bmo_ar2025.pdf, p. 51"
+    page_hints: dict[str, str] = {}  # "p. 51" → "/bmo_ar2025.pdf"
+    for fpath, fdata in files_dict.items():
+        if not (fpath.lstrip("/").startswith("cited_response") and fpath.endswith(".md")):
+            continue
+        try:
+            text = file_data_to_string(fdata)
+            for m in re.finditer(
+                r"(/[A-Za-z0-9._-]+\.(?:pdf|docx|pptx|xlsx)),\s*p\.\s*(\d+)",
+                text,
+            ):
+                doc_path = m.group(1)
+                page = m.group(2)
+                page_hints[f"p. {page}"] = doc_path
+        except Exception:
+            continue
+
+    # ── Rewrite source lines ────────────────────────────────────────────
+    def _replace_source(match):
+        num = match.group(1)
+        desc = match.group(2).strip()
+        page = match.group(3).strip()
+
+        # Already a path or URL — leave alone
+        if desc.startswith("/") or desc.startswith("http"):
+            return match.group(0)
+
+        page_key = f"p. {page}"
+
+        # 1) Exact page match from cited_response
+        if page_key in page_hints:
+            return f"{num}. {page_hints[page_key]}, {page_key}"
+
+        # 2) Keyword overlap against known doc stems
+        desc_words = set(re.findall(r"[a-z0-9]+", desc.lower()))
+        # Remove noise words
+        noise = {
+            "a", "an", "the", "and", "or", "of", "in", "on", "to", "for",
+            "with", "is", "are", "was", "were", "be", "been", "being",
+            "annual", "report", "financial", "statement", "statements",
+            "fiscal", "year", "q1", "q2", "q3", "q4", "quarterly",
+        }
+        desc_keywords = desc_words - noise
+
+        best_stem = None
+        best_score = 0
+        for stem, doc_path in known_docs.items():
+            stem_words = set(re.findall(r"[a-z0-9]+", stem))
+            common = desc_keywords & stem_words
+            score = len(common)
+            if score > best_score:
+                best_score = score
+                best_stem = doc_path
+
+        if best_score >= 1:
+            return f"{num}. {best_stem}, p. {page}"
+
+        return match.group(0)
+
+    # Match source lines: "N. Descriptive Name, p. NN"
+    content = re.sub(
+        r"^(\d+)\.\s+(.+?),\s*p\.\s*(\d+)",
+        _replace_source,
+        content,
+        flags=re.MULTILINE,
+    )
+
+    return content
 
 
 # --- Thinking Tool ---
@@ -239,7 +348,7 @@ def write_file(
 
 @tool(parse_docstring=True)
 def think_tool(
-    reflection: str,
+        reflection: str,
 ) -> str:
     """Tool for strategic reflection on research progress and decision-making.
 
@@ -358,3 +467,145 @@ def read_skill_supporting_file(skill_id: str, filename: str) -> str:
         f"Successfully read supporting file '{filename}' from skill '{skill_id}'"
     )
     return content
+
+
+# --- Wiki Query Tool ---
+
+
+@tool(parse_docstring=True)
+def llm_wiki_query(
+        question: str,
+        state: Annotated[dict, InjectedState],
+) -> str:
+    """Query the thread's ingested document wiki for grounded answers.
+
+    Use this tool during the Research phase to search the knowledge base built
+    from uploaded documents (PDFs, DOCX, etc.).  The wiki contains synthesized
+    pages covering entities, concepts, sources, comparisons, and prior queries.
+
+    This is a RESEARCH tool — its output is raw findings, NOT a final answer.
+    After calling this tool you MUST still follow the full workflow:
+    1. Plan with ``write_todos`` before calling this tool.
+    2. Evaluate the wiki results — if incomplete, fill gaps with ``read_file``
+       (on /wiki/ or /raw/ files) or delegate to sub-agents via ``task()``.
+    3. Synthesize ALL findings into ``/final_report.md`` using ``write_file``.
+    4. The verification loop will review your report automatically.
+
+    Args:
+        question: Natural-language question to ask against the wiki.
+
+    Returns:
+        Raw wiki findings with document citations — must be synthesized into
+        the final report, not output directly.
+    """
+    import asyncio
+    import concurrent.futures
+
+    from thread_wiki.models import ThreadWikiPaths, _resolve_wiki_base_dir
+    from thread_wiki.service import run_query
+
+    # Resolve thread_id from doc_folder in state.
+    doc_folder = (state or {}).get("doc_folder") or os.environ.get("DOC_FOLDER", "")
+    thread_id = None
+    if doc_folder:
+        thread_id = Path(doc_folder).name
+
+    if not thread_id:
+        return (
+            "Error: Cannot determine thread for wiki query. "
+            "No document folder is configured for this session."
+        )
+
+    # tools.py lives in research_agent/ — go up one level to project root.
+    base_dir = _resolve_wiki_base_dir(Path(__file__).resolve().parent.parent)
+    paths = ThreadWikiPaths.resolve(thread_id, base_dir)
+
+    if not paths.wiki_content.exists():
+        return (
+            "The document wiki has not been built yet for this session. "
+            "Use `read_docs_folder` or `read_file` on /raw/ files to access "
+            "documents directly while the wiki is being ingested."
+        )
+
+    async def _query():
+        return await asyncio.wait_for(
+            run_query(paths, f"Thread {thread_id[:8]}", question, file_results=False),
+            timeout=120,
+        )
+
+    def _run_in_new_loop():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            return loop.run_until_complete(_query())
+        finally:
+            loop.close()
+
+    try:
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+
+        if current_loop is not None and current_loop.is_running():
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                result = pool.submit(_run_in_new_loop).result(timeout=130)
+        else:
+            result = asyncio.run(_query())
+    except (TimeoutError, concurrent.futures.TimeoutError):
+        return "Wiki query timed out. Try a more specific question or use `read_file` on /wiki/ or /raw/ files directly."
+    except Exception as e:
+        logger.warning("Wiki query tool failed: %s", e)
+        return f"Wiki query failed: {e}. Use `read_file` on /wiki/ or /raw/ files directly."
+
+    if not result or not result.answer:
+        return (
+            "The wiki query returned no answer. The information may not be "
+            "covered by the ingested documents. Use `read_file` on /wiki/ "
+            "pages or /raw/ source files, or delegate to a sub-agent for "
+            "web search."
+        )
+
+    # Sanitize paths in the answer for the orchestrator's filesystem view.
+    # Converts wiki-internal paths like /raw/bmo_ar2025.pdf.md, p. 38
+    # to orchestrator-accessible paths like /bmo_ar2025.pdf, p. 38
+    import re as _re
+    answer = _re.sub(
+        r"/raw/([A-Za-z0-9._-]+)\.(pdf|docx|pptx|xlsx)\.(md|txt)\b",
+        r"/\1.\2",
+        result.answer,
+    )
+    answer = _re.sub(
+        r"/raw/([A-Za-z0-9._-]+\.(?:pdf|docx|pptx|xlsx))\b",
+        r"/\1",
+        answer,
+    )
+
+    # Persist wiki findings to a /cited_response*.md file so the model can
+    # reference them later when synthesizing /final_report.md.  First call
+    # saves to /cited_response.md, subsequent calls to /cited_response_1.md,
+    # /cited_response_2.md, etc.
+    files_dict = (state or {}).get("files", {})
+    if "/cited_response.md" not in files_dict and "cited_response.md" not in files_dict:
+        cite_path = "/cited_response.md"
+    else:
+        idx = 1
+        while (
+                f"/cited_response_{idx}.md" in files_dict
+                or f"cited_response_{idx}.md" in files_dict
+        ):
+            idx += 1
+        cite_path = f"/cited_response_{idx}.md"
+
+    try:
+        send_files_to_state({cite_path: create_file_data(
+            f"# Wiki Query Result\n\n"
+            f"**Question:** {question}\n\n"
+            f"---\n\n"
+            f"{answer}"
+        )})
+        logger.info("Persisted wiki query result to %s", cite_path)
+    except Exception as e:
+        logger.warning("Could not persist wiki result to state: %s", e)
+
+    return answer

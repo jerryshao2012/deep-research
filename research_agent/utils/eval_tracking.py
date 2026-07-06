@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
+
+from pathlib import Path
 
 from logger_utils import setup_logger
 
@@ -639,9 +641,17 @@ def make_run_record(
         stream_fallback_used: bool,
         output_file: str,
         git_sha: str,
+        experiment_id: str | None = None,
+        variant: str | None = None,
+        prompt_version: str | None = None,
 ) -> dict[str, Any]:
-    """Build one JSONL entry for an evaluation run."""
-    return {
+    """Build one JSONL entry for an evaluation run.
+
+    Optional experiment fields enable zero-code-change A/B testing across
+    deployments: set EXPERIMENT_ID / EXPERIMENT_VARIANT env vars on each
+    instance and compare results in the eval history.
+    """
+    record: dict[str, Any] = {
         "timestamp_utc": utc_now_iso(),
         "run_type": run_type,
         "manifest": manifest,
@@ -653,6 +663,14 @@ def make_run_record(
         "output_file": output_file,
         "metrics": metrics,
     }
+    # Only include experiment fields when present — keeps JSONL lean.
+    if experiment_id:
+        record["experiment_id"] = experiment_id
+    if variant:
+        record["variant"] = variant
+    if prompt_version:
+        record["prompt_version"] = prompt_version
+    return record
 
 
 def append_jsonl(path: Path, record: dict[str, Any]) -> None:
@@ -872,7 +890,7 @@ async def log_server_metrics(
         }
 
         # Create simple run record with timestamp and facts
-        record = {
+        record: dict[str, Any] = {
             "timestamp_utc": utc_now_iso(),
             "model_name": model_name,
             "context": context or {},
@@ -881,6 +899,16 @@ async def log_server_metrics(
             "summary": summary,
             "files": list(files.keys()) if files else [],
         }
+
+        # ── Experiment tracking (Wave 3) ──────────────────────────────
+        # Read from env vars so deployments can be A/B tested without
+        # code changes.
+        experiment_id = os.environ.get("EXPERIMENT_ID")
+        experiment_variant = os.environ.get("EXPERIMENT_VARIANT")
+        if experiment_id:
+            record["experiment_id"] = experiment_id
+        if experiment_variant:
+            record["variant"] = experiment_variant
 
         # Append to history file (use async file I/O if available, otherwise sync)
         history_path = Path(history_file)

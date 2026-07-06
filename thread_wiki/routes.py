@@ -475,7 +475,7 @@ async def cancel_wiki_ingest(
     "/threads/{thread_id}/wiki/query",
     response_model=WikiQueryResponse,
 )
-async def query_wiki(
+async def llm_wiki_query(
     thread_id: str,
     body: WikiQueryRequestModel,
     current_user=Depends(_wiki_get_current_user),

@@ -62,10 +62,19 @@ uv run pytest tests/ -v                    # Run full test suite
    - `think_tool()` — reflection/strategic pausing
    - `fetch_webpage_content()` — page retrieval logic
 
-3. **Validation**: Tests verify your changes don't break core functionality
+3. **Verification Loop**: The post-generation verification system ([research_agent/utils/verification.py](research_agent/utils/verification.py)) enables iterative report refinement:
+   - **Citation grounding** — reuses `citation_validator.py` to check URL reachability and claim accuracy
+   - **LLM-as-judge sufficiency** — evaluates whether the report fully answers the question
+   - **Adversarial gap analysis** — devil's-advocate review to find missing perspectives
+   - Reports that fail verification are fed back to the model for revision (up to `MAX_VERIFICATION_ROUNDS` iterations)
+   - Controlled via `ENABLE_VERIFICATION` and `MAX_VERIFICATION_ROUNDS` env vars
+
+4. **Validation**: Tests verify your changes don't break core functionality
    ```bash
    uv run pytest tests/test_prompts_validation.py -v  # Validate prompts quality
    uv run pytest tests/test_research_agent_cli_e2e.py  # Test full workflow
+   uv run pytest tests/test_verification.py -v          # Test verification loop
+   uv run pytest tests/test_learning.py -v              # Test pattern learning
    ```
 
 ### Adding New Skills
@@ -160,9 +169,18 @@ export MODEL_TPM=120000                        # Tokens per minute quota
 export MODEL_RPM=500                           # Requests per minute quota
 export GRAPH_RECURSION_LIMIT=200               # Multi-agent recursion depth
 
+# Verification Loop (iterative report refinement)
+export ENABLE_VERIFICATION=true                # Enable post-generation verification (default: true)
+export MAX_VERIFICATION_ROUNDS=2               # Max revision iterations per report (default: 2)
+
+# Experiment Tracking (zero-code A/B testing)
+export EXPERIMENT_ID=prompt-v2                 # Optional experiment identifier
+export EXPERIMENT_VARIANT=treatment            # Optional variant label (control/treatment)
+
 # Tracing & Monitoring
 export LANGCHAIN_API_KEY=...                   # LangSmith (optional)
-export ENABLE_EVAL_TRACKING=true               # Evaluation tracking
+export ENABLE_EVAL_TRACKING=true               # Evaluation tracking (default: true)
+export EVAL_LOG_QUESTIONS=false                # Log user questions to eval history (default: false)
 
 # File I/O Limits
 export MAX_FILES_TO_READ=20                    # Max files in doc folder
@@ -261,7 +279,16 @@ research_agent/
 │       └── processor.py
 └── utils/                         # Utilities
     ├── cli.py                     # CLI helpers
-    └── state.py                   # Agent state definitions
+    ├── citation_validator.py      # URL reachability + claim grounding
+    ├── content_extractors.py      # PDF/DOCX/PPTX/XLSX text extraction
+    ├── eval_tracking.py           # Metrics collection, baseline comparison
+    ├── json_utils.py              # Robust JSON parsing with repair
+    ├── knowledge_filesystem.py    # File I/O with safety limits
+    ├── learning.py                # Trend analysis from eval history
+    ├── skill_registry.py          # Dynamic skill discovery
+    ├── text_search.py             # Hybrid BM25+FAISS search index
+    ├── verification.py            # Post-generation adversarial verification
+    └── web_search.py              # Tavily search + webpage fetching
 ```
 
 **Tests**
@@ -270,6 +297,9 @@ tests/
 ├── conftest.py                    # Pytest fixtures (mock tools, temp dirs)
 ├── test_*.py                      # Test files (unit, integration)
 ├── test_prompts_validation.py     # Validates prompt quality
+├── test_verification.py           # Verification loop unit + integration tests
+├── test_learning.py               # Pattern learning and baseline tests
+├── test_eval_tracking.py          # Metrics collection and comparison tests
 └── test_research_agent_cli_e2e.py # End-to-end workflow tests
 ```
 
@@ -311,6 +341,8 @@ Follow root [copilot-instructions.md](../.github/copilot-instructions.md):
 | `Rate limit exceeded` | Increase `MODEL_TPM` / `MODEL_RPM` or wait before retrying |
 | `File path errors in tools` | Use `normalize_path_for_filesystem_tools()` helper (in [research_agent/utils/](research_agent/utils/)) |
 | `Golden dataset not recorded` | Ensure `--eval-golden-dataset --eval-mode baseline` flags; check `output/eval_history/` |
+| `Verification loop not triggering` | Check `ENABLE_VERIFICATION=true` and `/final_report.md` exists in state files |
+| `Verification adds too much latency` | Reduce `MAX_VERIFICATION_ROUNDS` to 1; set `ENABLE_VERIFICATION=false` to disable |
 | `Docker build fails on Windows` | Use WSL2; upgrade `uv` to ≥0.5.0 in Dockerfile |
 
 ---

@@ -38,6 +38,8 @@ env/
 .idea/
 .vscode/
 .claude/
+.codex/
+.github/
 *.swp
 *.swo
 *~
@@ -66,10 +68,6 @@ output/
 sync/
 sync-aws/
 index/
-
-# threadroot:begin local-state
-.codex/
-# threadroot:end local-state
 
 # CCE (code-context-engine)
 # CCE local cache (per-machine, not for version control)
