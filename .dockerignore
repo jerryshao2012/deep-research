@@ -29,6 +29,9 @@ deep_research_example.egg-info/
 # Development tools
 .ruff_cache/
 .DS_Store
+**/.DS_Store
+.deepagents/
+.mcp.json
 
 # Environment and secrets
 .env
