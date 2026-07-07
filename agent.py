@@ -402,6 +402,25 @@ class ResearchStateMiddleware(AgentMiddleware):
                         MAX_VERIFICATION_ROUNDS,
                     )
 
+                    # ── Emit verification progress to do ─────────────────
+                    existing_todos = list(state.get("todos") or [])
+                    verification_todo = {
+                        "id": "verification_pass",
+                        "content": (
+                            f"Verifying report quality "
+                            f"(round {verification_round + 1}/{MAX_VERIFICATION_ROUNDS})..."
+                        ),
+                        "status": "in_progress",
+                    }
+                    filtered_todos = [
+                        t for t in existing_todos
+                        if not (
+                                isinstance(t, dict)
+                                and "verif" in str(t.get("id", "")).lower()
+                        )
+                    ]
+                    updates["todos"] = filtered_todos + [verification_todo]
+
                     try:
                         # Run verification synchronously (the event-loop
                         # / thread-pool pattern from _check_if_needs_deep_research).
@@ -456,6 +475,17 @@ class ResearchStateMiddleware(AgentMiddleware):
                             sufficiency_reason="",
                             error_message=str(exc),
                         )
+
+                    # ── Mark verification to do as completed ─────────────
+                    completed_verification_todo = {
+                        "id": "verification_pass",
+                        "content": (
+                            f"Verified report quality "
+                            f"(round {verification_round + 1}/{MAX_VERIFICATION_ROUNDS})"
+                        ),
+                        "status": "completed",
+                    }
+                    updates["todos"] = filtered_todos + [completed_verification_todo]
 
                     if verdict.status == "needs_revision":
                         feedback_text = format_feedback(verdict)
@@ -675,6 +705,27 @@ class ResearchStateMiddleware(AgentMiddleware):
                         MAX_VERIFICATION_ROUNDS,
                     )
 
+                    # ── Emit verification progress todo ─────────────────
+                    # Add an in_progress verification task so the frontend
+                    # shows a clock icon during the hook's execution window.
+                    existing_todos = list(state.get("todos") or [])
+                    verification_todo = {
+                        "id": "verification_pass",
+                        "content": (
+                            f"Verifying report quality "
+                            f"(round {verification_round + 1}/{MAX_VERIFICATION_ROUNDS})..."
+                        ),
+                        "status": "in_progress",
+                    }
+                    filtered_todos = [
+                        t for t in existing_todos
+                        if not (
+                                isinstance(t, dict)
+                                and "verif" in str(t.get("id", "")).lower()
+                        )
+                    ]
+                    updates["todos"] = filtered_todos + [verification_todo]
+
                     try:
                         # Direct await — completely non-blocking!
                         verdict = await verify_report(
@@ -705,6 +756,17 @@ class ResearchStateMiddleware(AgentMiddleware):
                             sufficiency_reason="",
                             error_message=str(exc),
                         )
+
+                    # ── Mark verification to do as completed ─────────────
+                    completed_verification_todo = {
+                        "id": "verification_pass",
+                        "content": (
+                            f"Verified report quality "
+                            f"(round {verification_round + 1}/{MAX_VERIFICATION_ROUNDS})"
+                        ),
+                        "status": "completed",
+                    }
+                    updates["todos"] = filtered_todos + [completed_verification_todo]
 
                     if verdict.status == "needs_revision":
                         feedback_text = format_feedback(verdict)
