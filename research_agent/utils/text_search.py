@@ -19,11 +19,11 @@ import logging
 import math
 import pickle
 import re
-from collections import defaultdict
-from pathlib import Path
 
+from collections import defaultdict
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -420,6 +420,12 @@ class HybridSearchIndex:
         # 1) BM25: wide-net recall.
         bm25_candidates = self.bm25.search(query, k=min(_HYBRID_BM25_K, len(self.bm25)))
         if not bm25_candidates:
+            logger.warning(
+                "BM25 returned zero results for query=%r. "
+                "FAISS index is available (%s) but HybridSearchIndex.search() "
+                "does not auto-fallback — call search_faiss_only() explicitly.",
+                query, "yes" if self._faiss else "no",
+            )
             return []
 
         # 2) FAISS: re-rank candidates by semantic similarity.
@@ -453,6 +459,34 @@ class HybridSearchIndex:
         scored: list[tuple[Document, float]] = []
         for doc, distance in results:
             relevance = 1.0 / (1.0 + distance)  # Map [0, ∞) → (0, 1]
+            scored.append((doc, relevance))
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return scored
+
+    def search_faiss_only(self, query: str, k: int = 5) -> list[tuple[Document, float]]:
+        """Search the full FAISS index directly (semantic-only, no BM25 gating).
+
+        Use this as a fallback when BM25 keyword search returns zero or few
+        results.  The FAISS index was built over ALL documents at index-build
+        time, so this captures synonyms and paraphrases that BM25 misses.
+
+        Returns the same ``list[tuple[Document, float]]`` format as
+        :meth:`search`, making it a drop-in fallback.
+        """
+        if not self._faiss:
+            return []
+
+        try:
+            results = self._faiss.similarity_search_with_score(query, k=k)
+        except Exception:
+            logger.debug("FAISS direct search failed", exc_info=True)
+            return []
+
+        # FAISS returns L2 distance (lower = better).  Invert to relevance
+        # score (higher = better) so the output format is consistent.
+        scored: list[tuple[Document, float]] = []
+        for doc, distance in results:
+            relevance = 1.0 / (1.0 + distance)
             scored.append((doc, relevance))
         scored.sort(key=lambda x: x[1], reverse=True)
         return scored

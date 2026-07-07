@@ -18,7 +18,7 @@ import logging
 import os
 import re
 import sys
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from pathlib import Path
 
@@ -269,8 +269,18 @@ Writing and organization rules:
 Evidence rules:
 - Every non-trivial claim should be traceable to the ingested source set.
 - Avoid introducing unsupported external facts.
-- If evidence is weak or missing, say so directly.
-- If raw documents are too large to read in full, you may use the `retrieve_wiki_documents` tool to query them and retrieve relevant snippets.
+- If raw documents are too large to read in full, use the `retrieve_wiki_documents` tool to query them and retrieve relevant snippets.
+
+Anti-hallucination rules (MANDATORY — apply to EVERY query response):
+- NEVER conclude "no information available" or "the document does not mention X" without first:
+  a) Calling `retrieve_wiki_documents` with at least 3 query variations (different phrasings, synonyms).
+  b) Reading the top-ranked results from each search.
+  c) Trying related/adjacent terms (e.g. if "acquisition" yields nothing, try "purchase", "buyout", "takeover", "transaction", "M&A", "business combination").
+- If after thorough multi-query searching you still cannot find the information, your response MUST include:
+  * The exact search queries you tried.
+  * Which documents were in the search index.
+  * That the information MAY exist in unexamined sections.
+- Never present a negative claim with high confidence — always qualify it.
 
 Filesystem policy:
 - Never write to `/raw/`.
@@ -1036,6 +1046,11 @@ def _run_agent(
                         "Available raw files are under /raw/."
                     )
 
+                logger.info(
+                    "retrieve_wiki_documents called: query=%r, k=%d, index_size=%d, has_faiss=%s",
+                    query, k, len(search_idx), search_idx.has_faiss,
+                )
+
                 # Primary search: full query.
                 results = search_index(query, search_idx, k=k)
 
@@ -1066,7 +1081,38 @@ def _run_agent(
                         # Re-sort by descending score.
                         results.sort(key=lambda x: x[1], reverse=True)
 
+                # FAISS fallback: if BM25 (full query + per-term) still returns
+                # < k results, try FAISS-only semantic search on the full index.
+                # BM25 is keyword-based and misses synonyms/paraphrases; FAISS
+                # catches those via embedding similarity.
+                if len(results) < k and search_idx.has_faiss:
+                    faiss_results = search_idx.search_faiss_only(query, k=k)
+                    logger.info(
+                        "retrieve_wiki_documents FAISS fallback: query=%r, "
+                        "bm25_hits=%d, faiss_hits=%d",
+                        query, len(results), len(faiss_results),
+                    )
+                    seen_ids = {id(d) for d, _ in results}
+                    for doc, score in faiss_results:
+                        if id(doc) not in seen_ids:
+                            results.append((doc, score))
+                            seen_ids.add(id(doc))
+                    results.sort(key=lambda x: x[1], reverse=True)
+
+                logger.info(
+                    "retrieve_wiki_documents final: query=%r, total_hits=%d, "
+                    "top_sources=%s",
+                    query, len(results),
+                    [(doc.metadata.get("source_path", "?"), round(score, 4))
+                     for doc, score in results[:k]],
+                )
+
                 if not results:
+                    logger.warning(
+                        "retrieve_wiki_documents ZERO results: query=%r, "
+                        "index_size=%d, has_faiss=%s",
+                        query, len(search_idx), search_idx.has_faiss,
+                    )
                     return (
                         "No matching document snippets found for query. "
                         "Try reading `/raw/` files directly with the read_file tool, "
