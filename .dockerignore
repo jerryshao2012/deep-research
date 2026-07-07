@@ -52,6 +52,8 @@ CLAUDE.md
 .codex/
 .cce/
 .claude/
+.kun-canvas/
+.kunsdd/
 
 # Azure deployment configs
 

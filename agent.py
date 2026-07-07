@@ -553,6 +553,236 @@ class ResearchStateMiddleware(AgentMiddleware):
 
         return updates if updates else None
 
+    async def aafter_model(self, state: ResearchState, runtime: Any) -> dict[str, Any] | None:
+        """Asynchronous version of after_model that runs verification without blocking the main event loop."""
+        chat_start_time = state.get("chat_start_time")
+        updates = {}
+
+        # ── Progress messages ──────────────────────────────────────────────
+        messages = state.get("messages", [])
+        last_msg = messages[-1] if messages else None
+        last_tool_calls = getattr(last_msg, "tool_calls", None) or []
+
+        if isinstance(chat_start_time, (int, float)):
+            chat_elapsed_seconds = time.time() - chat_start_time
+            updates["chat_elapsed_seconds"] = chat_elapsed_seconds
+
+        # ── Stream reports into chat history ──────────────────────────────
+        state_files = state.get("files") or {}
+        if (
+                isinstance(state_files, dict)
+                and not last_tool_calls
+                and "/final_report.md" in state_files
+        ):
+            streamed = set(state.get("_streamed_files") or [])
+            new_messages: list = []
+
+            # ── Phase 1: unstreamed cited_response files, sorted ──────────
+            cited_files = sorted(
+                [
+                    f for f in state_files
+                    if f.lstrip("/").startswith("cited_response")
+                       and f.endswith(".md")
+                       and f not in streamed
+                ],
+                key=lambda f: (
+                    0 if f.rstrip(".md").rstrip("/") in ("/cited_response", "cited_response")
+                    else int(f.rstrip(".md").rsplit("_", 1)[-1])
+                    if f.rstrip(".md").rsplit("_", 1)[-1].isdigit()
+                    else 99
+                ),
+            )
+            for file_path in cited_files:
+                try:
+                    content = file_data_to_string(state_files[file_path])
+                    if content.strip():
+                        new_messages.append(
+                            AIMessage(
+                                content=f"**LLM Wiki Query Findings:**\n\n{content.strip()}"
+                            )
+                        )
+                        streamed.add(file_path)
+                except Exception:
+                    logger.debug(
+                        "Failed to stream %s to chat", file_path, exc_info=True
+                    )
+
+            # ── Phase 2: separator ────────────────────────────────────────
+            if new_messages and "/final_report.md" not in streamed:
+                new_messages.append(AIMessage(content="---"))
+
+            # ── Phase 3: final report ─────────────────────────────────────
+            if "/final_report.md" not in streamed:
+                try:
+                    content = file_data_to_string(state_files["/final_report.md"])
+                    if content.strip():
+                        new_messages.append(
+                            AIMessage(
+                                content=f"**Final Report:**\n\n{content.strip()}"
+                            )
+                        )
+                        streamed.add("/final_report.md")
+                except Exception:
+                    logger.debug(
+                        "Failed to stream /final_report.md to chat", exc_info=True
+                    )
+
+            if new_messages:
+                if "messages" in updates:
+                    updates["messages"].extend(new_messages)
+                else:
+                    updates["messages"] = new_messages
+                updates["_streamed_files"] = list(streamed)
+
+        # ── Post-generation verification hook ────────────────────────────
+        if (
+                ENABLE_VERIFICATION
+                and not last_tool_calls
+                and isinstance(state_files, dict)
+                and "/final_report.md" in state_files
+        ):
+            verification_round = state.get("verification_round", 0)
+            if verification_round < MAX_VERIFICATION_ROUNDS:
+                try:
+                    report_text = file_data_to_string(
+                        state_files["/final_report.md"]
+                    )
+                except Exception:
+                    report_text = ""
+
+                if report_text.strip():
+                    user_question = ""
+                    msgs = state.get("messages", [])
+                    for m in reversed(msgs):
+                        if isinstance(m, HumanMessage):
+                            user_question = str(m.content)
+                            break
+                        elif isinstance(m, dict) and m.get("role") == "user":
+                            user_question = str(m.get("content", ""))
+                            break
+                    if not user_question:
+                        if "/research_request.md" in state_files:
+                            try:
+                                user_question = file_data_to_string(
+                                    state_files["/research_request.md"]
+                                )
+                            except Exception:
+                                pass
+
+                    logger.info(
+                        "Verification round %d/%d — reviewing /final_report.md (async)",
+                        verification_round + 1,
+                        MAX_VERIFICATION_ROUNDS,
+                    )
+
+                    try:
+                        # Direct await — completely non-blocking!
+                        verdict = await verify_report(
+                            question=user_question,
+                            report=report_text,
+                        )
+                        logger.info(
+                            "Verification verdict: %s (score=%.2f, "
+                            "grounding_failures=%d, gaps=%d)",
+                            verdict.status,
+                            verdict.sufficiency_score,
+                            sum(
+                                1
+                                for r in verdict.grounding_results
+                                if not r.grounded or not r.reachable
+                            ),
+                            len(verdict.adversarial_gaps),
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Verification check failed: %s. "
+                            "Allowing report through without revision.",
+                            exc,
+                        )
+                        verdict = VerificationVerdict(
+                            status="complete",
+                            sufficiency_score=1.0,
+                            sufficiency_reason="",
+                            error_message=str(exc),
+                        )
+
+                    if verdict.status == "needs_revision":
+                        feedback_text = format_feedback(verdict)
+                        logger.info(
+                            "Report needs revision — injecting feedback "
+                            "for round %d",
+                            verification_round + 1,
+                        )
+                        updates["verification_round"] = verification_round + 1
+                        updates["verification_feedback"] = feedback_text
+                        updates.setdefault("messages", [])
+                        if isinstance(updates["messages"], list):
+                            updates["messages"] = [
+                                                      SystemMessage(content=feedback_text)
+                                                  ] + updates["messages"]
+                    else:
+                        updates["verification_round"] = verification_round
+                        updates["verification_feedback"] = None
+
+        # Optional: Log eval metrics on completion (when graph is done)
+        if ENABLE_EVAL_TRACKING and state.get("files"):
+            files = state.get("files", {})
+            if not isinstance(files, dict):
+                return updates if updates else None
+
+            has_final_output = "/final_report.md" in files
+
+            if has_final_output and not state.get("_eval_logged", False):
+                updates["_eval_logged"] = True
+                runtime_seconds = 0.0
+                if isinstance(chat_start_time, (int, float)):
+                    runtime_seconds = time.time() - chat_start_time
+
+                messages = state.get("messages", [])
+                doc_folder = state.get("doc_folder") or os.environ.get(
+                    "DOC_FOLDER", "N/A"
+                )
+                skill = state.get("skill", "research")
+                no_web = state.get("no_web", False)
+                model_name = os.environ.get(
+                    "MODEL_NAME", os.environ.get("AZURE_OPENAI_DEPLOYMENT", "N/A")
+                )
+
+                user_message = None
+                for m in messages:
+                    if isinstance(m, dict) and m.get("role") == "user":
+                        user_message = m.get("content", "")
+                        break
+                    elif hasattr(m, "type") and getattr(m, "type", None) == "human":
+                        user_message = getattr(m, "content", "")
+                        break
+                subject = user_message
+
+                if not EVAL_LOG_QUESTIONS:
+                    subject = "[REDACTED]"
+
+                context = {
+                    "subject": subject,
+                    "skill": skill,
+                    "doc_folder": doc_folder,
+                    "no_web": no_web,
+                }
+
+                try:
+                    await log_server_metrics(
+                        messages=messages,
+                        files=files,
+                        runtime_seconds=runtime_seconds,
+                        model_name=model_name,
+                        context=context,
+                        history_file=EVAL_HISTORY_FILE,
+                    )
+                    logger.info("✅ Metrics logging completed (async)")
+                except Exception as e:
+                    logger.error(f"⚠️  Failed metrics logging: {e}")
+
+        return updates if updates else None
+
     def _extract_parameters_from_user_input(
             self, state: ResearchState, messages: list
     ) -> dict[str, Any]:

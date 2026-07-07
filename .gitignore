@@ -40,6 +40,8 @@ env/
 .claude/
 .codex/
 .github/
+.kun-canvas/
+.kunsdd/
 *.swp
 *.swo
 *~

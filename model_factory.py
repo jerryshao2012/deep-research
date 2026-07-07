@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 
 import httpx
 from azure.identity import ManagedIdentityCredential, get_bearer_token_provider
@@ -12,6 +11,7 @@ from langchain.chat_models import init_chat_model
 from langchain.embeddings import init_embeddings
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph_checkpoint_cosmosdb import CosmosDBSaver
+from pathlib import Path
 from pydantic import SecretStr
 
 from logger_utils import setup_logger
@@ -269,7 +269,27 @@ def create_memory_saver():
     raise ValueError(f"Unsupported MEMORY_TYPE: {memory_type}")
 
 
-def get_configured_model():
+_cached_model = None
+
+
+def clear_model_cache():
+    """Clear the globally cached model instance."""
+    global _cached_model
+    _cached_model = None
+
+
+def get_configured_model(bypass_cache: bool = False):
+    """Get the globally cached model instance or build it if missing."""
+    global _cached_model
+    if not bypass_cache and _cached_model is not None:
+        return _cached_model
+    model = _build_configured_model()
+    if not bypass_cache:
+        _cached_model = model
+    return model
+
+
+def _build_configured_model():
     """Build the first matching chat model from the environment configuration with rate limit retry."""
     verify_ssl = get_ssl_verify_config()
 

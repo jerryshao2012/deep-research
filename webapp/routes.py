@@ -15,12 +15,12 @@ import re
 import shutil
 import sys
 import zipfile
-from pathlib import Path, PurePosixPath
 from typing import Any
 
 import yaml
 from fastapi import File, Form, Header, HTTPException, Request, UploadFile, status
 from fastapi.responses import FileResponse, RedirectResponse
+from pathlib import Path, PurePosixPath
 
 import webapp.config as _cfg
 from research_agent.utils.content_extractors import extract_supported_document
@@ -110,10 +110,10 @@ def register_document_routes(app) -> None:
 
     @app.get("/documents/view/{filename}")
     async def view_document(
-        request: Request,
-        filename: str,
-        folder: str = "policy",
-        x_api_key: str | None = Header(None),
+            request: Request,
+            filename: str,
+            folder: str = "policy",
+            x_api_key: str | None = Header(None),
     ):
         """Serve a document for inline viewing (browser renders instead of downloading)."""
         if not is_authenticated(x_api_key, request):
@@ -148,10 +148,10 @@ def register_document_routes(app) -> None:
 
     @app.get("/documents/extract/{filename}")
     async def extract_document(
-        request: Request,
-        filename: str,
-        folder: str = "policy",
-        x_api_key: str | None = Header(None),
+            request: Request,
+            filename: str,
+            folder: str = "policy",
+            x_api_key: str | None = Header(None),
     ) -> dict:
         """Extract text/markdown content from a document for preview."""
         if not is_authenticated(x_api_key, request):
@@ -204,10 +204,10 @@ def register_document_routes(app) -> None:
 
     @app.post("/documents/upload", status_code=status.HTTP_201_CREATED)
     async def upload_documents(
-        request: Request,
-        folder: str = Form("policy"),
-        files: list[UploadFile] = File(...),
-        x_api_key: str | None = Header(None),
+            request: Request,
+            folder: str = Form("policy"),
+            files: list[UploadFile] = File(...),
+            x_api_key: str | None = Header(None),
     ) -> dict:
         """Upload documents to a specified folder within docs directory."""
         if not is_authenticated(x_api_key, request):
@@ -221,14 +221,40 @@ def register_document_routes(app) -> None:
         destination_dir = m.DOCS_ROOT.joinpath(*relative_folder.parts)
         await asyncio.to_thread(destination_dir.mkdir, parents=True, exist_ok=True)
 
+        MAX_UPLOAD_SIZE_MB = int(os.getenv("MAX_UPLOAD_SIZE_MB", "500"))
+        max_bytes = MAX_UPLOAD_SIZE_MB * 1024 * 1024
+
+        content_length = request.headers.get("content-length")
+        if content_length and int(content_length) > max_bytes:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=f"Upload size exceeds limit of {MAX_UPLOAD_SIZE_MB}MB.",
+            )
+
         saved: list[dict[str, Any]] = []
         total_uploaded_size = 0
+        import shutil
+
         for upload in files:
+            # Check size on the file object
+            upload.file.seek(0, 2)  # seek to end
+            file_size = upload.file.tell()
+            upload.file.seek(0)  # reset to beginning
+
+            if file_size > max_bytes:
+                raise HTTPException(
+                    status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                    detail=f"File {upload.filename} exceeds limit of {MAX_UPLOAD_SIZE_MB}MB.",
+                )
+
             filename = safe_filename(upload.filename)
-            content = await upload.read()
             destination = destination_dir / filename
-            await asyncio.to_thread(destination.write_bytes, content)
-            file_size = len(content)
+
+            def _write_stream(up_file, dest):
+                with open(dest, "wb") as f:
+                    shutil.copyfileobj(up_file, f)
+
+            await asyncio.to_thread(_write_stream, upload.file, destination)
             total_uploaded_size += file_size
             saved.append(
                 {
@@ -265,9 +291,9 @@ def register_document_routes(app) -> None:
 
     @app.get("/documents/list")
     async def list_documents(
-        request: Request,
-        folder: str = "policy",
-        x_api_key: str | None = Header(None),
+            request: Request,
+            folder: str = "policy",
+            x_api_key: str | None = Header(None),
     ) -> dict:
         """List all files in a specified folder within docs directory."""
         if not is_authenticated(x_api_key, request):
@@ -314,10 +340,10 @@ def register_document_routes(app) -> None:
 
     @app.get("/documents/download/{filename}")
     async def download_document(
-        request: Request,
-        filename: str,
-        folder: str = "policy",
-        x_api_key: str | None = Header(None),
+            request: Request,
+            filename: str,
+            folder: str = "policy",
+            x_api_key: str | None = Header(None),
     ):
         """Download a specific file from a folder."""
         if not is_authenticated(x_api_key, request):
@@ -351,10 +377,10 @@ def register_document_routes(app) -> None:
 
     @app.delete("/documents/{filename}", status_code=status.HTTP_200_OK)
     async def delete_document(
-        request: Request,
-        filename: str,
-        folder: str = "policy",
-        x_api_key: str | None = Header(None),
+            request: Request,
+            filename: str,
+            folder: str = "policy",
+            x_api_key: str | None = Header(None),
     ) -> dict:
         """Delete a specific file from a folder."""
         if not is_authenticated(x_api_key, request):
@@ -398,9 +424,9 @@ def register_document_routes(app) -> None:
 
     @app.delete("/documents/folder/{folder}", status_code=status.HTTP_200_OK)
     async def delete_folder_contents(
-        request: Request,
-        folder: str,
-        x_api_key: str | None = Header(None),
+            request: Request,
+            folder: str,
+            x_api_key: str | None = Header(None),
     ) -> dict:
         """Delete all files in a specified folder."""
         if not is_authenticated(x_api_key, request):
@@ -458,7 +484,7 @@ def register_oauth_routes(app) -> None:
 
     @app.get("/auth/login/{provider}")
     async def oauth_login(
-        provider: str, request: Request, redirect_url: str | None = None
+            provider: str, request: Request, redirect_url: str | None = None
     ):
         """Initiate OAuth login with Google or GitHub."""
         if not _cfg.OAUTH_ENABLED:
@@ -603,16 +629,16 @@ def register_oauth_routes(app) -> None:
                 k: v
                 for k, v in user_data.items()
                 if k
-                not in {
-                    "identity",
-                    "email",
-                    "name",
-                    "provider",
-                    "picture",
-                    "avatar_url",
-                    "raw_token",
-                    "session_token",
-                }
+                   not in {
+                       "identity",
+                       "email",
+                       "name",
+                       "provider",
+                       "picture",
+                       "avatar_url",
+                       "raw_token",
+                       "session_token",
+                   }
             },
         }
 
@@ -739,7 +765,7 @@ def register_skills_routes(app) -> None:
 
                 # 2. System / Migrated skills from .deepagents/skills/
                 deepagents_skills_dir = (
-                    Path(__file__).resolve().parent.parent / ".deepagents" / "skills"
+                        Path(__file__).resolve().parent.parent / ".deepagents" / "skills"
                 )
                 if deepagents_skills_dir.is_dir():
                     for skill_dir in deepagents_skills_dir.iterdir():
@@ -755,15 +781,15 @@ def register_skills_routes(app) -> None:
                                 fm = yaml.safe_load(match.group(1)) or {}
                                 name = fm.get("name", skill_dir.name)
                                 if (
-                                    name not in seen_ids
-                                    and skill_dir.name not in seen_ids
+                                        name not in seen_ids
+                                        and skill_dir.name not in seen_ids
                                 ):
                                     skills_list.append(
                                         {
                                             "id": skill_dir.name,
                                             "name": name,
                                             "description": (
-                                                fm.get("description") or ""
+                                                    fm.get("description") or ""
                                             ).strip(),
                                             "source": "system",
                                             "is_removable": False,
@@ -777,10 +803,10 @@ def register_skills_routes(app) -> None:
 
                 # 3. Uploaded custom skills from ./doc/.deepagents/skills/ and ./docs/.deepagents/skills/
                 docs_skills_dir = (
-                    Path(__file__).resolve().parent.parent
-                    / "docs"
-                    / ".deepagents"
-                    / "skills"
+                        Path(__file__).resolve().parent.parent
+                        / "docs"
+                        / ".deepagents"
+                        / "skills"
                 )
                 if docs_skills_dir.is_dir():
                     for skill_dir in docs_skills_dir.iterdir():
@@ -796,15 +822,15 @@ def register_skills_routes(app) -> None:
                                 fm = yaml.safe_load(match.group(1)) or {}
                                 name = fm.get("name", skill_dir.name)
                                 if (
-                                    name not in seen_ids
-                                    and skill_dir.name not in seen_ids
+                                        name not in seen_ids
+                                        and skill_dir.name not in seen_ids
                                 ):
                                     skills_list.append(
                                         {
                                             "id": skill_dir.name,
                                             "name": name,
                                             "description": (
-                                                fm.get("description") or ""
+                                                    fm.get("description") or ""
                                             ).strip(),
                                             "source": "uploaded",
                                             "is_removable": True,
@@ -831,11 +857,11 @@ def register_skills_routes(app) -> None:
 
     @app.post("/skills/upload", status_code=status.HTTP_201_CREATED)
     async def upload_skill(
-        request: Request,
-        file: UploadFile | None = File(None),
-        files: list[UploadFile] | None = File(None),
-        paths: list[str] | None = Form(None),
-        x_api_key: str | None = Header(None),
+            request: Request,
+            file: UploadFile | None = File(None),
+            files: list[UploadFile] | None = File(None),
+            paths: list[str] | None = Form(None),
+            x_api_key: str | None = Header(None),
     ):
         """Upload and install a new agent skill archive (.zip), SKILL.md file, or full skill directory into ./doc/.deepagents/skills/."""
         if not is_authenticated(x_api_key, request):
@@ -845,10 +871,10 @@ def register_skills_routes(app) -> None:
             )
         try:
             doc_skills_dir = (
-                Path(__file__).resolve().parent.parent
-                / "docs"
-                / ".deepagents"
-                / "skills"
+                    Path(__file__).resolve().parent.parent
+                    / "docs"
+                    / ".deepagents"
+                    / "skills"
             )
             doc_skills_dir.mkdir(parents=True, exist_ok=True)
 
@@ -888,7 +914,7 @@ def register_skills_routes(app) -> None:
                             m
                             for m in members
                             if not m.filename.startswith("__MACOSX")
-                            and not m.filename.startswith("._")
+                               and not m.filename.startswith("._")
                         ]
                         first_parts = {
                             m.filename.split("/")[0]
@@ -947,7 +973,7 @@ def register_skills_routes(app) -> None:
 
     @app.delete("/skills/{skill_id}")
     async def delete_skill(
-        skill_id: str, request: Request, x_api_key: str | None = Header(None)
+            skill_id: str, request: Request, x_api_key: str | None = Header(None)
     ):
         """Remove an uploaded skill from ./doc/.deepagents/skills/."""
         if not is_authenticated(x_api_key, request):
@@ -957,10 +983,10 @@ def register_skills_routes(app) -> None:
             )
         try:
             doc_skills_dir = (
-                Path(__file__).resolve().parent.parent
-                / "docs"
-                / ".deepagents"
-                / "skills"
+                    Path(__file__).resolve().parent.parent
+                    / "docs"
+                    / ".deepagents"
+                    / "skills"
             )
             skill_dir = doc_skills_dir / skill_id
             if not skill_dir.exists() or not skill_dir.is_dir():

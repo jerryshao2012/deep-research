@@ -15,10 +15,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import sys
-from pathlib import Path
 from typing import TYPE_CHECKING
+
+from pathlib import Path
 
 from .models import (
     CommunityInfo,
@@ -41,6 +43,18 @@ if TYPE_CHECKING:
     from .models import WikiPageMetadata  # noqa: F401
 
 logger = logging.getLogger(__name__)
+
+_agent_cache: dict[tuple[str, bool], Any] = {}
+_search_index_cache: dict[str, Any] = {}
+
+
+def _invalidate_agent_cache(wiki_dir: Path):
+    """Invalidate cached agent and search index for a wiki directory."""
+    path_key = str(Path(wiki_dir).resolve())
+    _agent_cache.pop((path_key, True), None)
+    _agent_cache.pop((path_key, False), None)
+    _search_index_cache.pop(path_key, None)
+
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
@@ -130,9 +144,36 @@ def _build_context_budget_instructions() -> str:
 
 
 def _total_raw_size(raw_dir: Path) -> int:
-    """Return the total character count of all staged raw source files."""
+    """Return the total character count of all staged raw source files, with caching."""
     if not raw_dir.exists():
         return 0
+
+    # Find all files in raw_dir
+    files = []
+    for path in sorted(raw_dir.rglob("*")):
+        if path.is_file():
+            try:
+                stat = path.stat()
+                files.append((str(path.relative_to(raw_dir)), stat.st_mtime, stat.st_size))
+            except Exception:
+                pass
+
+    if not files:
+        return 0
+
+    import json
+    cache_file = raw_dir.parent / ".raw_size_cache"
+
+    # Try to load cache
+    if cache_file.exists():
+        try:
+            cache_data = json.loads(cache_file.read_text(encoding="utf-8"))
+            if cache_data.get("files") == files:
+                return cache_data["total_size"]
+        except Exception:
+            pass
+
+    # Cache miss or invalid: compute total character count by reading files
     total = 0
     for path in raw_dir.rglob("*"):
         if path.is_file():
@@ -140,6 +181,16 @@ def _total_raw_size(raw_dir: Path) -> int:
                 total += len(path.read_text(encoding="utf-8"))
             except Exception:
                 pass
+
+    # Save cache
+    try:
+        cache_file.write_text(
+            json.dumps({"files": files, "total_size": total}, indent=2),
+            encoding="utf-8"
+        )
+    except Exception:
+        pass
+
     return total
 
 
@@ -391,7 +442,19 @@ def _fallback_pdf_extract(file_path: Path) -> str:
             return "\n\n".join(page_texts)
         except Exception as e:
             return f"Error extracting PDF text: {e}"
-    return ""
+
+
+def _extract_and_write_binary_source(src: Path, dest: Path) -> tuple[Path, str]:
+    """Helper for ProcessPoolExecutor to extract and write binary source content."""
+    text = _extract_binary_source(src)
+    stem = f"{src.stem}.{src.suffix.lstrip('.')}"
+    counter = 2
+    final_dest = dest
+    while final_dest.exists():
+        final_dest = dest.parent / f"{stem}-{counter}.md"
+        counter += 1
+    final_dest.write_text(text, encoding="utf-8")
+    return (final_dest, stem)
 
 
 def _stage_sources(source_paths: list[Path], raw_dir: Path) -> list[Path]:
@@ -401,8 +464,8 @@ def _stage_sources(source_paths: list[Path], raw_dir: Path) -> list[Path]:
     Binary formats (.pdf, .docx, .pptx, .xlsx) are extracted to markdown/text
     via ``content_extractors`` and saved as ``.md`` in the raw directory.
 
-    Binary extractions run in parallel via a thread pool to reduce wall-clock
-    time when multiple PDFs or office documents are staged together.
+    Binary extractions run in parallel via a process pool (falling back to a thread
+    pool) to reduce wall-clock time when multiple PDFs or office documents are staged.
     """
     import concurrent.futures
 
@@ -452,32 +515,36 @@ def _stage_sources(source_paths: list[Path], raw_dir: Path) -> list[Path]:
 
     # Process binary sources in parallel (CPU-bound extraction).
     if binary_sources:
-
-        def _extract_one(src: Path, dest: Path) -> tuple[Path, str] | None:
-            """Extract one binary source; returns (final_dest, stem) or None."""
-            text = _extract_binary_source(src)
-            stem = f"{src.stem}.{src.suffix.lstrip('.')}"
-            counter = 2
-            while dest.exists():
-                dest = raw_dir / f"{stem}-{counter}.md"
-                counter += 1
-            dest.write_text(text, encoding="utf-8")
-            return (dest, stem)
-
         max_workers = min(len(binary_sources), 4)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {
-                executor.submit(_extract_one, src, dest): src
-                for src, dest in binary_sources
-            }
-            for future in concurrent.futures.as_completed(futures):
-                try:
-                    result = future.result()
-                    if result is not None:
-                        staged.append(result[0])
-                except Exception:
-                    src = futures[future]
-                    logger.exception("Failed to extract binary source: %s", src)
+        try:
+            with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+                futures = {
+                    executor.submit(_extract_and_write_binary_source, src, dest): src
+                    for src, dest in binary_sources
+                }
+                for future in concurrent.futures.as_completed(futures):
+                    try:
+                        result = future.result()
+                        if result is not None:
+                            staged.append(result[0])
+                    except Exception:
+                        src = futures[future]
+                        logger.exception("Failed to extract binary source in process pool: %s", src)
+        except Exception as p_err:
+            logger.warning("ProcessPoolExecutor failed, falling back to ThreadPoolExecutor: %s", p_err)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {
+                    executor.submit(_extract_and_write_binary_source, src, dest): src
+                    for src, dest in binary_sources
+                }
+                for future in concurrent.futures.as_completed(futures):
+                    try:
+                        result = future.result()
+                        if result is not None:
+                            staged.append(result[0])
+                    except Exception:
+                        src = futures[future]
+                        logger.exception("Failed to extract binary source in fallback thread pool: %s", src)
 
     return staged
 
@@ -769,13 +836,13 @@ def _repair_index(topic: str, wiki_dir: Path, staged_count: int) -> bool:
 
 
 def _append_log_entry(
-    wiki_dir: Path,
-    phase: str,
-    outcome: str,
-    *,
-    summary: str = "",
-    sources_count: int = 0,
-    pages_affected: str = "",
+        wiki_dir: Path,
+        phase: str,
+        outcome: str,
+        *,
+        summary: str = "",
+        sources_count: int = 0,
+        pages_affected: str = "",
 ) -> None:
     """Append a structured entry to the wiki's log.md.
 
@@ -828,13 +895,13 @@ def _resolve_model():
 
 
 def _run_agent(
-    wiki_dir: Path,
-    prompt: str,
-    *,
-    read_only: bool = False,
-    search_index: object | None = None,
-    total_raw_size: int | None = None,
-    progress_callback: object | None = None,
+        wiki_dir: Path,
+        prompt: str,
+        *,
+        read_only: bool = False,
+        search_index: object | None = None,
+        total_raw_size: int | None = None,
+        progress_callback: object | None = None,
 ) -> str:
     """Execute one deepagents pass against the wiki workspace.
 
@@ -847,51 +914,11 @@ def _run_agent(
             computed on demand (reads all raw files).
         progress_callback: Optional callable(str) for sub-phase progress updates.
     """
-    from deepagents import create_deep_agent
-    from deepagents.backends import CompositeBackend, FilesystemBackend
-    from deepagents.middleware.filesystem import FilesystemPermission
+    path_key = str(Path(wiki_dir).resolve())
+    cache_key = (path_key, read_only)
 
-    # For server environments, we MUST NOT give the wiki synthesizer a shell.
-    # It only needs to read/write files in the wiki directory.
-    raw_backend = FilesystemBackend(root_dir=wiki_dir / "raw", virtual_mode=True)
-    wiki_backend = FilesystemBackend(root_dir=wiki_dir / "wiki", virtual_mode=True)
-    root_backend = FilesystemBackend(root_dir=wiki_dir, virtual_mode=True)
-    backend = CompositeBackend(
-        default=root_backend,
-        routes={
-            "/raw/": raw_backend,
-            "/wiki/": wiki_backend,
-            "/log.md": root_backend,
-            "/AGENTS.md": root_backend,
-            "/purpose.md": root_backend,
-        },
-    )
-
-    if read_only:
-        permissions = [
-            FilesystemPermission(operations=["write"], paths=["/raw/**"], mode="deny"),
-            FilesystemPermission(operations=["write"], paths=["/wiki/**"], mode="deny"),
-            FilesystemPermission(operations=["write"], paths=["/log.md"], mode="deny"),
-            FilesystemPermission(
-                operations=["write"], paths=["/AGENTS.md"], mode="deny"
-            ),
-            FilesystemPermission(
-                operations=["write"], paths=["/purpose.md"], mode="deny"
-            ),
-            FilesystemPermission(operations=["write"], paths=["/**"], mode="deny"),
-        ]
-    else:
-        permissions = [
-            FilesystemPermission(operations=["write"], paths=["/raw/**"], mode="deny"),
-            FilesystemPermission(
-                operations=["write"], paths=["/AGENTS.md"], mode="deny"
-            ),
-            FilesystemPermission(operations=["write"], paths=["/log.md"], mode="deny"),
-            FilesystemPermission(
-                operations=["write"], paths=["/purpose.md"], mode="deny"
-            ),
-            FilesystemPermission(operations=["write"], paths=["/**"], mode="allow"),
-        ]
+    if search_index is not None:
+        _search_index_cache[path_key] = search_index
 
     # ── Budget-aware: pre-build search index when raw content is large ─────
     _raw_dir = wiki_dir / "raw"
@@ -900,164 +927,206 @@ def _run_agent(
     )
     _raw_budget = _calculate_context_budget()["raw_sources"]
     _use_search = _total_raw > _raw_budget
-    _cached_index = search_index  # May be None (build on demand)
-    if _use_search and _cached_index is not None:
-        logger.info("Using cached search index for raw content (%d chars).", _total_raw)
-    elif _use_search:
-        logger.info(
-            "Raw content (%d chars) exceeds raw source budget (%d chars); "
-            "pre-building search index and recommending retrieve_wiki_documents tool.",
-            _total_raw,
-            _raw_budget,
+
+    if cache_key in _agent_cache:
+        agent = _agent_cache[cache_key]
+    else:
+        from deepagents import create_deep_agent
+        from deepagents.backends import CompositeBackend, FilesystemBackend
+        from deepagents.middleware.filesystem import FilesystemPermission
+
+        # For server environments, we MUST NOT give the wiki synthesizer a shell.
+        # It only needs to read/write files in the wiki directory.
+        raw_backend = FilesystemBackend(root_dir=wiki_dir / "raw", virtual_mode=True)
+        wiki_backend = FilesystemBackend(root_dir=wiki_dir / "wiki", virtual_mode=True)
+        root_backend = FilesystemBackend(root_dir=wiki_dir, virtual_mode=True)
+        backend = CompositeBackend(
+            default=root_backend,
+            routes={
+                "/raw/": raw_backend,
+                "/wiki/": wiki_backend,
+                "/log.md": root_backend,
+                "/AGENTS.md": root_backend,
+                "/purpose.md": root_backend,
+            },
         )
-        # Eagerly build the search index so the tool is ready when the LLM calls it.
-        try:
-            from research_agent.utils.text_search import load_or_build_search_index
 
-            _index_dir = wiki_dir / "index"
-            _cached_index = load_or_build_search_index(_raw_dir, _index_dir)
-            logger.info("Search index built successfully for %s", _raw_dir)
-        except Exception:
-            logger.exception(
-                "Failed to pre-build search index; tool will build on first call."
+        if read_only:
+            permissions = [
+                FilesystemPermission(operations=["write"], paths=["/raw/**"], mode="deny"),
+                FilesystemPermission(operations=["write"], paths=["/wiki/**"], mode="deny"),
+                FilesystemPermission(operations=["write"], paths=["/log.md"], mode="deny"),
+                FilesystemPermission(
+                    operations=["write"], paths=["/AGENTS.md"], mode="deny"
+                ),
+                FilesystemPermission(
+                    operations=["write"], paths=["/purpose.md"], mode="deny"
+                ),
+                FilesystemPermission(operations=["write"], paths=["/**"], mode="deny"),
+            ]
+        else:
+            permissions = [
+                FilesystemPermission(operations=["write"], paths=["/raw/**"], mode="deny"),
+                FilesystemPermission(
+                    operations=["write"], paths=["/AGENTS.md"], mode="deny"
+                ),
+                FilesystemPermission(operations=["write"], paths=["/log.md"], mode="deny"),
+                FilesystemPermission(
+                    operations=["write"], paths=["/purpose.md"], mode="deny"
+                ),
+                FilesystemPermission(operations=["write"], paths=["/**"], mode="allow"),
+            ]
+
+        if _use_search and path_key not in _search_index_cache:
+            logger.info(
+                "Raw content (%d chars) exceeds raw source budget (%d chars); "
+                "pre-building search index and recommending retrieve_wiki_documents tool.",
+                _total_raw,
+                _raw_budget,
             )
+            # Eagerly build the search index so the tool is ready when the LLM calls it.
+            try:
+                from research_agent.utils.text_search import load_or_build_search_index
 
-    from langchain_core.tools import tool
-
-    @tool
-    def retrieve_wiki_documents(query: str, k: int = 5) -> str:
-        """Retrieve top-k relevant document snippets from the raw documents text search index.
-
-        Use this tool when you need to search large raw source documents in `/raw/`
-        for specific facts.  Returns ranked snippets with source file paths, page
-        numbers, and relevance scores.
-        """
-        nonlocal _cached_index
-
-        try:
-            from research_agent.utils.text_search import (
-                load_or_build_search_index,
-                search_index,
-            )
-
-            index_dir = wiki_dir / "index"
-            raw_dir = wiki_dir / "raw"
-
-            # Use cached index if available, otherwise build on demand.
-            if _cached_index is not None:
-                search_idx = _cached_index
-            else:
-                search_idx = load_or_build_search_index(raw_dir, index_dir)
-                _cached_index = search_idx  # Cache for subsequent calls.
-
-            # Notify progress callback with the search query.
-            if progress_callback is not None:
-                try:
-                    progress_callback(f"Searching documents for: {query[:120]}...")
-                except Exception:
-                    pass  # Progress callback failures must not break the tool.
-
-            if not search_idx:
-                return (
-                    "Error: No search index is available or could be built. "
-                    "You must read `/raw/` files directly using the read_file tool. "
-                    "Available raw files are under /raw/."
+                _index_dir = wiki_dir / "index"
+                _search_index_cache[path_key] = load_or_build_search_index(_raw_dir, _index_dir)
+                logger.info("Search index built successfully for %s", _raw_dir)
+            except Exception:
+                logger.exception(
+                    "Failed to pre-build search index; tool will build on first call."
                 )
 
-            # Primary search: full query.
-            results = search_index(query, search_idx, k=k)
+        from langchain_core.tools import tool
 
-            # Fallback: if full query returns < k results, try individual terms
-            # and merge.  This compensates for BM25 being keyword-based (unlike
-            # FAISS which does semantic matching).
-            if len(results) < k:
-                terms = query.split()
-                if len(terms) > 1:
-                    term_results: dict[int, tuple[Document, float]] = {}
-                    for term in terms:
-                        if len(term) < 3:
-                            continue
-                        tr = search_index(term, search_idx, k=k)
-                        for doc, score in tr:
-                            doc_id = id(doc)
-                            if (
-                                doc_id not in term_results
-                                or score > term_results[doc_id][1]
-                            ):
-                                term_results[doc_id] = (doc, score)
-                    # Merge, keeping the best score per document.
-                    seen_ids = {id(d) for d, _ in results}
-                    for doc_id, (doc, score) in term_results.items():
-                        if doc_id not in seen_ids:
-                            results.append((doc, score))
-                            seen_ids.add(doc_id)
-                    # Re-sort by descending score.
-                    results.sort(key=lambda x: x[1], reverse=True)
+        @tool
+        def retrieve_wiki_documents(query: str, k: int = 5) -> str:
+            """Retrieve top-k relevant document snippets from the raw documents text search index.
 
-            if not results:
-                return (
-                    "No matching document snippets found for query. "
-                    "Try reading `/raw/` files directly with the read_file tool, "
-                    "or refine your search terms."
+            Use this tool when you need to search large raw source documents in `/raw/`
+            for specific facts.  Returns ranked snippets with source file paths, page
+            numbers, and relevance scores.
+            """
+            try:
+                from research_agent.utils.text_search import (
+                    load_or_build_search_index,
+                    search_index,
                 )
 
-            output_lines = []
-            for idx, (doc, score) in enumerate(results[:k], start=1):
-                meta = doc.metadata
-                src = meta.get("source_path") or "unknown"
-                page = meta.get("page")
-                locator = meta.get("locator")
-                heading = meta.get("heading")
+                index_dir = wiki_dir / "index"
+                raw_dir = wiki_dir / "raw"
 
-                # Strip leading /raw/ from source path in snippet output
-                if src.startswith("/raw/"):
-                    src = src[len("/raw/") :]
+                # Use cached index if available, otherwise build on demand.
+                if path_key in _search_index_cache:
+                    search_idx = _search_index_cache[path_key]
+                else:
+                    search_idx = load_or_build_search_index(raw_dir, index_dir)
+                    _search_index_cache[path_key] = search_idx
 
-                location_parts = []
-                if page:
-                    location_parts.append(f"p. {page}")
-                if locator and locator != f"Page {page}":
-                    location_parts.append(locator)
-                if heading:
-                    location_parts.append(heading)
+                # Notify progress callback with the search query.
+                if progress_callback is not None:
+                    try:
+                        progress_callback(f"Searching documents for: {query[:120]}...")
+                    except Exception:
+                        pass  # Progress callback failures must not break the tool.
 
-                loc_str = f" ({', '.join(location_parts)})" if location_parts else ""
-                output_lines.append(
-                    f"[{idx}] Source: /raw/{src}{loc_str} (Score: {score:.4f})\n"
-                    f"{doc.page_content}\n"
-                )
+                if not search_idx:
+                    return (
+                        "Error: No search index is available or could be built. "
+                        "You must read `/raw/` files directly using the read_file tool. "
+                        "Available raw files are under /raw/."
+                    )
 
-            return "\n---\n\n".join(output_lines)
-        except Exception as e:
-            logger.exception("retrieve_wiki_documents failed")
-            return f"Error retrieving raw documents: {e}"
+                # Primary search: full query.
+                results = search_index(query, search_idx, k=k)
 
-    model = _resolve_model()
-    agent = create_deep_agent(
-        model=model,
-        backend=backend,
-        permissions=permissions,
-        system_prompt=_BASE_SYSTEM_PROMPT,
-        tools=[retrieve_wiki_documents],
-    )
+                # Fallback: if full query returns < k results, try individual terms
+                # and merge.  This compensates for BM25 being keyword-based (unlike
+                # FAISS which does semantic matching).
+                if len(results) < k:
+                    terms = query.split()
+                    if len(terms) > 1:
+                        term_results: dict[int, tuple[Document, float]] = {}
+                        for term in terms:
+                            if len(term) < 3:
+                                continue
+                            tr = search_index(term, search_idx, k=k)
+                            for doc, score in tr:
+                                doc_id = id(doc)
+                                if (
+                                        doc_id not in term_results
+                                        or score > term_results[doc_id][1]
+                                ):
+                                    term_results[doc_id] = (doc, score)
+                        # Merge, keeping the best score per document.
+                        seen_ids = {id(d) for d, _ in results}
+                        for doc_id, (doc, score) in term_results.items():
+                            if doc_id not in seen_ids:
+                                results.append((doc, score))
+                                seen_ids.add(doc_id)
+                        # Re-sort by descending score.
+                        results.sort(key=lambda x: x[1], reverse=True)
 
-    # Apply a conservative recursion limit to prevent infinite tool-calling
-    # loops.  Index repair and lint passes should complete in < 30 turns;
-    # ingest review + apply may need more for large document sets.
-    from langchain_core.runnables import RunnableConfig
+                if not results:
+                    return (
+                        "No matching document snippets found for query. "
+                        "Try reading `/raw/` files directly with the read_file tool, "
+                        "or refine your search terms."
+                    )
 
-    _WIKI_AGENT_RECURSION_LIMIT = int(
-        __import__("os").getenv("WIKI_AGENT_RECURSION_LIMIT", "100")
-    )
-    # Timeout for the entire agent invocation (seconds).
-    _WIKI_AGENT_TIMEOUT = int(
-        __import__("os").getenv("WIKI_AGENT_TIMEOUT_SECONDS", "300")
-    )
-    agent = agent.with_config(
-        RunnableConfig(
-            recursion_limit=_WIKI_AGENT_RECURSION_LIMIT,
+                output_lines = []
+                for idx, (doc, score) in enumerate(results[:k], start=1):
+                    meta = doc.metadata
+                    src = meta.get("source_path") or "unknown"
+                    page = meta.get("page")
+                    locator = meta.get("locator")
+                    heading = meta.get("heading")
+
+                    # Strip leading /raw/ from source path in snippet output
+                    if src.startswith("/raw/"):
+                        src = src[len("/raw/"):]
+
+                    location_parts = []
+                    if page:
+                        location_parts.append(f"p. {page}")
+                    if locator and locator != f"Page {page}":
+                        location_parts.append(locator)
+                    if heading:
+                        location_parts.append(heading)
+
+                    loc_str = f" ({', '.join(location_parts)})" if location_parts else ""
+                    output_lines.append(
+                        f"[{idx}] Source: /raw/{src}{loc_str} (Score: {score:.4f})\n"
+                        f"{doc.page_content}\n"
+                    )
+
+                return "\n---\n\n".join(output_lines)
+            except Exception as e:
+                logger.exception("retrieve_wiki_documents failed")
+                return f"Error retrieving raw documents: {e}"
+
+        model = _resolve_model()
+        agent = create_deep_agent(
+            model=model,
+            backend=backend,
+            permissions=permissions,
+            system_prompt=_BASE_SYSTEM_PROMPT,
+            tools=[retrieve_wiki_documents],
         )
-    )
+
+        # Apply a conservative recursion limit to prevent infinite tool-calling
+        # loops.  Index repair and lint passes should complete in < 30 turns;
+        # ingest review + apply may need more for large document sets.
+        from langchain_core.runnables import RunnableConfig
+
+        _WIKI_AGENT_RECURSION_LIMIT = int(
+            os.getenv("WIKI_AGENT_RECURSION_LIMIT", "100")
+        )
+        agent = agent.with_config(
+            RunnableConfig(
+                recursion_limit=_WIKI_AGENT_RECURSION_LIMIT,
+            )
+        )
+        _agent_cache[cache_key] = agent
 
     # When raw content exceeds the budget, append a strong recommendation to
     # use the search tool instead of direct file reads.
@@ -1107,43 +1176,43 @@ def _run_agent(
 
 
 def _build_ingest_review_prompt(
-    topic: str, staged_names: list[str], note: str | None
+        topic: str, staged_names: list[str], note: str | None
 ) -> str:
     """Build the ingest review prompt (read-only analysis pass)."""
     source_block = "\n".join(f"- /raw/{name}" for name in staged_names)
     note_block = note or "(none)"
     budget_instructions = _build_context_budget_instructions()
     return (
-        f"Review the staged sources for topic '{topic}' and prepare a deep ingest plan.\n\n"
-        "Phase constraint: review-only. Do not create, edit, move, or delete files yet.\n\n"
-        f"{budget_instructions}\n\n"
-        "Analysis standards:\n"
-        "- Read `/purpose.md` first for directional guidance (goals, scope, key questions).\n"
-        "- Read every staged source before proposing wiki edits (or use retrieve_wiki_documents for large files).\n"
-        "- Distinguish direct evidence from inference.\n"
-        "- Prefer canonical page updates over creating fragmented pages.\n"
-        "- Preserve uncertainty; do not invent unsupported claims.\n"
-        "- Use source filename citations for non-trivial claims.\n"
-        + _DOCUMENT_CITATION_RULES
-        + "\nRequired output format (markdown):\n"
-        "## 1) Source-by-source extraction\n"
-        "## 2) Proposed wiki change set\n"
-        "## 3) Cross-source synthesis and structure\n"
-        "## 4) Contradictions and unresolved claims\n"
-        "## 5) Index updates and recency notes\n"
-        "## 6) Gaps and follow-up questions\n\n"
-        f"Staged sources:\n{source_block}\n\n"
-        f"Operator note: {note_block}\n"
+            f"Review the staged sources for topic '{topic}' and prepare a deep ingest plan.\n\n"
+            "Phase constraint: review-only. Do not create, edit, move, or delete files yet.\n\n"
+            f"{budget_instructions}\n\n"
+            "Analysis standards:\n"
+            "- Read `/purpose.md` first for directional guidance (goals, scope, key questions).\n"
+            "- Read every staged source before proposing wiki edits (or use retrieve_wiki_documents for large files).\n"
+            "- Distinguish direct evidence from inference.\n"
+            "- Prefer canonical page updates over creating fragmented pages.\n"
+            "- Preserve uncertainty; do not invent unsupported claims.\n"
+            "- Use source filename citations for non-trivial claims.\n"
+            + _DOCUMENT_CITATION_RULES
+            + "\nRequired output format (markdown):\n"
+              "## 1) Source-by-source extraction\n"
+              "## 2) Proposed wiki change set\n"
+              "## 3) Cross-source synthesis and structure\n"
+              "## 4) Contradictions and unresolved claims\n"
+              "## 5) Index updates and recency notes\n"
+              "## 6) Gaps and follow-up questions\n\n"
+              f"Staged sources:\n{source_block}\n\n"
+              f"Operator note: {note_block}\n"
     )
 
 
 def _build_ingest_apply_prompt(
-    topic: str,
-    staged_names: list[str],
-    review_summary: str,
-    note: str | None,
-    *,
-    merge: bool = False,
+        topic: str,
+        staged_names: list[str],
+        review_summary: str,
+        note: str | None,
+        *,
+        merge: bool = False,
 ) -> str:
     """Build the ingest apply prompt (mutating pass)."""
     source_block = "\n".join(f"- /raw/{name}" for name in staged_names)
@@ -1162,27 +1231,27 @@ def _build_ingest_apply_prompt(
         )
     budget_instructions = _build_context_budget_instructions()
     return (
-        f"Apply an approved ingest update for topic '{topic}'.\n\n"
-        f"{budget_instructions}\n\n"
-        "Required workflow:\n"
-        "1) Read `/purpose.md` for directional guidance (goals, scope, key questions).\n"
-        "2) Read all staged files in `/raw/` before editing wiki content.\n"
-        "3) Update canonical concept/entity/theme pages with high-signal evidence.\n"
-        "4) Integrate cross-source synthesis, not just per-source summaries.\n"
-        "5) Mark contradictions explicitly and preserve unresolved uncertainty.\n"
-        "6) Update `/wiki/index.md`.\n"
-        "7) Do not edit `/log.md`.\n"
-        "8) Never write to `/raw/`.\n" + merge_instruction + "\nWriting standards:\n"
-        "- Begin every wiki page with YAML frontmatter (title, category, summary, tags, sources, updated).\n"
-        "- Keep pages scannable with clear headings and concise prose.\n"
-        "- Use source filename citations for non-trivial claims.\n"
-        + _DOCUMENT_CITATION_RULES
-        + "- Avoid duplicative pages; merge into canonical pages when possible.\n\n"
-        "Return a concise apply report:\n"
-        "A) Files created  B) Files updated  C) Key synthesis  D) Remaining uncertainties\n\n"
-        f"Approved review plan:\n{review_summary}\n\n"
-        f"Staged sources:\n{source_block}\n\n"
-        f"Operator note: {note_block}\n"
+            f"Apply an approved ingest update for topic '{topic}'.\n\n"
+            f"{budget_instructions}\n\n"
+            "Required workflow:\n"
+            "1) Read `/purpose.md` for directional guidance (goals, scope, key questions).\n"
+            "2) Read all staged files in `/raw/` before editing wiki content.\n"
+            "3) Update canonical concept/entity/theme pages with high-signal evidence.\n"
+            "4) Integrate cross-source synthesis, not just per-source summaries.\n"
+            "5) Mark contradictions explicitly and preserve unresolved uncertainty.\n"
+            "6) Update `/wiki/index.md`.\n"
+            "7) Do not edit `/log.md`.\n"
+            "8) Never write to `/raw/`.\n" + merge_instruction + "\nWriting standards:\n"
+                                                                 "- Begin every wiki page with YAML frontmatter (title, category, summary, tags, sources, updated).\n"
+                                                                 "- Keep pages scannable with clear headings and concise prose.\n"
+                                                                 "- Use source filename citations for non-trivial claims.\n"
+            + _DOCUMENT_CITATION_RULES
+            + "- Avoid duplicative pages; merge into canonical pages when possible.\n\n"
+              "Return a concise apply report:\n"
+              "A) Files created  B) Files updated  C) Key synthesis  D) Remaining uncertainties\n\n"
+              f"Approved review plan:\n{review_summary}\n\n"
+              f"Staged sources:\n{source_block}\n\n"
+              f"Operator note: {note_block}\n"
     )
 
 
@@ -1206,43 +1275,43 @@ Document citation format rules (MANDATORY):
 def _build_query_prompt(topic: str, question: str) -> str:
     """Build the read-only query prompt."""
     return (
-        f"Answer this question about '{topic}': {question}\n\n"
-        "This is analysis-only. Do not create, edit, move, or delete files.\n\n"
-        "Required workflow:\n"
-        "1) Read `/purpose.md` first for directional guidance (goals, scope, key questions).\n"
-        "2) Read `/wiki/index.md` and use its categorized summaries to choose candidate pages.\n"
-        "3) Read recent `/log.md` entries (latest ~10 `## [` headings) to understand what was ingested recently.\n"
-        "4) Prefer checking relevant prior `/wiki/query/*.md` pages first.\n"
-        "5) Read the canonical wiki pages before final synthesis.\n"
-        "6) CRITICAL: Search `/raw/` documents using the `retrieve_wiki_documents` tool with MULTIPLE query "
-        "variations (at least 3 different phrasings of the question). Do NOT rely solely on wiki pages — "
-        "raw documents often contain details that wiki pages summarised away.\n"
-        "7) Provide a grounded answer with wiki or raw file path citations. "
-        "Every factual claim MUST include a source reference.\n"
-        "8) Decide whether this answer should be filed as a durable wiki page.\n\n"
-        "ANTI-HALLUCINATION RULES (MANDATORY):\n"
-        "- NEVER conclude 'no information available' or 'the document does not mention X' without first:\n"
-        "  a) Searching `/raw/` documents using `retrieve_wiki_documents` with at least 3 query variations\n"
-        "  b) Reading the top-ranked results from each search\n"
-        "  c) If still nothing found, searching for related/adjacent terms (e.g. if 'acquisition' "
-        "yields nothing, try 'purchase', 'buyout', 'takeover', 'transaction', 'M&A')\n"
-        "- If after thorough searching you genuinely cannot find the information, state EXACTLY:\n"
-        "  * Which documents you searched\n"
-        "  * Which search queries you tried\n"
-        "  * Which page ranges/sections you examined\n"
-        "  * That the information MAY still exist in unexamined sections\n"
-        "- Never present a negative claim with high confidence — always qualify it.\n\n"
-        "Contradiction disclosure (MANDATORY):\n"
-        "- Check wiki pages for unresolved `> **Contradiction**` callouts relevant to the question.\n"
-        "- If conflicting claims exist, clearly distinguish 'established facts' from 'claims with conflicting evidence'.\n"
-        "- Surface unresolved contradictions explicitly in the answer; do not silently pick one side.\n\n"
-        + _DOCUMENT_CITATION_RULES
-        + "\nOutput format (exact keys):\n"
-        "ANSWER:\n<markdown answer with citations>\n\n"
-        "DOCUMENTS_SEARCHED:\n<list of documents searched. Each page number MUST have its own 'p. ' prefix. Format EXACTLY as: bmo_ar2025.pdf: p. 10, p. 22, p. 30.  NEVER use 'pp. ' for individual pages — 'pp. ' is ONLY for ranges like pp. 10-15. Also list the search queries used.>\n\n"
-        "CONTRADICTIONS:\n<unresolved contradictions relevant to this question, or 'None'>\n\n"
-        "FILING_DECISION: file|skip\n"
-        "FILING_REASON: <one sentence>\n"
+            f"Answer this question about '{topic}': {question}\n\n"
+            "This is analysis-only. Do not create, edit, move, or delete files.\n\n"
+            "Required workflow:\n"
+            "1) Read `/purpose.md` first for directional guidance (goals, scope, key questions).\n"
+            "2) Read `/wiki/index.md` and use its categorized summaries to choose candidate pages.\n"
+            "3) Read recent `/log.md` entries (latest ~10 `## [` headings) to understand what was ingested recently.\n"
+            "4) Prefer checking relevant prior `/wiki/query/*.md` pages first.\n"
+            "5) Read the canonical wiki pages before final synthesis.\n"
+            "6) CRITICAL: Search `/raw/` documents using the `retrieve_wiki_documents` tool with MULTIPLE query "
+            "variations (at least 3 different phrasings of the question). Do NOT rely solely on wiki pages — "
+            "raw documents often contain details that wiki pages summarised away.\n"
+            "7) Provide a grounded answer with wiki or raw file path citations. "
+            "Every factual claim MUST include a source reference.\n"
+            "8) Decide whether this answer should be filed as a durable wiki page.\n\n"
+            "ANTI-HALLUCINATION RULES (MANDATORY):\n"
+            "- NEVER conclude 'no information available' or 'the document does not mention X' without first:\n"
+            "  a) Searching `/raw/` documents using `retrieve_wiki_documents` with at least 3 query variations\n"
+            "  b) Reading the top-ranked results from each search\n"
+            "  c) If still nothing found, searching for related/adjacent terms (e.g. if 'acquisition' "
+            "yields nothing, try 'purchase', 'buyout', 'takeover', 'transaction', 'M&A')\n"
+            "- If after thorough searching you genuinely cannot find the information, state EXACTLY:\n"
+            "  * Which documents you searched\n"
+            "  * Which search queries you tried\n"
+            "  * Which page ranges/sections you examined\n"
+            "  * That the information MAY still exist in unexamined sections\n"
+            "- Never present a negative claim with high confidence — always qualify it.\n\n"
+            "Contradiction disclosure (MANDATORY):\n"
+            "- Check wiki pages for unresolved `> **Contradiction**` callouts relevant to the question.\n"
+            "- If conflicting claims exist, clearly distinguish 'established facts' from 'claims with conflicting evidence'.\n"
+            "- Surface unresolved contradictions explicitly in the answer; do not silently pick one side.\n\n"
+            + _DOCUMENT_CITATION_RULES
+            + "\nOutput format (exact keys):\n"
+              "ANSWER:\n<markdown answer with citations>\n\n"
+              "DOCUMENTS_SEARCHED:\n<list of documents searched. Each page number MUST have its own 'p. ' prefix. Format EXACTLY as: bmo_ar2025.pdf: p. 10, p. 22, p. 30.  NEVER use 'pp. ' for individual pages — 'pp. ' is ONLY for ranges like pp. 10-15. Also list the search queries used.>\n\n"
+              "CONTRADICTIONS:\n<unresolved contradictions relevant to this question, or 'None'>\n\n"
+              "FILING_DECISION: file|skip\n"
+              "FILING_REASON: <one sentence>\n"
     )
 
 
@@ -1464,7 +1533,7 @@ def _build_graph_payload(wiki_dir: Path) -> dict:
 
 
 def _build_wiki_graph(
-    wiki_dir: Path,
+        wiki_dir: Path,
 ) -> tuple[nx.Graph, dict[str, str], dict[str, set[str]]]:
     """Build a NetworkX graph and adjacency info from wiki cross-references.
 
@@ -1581,7 +1650,7 @@ def _find_bridge_nodes(G: nx.Graph, communities: list[CommunityInfo]) -> list[st
 
 
 def _compute_direct_link_weight(
-    outlinks: dict[str, set[str]], page_a: str, page_b: str
+        outlinks: dict[str, set[str]], page_a: str, page_b: str
 ) -> float:
     """Signal 1: 1.0 if A links to B or B links to A, else 0.0. (Weight: 3x)."""
     out_a = outlinks.get(page_a, set())
@@ -1590,7 +1659,7 @@ def _compute_direct_link_weight(
 
 
 def _compute_source_overlap_weight(
-    page_metadata: dict[str, WikiPageMetadata], page_a: str, page_b: str
+        page_metadata: dict[str, WikiPageMetadata], page_a: str, page_b: str
 ) -> float:
     """Signal 2: Jaccard similarity of frontmatter sources[] lists. (Weight: 4x)."""
     ma = page_metadata.get(page_a)
@@ -1607,7 +1676,7 @@ def _compute_source_overlap_weight(
 
 
 def _compute_adamic_adar_weight(
-    G: nx.Graph, outlinks: dict[str, set[str]], page_a: str, page_b: str
+        G: nx.Graph, outlinks: dict[str, set[str]], page_a: str, page_b: str
 ) -> float:
     """Signal 3: Adamic-Adar index (sum of 1/log(degree) for shared neighbors). (Weight: 1.5x)."""
     import math
@@ -1627,7 +1696,7 @@ def _compute_adamic_adar_weight(
 
 
 def _compute_type_affinity_weight(
-    page_metadata: dict[str, WikiPageMetadata], page_a: str, page_b: str
+        page_metadata: dict[str, WikiPageMetadata], page_a: str, page_b: str
 ) -> float:
     """Signal 4: 1.0 if same category, 0.5 if complementary, else 0.0. (Weight: 1x)."""
     ma = page_metadata.get(page_a)
@@ -1689,7 +1758,7 @@ def _build_relevance_graph(wiki_dir: Path) -> dict:
     total_pairs = 0
 
     for i, page_a in enumerate(page_list):
-        for page_b in page_list[i + 1 :]:
+        for page_b in page_list[i + 1:]:
             total_pairs += 1
             direct = _compute_direct_link_weight(outlinks, page_a, page_b)
             overlap = _compute_source_overlap_weight(page_metadata, page_a, page_b)
@@ -1719,9 +1788,9 @@ def _build_relevance_graph(wiki_dir: Path) -> dict:
 
 
 def _generate_graph_insights(
-    wiki_dir: Path,
-    communities: list[CommunityInfo],
-    relevance_edges: list[RelevanceEdge],
+        wiki_dir: Path,
+        communities: list[CommunityInfo],
+        relevance_edges: list[RelevanceEdge],
 ) -> list[GraphInsight]:
     """Generate structured discovery signals from the knowledge graph.
 
@@ -1745,7 +1814,7 @@ def _generate_graph_insights(
         e
         for e in relevance_edges
         if e.total_score >= 2.0
-        and node_to_community.get(e.source_page) != node_to_community.get(e.target_page)
+           and node_to_community.get(e.source_page) != node_to_community.get(e.target_page)
     ]
     for e in sorted(cross_community_edges, key=lambda x: x.total_score, reverse=True)[
         :10
@@ -2029,7 +2098,7 @@ def _parse_review_item(line: str, section: str) -> ReviewItem | None:
 
     pairs: dict[str, str] = {}
     for match in _re_.finditer(
-        r"\*\*([^*]+)\*\*:\s*([^|]+?)(?=\s*\||\s*\*\*|\s*$)", line
+            r"\*\*([^*]+)\*\*:\s*([^|]+?)(?=\s*\||\s*\*\*|\s*$)", line
     ):
         key = match.group(1).strip().lower().replace(" ", "_")
         value = match.group(2).strip().rstrip("|").strip()
@@ -2089,7 +2158,7 @@ def _parse_query_decision(raw: str) -> tuple[str, bool, str]:
     reason_match = _REASON_RE.search(raw)
 
     should_file = (
-        decision_match is not None and decision_match.group(1).lower() == "file"
+            decision_match is not None and decision_match.group(1).lower() == "file"
     )
     reason = (
         reason_match.group(1).strip() if reason_match else "Decision marker missing."
@@ -2099,7 +2168,7 @@ def _parse_query_decision(raw: str) -> tuple[str, bool, str]:
     if decision_match:
         answer = raw[: decision_match.start()].strip()
     if answer.upper().startswith("ANSWER:"):
-        answer = answer[len("ANSWER:") :].strip()
+        answer = answer[len("ANSWER:"):].strip()
     if not answer:
         answer = raw or "No answer returned."
 
@@ -2110,7 +2179,7 @@ def _parse_query_decision(raw: str) -> tuple[str, bool, str]:
 
 
 def _build_chunked_processing_instructions(
-    chunked_sources: dict[str, list[dict]],
+        chunked_sources: dict[str, list[dict]],
 ) -> str:
     """Build instructions for processing chunked large sources.
 
@@ -2153,7 +2222,7 @@ _SOURCE_REF_RE = re.compile(r"/raw/([A-Za-z0-9._/\-]+)", re.IGNORECASE)
 
 
 def _find_source_references(
-    wiki_dir: Path, source_filename: str
+        wiki_dir: Path, source_filename: str
 ) -> dict[str, list[str]]:
     """Scan all wiki pages for references to a specific source file.
 
@@ -2172,7 +2241,7 @@ def _find_source_references(
     # and match both the raw path and the extracted .md variant.
     clean_name = source_filename
     if clean_name.startswith("/raw/"):
-        clean_name = clean_name[len("/raw/") :]
+        clean_name = clean_name[len("/raw/"):]
 
     # Build search patterns for both exact name and extracted .md variant
     search_patterns = [clean_name]
@@ -2227,7 +2296,7 @@ def _cascade_delete_source_references(wiki_dir: Path, source_filename: str) -> d
 
     clean_name = source_filename
     if clean_name.startswith("/raw/"):
-        clean_name = clean_name[len("/raw/") :]
+        clean_name = clean_name[len("/raw/"):]
     if clean_name.endswith(".md"):
         base_stem = clean_name[:-3]  # strip .md
     else:
@@ -2249,9 +2318,9 @@ def _cascade_delete_source_references(wiki_dir: Path, source_filename: str) -> d
 
     # Check for the source summary page
     for slug_variant in (
-        base_stem,
-        base_stem.replace(".", "-"),
-        base_stem.split(".")[0],
+            base_stem,
+            base_stem.replace(".", "-"),
+            base_stem.split(".")[0],
     ):
         candidate = wiki_content_dir / "sources" / f"{slug_variant}.md"
         if candidate.exists():
@@ -2295,7 +2364,7 @@ def _cascade_delete_source_references(wiki_dir: Path, source_filename: str) -> d
                 if content.startswith("---"):
                     end_idx = content.find("\n---", 3)
                     if end_idx != -1:
-                        new_content = new_frontmatter + content[end_idx + 4 :]
+                        new_content = new_frontmatter + content[end_idx + 4:]
                     else:
                         new_content = new_frontmatter + "\n" + body
                 else:
@@ -2337,13 +2406,13 @@ def _collect_source_files(docs_dir: Path) -> list[Path]:
 
 
 async def run_ingest(
-    paths: ThreadWikiPaths,
-    topic: str,
-    progress: IngestProgress,
-    cancel_event: asyncio.Event,
-    note: str | None = None,
-    *,
-    merge: bool = False,
+        paths: ThreadWikiPaths,
+        topic: str,
+        progress: IngestProgress,
+        cancel_event: asyncio.Event,
+        note: str | None = None,
+        *,
+        merge: bool = False,
 ) -> str:
     """Run the full ingest workflow with progress tracking and cancellation.
 
@@ -2360,6 +2429,7 @@ async def run_ingest(
     Returns the apply summary text.
     """
     try:
+        _invalidate_agent_cache(paths.wiki_dir)
         # Phase 1: Initialize
         progress.advance(IngestPhase.INITIALIZING, "Creating wiki scaffold...")
         await init_wiki(paths, topic)
@@ -2578,6 +2648,19 @@ async def run_ingest(
         progress.advance(IngestPhase.REFRESHING_INDEX, "Rebuilding wiki index...")
         await asyncio.to_thread(_refresh_index, topic, paths.wiki_dir)
 
+        # Pre-build search index for RAG
+        try:
+            from research_agent.utils.text_search import load_or_build_search_index
+            _raw_dir = paths.wiki_dir / "raw"
+            _index_dir = paths.wiki_dir / "index"
+            search_idx = await asyncio.to_thread(load_or_build_search_index, _raw_dir, _index_dir)
+            path_key = str(Path(paths.wiki_dir).resolve())
+            _search_index_cache[path_key] = search_idx
+            # Write a sentinel file to indicate index readiness
+            (paths.wiki_dir / ".index_ready").write_text("ready", encoding="utf-8")
+        except Exception:
+            logger.exception("Failed to pre-build search index during ingest")
+
         progress.mark_complete(f"Ingested {len(staged)} sources successfully.")
         await remove_progress_snapshot(paths.wiki_dir)
         return apply_result
@@ -2704,12 +2787,75 @@ def _extract_citations(answer: str) -> list[SourceCitation]:
     return citations
 
 
+def run_query_sync(
+        paths: ThreadWikiPaths,
+        topic: str,
+        question: str,
+        *,
+        file_results: bool = True,
+) -> WikiQueryResult:
+    """Query the thread's wiki knowledge base synchronously."""
+    query_prompt = _build_query_prompt(topic, question)
+    try:
+        raw_response = _run_agent(paths.wiki_dir, query_prompt, read_only=True)
+    except Exception as e:
+        logger.exception("Wiki query failed")
+        return WikiQueryResult(
+            answer=f"Wiki query failed: {e}",
+            filed_path=None,
+            sources_cited=[],
+        )
+    answer, should_file, reason = _parse_query_decision(raw_response)
+
+    _append_log_entry(
+        paths.wiki_dir,
+        "query.review",
+        "file" if should_file else "skip",
+        summary=answer[:320],
+    )
+
+    filed_path: str | None = None
+    if should_file and file_results:
+        slug = _slugify(question)[:80].rstrip("-") or "query"
+        target = f"/wiki/query/{slug}.md"
+        file_prompt = (
+            f"File a durable query answer for topic '{topic}'.\n\n"
+            f"Create or overwrite exactly: `{target}`\n\n"
+            "Requirements:\n"
+            "1) Write a clean, scannable markdown page.\n"
+            "2) Preserve grounded claims and include wiki file path citations.\n"
+            "3) Include sections: Question, Answer, and Sources.\n"
+            "4) Never write to `/raw/`.\n\n"
+            f"Filing reason: {reason}\n\nQuestion: {question}\n\nAnswer draft:\n{answer}\n"
+        )
+        try:
+            _run_agent(paths.wiki_dir, file_prompt, read_only=False)
+        except Exception as e:
+            logger.warning("Wiki query filing failed: %s", e)
+        else:
+            import threading
+            threading.Thread(target=_refresh_index, args=(topic, paths.wiki_dir), daemon=True).start()
+            _append_log_entry(
+                paths.wiki_dir,
+                "query.apply",
+                "filed",
+                summary=f"Filed query answer at {target}.",
+            )
+            filed_path = target
+
+    citations = _extract_citations(answer)
+
+    return WikiQueryResult(
+        answer=answer, filed_path=filed_path, sources_cited=citations
+    )
+
+
 async def run_query(
-    paths: ThreadWikiPaths,
-    topic: str,
-    question: str,
-    *,
-    file_results: bool = True,
+        paths: ThreadWikiPaths,
+        topic: str,
+        question: str,
+        *,
+        file_results: bool = True,
 ) -> WikiQueryResult:
     """Query the thread's wiki knowledge base.
 
@@ -2763,7 +2909,8 @@ async def run_query(
         except TimeoutError:
             logger.warning("Wiki query filing timed out after %ds", _QUERY_TIMEOUT)
         else:
-            await asyncio.to_thread(_refresh_index, topic, paths.wiki_dir)
+            # Fire-and-forget background task for index refresh
+            asyncio.create_task(asyncio.to_thread(_refresh_index, topic, paths.wiki_dir))
             await asyncio.to_thread(
                 _append_log_entry,
                 paths.wiki_dir,
@@ -2781,9 +2928,9 @@ async def run_query(
 
 
 async def run_lint(
-    paths: ThreadWikiPaths,
-    topic: str,
-    note: str | None = None,
+        paths: ThreadWikiPaths,
+        topic: str,
+        note: str | None = None,
 ) -> str:
     """Run lint reconciliation on the thread's wiki.
 
@@ -2794,6 +2941,7 @@ async def run_lint(
 
     Use this after document deletions to reconcile stale references.
     """
+    _invalidate_agent_cache(paths.wiki_dir)
     # Pass 1: Run graph analysis for structural health insights.
     graph_report = await asyncio.to_thread(_analyze_graph, paths.wiki_dir)
 
@@ -2885,7 +3033,7 @@ async def run_lint(
 
 
 async def check_cancellation(
-    cancel_event: asyncio.Event, *, phase_name: str = ""
+        cancel_event: asyncio.Event, *, phase_name: str = ""
 ) -> None:
     """Raise CancelledError if cancellation was requested."""
     if cancel_event.is_set():

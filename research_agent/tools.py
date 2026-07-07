@@ -261,8 +261,8 @@ def _normalize_document_sources(content: str, state: dict | None) -> str:
     for fpath in files_dict:
         clean = fpath.lstrip("/")
         if not any(
-            clean.lower().endswith(ext)
-            for ext in (".pdf", ".docx", ".pptx", ".xlsx")
+                clean.lower().endswith(ext)
+                for ext in (".pdf", ".docx", ".pptx", ".xlsx")
         ):
             continue
         stem = Path(clean).stem.lower()  # "bmo_ar2025"
@@ -281,8 +281,8 @@ def _normalize_document_sources(content: str, state: dict | None) -> str:
         try:
             text = file_data_to_string(fdata)
             for m in re.finditer(
-                r"(/[A-Za-z0-9._-]+\.(?:pdf|docx|pptx|xlsx)),\s*p\.\s*(\d+)",
-                text,
+                    r"(/[A-Za-z0-9._-]+\.(?:pdf|docx|pptx|xlsx)),\s*p\.\s*(\d+)",
+                    text,
             ):
                 doc_path = m.group(1)
                 page = m.group(2)
@@ -498,11 +498,8 @@ def llm_wiki_query(
         Raw wiki findings with document citations — must be synthesized into
         the final report, not output directly.
     """
-    import asyncio
-    import concurrent.futures
-
     from thread_wiki.models import ThreadWikiPaths, _resolve_wiki_base_dir
-    from thread_wiki.service import run_query
+    from thread_wiki.service import run_query_sync
 
     # Resolve thread_id from doc_folder in state.
     doc_folder = (state or {}).get("doc_folder") or os.environ.get("DOC_FOLDER", "")
@@ -527,33 +524,8 @@ def llm_wiki_query(
             "documents directly while the wiki is being ingested."
         )
 
-    async def _query():
-        return await asyncio.wait_for(
-            run_query(paths, f"Thread {thread_id[:8]}", question, file_results=False),
-            timeout=120,
-        )
-
-    def _run_in_new_loop():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            return loop.run_until_complete(_query())
-        finally:
-            loop.close()
-
     try:
-        try:
-            current_loop = asyncio.get_running_loop()
-        except RuntimeError:
-            current_loop = None
-
-        if current_loop is not None and current_loop.is_running():
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                result = pool.submit(_run_in_new_loop).result(timeout=130)
-        else:
-            result = asyncio.run(_query())
-    except (TimeoutError, concurrent.futures.TimeoutError):
-        return "Wiki query timed out. Try a more specific question or use `read_file` on /wiki/ or /raw/ files directly."
+        result = run_query_sync(paths, f"Thread {thread_id[:8]}", question, file_results=False)
     except Exception as e:
         logger.warning("Wiki query tool failed: %s", e)
         return f"Wiki query failed: {e}. Use `read_file` on /wiki/ or /raw/ files directly."
