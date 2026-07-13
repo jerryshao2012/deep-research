@@ -85,8 +85,13 @@ if [ -z "$DOCKER_HUB_USERNAME" ]; then
 fi
 echo "✅ Using Docker Hub user: $DOCKER_HUB_USERNAME"
 if [ -n "$DOCKER_HUB_PAT" ]; then
+  # Ensure container service is started
+  if ! container system status &>/dev/null; then
+    echo "🚀 Container system is not running. Auto-starting..."
+    container system start --disable-kernel-install
+  fi
   echo "🔐 Logging into Docker Hub..."
-  echo "$DOCKER_HUB_PAT" | docker login -u "$DOCKER_HUB_USERNAME" --password-stdin
+  echo "$DOCKER_HUB_PAT" | container registry login -u "$DOCKER_HUB_USERNAME" --password-stdin
 fi
 end_step
 

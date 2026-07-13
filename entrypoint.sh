@@ -110,7 +110,6 @@ setup_persistent_dir() {
 setup_persistent_dir "docs"
 setup_persistent_dir "output"
 setup_persistent_dir "input"
-setup_persistent_dir ".langgraph_api"
 
 echo ""
 echo "📋 Final state:"

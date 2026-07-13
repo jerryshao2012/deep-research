@@ -77,14 +77,38 @@ cd "$SCRIPT_DIR"
 ECR_URL="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
 IMAGE_TAG="$ECR_URL/$ECR_REPO_NAME:latest"
 
-echo "🔨 Building Docker image ($IMAGE_TAG)..."
-docker build --no-cache --platform linux/amd64 -f Dockerfile-aws -t "$IMAGE_TAG" .
+BUILD_VERSION=$(date +%Y%m%d%H%M%S)
+echo $BUILD_VERSION > .build_version
+echo "🔨 Building Docker image with tags: latest, $BUILD_VERSION"
+
+# Ensure container service is started
+if ! container system status &>/dev/null; then
+  echo "🚀 Container system is not running. Auto-starting..."
+  container system start --disable-kernel-install
+fi
+
+container build --no-cache --platform linux/amd64 -f Dockerfile-aws -t "$IMAGE_TAG" .
 
 echo "🔑 Logging in to AWS ECR..."
-aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$ECR_URL"
+aws ecr get-login-password --region "$AWS_REGION" | container registry login --username AWS --password-stdin "$ECR_URL"
 
 echo "⬆️  Pushing image to ECR..."
-docker push "$IMAGE_TAG"
+container image push "$IMAGE_TAG"
+if [ $? -ne 0 ]; then
+  echo "❌ Container push failed for '$IMAGE_TAG'."
+  exit 1
+fi
+
+VERSIONED_IMAGE_TAG="$ECR_URL/$ECR_REPO_NAME:$BUILD_VERSION"
+echo "🏷️  Tagging versioned image: $VERSIONED_IMAGE_TAG"
+container image tag "$IMAGE_TAG" "$VERSIONED_IMAGE_TAG"
+echo "🚀 Pushing versioned image..."
+container image push "$VERSIONED_IMAGE_TAG"
+if [ $? -ne 0 ]; then
+  echo "❌ Container push failed for '$VERSIONED_IMAGE_TAG'."
+  exit 1
+fi
+
 echo "✅ Image built and pushed successfully"
 end_step
 

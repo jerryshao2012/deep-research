@@ -84,12 +84,18 @@ end_step
 
 # 2. Verify image exists in ECR
 start_step "Verify Container Image"
-if ! aws ecr describe-images --repository-name "$ECR_REPO_NAME" --image-ids imageTag=latest --region "$AWS_REGION" &> /dev/null; then
-  echo "⚠️  WARNING: Image 'latest' not found in ECR repository '$ECR_REPO_NAME'!"
+if [ ! -f .build_version ]; then
+  echo "⚠️ .build_version not found. Please run ./build-aws.sh first."
+  exit 1
+fi
+BUILD_VERSION=$(cat .build_version)
+
+if ! aws ecr describe-images --repository-name "$ECR_REPO_NAME" --image-ids imageTag="$BUILD_VERSION" --region "$AWS_REGION" &> /dev/null; then
+  echo "⚠️  WARNING: Image '$BUILD_VERSION' not found in ECR repository '$ECR_REPO_NAME'!"
   echo "   Please run './build-aws.sh' first to build and push the image."
   exit 1
 fi
-echo "✅ Verified image exists in ECR"
+echo "✅ Verified image '$BUILD_VERSION' exists in ECR"
 
 NEW_VERSION=$(grep -E 'API_VERSION(:\s*\w+)?\s*=\s*' webapp/config.py | grep -o '"[^"]*"')
 NEW_VERSION=${NEW_VERSION//\"/}
@@ -257,7 +263,7 @@ SOURCE_CONFIG_FILE=$(mktemp)
 cat > "$SOURCE_CONFIG_FILE" <<EOF
 {
   "ImageRepository": {
-    "ImageIdentifier": "${ECR_URL}/${ECR_REPO_NAME}:latest",
+    "ImageIdentifier": "${ECR_URL}/${ECR_REPO_NAME}:${BUILD_VERSION}",
     "ImageConfiguration": {
       "Port": "2024",
       "RuntimeEnvironmentVariables": {
@@ -280,11 +286,13 @@ cat > "$SOURCE_CONFIG_FILE" <<EOF
         "MODEL_MAX_BACKOFF": "60.0",
         "MODEL_BACKOFF_MULTIPLIER": "2.0",
         "MODEL_RETRY_JITTER": "true",
-        "MEMORY_TYPE": "memory",
+        "MEMORY_TYPE": "",
         "REPORTS_OUTPUT_FOLDER": "/deps/deep_research/output",
         "EVAL_HISTORY_FILE": "/deps/deep_research/output/eval_history/server_runs.jsonl",
         "DOC_FOLDER": "/deps/deep_research/docs",
         "INPUT_FOLDER": "/deps/deep_research/input",
+        "WIKI_BASE_DIR": "/deps/deep_research",
+        "SQLITE_DB_PATH": "/deps/deep_research/deep_research.db",
         "S3_BUCKET_NAME": "${S3_BUCKET_NAME}",
         "AWS_REGION": "${AWS_REGION}"
       },

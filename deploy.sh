@@ -189,7 +189,7 @@ else
   az storage share create --name $FILE_SHARE_NAME --account-name $STORAGE_ACCOUNT_NAME --account-key $STORAGE_KEY --quota 100
 fi
 
-for dir in "docs" "docs/policy" "output" "output/eval_history" "input" ".langgraph_api"; do
+for dir in "docs" "docs/policy" "output" "output/eval_history" "input"; do
   if ! az storage directory exists --share-name $FILE_SHARE_NAME --path "$dir" --account-name $STORAGE_ACCOUNT_NAME --account-key $STORAGE_KEY --query "exists" -o tsv 2>/dev/null; then
     echo "  + Creating directory '$dir'"
     az storage directory create --share-name $FILE_SHARE_NAME --name "$dir" --account-name $STORAGE_ACCOUNT_NAME --account-key $STORAGE_KEY

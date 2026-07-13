@@ -84,7 +84,6 @@ TOP_FOLDERS=(
   "docs"
   "output"
   "input"
-  ".langgraph_api"
 )
 
 # ── Counters ────────────────────────────────────────────────────────
