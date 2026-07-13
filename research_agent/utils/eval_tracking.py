@@ -6,14 +6,14 @@ durations, tool invocations, and failures) to files for evaluation comparison.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
 import subprocess
 from datetime import datetime, timezone
-from typing import Any
-
 from pathlib import Path
+from typing import Any
 
 from logger_utils import setup_logger
 
@@ -135,7 +135,7 @@ def _extract_tool_call_count(message: Any) -> int:
 
 def _extract_usage_metadata(message: Any) -> dict[str, Any]:
     """Extract token usage metadata from a message.
-    
+
     Checks multiple possible locations where LLM providers store token counts:
     - usage_metadata (LangChain standard)
     - response_metadata.token_usage (OpenAI/Anthropic)
@@ -190,7 +190,7 @@ def _extract_usage_metadata(message: Any) -> dict[str, Any]:
 
 def _analyze_tool_call_parameters(tool_call: dict[str, Any]) -> dict[str, Any]:
     """Analyze tool call parameters for completeness and correctness.
-    
+
     Returns metadata about parameter quality including:
     - has_arguments: whether arguments were provided
     - argument_count: number of arguments passed
@@ -241,17 +241,17 @@ def _analyze_tool_call_parameters(tool_call: dict[str, Any]) -> dict[str, Any]:
 
 def _detect_self_correction(messages: list[Any], current_index: int, tool_name: str) -> dict[str, Any]:
     """Detect if agent corrected itself after a tool failure.
-    
+
     Analyzes message history to identify correction patterns:
     - Retry with different parameters
     - Alternative tool selection
     - Error acknowledgment and strategy change
-    
+
     Args:
         messages: Full message history
         current_index: Index of current tool response message
         tool_name: Name of the tool that was called
-        
+
     Returns:
         Dictionary with correction detection results
     """
@@ -331,7 +331,7 @@ def _detect_self_correction(messages: list[Any], current_index: int, tool_name: 
 
 def collect_run_metrics(result: dict[str, Any], runtime_seconds: float, stream_fallback_used: bool) -> dict[str, Any]:
     """Collect golden-dataset metrics from a run result and runtime context.
-    
+
     This is for CLI unit testing with baseline comparison. Includes completeness
     checks for /golden_dataset_metrics.md and /final_report.md files.
     """
@@ -496,15 +496,15 @@ def collect_server_metrics(
         runtime_seconds: float,
 ) -> dict[str, Any]:
     """Collect operational metrics for server/dev mode tracking.
-    
+
     Simplified version focused on facts only (no baseline comparison).
     Unlike CLI golden dataset evaluation, this does NOT check for specific
     output files or compare against baselines since user inputs vary each time.
-    
+
     Args:
         messages: List of conversation messages from agent state
         runtime_seconds: Total execution time in seconds
-        
+
     Returns:
         Dictionary with operational metrics for tracking
     """
@@ -847,14 +847,14 @@ async def log_server_metrics(
         history_file: str | Path = "./output/eval_history/dev_server_runs.jsonl",
 ) -> dict[str, Any] | None:
     """Log operational metrics for langgraph dev/server mode (async, non-blocking).
-    
+
     This function collects facts (tools called, tokens used, runtime, etc.)
     for general tracking purposes. Unlike CLI regression testing, this does NOT
     compare against baselines since user inputs vary each time.
-    
+
     This async version runs in the background and catches all exceptions to avoid
     interrupting the main chat response flow.
-    
+
     Args:
         messages: List of conversation messages from agent state
         files: Dictionary of files from agent state
@@ -862,7 +862,7 @@ async def log_server_metrics(
         model_name: Name of the LLM model used
         context: Optional context metadata (subject, skill, doc_folder, no_web)
         history_file: Path to JSONL history file
-        
+
     Returns:
         Dictionary with logged metrics summary for console output, or None on error
     """
@@ -913,7 +913,7 @@ async def log_server_metrics(
         # Append to history file (use async file I/O if available, otherwise sync)
         history_path = Path(history_file)
         if not history_path.parent.exists():
-            history_path.parent.mkdir(parents=True, exist_ok=True)
+            await asyncio.to_thread(history_path.parent.mkdir, parents=True, exist_ok=True)
 
         # Use asyncio.to_thread for file I/O to avoid blocking the event loop
         await _write_metrics_to_file(history_path, record)
@@ -936,8 +936,6 @@ async def _write_metrics_to_file(history_path: Path, record: dict) -> None:
         history_path: Path to the JSONL history file.
         record: Metrics record dict to append as a single JSON line.
     """
-    import json
-    import asyncio
 
     # Run file I/O in a thread pool to avoid blocking the event loop
     def _write_sync():

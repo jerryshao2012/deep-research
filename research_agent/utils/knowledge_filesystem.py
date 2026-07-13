@@ -792,9 +792,19 @@ def read_docs_folder_impl(
     try:
         folder.relative_to(allowed_root)
     except ValueError:
-        logger.error(
-            f"[read_doc_folder] Redirecting '{folder_path}' → '{allowed_root}' (only the configured doc_folder is permitted).")
-        folder = allowed_root
+        # On Windows, Unix-style absolute paths (e.g. /docs/threads/<id>) are
+        # resolved relative to the current drive root rather than the project CWD,
+        # so they won't match allowed_root.  Try stripping the leading slash and
+        # re-resolving from CWD before falling back to the allowed_root redirect.
+        cwd_relative = (Path.cwd() / folder_path.lstrip("/\\").replace("/", os.sep)).resolve()
+        try:
+            cwd_relative.relative_to(allowed_root)
+            folder = cwd_relative
+        except ValueError:
+            logger.warning(
+                f"[read_doc_folder] Redirecting '{folder_path}' → '{allowed_root}' "
+                "(only the configured doc_folder is permitted).")
+            folder = allowed_root
 
     if not folder.exists(): return f"Error: Folder '{folder}' does not exist."
     if not folder.is_dir(): return f"Error: '{folder}' is not a directory."
