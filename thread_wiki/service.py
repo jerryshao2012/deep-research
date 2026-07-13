@@ -15,12 +15,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import re
 import sys
-from typing import TYPE_CHECKING, Any
-
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .models import (
     CommunityInfo,
@@ -43,18 +41,6 @@ if TYPE_CHECKING:
     from .models import WikiPageMetadata  # noqa: F401
 
 logger = logging.getLogger(__name__)
-
-_agent_cache: dict[tuple[str, bool], Any] = {}
-_search_index_cache: dict[str, Any] = {}
-
-
-def _invalidate_agent_cache(wiki_dir: Path):
-    """Invalidate cached agent and search index for a wiki directory."""
-    path_key = str(Path(wiki_dir).resolve())
-    _agent_cache.pop((path_key, True), None)
-    _agent_cache.pop((path_key, False), None)
-    _search_index_cache.pop(path_key, None)
-
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
@@ -144,36 +130,9 @@ def _build_context_budget_instructions() -> str:
 
 
 def _total_raw_size(raw_dir: Path) -> int:
-    """Return the total character count of all staged raw source files, with caching."""
+    """Return the total character count of all staged raw source files."""
     if not raw_dir.exists():
         return 0
-
-    # Find all files in raw_dir
-    files = []
-    for path in sorted(raw_dir.rglob("*")):
-        if path.is_file():
-            try:
-                stat = path.stat()
-                files.append((str(path.relative_to(raw_dir)), stat.st_mtime, stat.st_size))
-            except Exception:
-                pass
-
-    if not files:
-        return 0
-
-    import json
-    cache_file = raw_dir.parent / ".raw_size_cache"
-
-    # Try to load cache
-    if cache_file.exists():
-        try:
-            cache_data = json.loads(cache_file.read_text(encoding="utf-8"))
-            if cache_data.get("files") == files:
-                return cache_data["total_size"]
-        except Exception:
-            pass
-
-    # Cache miss or invalid: compute total character count by reading files
     total = 0
     for path in raw_dir.rglob("*"):
         if path.is_file():
@@ -181,16 +140,6 @@ def _total_raw_size(raw_dir: Path) -> int:
                 total += len(path.read_text(encoding="utf-8"))
             except Exception:
                 pass
-
-    # Save cache
-    try:
-        cache_file.write_text(
-            json.dumps({"files": files, "total_size": total}, indent=2),
-            encoding="utf-8"
-        )
-    except Exception:
-        pass
-
     return total
 
 
@@ -269,18 +218,8 @@ Writing and organization rules:
 Evidence rules:
 - Every non-trivial claim should be traceable to the ingested source set.
 - Avoid introducing unsupported external facts.
-- If raw documents are too large to read in full, use the `retrieve_wiki_documents` tool to query them and retrieve relevant snippets.
-
-Anti-hallucination rules (MANDATORY — apply to EVERY query response):
-- NEVER conclude "no information available" or "the document does not mention X" without first:
-  a) Calling `retrieve_wiki_documents` with at least 3 query variations (different phrasings, synonyms).
-  b) Reading the top-ranked results from each search.
-  c) Trying related/adjacent terms (e.g. if "acquisition" yields nothing, try "purchase", "buyout", "takeover", "transaction", "M&A", "business combination").
-- If after thorough multi-query searching you still cannot find the information, your response MUST include:
-  * The exact search queries you tried.
-  * Which documents were in the search index.
-  * That the information MAY exist in unexamined sections.
-- Never present a negative claim with high confidence — always qualify it.
+- If evidence is weak or missing, say so directly.
+- If raw documents are too large to read in full, you may use the `retrieve_wiki_documents` tool to query them and retrieve relevant snippets.
 
 Filesystem policy:
 - Never write to `/raw/`.
@@ -452,19 +391,7 @@ def _fallback_pdf_extract(file_path: Path) -> str:
             return "\n\n".join(page_texts)
         except Exception as e:
             return f"Error extracting PDF text: {e}"
-
-
-def _extract_and_write_binary_source(src: Path, dest: Path) -> tuple[Path, str]:
-    """Helper for ProcessPoolExecutor to extract and write binary source content."""
-    text = _extract_binary_source(src)
-    stem = f"{src.stem}.{src.suffix.lstrip('.')}"
-    counter = 2
-    final_dest = dest
-    while final_dest.exists():
-        final_dest = dest.parent / f"{stem}-{counter}.md"
-        counter += 1
-    final_dest.write_text(text, encoding="utf-8")
-    return (final_dest, stem)
+    return ""
 
 
 def _stage_sources(source_paths: list[Path], raw_dir: Path) -> list[Path]:
@@ -474,8 +401,8 @@ def _stage_sources(source_paths: list[Path], raw_dir: Path) -> list[Path]:
     Binary formats (.pdf, .docx, .pptx, .xlsx) are extracted to markdown/text
     via ``content_extractors`` and saved as ``.md`` in the raw directory.
 
-    Binary extractions run in parallel via a process pool (falling back to a thread
-    pool) to reduce wall-clock time when multiple PDFs or office documents are staged.
+    Binary extractions run in parallel via a thread pool to reduce wall-clock
+    time when multiple PDFs or office documents are staged together.
     """
     import concurrent.futures
 
@@ -525,36 +452,32 @@ def _stage_sources(source_paths: list[Path], raw_dir: Path) -> list[Path]:
 
     # Process binary sources in parallel (CPU-bound extraction).
     if binary_sources:
+
+        def _extract_one(src: Path, dest: Path) -> tuple[Path, str] | None:
+            """Extract one binary source; returns (final_dest, stem) or None."""
+            text = _extract_binary_source(src)
+            stem = f"{src.stem}.{src.suffix.lstrip('.')}"
+            counter = 2
+            while dest.exists():
+                dest = raw_dir / f"{stem}-{counter}.md"
+                counter += 1
+            dest.write_text(text, encoding="utf-8")
+            return (dest, stem)
+
         max_workers = min(len(binary_sources), 4)
-        try:
-            with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
-                futures = {
-                    executor.submit(_extract_and_write_binary_source, src, dest): src
-                    for src, dest in binary_sources
-                }
-                for future in concurrent.futures.as_completed(futures):
-                    try:
-                        result = future.result()
-                        if result is not None:
-                            staged.append(result[0])
-                    except Exception:
-                        src = futures[future]
-                        logger.exception("Failed to extract binary source in process pool: %s", src)
-        except Exception as p_err:
-            logger.warning("ProcessPoolExecutor failed, falling back to ThreadPoolExecutor: %s", p_err)
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = {
-                    executor.submit(_extract_and_write_binary_source, src, dest): src
-                    for src, dest in binary_sources
-                }
-                for future in concurrent.futures.as_completed(futures):
-                    try:
-                        result = future.result()
-                        if result is not None:
-                            staged.append(result[0])
-                    except Exception:
-                        src = futures[future]
-                        logger.exception("Failed to extract binary source in fallback thread pool: %s", src)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(_extract_one, src, dest): src
+                for src, dest in binary_sources
+            }
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    result = future.result()
+                    if result is not None:
+                        staged.append(result[0])
+                except Exception:
+                    src = futures[future]
+                    logger.exception("Failed to extract binary source: %s", src)
 
     return staged
 
@@ -924,11 +847,56 @@ def _run_agent(
             computed on demand (reads all raw files).
         progress_callback: Optional callable(str) for sub-phase progress updates.
     """
-    path_key = str(Path(wiki_dir).resolve())
-    cache_key = (path_key, read_only)
+    from deepagents import create_deep_agent
+    from deepagents.backends import CompositeBackend, FilesystemBackend
+    from deepagents.middleware.filesystem import FilesystemPermission
 
-    if search_index is not None:
-        _search_index_cache[path_key] = search_index
+    # Resolve wiki_dir to its absolute real path so the root_dir stored in
+    # FilesystemBackend matches the \\?\ -prefixed paths that Path.resolve()
+    # produces on Windows for long paths, avoiding the "outside root" error.
+    wiki_dir = wiki_dir.resolve()
+
+    # For server environments, we MUST NOT give the wiki synthesizer a shell.
+    # It only needs to read/write files in the wiki directory.
+    raw_backend = FilesystemBackend(root_dir=wiki_dir / "raw", virtual_mode=True)
+    wiki_backend = FilesystemBackend(root_dir=wiki_dir / "wiki", virtual_mode=True)
+    root_backend = FilesystemBackend(root_dir=wiki_dir, virtual_mode=True)
+    backend = CompositeBackend(
+        default=root_backend,
+        routes={
+            "/raw/": raw_backend,
+            "/wiki/": wiki_backend,
+            "/log.md": root_backend,
+            "/AGENTS.md": root_backend,
+            "/purpose.md": root_backend,
+        },
+    )
+
+    if read_only:
+        permissions = [
+            FilesystemPermission(operations=["write"], paths=["/raw/**"], mode="deny"),
+            FilesystemPermission(operations=["write"], paths=["/wiki/**"], mode="deny"),
+            FilesystemPermission(operations=["write"], paths=["/log.md"], mode="deny"),
+            FilesystemPermission(
+                operations=["write"], paths=["/AGENTS.md"], mode="deny"
+            ),
+            FilesystemPermission(
+                operations=["write"], paths=["/purpose.md"], mode="deny"
+            ),
+            FilesystemPermission(operations=["write"], paths=["/**"], mode="deny"),
+        ]
+    else:
+        permissions = [
+            FilesystemPermission(operations=["write"], paths=["/raw/**"], mode="deny"),
+            FilesystemPermission(
+                operations=["write"], paths=["/AGENTS.md"], mode="deny"
+            ),
+            FilesystemPermission(operations=["write"], paths=["/log.md"], mode="deny"),
+            FilesystemPermission(
+                operations=["write"], paths=["/purpose.md"], mode="deny"
+            ),
+            FilesystemPermission(operations=["write"], paths=["/**"], mode="allow"),
+        ]
 
     # ── Budget-aware: pre-build search index when raw content is large ─────
     _raw_dir = wiki_dir / "raw"
@@ -937,242 +905,164 @@ def _run_agent(
     )
     _raw_budget = _calculate_context_budget()["raw_sources"]
     _use_search = _total_raw > _raw_budget
-
-    if cache_key in _agent_cache:
-        agent = _agent_cache[cache_key]
-    else:
-        from deepagents import create_deep_agent
-        from deepagents.backends import CompositeBackend, FilesystemBackend
-        from deepagents.middleware.filesystem import FilesystemPermission
-
-        # For server environments, we MUST NOT give the wiki synthesizer a shell.
-        # It only needs to read/write files in the wiki directory.
-        raw_backend = FilesystemBackend(root_dir=wiki_dir / "raw", virtual_mode=True)
-        wiki_backend = FilesystemBackend(root_dir=wiki_dir / "wiki", virtual_mode=True)
-        root_backend = FilesystemBackend(root_dir=wiki_dir, virtual_mode=True)
-        backend = CompositeBackend(
-            default=root_backend,
-            routes={
-                "/raw/": raw_backend,
-                "/wiki/": wiki_backend,
-                "/log.md": root_backend,
-                "/AGENTS.md": root_backend,
-                "/purpose.md": root_backend,
-            },
+    _cached_index = search_index  # May be None (build on demand)
+    if _use_search and _cached_index is not None:
+        logger.info("Using cached search index for raw content (%d chars).", _total_raw)
+    elif _use_search:
+        logger.info(
+            "Raw content (%d chars) exceeds raw source budget (%d chars); "
+            "pre-building search index and recommending retrieve_wiki_documents tool.",
+            _total_raw,
+            _raw_budget,
         )
+        # Eagerly build the search index so the tool is ready when the LLM calls it.
+        try:
+            from research_agent.utils.text_search import load_or_build_search_index
 
-        if read_only:
-            permissions = [
-                FilesystemPermission(operations=["write"], paths=["/raw/**"], mode="deny"),
-                FilesystemPermission(operations=["write"], paths=["/wiki/**"], mode="deny"),
-                FilesystemPermission(operations=["write"], paths=["/log.md"], mode="deny"),
-                FilesystemPermission(
-                    operations=["write"], paths=["/AGENTS.md"], mode="deny"
-                ),
-                FilesystemPermission(
-                    operations=["write"], paths=["/purpose.md"], mode="deny"
-                ),
-                FilesystemPermission(operations=["write"], paths=["/**"], mode="deny"),
-            ]
-        else:
-            permissions = [
-                FilesystemPermission(operations=["write"], paths=["/raw/**"], mode="deny"),
-                FilesystemPermission(
-                    operations=["write"], paths=["/AGENTS.md"], mode="deny"
-                ),
-                FilesystemPermission(operations=["write"], paths=["/log.md"], mode="deny"),
-                FilesystemPermission(
-                    operations=["write"], paths=["/purpose.md"], mode="deny"
-                ),
-                FilesystemPermission(operations=["write"], paths=["/**"], mode="allow"),
-            ]
-
-        if _use_search and path_key not in _search_index_cache:
-            logger.info(
-                "Raw content (%d chars) exceeds raw source budget (%d chars); "
-                "pre-building search index and recommending retrieve_wiki_documents tool.",
-                _total_raw,
-                _raw_budget,
+            _index_dir = wiki_dir / "index"
+            _cached_index = load_or_build_search_index(_raw_dir, _index_dir)
+            logger.info("Search index built successfully for %s", _raw_dir)
+        except Exception:
+            logger.exception(
+                "Failed to pre-build search index; tool will build on first call."
             )
-            # Eagerly build the search index so the tool is ready when the LLM calls it.
-            try:
-                from research_agent.utils.text_search import load_or_build_search_index
 
-                _index_dir = wiki_dir / "index"
-                _search_index_cache[path_key] = load_or_build_search_index(_raw_dir, _index_dir)
-                logger.info("Search index built successfully for %s", _raw_dir)
-            except Exception:
-                logger.exception(
-                    "Failed to pre-build search index; tool will build on first call."
+    from langchain_core.tools import tool
+
+    @tool
+    def retrieve_wiki_documents(query: str, k: int = 5) -> str:
+        """Retrieve top-k relevant document snippets from the raw documents text search index.
+
+        Use this tool when you need to search large raw source documents in `/raw/`
+        for specific facts.  Returns ranked snippets with source file paths, page
+        numbers, and relevance scores.
+        """
+        nonlocal _cached_index
+
+        try:
+            from research_agent.utils.text_search import (
+                load_or_build_search_index,
+                search_index,
+            )
+
+            index_dir = wiki_dir / "index"
+            raw_dir = wiki_dir / "raw"
+
+            # Use cached index if available, otherwise build on demand.
+            if _cached_index is not None:
+                search_idx = _cached_index
+            else:
+                search_idx = load_or_build_search_index(raw_dir, index_dir)
+                _cached_index = search_idx  # Cache for subsequent calls.
+
+            # Notify progress callback with the search query.
+            if progress_callback is not None:
+                try:
+                    progress_callback(f"Searching documents for: {query[:120]}...")
+                except Exception:
+                    pass  # Progress callback failures must not break the tool.
+
+            if not search_idx:
+                return (
+                    "Error: No search index is available or could be built. "
+                    "You must read `/raw/` files directly using the read_file tool. "
+                    "Available raw files are under /raw/."
                 )
 
-        from langchain_core.tools import tool
+            # Primary search: full query.
+            results = search_index(query, search_idx, k=k)
 
-        @tool
-        def retrieve_wiki_documents(query: str, k: int = 5) -> str:
-            """Retrieve top-k relevant document snippets from the raw documents text search index.
-
-            Use this tool when you need to search large raw source documents in `/raw/`
-            for specific facts.  Returns ranked snippets with source file paths, page
-            numbers, and relevance scores.
-            """
-            try:
-                from research_agent.utils.text_search import (
-                    load_or_build_search_index,
-                    search_index,
-                )
-
-                index_dir = wiki_dir / "index"
-                raw_dir = wiki_dir / "raw"
-
-                # Use cached index if available, otherwise build on demand.
-                if path_key in _search_index_cache:
-                    search_idx = _search_index_cache[path_key]
-                else:
-                    search_idx = load_or_build_search_index(raw_dir, index_dir)
-                    _search_index_cache[path_key] = search_idx
-
-                # Notify progress callback with the search query.
-                if progress_callback is not None:
-                    try:
-                        progress_callback(f"Searching documents for: {query[:120]}...")
-                    except Exception:
-                        pass  # Progress callback failures must not break the tool.
-
-                if not search_idx:
-                    return (
-                        "Error: No search index is available or could be built. "
-                        "You must read `/raw/` files directly using the read_file tool. "
-                        "Available raw files are under /raw/."
-                    )
-
-                logger.info(
-                    "retrieve_wiki_documents called: query=%r, k=%d, index_size=%d, has_faiss=%s",
-                    query, k, len(search_idx), search_idx.has_faiss,
-                )
-
-                # Primary search: full query.
-                results = search_index(query, search_idx, k=k)
-
-                # Fallback: if full query returns < k results, try individual terms
-                # and merge.  This compensates for BM25 being keyword-based (unlike
-                # FAISS which does semantic matching).
-                if len(results) < k:
-                    terms = query.split()
-                    if len(terms) > 1:
-                        term_results: dict[int, tuple[Document, float]] = {}
-                        for term in terms:
-                            if len(term) < 3:
-                                continue
-                            tr = search_index(term, search_idx, k=k)
-                            for doc, score in tr:
-                                doc_id = id(doc)
-                                if (
-                                        doc_id not in term_results
-                                        or score > term_results[doc_id][1]
-                                ):
-                                    term_results[doc_id] = (doc, score)
-                        # Merge, keeping the best score per document.
-                        seen_ids = {id(d) for d, _ in results}
-                        for doc_id, (doc, score) in term_results.items():
-                            if doc_id not in seen_ids:
-                                results.append((doc, score))
-                                seen_ids.add(doc_id)
-                        # Re-sort by descending score.
-                        results.sort(key=lambda x: x[1], reverse=True)
-
-                # FAISS fallback: if BM25 (full query + per-term) still returns
-                # < k results, try FAISS-only semantic search on the full index.
-                # BM25 is keyword-based and misses synonyms/paraphrases; FAISS
-                # catches those via embedding similarity.
-                if len(results) < k and search_idx.has_faiss:
-                    faiss_results = search_idx.search_faiss_only(query, k=k)
-                    logger.info(
-                        "retrieve_wiki_documents FAISS fallback: query=%r, "
-                        "bm25_hits=%d, faiss_hits=%d",
-                        query, len(results), len(faiss_results),
-                    )
+            # Fallback: if full query returns < k results, try individual terms
+            # and merge.  This compensates for BM25 being keyword-based (unlike
+            # FAISS which does semantic matching).
+            if len(results) < k:
+                terms = query.split()
+                if len(terms) > 1:
+                    term_results: dict[int, tuple[Document, float]] = {}
+                    for term in terms:
+                        if len(term) < 3:
+                            continue
+                        tr = search_index(term, search_idx, k=k)
+                        for doc, score in tr:
+                            doc_id = id(doc)
+                            if (
+                                    doc_id not in term_results
+                                    or score > term_results[doc_id][1]
+                            ):
+                                term_results[doc_id] = (doc, score)
+                    # Merge, keeping the best score per document.
                     seen_ids = {id(d) for d, _ in results}
-                    for doc, score in faiss_results:
-                        if id(doc) not in seen_ids:
+                    for doc_id, (doc, score) in term_results.items():
+                        if doc_id not in seen_ids:
                             results.append((doc, score))
-                            seen_ids.add(id(doc))
+                            seen_ids.add(doc_id)
+                    # Re-sort by descending score.
                     results.sort(key=lambda x: x[1], reverse=True)
 
-                logger.info(
-                    "retrieve_wiki_documents final: query=%r, total_hits=%d, "
-                    "top_sources=%s",
-                    query, len(results),
-                    [(doc.metadata.get("source_path", "?"), round(score, 4))
-                     for doc, score in results[:k]],
+            if not results:
+                return (
+                    "No matching document snippets found for query. "
+                    "Try reading `/raw/` files directly with the read_file tool, "
+                    "or refine your search terms."
                 )
 
-                if not results:
-                    logger.warning(
-                        "retrieve_wiki_documents ZERO results: query=%r, "
-                        "index_size=%d, has_faiss=%s",
-                        query, len(search_idx), search_idx.has_faiss,
-                    )
-                    return (
-                        "No matching document snippets found for query. "
-                        "Try reading `/raw/` files directly with the read_file tool, "
-                        "or refine your search terms."
-                    )
+            output_lines = []
+            for idx, (doc, score) in enumerate(results[:k], start=1):
+                meta = doc.metadata
+                src = meta.get("source_path") or "unknown"
+                page = meta.get("page")
+                locator = meta.get("locator")
+                heading = meta.get("heading")
 
-                output_lines = []
-                for idx, (doc, score) in enumerate(results[:k], start=1):
-                    meta = doc.metadata
-                    src = meta.get("source_path") or "unknown"
-                    page = meta.get("page")
-                    locator = meta.get("locator")
-                    heading = meta.get("heading")
+                # Strip leading /raw/ from source path in snippet output
+                if src.startswith("/raw/"):
+                    src = src[len("/raw/"):]
 
-                    # Strip leading /raw/ from source path in snippet output
-                    if src.startswith("/raw/"):
-                        src = src[len("/raw/"):]
+                location_parts = []
+                if page:
+                    location_parts.append(f"p. {page}")
+                if locator and locator != f"Page {page}":
+                    location_parts.append(locator)
+                if heading:
+                    location_parts.append(heading)
 
-                    location_parts = []
-                    if page:
-                        location_parts.append(f"p. {page}")
-                    if locator and locator != f"Page {page}":
-                        location_parts.append(locator)
-                    if heading:
-                        location_parts.append(heading)
+                loc_str = f" ({', '.join(location_parts)})" if location_parts else ""
+                output_lines.append(
+                    f"[{idx}] Source: /raw/{src}{loc_str} (Score: {score:.4f})\n"
+                    f"{doc.page_content}\n"
+                )
 
-                    loc_str = f" ({', '.join(location_parts)})" if location_parts else ""
-                    output_lines.append(
-                        f"[{idx}] Source: /raw/{src}{loc_str} (Score: {score:.4f})\n"
-                        f"{doc.page_content}\n"
-                    )
+            return "\n---\n\n".join(output_lines)
+        except Exception as e:
+            logger.exception("retrieve_wiki_documents failed")
+            return f"Error retrieving raw documents: {e}"
 
-                return "\n---\n\n".join(output_lines)
-            except Exception as e:
-                logger.exception("retrieve_wiki_documents failed")
-                return f"Error retrieving raw documents: {e}"
+    model = _resolve_model()
+    agent = create_deep_agent(
+        model=model,
+        backend=backend,
+        permissions=permissions,
+        system_prompt=_BASE_SYSTEM_PROMPT,
+        tools=[retrieve_wiki_documents],
+    )
 
-        model = _resolve_model()
-        agent = create_deep_agent(
-            model=model,
-            backend=backend,
-            permissions=permissions,
-            system_prompt=_BASE_SYSTEM_PROMPT,
-            tools=[retrieve_wiki_documents],
+    # Apply a conservative recursion limit to prevent infinite tool-calling
+    # loops.  Index repair and lint passes should complete in < 30 turns;
+    # ingest review + apply may need more for large document sets.
+    from langchain_core.runnables import RunnableConfig
+
+    _WIKI_AGENT_RECURSION_LIMIT = int(
+        __import__("os").getenv("WIKI_AGENT_RECURSION_LIMIT", "100")
+    )
+    # Timeout for the entire agent invocation (seconds).
+    _WIKI_AGENT_TIMEOUT = int(
+        __import__("os").getenv("WIKI_AGENT_TIMEOUT_SECONDS", "300")
+    )
+    agent = agent.with_config(
+        RunnableConfig(
+            recursion_limit=_WIKI_AGENT_RECURSION_LIMIT,
         )
-
-        # Apply a conservative recursion limit to prevent infinite tool-calling
-        # loops.  Index repair and lint passes should complete in < 30 turns;
-        # ingest review + apply may need more for large document sets.
-        from langchain_core.runnables import RunnableConfig
-
-        _WIKI_AGENT_RECURSION_LIMIT = int(
-            os.getenv("WIKI_AGENT_RECURSION_LIMIT", "100")
-        )
-        agent = agent.with_config(
-            RunnableConfig(
-                recursion_limit=_WIKI_AGENT_RECURSION_LIMIT,
-            )
-        )
-        _agent_cache[cache_key] = agent
+    )
 
     # When raw content exceeds the budget, append a strong recommendation to
     # use the search tool instead of direct file reads.
@@ -2475,7 +2365,6 @@ async def run_ingest(
     Returns the apply summary text.
     """
     try:
-        _invalidate_agent_cache(paths.wiki_dir)
         # Phase 1: Initialize
         progress.advance(IngestPhase.INITIALIZING, "Creating wiki scaffold...")
         await init_wiki(paths, topic)
@@ -2694,19 +2583,6 @@ async def run_ingest(
         progress.advance(IngestPhase.REFRESHING_INDEX, "Rebuilding wiki index...")
         await asyncio.to_thread(_refresh_index, topic, paths.wiki_dir)
 
-        # Pre-build search index for RAG
-        try:
-            from research_agent.utils.text_search import load_or_build_search_index
-            _raw_dir = paths.wiki_dir / "raw"
-            _index_dir = paths.wiki_dir / "index"
-            search_idx = await asyncio.to_thread(load_or_build_search_index, _raw_dir, _index_dir)
-            path_key = str(Path(paths.wiki_dir).resolve())
-            _search_index_cache[path_key] = search_idx
-            # Write a sentinel file to indicate index readiness
-            (paths.wiki_dir / ".index_ready").write_text("ready", encoding="utf-8")
-        except Exception:
-            logger.exception("Failed to pre-build search index during ingest")
-
         progress.mark_complete(f"Ingested {len(staged)} sources successfully.")
         await remove_progress_snapshot(paths.wiki_dir)
         return apply_result
@@ -2833,69 +2709,6 @@ def _extract_citations(answer: str) -> list[SourceCitation]:
     return citations
 
 
-def run_query_sync(
-        paths: ThreadWikiPaths,
-        topic: str,
-        question: str,
-        *,
-        file_results: bool = True,
-) -> WikiQueryResult:
-    """Query the thread's wiki knowledge base synchronously."""
-    query_prompt = _build_query_prompt(topic, question)
-    try:
-        raw_response = _run_agent(paths.wiki_dir, query_prompt, read_only=True)
-    except Exception as e:
-        logger.exception("Wiki query failed")
-        return WikiQueryResult(
-            answer=f"Wiki query failed: {e}",
-            filed_path=None,
-            sources_cited=[],
-        )
-    answer, should_file, reason = _parse_query_decision(raw_response)
-
-    _append_log_entry(
-        paths.wiki_dir,
-        "query.review",
-        "file" if should_file else "skip",
-        summary=answer[:320],
-    )
-
-    filed_path: str | None = None
-    if should_file and file_results:
-        slug = _slugify(question)[:80].rstrip("-") or "query"
-        target = f"/wiki/query/{slug}.md"
-        file_prompt = (
-            f"File a durable query answer for topic '{topic}'.\n\n"
-            f"Create or overwrite exactly: `{target}`\n\n"
-            "Requirements:\n"
-            "1) Write a clean, scannable markdown page.\n"
-            "2) Preserve grounded claims and include wiki file path citations.\n"
-            "3) Include sections: Question, Answer, and Sources.\n"
-            "4) Never write to `/raw/`.\n\n"
-            f"Filing reason: {reason}\n\nQuestion: {question}\n\nAnswer draft:\n{answer}\n"
-        )
-        try:
-            _run_agent(paths.wiki_dir, file_prompt, read_only=False)
-        except Exception as e:
-            logger.warning("Wiki query filing failed: %s", e)
-        else:
-            import threading
-            threading.Thread(target=_refresh_index, args=(topic, paths.wiki_dir), daemon=True).start()
-            _append_log_entry(
-                paths.wiki_dir,
-                "query.apply",
-                "filed",
-                summary=f"Filed query answer at {target}.",
-            )
-            filed_path = target
-
-    citations = _extract_citations(answer)
-
-    return WikiQueryResult(
-        answer=answer, filed_path=filed_path, sources_cited=citations
-    )
-
-
 async def run_query(
         paths: ThreadWikiPaths,
         topic: str,
@@ -2955,8 +2768,7 @@ async def run_query(
         except TimeoutError:
             logger.warning("Wiki query filing timed out after %ds", _QUERY_TIMEOUT)
         else:
-            # Fire-and-forget background task for index refresh
-            asyncio.create_task(asyncio.to_thread(_refresh_index, topic, paths.wiki_dir))
+            await asyncio.to_thread(_refresh_index, topic, paths.wiki_dir)
             await asyncio.to_thread(
                 _append_log_entry,
                 paths.wiki_dir,
@@ -2987,7 +2799,6 @@ async def run_lint(
 
     Use this after document deletions to reconcile stale references.
     """
-    _invalidate_agent_cache(paths.wiki_dir)
     # Pass 1: Run graph analysis for structural health insights.
     graph_report = await asyncio.to_thread(_analyze_graph, paths.wiki_dir)
 
