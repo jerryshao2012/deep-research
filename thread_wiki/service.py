@@ -14,12 +14,29 @@ the background task terminates promptly.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import logging
+import math
+import os
 import re
+import shutil
 import sys
+import threading
+from collections import defaultdict
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from deepagents import create_deep_agent
+from deepagents.backends import CompositeBackend, FilesystemBackend
+from deepagents.middleware.filesystem import FilesystemPermission
+from langchain_core.runnables import RunnableConfig
+from networkx.algorithms.community import louvain_communities
+
+from model_factory import get_configured_model
+from research_agent.utils.text_search import (
+    load_or_build_search_index,
+)
 from .models import (
     CommunityInfo,
     GraphInsight,
@@ -32,6 +49,7 @@ from .models import (
     ThreadWikiPaths,
     WikiQueryResult,
 )
+from .models import parse_frontmatter
 from .progress import remove_progress_snapshot, save_progress
 
 if TYPE_CHECKING:
@@ -83,8 +101,6 @@ _WIKI_CHUNK_OVERLAP_CHARS = int(
 
 def _get_context_max_chars() -> int:
     """Return the configured context window size in characters."""
-    import os
-
     env_val = os.getenv("WIKI_CONTEXT_MAX_CHARS")
     if env_val:
         try:
@@ -312,8 +328,6 @@ def _purpose_md(topic: str) -> str:
 
 def _copy_templates(wiki_dir: Path) -> None:
     """Copy page templates from the package into the wiki workspace (if missing)."""
-    import shutil
-
     templates_src = Path(__file__).resolve().parent / "templates"
     if not templates_src.exists():
         return
@@ -404,8 +418,6 @@ def _stage_sources(source_paths: list[Path], raw_dir: Path) -> list[Path]:
     Binary extractions run in parallel via a thread pool to reduce wall-clock
     time when multiple PDFs or office documents are staged together.
     """
-    import concurrent.futures
-
     raw_dir.mkdir(parents=True, exist_ok=True)
     staged: list[Path] = []
 
@@ -625,8 +637,6 @@ def _strip_markdown_inline(text: str) -> str:
 
 def _refresh_index(topic: str, wiki_dir: Path) -> None:
     """Rebuild wiki/index.md from current markdown pages, using YAML frontmatter when available."""
-    from .models import parse_frontmatter
-
     wiki_content_dir = wiki_dir / "wiki"
     pages = [p for p in sorted(wiki_content_dir.rglob("*.md")) if p.name != "index.md"]
 
@@ -781,8 +791,6 @@ def _append_log_entry(
 
     Format: ``## [YYYY-MM-DD] op | Title`` with metadata list.
     """
-    from datetime import UTC, datetime
-
     log_path = wiki_dir / "log.md"
     if not log_path.exists():
         log_path.write_text("# Change Log\n", encoding="utf-8")
@@ -820,8 +828,6 @@ def _resolve_model():
     # Import here to avoid circular imports at module load time.
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     try:
-        from model_factory import get_configured_model
-
         return get_configured_model()
     finally:
         sys.path.pop(0)
@@ -847,20 +853,23 @@ def _run_agent(
             computed on demand (reads all raw files).
         progress_callback: Optional callable(str) for sub-phase progress updates.
     """
-    from deepagents import create_deep_agent
-    from deepagents.backends import CompositeBackend, FilesystemBackend
-    from deepagents.middleware.filesystem import FilesystemPermission
-
     # Resolve wiki_dir to its absolute real path so the root_dir stored in
     # FilesystemBackend matches the \\?\ -prefixed paths that Path.resolve()
     # produces on Windows for long paths, avoiding the "outside root" error.
     wiki_dir = wiki_dir.resolve()
 
+    # On Windows, str(Path) of a long path includes \\?\ prefix internally.
+    # Pass these string representations to FilesystemBackend for correct
+    # path containment validation across subdirectories.
+    root_dir_str = str(wiki_dir)
+    raw_dir_str = str(wiki_dir / "raw")
+    wiki_subdir_str = str(wiki_dir / "wiki")
+
     # For server environments, we MUST NOT give the wiki synthesizer a shell.
     # It only needs to read/write files in the wiki directory.
-    raw_backend = FilesystemBackend(root_dir=wiki_dir / "raw", virtual_mode=True)
-    wiki_backend = FilesystemBackend(root_dir=wiki_dir / "wiki", virtual_mode=True)
-    root_backend = FilesystemBackend(root_dir=wiki_dir, virtual_mode=True)
+    raw_backend = FilesystemBackend(root_dir=raw_dir_str, virtual_mode=True)
+    wiki_backend = FilesystemBackend(root_dir=wiki_subdir_str, virtual_mode=True)
+    root_backend = FilesystemBackend(root_dir=root_dir_str, virtual_mode=True)
     backend = CompositeBackend(
         default=root_backend,
         routes={
@@ -917,8 +926,6 @@ def _run_agent(
         )
         # Eagerly build the search index so the tool is ready when the LLM calls it.
         try:
-            from research_agent.utils.text_search import load_or_build_search_index
-
             _index_dir = wiki_dir / "index"
             _cached_index = load_or_build_search_index(_raw_dir, _index_dir)
             logger.info("Search index built successfully for %s", _raw_dir)
@@ -940,11 +947,6 @@ def _run_agent(
         nonlocal _cached_index
 
         try:
-            from research_agent.utils.text_search import (
-                load_or_build_search_index,
-                search_index,
-            )
-
             index_dir = wiki_dir / "index"
             raw_dir = wiki_dir / "raw"
 
@@ -1049,8 +1051,6 @@ def _run_agent(
     # Apply a conservative recursion limit to prevent infinite tool-calling
     # loops.  Index repair and lint passes should complete in < 30 turns;
     # ingest review + apply may need more for large document sets.
-    from langchain_core.runnables import RunnableConfig
-
     _WIKI_AGENT_RECURSION_LIMIT = int(
         __import__("os").getenv("WIKI_AGENT_RECURSION_LIMIT", "100")
     )
@@ -1266,8 +1266,6 @@ def _analyze_graph(wiki_dir: Path) -> dict:
     - ``disconnected``: groups of pages with no cross-references to other groups
     - ``total_pages``, ``total_links``: summary stats
     """
-    from collections import defaultdict
-
     wiki_content_dir = wiki_dir / "wiki"
     if not wiki_content_dir.exists():
         return {
@@ -1411,8 +1409,6 @@ def _build_graph_payload(wiki_dir: Path) -> dict:
     - ``edges``: list of {source, target, weight}
     - ``communities``: list of {id, cohesion, size}
     """
-    from .models import parse_frontmatter
-
     wiki_content_dir = wiki_dir / "wiki"
     G, name_to_rel, outlinks = _build_wiki_graph(wiki_dir)
 
@@ -1476,10 +1472,6 @@ def _build_wiki_graph(
     Returns (graph, name_to_rel, outlinks) where graph is an undirected
     NetworkX graph with page relative paths as nodes.
     """
-    from collections import defaultdict
-
-    import networkx as nx
-
     wiki_content_dir = wiki_dir / "wiki"
     link_re = re.compile(r"\[([^]]*?)]\(([^)]+\.md)\)|\[\[([^]]+\.md)]]", re.IGNORECASE)
 
@@ -1524,8 +1516,6 @@ def _detect_communities(wiki_dir: Path) -> list[CommunityInfo]:
     cross-referenced wiki pages, then computes cohesion scores for each
     community.  Low-cohesion communities are flagged as knowledge gaps.
     """
-    from networkx.algorithms.community import louvain_communities
-
     G, name_to_rel, _outlinks = _build_wiki_graph(wiki_dir)
     if G.number_of_nodes() < 3:
         return []
@@ -1615,8 +1605,6 @@ def _compute_adamic_adar_weight(
         G: nx.Graph, outlinks: dict[str, set[str]], page_a: str, page_b: str
 ) -> float:
     """Signal 3: Adamic-Adar index (sum of 1/log(degree) for shared neighbors). (Weight: 1.5x)."""
-    import math
-
     neighbors_a = set(G.neighbors(page_a))
     neighbors_b = set(G.neighbors(page_b))
     shared = neighbors_a & neighbors_b
@@ -1668,8 +1656,6 @@ def _build_relevance_graph(wiki_dir: Path) -> dict:
     - ``page_count``: total pages analyzed
     - ``total_pairs``: total number of pairs evaluated
     """
-    from .models import parse_frontmatter
-
     wiki_content_dir = wiki_dir / "wiki"
 
     # Build metadata map
@@ -2030,10 +2016,8 @@ def _parse_review_item(line: str, section: str) -> ReviewItem | None:
     Handles the structured format: ``- **Key**: value | **Key2**: value2``
     """
     # Extract bold-keyed values
-    import re as _re_
-
     pairs: dict[str, str] = {}
-    for match in _re_.finditer(
+    for match in re.finditer(
             r"\*\*([^*]+)\*\*:\s*([^|]+?)(?=\s*\||\s*\*\*|\s*$)", line
     ):
         key = match.group(1).strip().lower().replace(" ", "_")
@@ -2166,8 +2150,6 @@ def _find_source_references(
     (snippets from the page body where the source is mentioned).  Also
     identifies pages that list the source in their frontmatter ``sources[]``.
     """
-    from .models import parse_frontmatter
-
     wiki_content_dir = wiki_dir / "wiki"
     if not wiki_content_dir.exists():
         return {}
@@ -2228,8 +2210,6 @@ def _cascade_delete_source_references(wiki_dir: Path, source_filename: str) -> d
     - ``pages_with_body_refs``: list of page paths with inline /raw/ mentions
     - ``source_summary_page``: the source summary page path (if it exists)
     """
-    from .models import parse_frontmatter
-
     clean_name = source_filename
     if clean_name.startswith("/raw/"):
         clean_name = clean_name[len("/raw/"):]
@@ -2425,11 +2405,10 @@ async def run_ingest(
         _cached_index: object | None = None
         if _use_search:
             try:
-                from research_agent.utils.text_search import (
-                    load_or_build_search_index,
-                )
-
                 _index_dir = paths.wiki_dir / "index"
+                # Clear stale index to ensure renamed/updated files are reflected
+                if _index_dir.exists():
+                    await asyncio.to_thread(shutil.rmtree, _index_dir)
                 _cached_index = await asyncio.to_thread(
                     load_or_build_search_index, paths.raw_dir, _index_dir
                 )
@@ -2566,8 +2545,6 @@ async def run_ingest(
                 )
 
         if _run_review_bg:
-            import threading
-
             _review_thread = threading.Thread(
                 target=_post_ingest_review_sync,
                 daemon=True,

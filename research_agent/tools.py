@@ -5,16 +5,17 @@ planning (think_tool), and local workspace interactions (ls, glob, read_file,
 write_file, read_docs_folder). Handles state injection and directory constraints.
 """
 
+import asyncio
 import os
 import re
 from datetime import datetime
+from pathlib import Path
 from typing import Annotated, Literal
 
 from deepagents.backends.utils import create_file_data, file_data_to_string
 from dotenv import load_dotenv
 from langchain_core.tools import InjectedToolArg, tool
 from langgraph.prebuilt import InjectedState
-from pathlib import Path
 
 from logger_utils import setup_logger
 from research_agent.utils.knowledge_filesystem import (
@@ -30,6 +31,8 @@ from research_agent.utils.web_search import (
     fetch_webpage_content_impl,
     tavily_search_impl,
 )
+from thread_wiki.models import ThreadWikiPaths, _resolve_wiki_base_dir
+from thread_wiki.service import run_query
 
 # Load environment variables
 load_dotenv()
@@ -498,9 +501,6 @@ def llm_wiki_query(
         Raw wiki findings with document citations — must be synthesized into
         the final report, not output directly.
     """
-    from thread_wiki.models import ThreadWikiPaths, _resolve_wiki_base_dir
-    from thread_wiki.service import run_query_sync
-
     # Resolve thread_id from doc_folder in state.
     doc_folder = (state or {}).get("doc_folder") or os.environ.get("DOC_FOLDER", "")
     thread_id = None
@@ -525,7 +525,9 @@ def llm_wiki_query(
         )
 
     try:
-        result = run_query_sync(paths, f"Thread {thread_id[:8]}", question, file_results=False)
+        # Call the async run_query via asyncio.run() since this tool is sync.
+        # LangChain wraps this tool in run_in_executor, so we're in a thread pool.
+        result = asyncio.run(run_query(paths, f"Thread {thread_id[:8]}", question, file_results=False))
     except Exception as e:
         logger.warning("Wiki query tool failed: %s", e)
         return f"Wiki query failed: {e}. Use `read_file` on /wiki/ or /raw/ files directly."
@@ -541,13 +543,12 @@ def llm_wiki_query(
     # Sanitize paths in the answer for the orchestrator's filesystem view.
     # Converts wiki-internal paths like /raw/bmo_ar2025.pdf.md, p. 38
     # to orchestrator-accessible paths like /bmo_ar2025.pdf, p. 38
-    import re as _re
-    answer = _re.sub(
+    answer = re.sub(
         r"/raw/([A-Za-z0-9._-]+)\.(pdf|docx|pptx|xlsx)\.(md|txt)\b",
         r"/\1.\2",
         result.answer,
     )
-    answer = _re.sub(
+    answer = re.sub(
         r"/raw/([A-Za-z0-9._-]+\.(?:pdf|docx|pptx|xlsx))\b",
         r"/\1",
         answer,

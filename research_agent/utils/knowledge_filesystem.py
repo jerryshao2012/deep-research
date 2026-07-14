@@ -6,6 +6,7 @@ routines for listing, globbing, reading, and querying document workspace section
 
 from __future__ import annotations
 
+import fnmatch
 import os
 import random
 import re
@@ -20,6 +21,7 @@ from langgraph.prebuilt import InjectedState
 
 from logger_utils import setup_logger
 from research_agent.utils.content_extractors import extract_supported_document
+from research_agent.utils.text_search import load_or_build_search_index
 
 # Load environment variables
 load_dotenv()
@@ -83,13 +85,13 @@ def normalize_path_for_filesystem_tools(
         path_str: str
 ) -> str:
     """Normalize paths for cross-platform compatibility with deepagents filesystem tools.
-    
+
     Deepagents filesystem tools (glob, ls, etc.) expect paths relative to the working directory.
     This function ensures paths start with './' instead of '/' for proper resolution on all platforms.
-    
+
     Args:
         path_str: The path string to normalize
-        
+
     Returns:
         Normalized path string with proper relative prefix
     """
@@ -350,7 +352,7 @@ def ls_impl(
         state: Annotated[dict, InjectedState] = None
 ) -> str:
     """List files in a directory with fallback support.
-    
+
     Tries to list from the virtual filesystem in state first (DeepAgents backend),
     then falls back to the local filesystem if not available.
 
@@ -418,7 +420,7 @@ def glob_impl(
         state: Annotated[dict, InjectedState] = None
 ) -> str:
     """Implementation of glob pattern matching with fallback support.
-    
+
     Tries to match against the virtual filesystem in state first, then falls back
     to the local filesystem if not available.
 
@@ -434,7 +436,6 @@ def glob_impl(
     # Try 1: Check virtual filesystem in state (DeepAgents backend)
     if state and "files" in state:
         try:
-            import fnmatch
             matched_files = []
 
             for file_path in state["files"]:
@@ -525,7 +526,7 @@ def read_file_impl(
         state: Annotated[dict, InjectedState] = None
 ) -> str:
     """Implementation of file reading with fallback support.
-    
+
     Tries to read from the virtual filesystem in state first (DeepAgents backend),
     then falls back to the local filesystem if not available.
 
@@ -709,19 +710,34 @@ def _check_thread_wiki_ready(folder_path: str) -> tuple[bool, str | None]:
                 wiki_content = base / "docs" / "threads-wiki" / thread_id / "wiki"
                 index_path = wiki_content / "index.md"
 
+                logger.debug(
+                    "[read_doc_folder] Thread docs folder detected: thread_id=%s, "
+                    "wiki_content=%s, index_path=%s, exists=%s",
+                    thread_id, wiki_content, index_path, index_path.exists()
+                )
+
                 if index_path.exists():
                     content = index_path.read_text(encoding="utf-8")
                     if "_No pages yet._" not in content:
                         logger.info(
-                            "[read_doc_folder] docs/threads/%s folder detected — wiki is ready at %s",
+                            "[read_doc_folder] docs/threads/%s folder detected — wiki is READY at %s",
                             thread_id,
                             wiki_content,
                         )
                         return True, str(wiki_content)
+                    else:
+                        logger.debug(
+                            "[read_doc_folder] docs/threads/%s wiki index exists but still empty",
+                            thread_id
+                        )
 
+                logger.debug(
+                    "[read_doc_folder] docs/threads/%s folder detected — wiki NOT ready yet",
+                    thread_id
+                )
                 return True, None  # It IS a thread docs folder, but wiki not ready yet
-    except Exception:
-        pass
+    except Exception as e:
+        logger.exception("[read_doc_folder] Error checking thread wiki: %s", e)
     return False, None
 
 
@@ -762,11 +778,12 @@ def read_docs_folder_impl(
         )
         wiki_index_path = str(Path(wiki_content_path) / "index.md")
         return (
-            "The documents in this folder have already been ingested into the wiki workspace. "
+            "The documents in this folder have already been ingested into the wiki knowledge base. "
             "Do NOT re-process the raw files. "
-            "Instead, use the `read_file` tool to read the synthesised wiki pages. "
-            f"Start with the wiki index at `{wiki_index_path}` for an overview and list of all pages, "
-            "then read individual wiki pages for detailed information.\n\n"
+            "Instead, use the `llm_wiki_query` tool to search the knowledge base with natural language questions. "
+            "`llm_wiki_query` performs semantic search and LLM synthesis over all ingested documents and is "
+            "the preferred way to retrieve information from uploaded documents. "
+            f"If you need to browse the wiki structure, the index is at `{wiki_index_path}`.\n\n"
             "Do NOT call `read_doc_folder` again on this folder."
         )
 
@@ -891,8 +908,6 @@ def read_docs_folder_impl(
     if len(total_text) > 40000:
         logger.info("\n".join(summary_lines))
         try:
-            from research_agent.utils.text_search import load_or_build_search_index
-
             extracted_dir = output_subfolder / "extracted"
             index_dir = output_subfolder / "index"
             load_or_build_search_index(extracted_dir, index_dir)
@@ -927,13 +942,13 @@ def normalize_citations_for_comparison(text: str) -> str:
 def get_target_cited_response_path(content: str, state_files: dict | None,
                                    existing_cited_responses: list[str] | None) -> str:
     """Resolve the file path to write the cited response to, avoiding overwriting cited responses from previous turns.
-    
+
     If the content (ignoring sanitization/citation diffs) matches any cited_response in state_files,
     that matching path is returned (in-place sanitization/update).
-    
+
     Otherwise, if a new cited_response file (not in existing_cited_responses) was already created during this turn,
     that path is returned (so multiple writes in the same turn reuse the same new path).
-    
+
     Otherwise, a new cited_response path is allocated (e.g. /cited_response.md if it doesn't exist in existing_cited_responses,
     or /cited_response_N.md where N is determined by incrementing the highest existing suffix).
     """
@@ -942,7 +957,6 @@ def get_target_cited_response_path(content: str, state_files: dict | None,
     # Fallback to global thread mapping if existing_cited_responses is None/empty
     if not existing_cited_responses:
         try:
-            from langgraph.config import get_config
             config = get_config()
             thread_id = config.get("configurable", {}).get("thread_id")
             if thread_id:
@@ -990,7 +1004,7 @@ def get_target_cited_response_path(content: str, state_files: dict | None,
 
 def get_active_cited_response_path(state_files: dict | None, existing_cited_responses: list[str] | None) -> str:
     """Find the active cited response path for the current turn.
-    
+
     This is either:
     1. A cited response file in state_files that is NOT in existing_cited_responses (meaning it was created this turn).
     2. Or if none, the highest index /cited_response*.md in state_files.
@@ -1001,7 +1015,6 @@ def get_active_cited_response_path(state_files: dict | None, existing_cited_resp
     # Fallback to global thread mapping if existing_cited_responses is None/empty
     if not existing_cited_responses:
         try:
-            from langgraph.config import get_config
             config = get_config()
             thread_id = config.get("configurable", {}).get("thread_id")
             if thread_id:
