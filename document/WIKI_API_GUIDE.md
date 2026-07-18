@@ -2,6 +2,19 @@
 
 The Thread Wiki feature provides **per-thread RAG (Retrieval-Augmented Generation) without a vector database**. When documents are uploaded to a thread's folder, they are automatically ingested into a wiki knowledge base that the deep research agent uses as grounded context.
 
+## Current Implementation
+
+This guide documents the repository's active `thread_wiki` implementation. It is a filesystem-backed, LLM-maintained wiki rather than a conventional embedding-and-vector-search pipeline.
+
+- Uploaded documents remain the source of truth under `./docs/threads/<thread-id>/`.
+- Extracted source text and generated wiki pages are stored under `./docs/threads-wiki/<thread-id>/`.
+- Ingest uses an LLM to review sources, update wiki pages, maintain links, and refresh the wiki index.
+- Query uses the generated wiki and staged source text to produce grounded answers with source citations.
+- No embedding model, vector index, or vector database is required by Thread Wiki.
+- No alternative RAG backend or backend-selection configuration is currently exposed. SAG is not integrated.
+
+The endpoints below describe this implementation only. A future retrieval backend should preserve this API contract where practical, but its configuration and storage lifecycle would require separate documentation.
+
 ## How It Works
 
 ```
