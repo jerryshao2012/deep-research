@@ -252,13 +252,22 @@ docker run --env TAVILY_API_KEY=<key> deep-research:latest \
   "Research topic" --skill golden-dataset
 ```
 
-### Azure Container Apps (Production)
-See [AZURE_DEPLOY.md](document/AZURE_DEPLOY.md) for complete walkthrough:
+### Cloud Deployment Options
+- **Azure Container Apps**: See [AZURE_DEPLOY.md](document/AZURE_DEPLOY.md) for complete walkthrough:
 ```bash
 source ./env.sh
 bash build.sh      # Build, test, push to ACR
 bash deploy.sh     # Deploy to Azure Container Apps
 ```
+
+- **AWS App Runner & ECR**: See [AWS_DEPLOY.md](document/AWS_DEPLOY.md) for complete walkthrough:
+```bash
+source ./env-aws.sh
+bash build-aws.sh   # Build and push to ECR
+bash deploy-aws.sh  # Deploy to AWS App Runner
+```
+
+- **Vercel UI & Serverless**: See [VERCEL_DEPLOY.md](document/VERCEL_DEPLOY.md) for frontend deployment and CORS configuration.
 
 ---
 

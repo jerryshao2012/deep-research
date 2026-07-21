@@ -35,9 +35,7 @@ uv run pytest tests/ --cov=research_agent --cov-report=html  # coverage
 uv run ruff check .
 uv run mypy research_agent/
 
-# Docker build + deploy to Azure
-bash build.sh
-bash deploy.sh
+# Deployment guides: see document/AZURE_DEPLOY.md, document/AWS_DEPLOY.md, and document/VERCEL_DEPLOY.md
 ```
 
 ## Architecture
