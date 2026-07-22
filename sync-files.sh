@@ -146,15 +146,51 @@ except:
   done <<< "$dirs"
 }
 
+# ── Helper: discover all subdirectories locally inside SYNC_ROOT ───
+discover_local_dirs() {
+  local prefix="$1"
+  local local_path="${SYNC_ROOT}/${prefix}"
+  if [ -d "$local_path" ]; then
+    find "$local_path" -mindepth 1 -type d 2>/dev/null | while IFS= read -r d; do
+      rel="${d#${SYNC_ROOT}/}"
+      [ -n "$rel" ] && echo "$rel"
+    done
+  fi
+}
+
+}
+
 # ── Build full folder list (top-level + all discovered subfolders) ──
 echo "🔍 Discovering remote folder structure..."
-SYNC_FOLDERS=()
+ALL_FOLDERS=()
 for top in "${TOP_FOLDERS[@]}"; do
-  SYNC_FOLDERS+=("$top")
+  ALL_FOLDERS+=("$top")
   while IFS= read -r sub; do
     [ -n "$sub" ] || continue
-    SYNC_FOLDERS+=("$sub")
+    ALL_FOLDERS+=("$sub")
   done < <(discover_remote_dirs "$top")
+
+  while IFS= read -r sub; do
+    [ -n "$sub" ] || continue
+    ALL_FOLDERS+=("$sub")
+  done < <(discover_local_dirs "$top")
+done
+
+# De-duplicate while preserving order
+SYNC_FOLDERS=()
+for f in "${ALL_FOLDERS[@]}"; do
+  already=false
+  if [ ${#SYNC_FOLDERS[@]} -gt 0 ]; then
+    for existing in "${SYNC_FOLDERS[@]}"; do
+      if [[ "$existing" == "$f" ]]; then
+        already=true
+        break
+      fi
+    done
+  fi
+  if ! $already; then
+    SYNC_FOLDERS+=("$f")
+  fi
 done
 echo "   Found ${#SYNC_FOLDERS[@]} folder(s): ${SYNC_FOLDERS[*]}"
 echo ""
@@ -249,53 +285,64 @@ for folder in "${SYNC_FOLDERS[@]}"; do
   # ── Get remote file list (works for all folder types) ────────────
   remote_names=$(list_remote_files "$folder")
 
-  if [ -z "$remote_names" ]; then
-    echo "⏭️  ${folder}/  — empty or not on server, skipping"
+  if [ -n "$remote_names" ]; then
+    remote_count=$(echo "$remote_names" | wc -l)
+    remote_count=${remote_count//[[:space:]]/}
+  else
+    remote_count=0
+  fi
+
+  # ── Get local file list ───────────────────────────────────────────
+  local_files=()
+  if [ -d "$local_folder" ]; then
+    while IFS= read -r lf; do
+      [ -f "$lf" ] && local_files+=("$lf")
+    done < <(find "$local_folder" -maxdepth 1 -type f 2>/dev/null)
+  fi
+  local_count=${#local_files[@]}
+
+  # Skip if both remote and local are empty
+  if [ "$remote_count" -eq 0 ] && [ "$local_count" -eq 0 ]; then
+    echo "⏭️  ${folder}/  — empty on server and local, skipping"
     SKIPPED=$(( SKIPPED + 1 ))
     continue
   fi
-
-  # Count remote files
-  remote_count=$(echo "$remote_names" | wc -l)
-  remote_count=${remote_count//[[:space:]]/}
 
   # ── PHASE 1: Download ──────────────────────────────────────────
   if [[ "$MODE" != "upload" ]]; then
     mkdir -p "$local_folder"
     downloaded=0
 
-    while IFS= read -r fname; do
-      [ -n "$fname" ] || continue
-      dest="${local_folder}/${fname}"
-      if [ ! -f "$dest" ]; then
-        download_file "$folder" "$fname" "$local_folder"
-        downloaded=$(( downloaded + 1 ))
-      fi
-    done <<< "$remote_names"
+    if [ "$remote_count" -gt 0 ]; then
+      while IFS= read -r fname; do
+        [ -n "$fname" ] || continue
+        dest="${local_folder}/${fname}"
+        if [ ! -f "$dest" ]; then
+          download_file "$folder" "$fname" "$local_folder"
+          downloaded=$(( downloaded + 1 ))
+        fi
+      done <<< "$remote_names"
+    fi
 
-    echo "📁 ${folder}/  — 📥 ${downloaded} new / ${remote_count} total"
+    echo "📁 ${folder}/  — 📥 ${downloaded} new / ${remote_count} server files (${local_count} local)"
     TOTAL_DOWNLOADED=$(( TOTAL_DOWNLOADED + downloaded ))
   else
-    echo "📁 ${folder}/  — (${remote_count} files on server)"
+    echo "📁 ${folder}/  — (${remote_count} server files, ${local_count} local files)"
   fi
 
   # ── PHASE 2: Upload files missing on Azure ─────────────────────
   if [[ "$MODE" != "download" ]]; then
-    # Ensure local folder exists for scanning
-    if [ ! -d "$local_folder" ]; then
-      continue
+    if [ "$local_count" -gt 0 ]; then
+      for local_file in "${local_files[@]}"; do
+        [ -f "$local_file" ] || continue
+        fname=$(basename "$local_file")
+        if [ "$remote_count" -eq 0 ] || ! echo "$remote_names" | grep -qxF "$fname"; then
+          echo "   ↑ uploading: ${folder}/${fname}"
+          upload_file "$folder" "$local_file" "$fname"
+          TOTAL_UPLOADED=$(( TOTAL_UPLOADED + 1 ))
+        fi
+      done
     fi
-
-    # Use find to list ALL files (including dotfiles) — glob * misses dotfiles
-    while IFS= read -r local_file; do
-      [ -f "$local_file" ] || continue
-      fname=$(basename "$local_file")
-      if ! echo "$remote_names" | grep -qxF "$fname"; then
-        echo "   ↑ uploading: ${folder}/${fname}"
-        upload_file "$folder" "$local_file" "$fname"
-        TOTAL_UPLOADED=$(( TOTAL_UPLOADED + 1 ))
-      fi
-    done < <(find "$local_folder" -maxdepth 1 -type f 2>/dev/null)
   fi
 done
 

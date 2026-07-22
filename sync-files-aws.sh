@@ -91,12 +91,10 @@ TOTAL_UPLOADED=0
 SKIPPED=0
 
 # ── Helper: discover all subdirectories on S3 for a given prefix ────
-# Uses aws s3 ls to find common prefixes (directories).
 discover_s3_dirs() {
   local prefix="$1"
   local s3_path="s3://${S3_BUCKET_NAME}/${prefix}/"
 
-  # List common prefixes (subdirectories) at this level
   local subdirs
   subdirs=$(aws s3 ls "$s3_path" --region "$AWS_REGION" 2>/dev/null | \
     grep "PRE " | awk '{print $2}' | sed 's/\/$//') || subdirs=""
@@ -114,15 +112,49 @@ discover_s3_dirs() {
   done <<< "$subdirs"
 }
 
+# ── Helper: discover all subdirectories locally inside SYNC_ROOT ───
+discover_local_dirs() {
+  local prefix="$1"
+  local local_path="${SYNC_ROOT}/${prefix}"
+  if [ -d "$local_path" ]; then
+    find "$local_path" -mindepth 1 -type d 2>/dev/null | while IFS= read -r d; do
+      rel="${d#${SYNC_ROOT}/}"
+      [ -n "$rel" ] && echo "$rel"
+    done
+  fi
+}
+
 # ── Build full folder list (top-level + all discovered subfolders) ──
-echo "🔍 Discovering S3 folder structure..."
-SYNC_FOLDERS=()
+echo "🔍 Discovering folder structure (S3 + local)..."
+ALL_FOLDERS=()
 for top in "${TOP_FOLDERS[@]}"; do
-  SYNC_FOLDERS+=("$top")
+  ALL_FOLDERS+=("$top")
   while IFS= read -r sub; do
     [ -n "$sub" ] || continue
-    SYNC_FOLDERS+=("$sub")
+    ALL_FOLDERS+=("$sub")
   done < <(discover_s3_dirs "$top")
+
+  while IFS= read -r sub; do
+    [ -n "$sub" ] || continue
+    ALL_FOLDERS+=("$sub")
+  done < <(discover_local_dirs "$top")
+done
+
+# De-duplicate while preserving order
+SYNC_FOLDERS=()
+for f in "${ALL_FOLDERS[@]}"; do
+  already=false
+  if [ ${#SYNC_FOLDERS[@]} -gt 0 ]; then
+    for existing in "${SYNC_FOLDERS[@]}"; do
+      if [[ "$existing" == "$f" ]]; then
+        already=true
+        break
+      fi
+    done
+  fi
+  if ! $already; then
+    SYNC_FOLDERS+=("$f")
+  fi
 done
 echo "   Found ${#SYNC_FOLDERS[@]} folder(s): ${SYNC_FOLDERS[*]}"
 echo ""
@@ -148,61 +180,73 @@ for folder in "${SYNC_FOLDERS[@]}"; do
   # ── Get remote file list ──────────────────────────────────────────
   remote_names=$(list_s3_files "$folder")
 
-  if [ -z "$remote_names" ]; then
-    echo "⏭️  ${folder}/  — empty or not on S3, skipping"
+  if [ -n "$remote_names" ]; then
+    remote_count=$(echo "$remote_names" | wc -l)
+    remote_count=${remote_count//[[:space:]]/}
+  else
+    remote_count=0
+  fi
+
+  # ── Get local file list ───────────────────────────────────────────
+  local_files=()
+  if [ -d "$local_folder" ]; then
+    while IFS= read -r lf; do
+      [ -f "$lf" ] && local_files+=("$lf")
+    done < <(find "$local_folder" -maxdepth 1 -type f 2>/dev/null)
+  fi
+  local_count=${#local_files[@]}
+
+  # Skip if both remote and local are empty
+  if [ "$remote_count" -eq 0 ] && [ "$local_count" -eq 0 ]; then
+    echo "⏭️  ${folder}/  — empty on S3 and local, skipping"
     SKIPPED=$(( SKIPPED + 1 ))
     continue
   fi
-
-  # Count remote files
-  remote_count=$(echo "$remote_names" | wc -l)
-  remote_count=${remote_count//[[:space:]]/}
 
   # ── PHASE 1: Download ──────────────────────────────────────────
   if [[ "$MODE" != "upload" ]]; then
     mkdir -p "$local_folder"
     downloaded=0
 
-    while IFS= read -r fname; do
-      [ -n "$fname" ] || continue
-      dest="${local_folder}/${fname}"
-      if [ ! -f "$dest" ]; then
-        if $VERBOSE; then
-          echo "   📥 downloading: ${folder}/${fname}"
+    if [ "$remote_count" -gt 0 ]; then
+      while IFS= read -r fname; do
+        [ -n "$fname" ] || continue
+        dest="${local_folder}/${fname}"
+        if [ ! -f "$dest" ]; then
+          if $VERBOSE; then
+            echo "   📥 downloading: ${folder}/${fname}"
+          fi
+          aws s3 cp "s3://${S3_BUCKET_NAME}/${folder}/${fname}" "$dest" \
+            --region "$AWS_REGION" --quiet 2>/dev/null || \
+            echo "   ⚠️  failed to download ${fname}"
+          downloaded=$(( downloaded + 1 ))
         fi
-        aws s3 cp "s3://${S3_BUCKET_NAME}/${folder}/${fname}" "$dest" \
-          --region "$AWS_REGION" --quiet 2>/dev/null || \
-          echo "   ⚠️  failed to download ${fname}"
-        downloaded=$(( downloaded + 1 ))
-      fi
-    done <<< "$remote_names"
+      done <<< "$remote_names"
+    fi
 
-    echo "📁 ${folder}/  — 📥 ${downloaded} new / ${remote_count} total"
+    echo "📁 ${folder}/  — 📥 ${downloaded} new / ${remote_count} S3 files (${local_count} local)"
     TOTAL_DOWNLOADED=$(( TOTAL_DOWNLOADED + downloaded ))
   else
-    echo "📁 ${folder}/  — (${remote_count} files on S3)"
+    echo "📁 ${folder}/  — (${remote_count} S3 files, ${local_count} local files)"
   fi
 
   # ── PHASE 2: Upload files missing on S3 ────────────────────────
   if [[ "$MODE" != "download" ]]; then
-    if [ ! -d "$local_folder" ]; then
-      continue
-    fi
-
-    # Use find to list ALL files (including dotfiles) — glob * misses dotfiles
-    while IFS= read -r local_file; do
-      [ -f "$local_file" ] || continue
-      fname=$(basename "$local_file")
-      if ! echo "$remote_names" | grep -qxF "$fname"; then
-        if $VERBOSE; then
-          echo "   📤 uploading: ${folder}/${fname}"
+    if [ "$local_count" -gt 0 ]; then
+      for local_file in "${local_files[@]}"; do
+        [ -f "$local_file" ] || continue
+        fname=$(basename "$local_file")
+        if [ "$remote_count" -eq 0 ] || ! echo "$remote_names" | grep -qxF "$fname"; then
+          if $VERBOSE || [ "$remote_count" -eq 0 ]; then
+            echo "   📤 uploading: ${folder}/${fname}"
+          fi
+          aws s3 cp "$local_file" "s3://${S3_BUCKET_NAME}/${folder}/${fname}" \
+            --region "$AWS_REGION" --quiet 2>/dev/null || \
+            echo "   ⚠️  failed to upload ${fname}"
+          TOTAL_UPLOADED=$(( TOTAL_UPLOADED + 1 ))
         fi
-        aws s3 cp "$local_file" "s3://${S3_BUCKET_NAME}/${folder}/${fname}" \
-          --region "$AWS_REGION" --quiet 2>/dev/null || \
-          echo "   ⚠️  failed to upload ${fname}"
-        TOTAL_UPLOADED=$(( TOTAL_UPLOADED + 1 ))
-      fi
-    done < <(find "$local_folder" -maxdepth 1 -type f 2>/dev/null)
+      done
+    fi
   fi
 done
 
