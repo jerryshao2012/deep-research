@@ -13,6 +13,7 @@ import re
 import time
 import traceback
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from deepagents import SubAgent, create_deep_agent
@@ -32,7 +33,6 @@ from langchain_core.messages import (
     SystemMessage,
 )
 from langchain_core.runnables import RunnableConfig
-from pathlib import Path
 
 from logger_utils import setup_logger
 from model_factory import create_memory_saver, get_configured_model
@@ -41,12 +41,14 @@ from research_agent import (
     RESEARCHER_INSTRUCTIONS,
     SUBAGENT_DELEGATION_INSTRUCTIONS,
 )
+from research_agent.clarification.middleware import ClarificationMiddleware
+from research_agent.clarification.tool import clarify_requirements
 from research_agent.prompts import RESEARCHER_DESCRIPTION
 from research_agent.tools import (
     fetch_webpage_content,
     glob,
-    ls,
     llm_wiki_query,
+    ls,
     read_docs_folder,
     read_file,
     tavily_search,
@@ -1149,6 +1151,7 @@ checkpointer = create_memory_saver()
 _agent_kwargs: dict[str, Any] = dict(
     model=model,
     tools=[
+        clarify_requirements,
         think_tool,
         read_file,
         write_file,
@@ -1159,7 +1162,10 @@ _agent_kwargs: dict[str, Any] = dict(
     ],
     system_prompt=INSTRUCTIONS,
     subagents=[research_sub_agent],
-    middleware=[ResearchStateMiddleware()],
+    middleware=[
+        ClarificationMiddleware(),
+        ResearchStateMiddleware(),
+    ],
     skills=[
         ".deepagents/skills/",
         "./doc/.deepagents/skills/",

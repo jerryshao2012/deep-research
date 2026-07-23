@@ -92,6 +92,9 @@ export ENABLE_VERIFICATION=true
 # Max revision iterations per report — bounds cost (default: 2)
 export MAX_VERIFICATION_ROUNDS=2
 
+# Emergency kill switch for requirement clarification (default: true)
+export ENABLE_REQUIREMENT_CLARIFICATION=true
+
 # Experiment Tracking — Zero-Code A/B Testing
 # Set these on different deployments to compare results in eval history
 export EXPERIMENT_ID=prompt-v2              # Optional experiment identifier
