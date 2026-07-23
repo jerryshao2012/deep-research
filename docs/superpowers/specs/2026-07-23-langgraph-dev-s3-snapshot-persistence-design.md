@@ -46,9 +46,15 @@ The restore operation:
    initial migration when no generation manifest exists.
 7. Fails startup instead of launching with empty state when S3 contains a
    previously valid non-empty snapshot that cannot be restored.
-8. Claims a new writer epoch using an S3 conditional manifest update
+8. In normal mode, claims a new writer epoch using an S3 conditional manifest update
    (`If-Match` against the ETag read at startup). A process that loses the
    conditional update fails startup and never serves traffic.
+
+When `LANGGRAPH_S3_READ_ONLY=true`, startup skips writer-epoch claim and does
+not start the publisher. Authentication/request middleware rejects all
+thread/run/document/wiki mutations with HTTP 503 while allowing health and
+read-only verification requests. This mode exists only for the first guarded
+rollout under temporarily denied S3 write permission.
 
 The custom FastAPI lifespan must not perform a second startup download after
 the LangGraph runtime has already loaded its in-memory catalog.
@@ -83,12 +89,18 @@ are rejected and logged.
 
 ### Manifest and writer fencing
 
-The JSON manifest uses a versioned schema:
+The root pointer manifest uses a versioned schema:
 
 - `schema_version`
 - `active_generation`
 - `previous_generation`
 - `writer_epoch`
+- `created_at`
+
+Every immutable generation contains its own `manifest.json` with:
+
+- `schema_version`
+- `generation`
 - `created_at`
 - `thread_ids`
 - `thread_versions`, mapping thread IDs to normalized `updated_at` values
@@ -105,6 +117,8 @@ ETag loss marks health unready and terminates the process immediately. Combined
 with idle-only snapshots and monotonic thread timestamps, this prevents an old
 instance from publishing stale state for an existing thread.
 
+Startup validates active or previous generation against that generation's own
+immutable manifest, never against metadata copied from another generation.
 Retain the active generation, previous generation, and the five most recent
 valid generations. Empty-bucket bootstrap accepts only an explicitly supplied,
 validated non-empty snapshot or a genuinely new demo with no prior manifest.
@@ -178,6 +192,8 @@ be restored by accident.
 - Startup restore occurs before `langgraph dev`.
 - Duplicate lifespan restore is absent.
 - Frozen AWS build installs manifest-compatible runtime versions.
+- Read-only startup succeeds with S3 writes denied, skips epoch claim, and
+  rejects every mutating endpoint.
 - Valid thread additions publish a new generation.
 - Same thread set with updated state publishes.
 - Snapshot is deferred while any run is pending or running.
@@ -205,7 +221,8 @@ be restored by accident.
 2. Add a temporary IAM deny for App Runner writes to `.langgraph_api/*`, then
    resume the currently deployed unguarded image. It may read the snapshot but
    cannot overwrite it.
-3. Deploy the guarded image with `LANGGRAPH_S3_READ_ONLY=true`.
+3. Deploy the guarded image with `LANGGRAPH_S3_READ_ONLY=true`. The guarded
+   request layer returns 503 for all mutations during this maintenance phase.
 4. Confirm `/ok`, `/threads/search`, target detail/state, documents, and wiki
    while the guarded image is read-only.
 5. Restore IAM write permission and update App Runner to
