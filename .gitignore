@@ -24,6 +24,9 @@ wheels/
 .pytest_cache/
 .deepeval/
 .ruff_cache/
+deep_research.db
+deep_research.db-shm
+deep_research.db-wal
 
 # Virtual Environment
 .venv/

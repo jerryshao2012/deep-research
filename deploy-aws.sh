@@ -142,10 +142,14 @@ resolve_singleton_autoscaling_configuration() {
         --query "AutoScalingConfiguration.[Status,MinSize,MaxSize]" \
         --output text 2>/dev/null || echo ""
     )
-    if [ "$configuration_state" != $'ACTIVE\t1\t1' ]; then
-      echo "⚠️  Existing auto scaling revision is not an active singleton; creating a corrected revision." >&2
-      configuration_arn=""
-    fi
+    case "$configuration_state" in
+      $'ACTIVE\t1\t1'|$'active\t1\t1')
+        ;;
+      *)
+        echo "⚠️  Existing auto scaling revision is not an active singleton; creating a corrected revision." >&2
+        configuration_arn=""
+        ;;
+    esac
   fi
 
   if [ -z "$configuration_arn" ] \
@@ -487,6 +491,7 @@ cat > "$SOURCE_CONFIG_FILE" <<EOF
         "DOC_FOLDER": "/deps/deep_research/docs",
         "INPUT_FOLDER": "/deps/deep_research/input",
         "WIKI_BASE_DIR": "/deps/deep_research",
+        "FRONTEND_URLS": "${FRONTEND_URLS}",
         "SQLITE_DB_PATH": "/deps/deep_research/deep_research.db",
         "S3_BUCKET_NAME": "${S3_BUCKET_NAME}",
         "AWS_REGION": "${AWS_REGION}",
@@ -495,7 +500,8 @@ cat > "$SOURCE_CONFIG_FILE" <<EOF
         "LANGGRAPH_SNAPSHOT_STABILITY_SECONDS": "12",
         "LANGGRAPH_SNAPSHOT_SCAN_INTERVAL_SECONDS": "2",
         "LANGGRAPH_FENCE_INTERVAL_SECONDS": "2",
-        "LANGGRAPH_SNAPSHOT_RETENTION_COUNT": "5"
+        "LANGGRAPH_SNAPSHOT_RETENTION_COUNT": "5",
+        "LANGGRAPH_WRITER_EPOCH": "${APP_NAME}"
       },
       "RuntimeEnvironmentSecrets": {
         "TAVILY_API_KEY": "${SECRET_ARN}:TAVILY-API-KEY::",
@@ -503,7 +509,9 @@ cat > "$SOURCE_CONFIG_FILE" <<EOF
         "UPLOAD_API_KEY": "${SECRET_ARN}:UPLOAD-API-KEY::",
         "AWS_BEARER_TOKEN_BEDROCK": "${SECRET_ARN}:AWS-BEARER-TOKEN-BEDROCK::",
         "AWS_BEDROCK_ENDPOINT": "${SECRET_ARN}:AWS-BEDROCK-ENDPOINT::",
-        "MODEL_NAME": "${SECRET_ARN}:MODEL-NAME::"
+        "MODEL_NAME": "${SECRET_ARN}:MODEL-NAME::",
+        "GOOGLE_CLIENT_ID": "${SECRET_ARN}:GOOGLE-CLIENT-ID::",
+        "GOOGLE_CLIENT_SECRET": "${SECRET_ARN}:GOOGLE-CLIENT-SECRET::"
       }
     },
     "ImageRepositoryType": "ECR"

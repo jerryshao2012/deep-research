@@ -648,6 +648,7 @@ def test_aws_deploy_defaults_to_read_only_snapshot_rollout() -> None:
         "LANGGRAPH_SNAPSHOT_SCAN_INTERVAL_SECONDS": "2",
         "LANGGRAPH_FENCE_INTERVAL_SECONDS": "2",
         "LANGGRAPH_SNAPSHOT_RETENTION_COUNT": "5",
+        "LANGGRAPH_WRITER_EPOCH": "${APP_NAME}",
     }
     for name, value in expected_environment.items():
         assert f'"{name}": "{value}"' in source
@@ -903,6 +904,63 @@ esac
     )
 
 
+def test_aws_deploy_reuses_lowercase_active_singleton_configuration(
+    tmp_path,
+) -> None:
+    source = (PROJECT_ROOT / "deploy-aws.sh").read_text(encoding="utf-8")
+    function_source = _extract_shell_function(
+        source,
+        "resolve_singleton_autoscaling_configuration",
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    call_log = tmp_path / "aws.log"
+    fake_aws = fake_bin / "aws"
+    fake_aws.write_text(
+        """#!/bin/sh
+printf '%s\\n' "$*" >> "$CALL_LOG"
+case "$*" in
+  *"list-auto-scaling-configurations"*) printf 'arn:existing' ;;
+  *"describe-auto-scaling-configuration"*) printf 'active\\t1\\t1' ;;
+  *"create-auto-scaling-configuration"*) printf 'arn:unexpected' ;;
+esac
+""",
+        encoding="utf-8",
+    )
+    fake_aws.chmod(0o755)
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "PATH": f"{fake_bin}{os.pathsep}{environment['PATH']}",
+            "CALL_LOG": str(call_log),
+            "AWS_REGION": "us-east-1",
+            "SEED": "0312",
+        }
+    )
+
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            (
+                "set -e\n"
+                f"{function_source}\n"
+                "resolve_singleton_autoscaling_configuration"
+            ),
+        ],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "arn:existing"
+    assert "create-auto-scaling-configuration" not in call_log.read_text(
+        encoding="utf-8"
+    )
+
+
 @pytest.mark.parametrize(
     ("deployed_version", "expected_version", "expected_returncode"),
     [
@@ -1021,3 +1079,68 @@ def test_aws_deploy_exit_trap_removes_registered_temp_file(
 
     assert result.returncode == 7
     assert not temporary_file.exists()
+
+
+def test_aws_deploy_injects_google_oauth_credentials() -> None:
+    source = (PROJECT_ROOT / "deploy-aws.sh").read_text(encoding="utf-8")
+
+    assert (
+        '"GOOGLE_CLIENT_ID": '
+        '"${SECRET_ARN}:GOOGLE-CLIENT-ID::"'
+    ) in source
+    assert (
+        '"GOOGLE_CLIENT_SECRET": '
+        '"${SECRET_ARN}:GOOGLE-CLIENT-SECRET::"'
+    ) in source
+
+
+def test_aws_deploy_configures_cloudfront_frontend_origin() -> None:
+    deploy_source = (PROJECT_ROOT / "deploy-aws.sh").read_text(
+        encoding="utf-8"
+    )
+    environment_source = (PROJECT_ROOT / "env-aws.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert (
+        'export FRONTEND_URLS="${FRONTEND_URLS:-'
+        'https://d600y3wyk0xvf.cloudfront.net}"'
+    ) in environment_source
+    assert '"FRONTEND_URLS": "${FRONTEND_URLS}"' in deploy_source
+
+
+def test_environment_frontend_origin_is_primary_oauth_fallback() -> None:
+    environment = os.environ.copy()
+    environment["FRONTEND_URLS"] = (
+        "https://d600y3wyk0xvf.cloudfront.net"
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from webapp.config import FRONTEND_ORIGINS; "
+                "print(FRONTEND_ORIGINS[0])"
+            ),
+        ],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().splitlines()[-1] == (
+        "https://d600y3wyk0xvf.cloudfront.net"
+    )
+
+
+def test_aws_secret_sync_includes_google_oauth_credentials() -> None:
+    source = (PROJECT_ROOT / "secrets-aws.sh.example").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'source ./.env.docker' in source
+    assert '"GOOGLE-CLIENT-ID": "$GOOGLE_CLIENT_ID"' in source
+    assert '"GOOGLE-CLIENT-SECRET": "$GOOGLE_CLIENT_SECRET"' in source

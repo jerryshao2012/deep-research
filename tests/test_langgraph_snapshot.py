@@ -1474,6 +1474,40 @@ def test_failed_writer_claim_aborts_runtime_controller(
     assert started == []
 
 
+def test_runtime_controller_uses_configured_logical_writer_epoch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FakeS3Client()
+    source = make_snapshot(tmp_path, threads=[thread("t1")])
+    publish_generation(client, BUCKET, source, None, "old-writer")
+    monkeypatch.setenv("LANGGRAPH_WRITER_EPOCH", "aws-apprunner-demo")
+    monkeypatch.setattr(
+        snapshot_module,
+        "start_snapshot_publisher",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        snapshot_module,
+        "start_fence_monitor",
+        lambda *args, **kwargs: None,
+    )
+
+    lease = start_runtime_controller(
+        client,
+        BUCKET,
+        source,
+        read_only=False,
+        require_restore_receipt=False,
+    )
+
+    assert lease is not None
+    assert lease.writer_epoch == "aws-apprunner-demo"
+    assert read_json_object(client, ROOT_MANIFEST_KEY)["writer_epoch"] == (
+        "aws-apprunner-demo"
+    )
+
+
 def test_successful_publish_advances_lease_etag_without_self_fencing(
     tmp_path: Path,
 ) -> None:
@@ -1871,6 +1905,129 @@ def test_fence_loss_terminates_process(tmp_path: Path) -> None:
 
     assert lease.fenced.is_set()
     assert terminated and terminated[0] != 0
+
+
+def test_fence_monitor_adopts_etag_from_same_logical_writer(
+    tmp_path: Path,
+) -> None:
+    client = FakeS3Client()
+    source = make_snapshot(tmp_path, threads=[thread("t1")])
+    initial_etag = publish_generation(
+        client,
+        BUCKET,
+        source,
+        None,
+        "aws-apprunner-demo",
+    )
+    pointer, loaded_etag = load_pointer(client, BUCKET)
+    assert pointer is not None
+    assert loaded_etag == initial_etag
+    lease = RuntimeLease(
+        writer_epoch="aws-apprunner-demo",
+        etag=initial_etag,
+    )
+    sibling_etag = claim_writer_epoch(
+        client,
+        BUCKET,
+        pointer,
+        initial_etag,
+        "aws-apprunner-demo",
+    )
+    stopped = threading.Event()
+    terminated: list[int] = []
+
+    run_fence_monitor(
+        client,
+        BUCKET,
+        lease,
+        sleep=lambda _seconds: stopped.set(),
+        stop=stopped.is_set,
+        terminate=terminated.append,
+    )
+
+    assert lease.etag == sibling_etag
+    assert not lease.fenced.is_set()
+    assert terminated == []
+
+
+def test_publisher_retries_same_logical_writer_cas_race(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FakeS3Client()
+    source = make_snapshot(tmp_path, threads=[thread("t1")])
+    initial_etag = publish_generation(
+        client,
+        BUCKET,
+        source,
+        None,
+        "aws-apprunner-demo",
+    )
+    initial_generation = read_json_object(
+        client,
+        ROOT_MANIFEST_KEY,
+    )["active_generation"]
+    lease = RuntimeLease(
+        writer_epoch="aws-apprunner-demo",
+        etag=initial_etag,
+    )
+    original_commit = snapshot_module._commit_prepared_generation
+    inject_sibling_claim = True
+
+    def commit_with_one_sibling_race(*args, **kwargs):
+        nonlocal inject_sibling_claim
+        if inject_sibling_claim:
+            inject_sibling_claim = False
+            pointer, remote_etag = load_pointer(client, BUCKET)
+            assert pointer is not None
+            assert remote_etag is not None
+            claim_writer_epoch(
+                client,
+                BUCKET,
+                pointer,
+                remote_etag,
+                lease.writer_epoch,
+            )
+        return original_commit(*args, **kwargs)
+
+    monkeypatch.setattr(
+        snapshot_module,
+        "_commit_prepared_generation",
+        commit_with_one_sibling_race,
+    )
+    elapsed = 0.0
+    stopped = threading.Event()
+    sleeps = 0
+    terminated: list[int] = []
+
+    def clock() -> float:
+        return elapsed
+
+    def sleep(seconds: float) -> None:
+        nonlocal elapsed, sleeps
+        elapsed += seconds
+        sleeps += 1
+        if sleeps >= 6:
+            stopped.set()
+
+    run_snapshot_publisher(
+        client,
+        BUCKET,
+        source,
+        lease,
+        scan_interval_seconds=6.0,
+        clock=clock,
+        sleep=sleep,
+        stop=stopped.is_set,
+        terminate=terminated.append,
+    )
+
+    assert read_json_object(
+        client,
+        ROOT_MANIFEST_KEY,
+    )["active_generation"] != initial_generation
+    assert not lease.fenced.is_set()
+    assert terminated == []
 
 
 def test_same_thread_older_updated_at_is_not_published(tmp_path: Path) -> None:

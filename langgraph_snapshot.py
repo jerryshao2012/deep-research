@@ -983,6 +983,26 @@ def _fence_lease(
     terminate(2)
 
 
+def _adopt_same_writer_etag(
+    client: object,
+    bucket: str,
+    lease: RuntimeLease,
+) -> bool:
+    """Refresh a logical writer group's ETag after a sibling advances it."""
+    try:
+        pointer, remote_etag = load_pointer(client, bucket)
+    except SnapshotRestoreError:
+        return False
+    if (
+        pointer is None
+        or remote_etag is None
+        or pointer.get("writer_epoch") != lease.writer_epoch
+    ):
+        return False
+    lease.etag = remote_etag
+    return True
+
+
 def _validate_stability_seconds(stability_seconds: float) -> float:
     if (
         isinstance(stability_seconds, bool)
@@ -1090,9 +1110,20 @@ def run_snapshot_publisher(
                 lease.writer_epoch,
             )
         except SnapshotConflictError as exc:
-            logging.error("snapshot publisher lost preparation fence: %s", exc)
-            _fence_lease(lease, terminate)
-            return
+            with lease.lock:
+                if _adopt_same_writer_etag(client, bucket, lease):
+                    logging.warning(
+                        "snapshot publisher refreshed logical-writer fence "
+                        "after preparation race"
+                    )
+                    observed = None
+                    continue
+                logging.error(
+                    "snapshot publisher lost preparation fence: %s",
+                    exc,
+                )
+                _fence_lease(lease, terminate)
+                return
         except SnapshotPublishError as exc:
             logging.warning("snapshot publication deferred: %s", exc)
             if wait_for_next_scan():
@@ -1113,9 +1144,19 @@ def run_snapshot_publisher(
                     lease.writer_epoch,
                 )
             except SnapshotConflictError as exc:
-                logging.error("snapshot publisher lost root CAS: %s", exc)
-                _fence_lease(lease, terminate)
-                return
+                if _adopt_same_writer_etag(client, bucket, lease):
+                    logging.warning(
+                        "snapshot publisher refreshed logical-writer fence "
+                        "after commit race"
+                    )
+                    observed = None
+                else:
+                    logging.error(
+                        "snapshot publisher lost root CAS: %s",
+                        exc,
+                    )
+                    _fence_lease(lease, terminate)
+                    return
             except SnapshotPublishError as exc:
                 logging.warning("snapshot publication deferred: %s", exc)
             else:
@@ -1221,12 +1262,16 @@ def run_fence_monitor(
             else:
                 if (
                     pointer is None
-                    or remote_etag != lease.etag
                     or pointer.get("writer_epoch") != lease.writer_epoch
                 ):
                     logging.error("snapshot fence monitor detected lease loss")
                     _fence_lease(lease, terminate)
                     return
+                if remote_etag != lease.etag:
+                    lease.etag = remote_etag
+                    logging.warning(
+                        "snapshot fence monitor adopted logical-writer ETag"
+                    )
         if wait_for_next_check():
             return
 
@@ -1462,7 +1507,10 @@ def start_runtime_controller(
             "fallback restored generation is not active; refusing writer claim"
         )
 
-    writer_epoch = str(uuid4())
+    writer_epoch = (
+        os.getenv("LANGGRAPH_WRITER_EPOCH", "").strip()
+        or str(uuid4())
+    )
     claimed_etag = claim_writer_epoch(
         resolved_client,
         resolved_bucket,

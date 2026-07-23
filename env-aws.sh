@@ -4,6 +4,7 @@ export APP_NAME="deep-research-agent-$SEED"
 # AWS Configuration
 export AWS_REGION="us-east-1"
 export AWS_PAGER=""
+export FRONTEND_URLS="${FRONTEND_URLS:-https://d600y3wyk0xvf.cloudfront.net}"
 
 # 1. Build and push Docker image (ECR)
 export ECR_REPO_NAME="deep-research-agent-$SEED"

@@ -38,7 +38,7 @@ else:
     DOCS_ROOT: Path = _BASE / "docs"
 
 # Semantic API version — bump on every public-facing change
-API_VERSION: str = "1.8.108"
+API_VERSION: str = "1.8.111"
 
 # ── Authentication ────────────────────────────────────────────────────────────
 
@@ -86,11 +86,11 @@ _frontend_origins: list[str] = [
 
 _env_frontend_urls = os.environ.get("FRONTEND_URLS", "")
 if _env_frontend_urls:
-    _frontend_origins.extend(
+    _frontend_origins[0:0] = [
         origin.strip().rstrip("/")
         for origin in _env_frontend_urls.split(",")
         if origin.strip()
-    )
+    ]
 
 # Deduplicate while preserving order and removing empties.
 FRONTEND_ORIGINS: list[str] = list(
