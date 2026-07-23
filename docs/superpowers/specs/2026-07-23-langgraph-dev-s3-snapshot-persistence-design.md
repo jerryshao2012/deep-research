@@ -58,20 +58,24 @@ the LangGraph runtime has already loaded its in-memory catalog.
 The background publisher observes local `.langgraph_api` changes but never
 uploads files directly over the active snapshot. For each publish:
 
-1. Wait for the LangGraph persistence flush to settle.
-2. Require two identical source file fingerprints on consecutive scans, with
-   no `.tmp` files present.
+1. Wait until `.langgraph_ops.pckl` reports no pending or running runs.
+2. Require two identical source file fingerprints at least twelve seconds
+   apart (longer than the runtime's ten-second flush interval), with no `.tmp`
+   files present.
 3. Copy every persistence pickle into a same-filesystem temporary directory,
    then confirm source fingerprints did not change during the copy.
 4. Load every copied pickle, calculate size and SHA-256, validate
    `.langgraph_ops.pckl`, and check that checkpoint files are readable.
-5. Compare candidate thread IDs with the last published manifest.
-6. Reject the candidate if any published thread disappeared.
+5. Compare candidate thread IDs and each thread's `updated_at` with the last
+   published manifest.
+6. Reject the candidate if any published thread disappeared or any thread
+   timestamp moved backward.
 7. Upload all files under an immutable generation prefix.
 8. Re-read the manifest and require both the process writer epoch and expected
    ETag to match.
 9. Update the manifest with S3 `If-Match` only after every generation file
-   succeeds. A failed conditional update fences the publisher permanently.
+   succeeds. A failed conditional update terminates the process so a fenced
+   instance cannot acknowledge non-persistent requests.
 
 Manifest update is the commit point. A partial generation is never restored.
 Thread additions and state updates are accepted. Empty or shrinking catalogs
@@ -87,6 +91,7 @@ The JSON manifest uses a versioned schema:
 - `writer_epoch`
 - `created_at`
 - `thread_ids`
+- `thread_versions`, mapping thread IDs to normalized `updated_at` values
 - `runtime_versions`
 - `files`, containing key, size, and SHA-256 for every pickle
 
@@ -94,6 +99,11 @@ Generation names combine UTC timestamp and UUID. App Runner replacement claims
 a new random writer epoch with an ETag-conditional update. Every later publish
 requires that same epoch and current ETag. An old instance cannot overwrite a
 new instance's manifest even when both exist briefly during deployment.
+
+A lightweight fence monitor checks the manifest every two seconds. Epoch or
+ETag loss marks health unready and terminates the process immediately. Combined
+with idle-only snapshots and monotonic thread timestamps, this prevents an old
+instance from publishing stale state for an existing thread.
 
 Retain the active generation, previous generation, and the five most recent
 valid generations. Empty-bucket bootstrap accepts only an explicitly supplied,
@@ -153,6 +163,7 @@ be restored by accident.
 - Failed generation upload: retain current manifest.
 - Failed manifest update: uploaded generation remains unused.
 - Writer epoch or ETag mismatch: stop publisher; old instance is fenced.
+- Fence monitor detects epoch loss: fail health and terminate process.
 - Runtime version mismatch: reject restore without touching local/S3 state.
 - Invalid S3 generation at startup: try previous recorded generation or
   canonical migration snapshot; otherwise fail closed.
@@ -169,6 +180,8 @@ be restored by accident.
 - Frozen AWS build installs manifest-compatible runtime versions.
 - Valid thread additions publish a new generation.
 - Same thread set with updated state publishes.
+- Snapshot is deferred while any run is pending or running.
+- Stability scans are separated by at least twelve seconds.
 - Empty and shrinking catalogs are rejected.
 - Old writer loses an ETag race and cannot move the manifest.
 - Same-thread stale state cannot roll the manifest backward.
@@ -187,15 +200,26 @@ be restored by accident.
 
 ## Deployment Verification
 
-1. Pause App Runner.
-2. Publish the protected seven-thread snapshot as initial generation.
-3. Upload missing target thread documents and wiki files.
-4. Build and deploy the guarded image.
-5. Resume service.
+1. Keep App Runner paused while publishing the protected seven-thread snapshot
+   and missing target documents/wiki.
+2. Add a temporary IAM deny for App Runner writes to `.langgraph_api/*`, then
+   resume the currently deployed unguarded image. It may read the snapshot but
+   cannot overwrite it.
+3. Deploy the guarded image with `LANGGRAPH_S3_READ_ONLY=true`.
+4. Confirm `/ok`, `/threads/search`, target detail/state, documents, and wiki
+   while the guarded image is read-only.
+5. Restore IAM write permission and update App Runner to
+   `LANGGRAPH_S3_READ_ONLY=false`. This second rollout contains only guarded
+   writers, so epoch fencing covers deployment overlap.
 6. Confirm `/ok` returns 200.
 7. Confirm `/threads/search` is non-empty and contains
    `019f3a49-a376-7be2-901d-9f780579a865`.
 8. Confirm target thread detail/state return 200.
 9. Confirm Documents and Wiki tabs have backing files.
 10. Wait beyond both persistence intervals and repeat checks.
-11. restart App Runner and repeat checks.
+11. Restart App Runner and repeat checks.
+
+AWS does not allow `UpdateService` or `StartDeployment` while a service is
+paused. The two-phase read-only rollout above is therefore required for the
+first guarded deployment. Later deployments can roll normally because every
+running image participates in writer fencing.
