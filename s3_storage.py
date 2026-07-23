@@ -24,7 +24,9 @@ Usage in webapp.py / the LangGraph Platform app:
 
 from __future__ import annotations
 
+import argparse
 import os
+import sys
 import threading
 from pathlib import Path
 
@@ -38,9 +40,31 @@ _s3_client = None
 _client_lock = threading.Lock()
 
 
+class S3ConfigurationError(RuntimeError):
+    """Raised when required S3 environment configuration is incomplete."""
+
+
+def _validate_s3_configuration(*, required: bool) -> bool:
+    missing = [
+        name
+        for name in ("S3_BUCKET_NAME", "AWS_REGION")
+        if not os.environ.get(name)
+    ]
+    if not missing:
+        return True
+    if required:
+        raise S3ConfigurationError(
+            "missing required S3 configuration: " + ", ".join(missing)
+        )
+    return False
+
+
 def is_s3_enabled() -> bool:
     """Return True if S3 sync is configured (env vars present)."""
-    return bool(os.environ.get("S3_BUCKET_NAME") and os.environ.get("AWS_REGION"))
+    return bool(
+        os.environ.get("S3_BUCKET_NAME")
+        and os.environ.get("AWS_REGION")
+    )
 
 
 def _get_bucket() -> str:
@@ -78,25 +102,32 @@ def _download_prefix(s3_prefix: str, local_dir: Path) -> int:
     # Ensure prefix has trailing slash for listing, but strip for key construction
     prefix = s3_prefix.rstrip("/") + "/"
     local_dir.mkdir(parents=True, exist_ok=True)
+    resolved_root = local_dir.resolve()
 
     downloaded = 0
     paginator = client.get_paginator("list_objects_v2")
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
         for obj in page.get("Contents", []):
             key = obj["Key"]
+            if not isinstance(key, str) or not key.startswith(prefix):
+                raise ValueError("unsafe S3 object key outside requested prefix")
             # Compute relative path after the prefix
             relative = key[len(prefix):]
             if not relative or relative.endswith("/"):
                 continue  # skip directory markers
 
-            dest = local_dir / relative
+            components = relative.split("/")
+            if any(component in {"", ".", ".."} for component in components):
+                raise ValueError(f"unsafe S3 object key: {key}")
+            dest = resolved_root.joinpath(*components).resolve()
+            try:
+                dest.relative_to(resolved_root)
+            except ValueError as exc:
+                raise ValueError(f"unsafe S3 object key: {key}") from exc
             dest.parent.mkdir(parents=True, exist_ok=True)
 
-            try:
-                client.download_file(bucket, key, str(dest))
-                downloaded += 1
-            except Exception as exc:
-                logger.warning(f"S3 download failed: {key} → {dest}: {exc}")
+            client.download_file(bucket, key, str(dest))
+            downloaded += 1
 
     return downloaded
 
@@ -210,29 +241,26 @@ def _resolve_tracked_folders() -> list[tuple[str, Path]]:
     input_folder = os.environ.get("INPUT_FOLDER", "./input")
     pairs.append(("input", Path(input_folder)))
 
-    # .langgraph_api/ → relative to project root
-    langgraph_api = Path(__file__).resolve().parent / ".langgraph_api"
-    pairs.append((".langgraph_api", langgraph_api))
-
     return pairs
 
 
-def startup_sync() -> None:
+def startup_sync() -> int:
     """Download all tracked folders from S3 to local filesystem on app startup.
 
     Called from webapp.py lifespan. Silent no-op if S3 is not configured.
     """
     if not is_s3_enabled():
         logger.debug("S3 sync not configured — skipping startup sync")
-        return
+        return 0
 
     logger.info("S3 startup sync: downloading tracked folders...")
     total = 0
     for s3_prefix, local_path in _resolve_tracked_folders():
-        count = download_prefix_sync(s3_prefix, local_path)
+        count = _download_prefix(s3_prefix, local_path)
         total += count
 
     logger.info(f"S3 startup sync complete: {total} files downloaded")
+    return total
 
 
 # ── S3 key helpers for callers ────────────────────────────────────────────────
@@ -256,3 +284,35 @@ def local_path_to_s3_key(local_path: str | Path, base_s3_prefix: str, base_local
         # Fallback: use filename only
         relative = Path(local_path.name)
     return f"{base_s3_prefix.rstrip('/')}/{relative}"
+
+
+def _cli_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="python -m s3_storage",
+        description="Synchronize generic application folders with S3.",
+    )
+    parser.add_subparsers(dest="command", required=True).add_parser("startup")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run a required generic S3 startup sync."""
+    args = _cli_parser().parse_args(argv)
+    if args.command != "startup":
+        return 2
+    try:
+        _validate_s3_configuration(required=True)
+    except S3ConfigurationError as exc:
+        sys.stderr.write(f"S3 startup configuration failed: {exc}\n")
+        return 2
+    try:
+        startup_sync()
+    except Exception as exc:
+        logger.error("S3 startup sync failed: %s", exc)
+        sys.stderr.write(f"S3 startup sync failed: {exc}\n")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

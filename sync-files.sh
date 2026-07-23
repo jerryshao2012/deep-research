@@ -346,6 +346,22 @@ for folder in "${SYNC_FOLDERS[@]}"; do
   fi
 done
 
+# ── Sync database file (deep_research.db) ───────────────────────────
+if [[ "$MODE" != "download" ]] && [ -f "./deep_research.db" ]; then
+  echo "   ↑ uploading database file: deep_research.db"
+  upload_file "" "./deep_research.db" "deep_research.db"
+  TOTAL_UPLOADED=$(( TOTAL_UPLOADED + 1 ))
+fi
+
+if [[ "$MODE" != "upload" ]]; then
+  db_remote=$(list_remote_files "" | grep -x "deep_research.db" || true)
+  if [ -n "$db_remote" ]; then
+    echo "   📥 downloading database file: deep_research.db"
+    download_file "" "deep_research.db" "$SYNC_ROOT"
+    TOTAL_DOWNLOADED=$(( TOTAL_DOWNLOADED + 1 ))
+  fi
+fi
+
 # ── Count total files in sync root ──────────────────────────────────
 TOTAL_LOCAL=$(find "$SYNC_ROOT" -type f 2>/dev/null | wc -l)
 TOTAL_LOCAL=${TOTAL_LOCAL//[[:space:]]/}

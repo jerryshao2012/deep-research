@@ -38,7 +38,7 @@ else:
     DOCS_ROOT: Path = _BASE / "docs"
 
 # Semantic API version — bump on every public-facing change
-API_VERSION: str = "1.8.106"
+API_VERSION: str = "1.8.108"
 
 # ── Authentication ────────────────────────────────────────────────────────────
 

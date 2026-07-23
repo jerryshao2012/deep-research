@@ -9,10 +9,10 @@ __pycache__/
 venv/
 env/
 sync/
+sync-aws/
 
 # Package management (uv)
 .venv
-uv.lock
 
 # Testing
 .pytest_cache/
@@ -24,6 +24,13 @@ output/
 input/
 deep_research_example.egg-info/
 .langgraph_api/
+.langgraph_snapshots/
+..langgraph_api.*
+..langgraph_snapshots.*
+*.pckl
+*.pckl.tmp
+*.pickle
+deep_research.db*
 .scripts/
 
 # Development tools
@@ -33,9 +40,12 @@ deep_research_example.egg-info/
 .mcp.json
 
 # Environment and secrets
-.env
-.env.example
+.env*
+.env-aws.docker
+!.env.example
 secrets*.sh
+current_config.json
+*.log
 
 # Deployment scripts
 .build_version

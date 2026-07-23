@@ -1,4 +1,7 @@
-FROM python:3.12-slim
+FROM python:3.12.13-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b
+
+# Root OCI index above resolves linux/amd64 to
+# sha256:72d3d75f2639ab82b34b29390ad3d6e0827c775befee94edda8e9976818f488d.
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -15,15 +18,31 @@ WORKDIR /deps/deep_research
 
 # Copy the local package
 ADD . /deps/deep_research
-RUN cp /deps/deep_research/.env-aws.docker /deps/deep_research/.env
+RUN touch /deps/deep_research/.env
 
-# Note: Runtime directories (docs/, output/, input/) are mounted by the entrypoint:
-#   Azure: Azure File Share → /deps/deep_research/mnt
-#   AWS:   S3 bucket (via s3fs) → /deps/deep_research/mnt
-# No need to create them in the Docker image
+# AWS injects runtime configuration through App Runner and restores persistent
+# files directly from S3 in the entrypoint.
 
-# Use standard pip install to ensure cross-architecture builds (AMD64 on ARM64) resolve wheels correctly
-RUN pip install --no-cache-dir -e .
+# Freeze the Python runtime to the committed lock file. uv creates the runtime
+# environment at /deps/deep_research/.venv.
+RUN pip install --no-cache-dir "uv==0.8.17" \
+    && uv sync --frozen --no-dev
+
+ENV PATH="/deps/deep_research/.venv/bin:$PATH"
+
+# Fail the image build if the exact runtime environment cannot load the S3
+# snapshot stack or expose the LangGraph CLI. No AWS credentials are required.
+RUN /deps/deep_research/.venv/bin/python -c \
+      "import boto3; import langgraph_api; import langgraph_runtime_inmem; import langgraph_snapshot" \
+    && test "$(command -v langgraph)" = "/deps/deep_research/.venv/bin/langgraph" \
+    && /deps/deep_research/.venv/bin/langgraph dev --help > /dev/null \
+    && rm -rf /deps/deep_research/.langgraph_api \
+      /deps/deep_research/.langgraph_api.restore-receipt.json \
+      /deps/deep_research/..langgraph_api.restore-* \
+      /deps/deep_research/..langgraph_api.backup-* \
+      /deps/deep_research/..langgraph_api.publish-* \
+      /deps/deep_research/..langgraph_api.canonical-* \
+      /deps/deep_research/..langgraph_api.restore-receipt.json.*
 
 # Set the host for the dev server
 ENV HOST=0.0.0.0
@@ -41,4 +60,3 @@ ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 
 # Launch using langgraph dev
 CMD ["langgraph", "dev", "--host", "0.0.0.0", "--port", "2024", "--no-reload", "--no-browser"]
-

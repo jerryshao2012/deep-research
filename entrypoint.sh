@@ -2,48 +2,25 @@
 set -e
 
 # ── Storage backend detection ────────────────────────────────────────────────
-# This entrypoint works identically for Azure and AWS:
+# This entrypoint supports Azure and AWS:
 #   Azure: Azure File Share is mounted at MOUNT_PATH by the platform
-#   AWS:   S3 bucket is mounted at MOUNT_PATH via s3fs-fuse
-# After mounting, both backends use the same symlink logic below.
+#   AWS:   boto3 downloads generic files and restores guarded LangGraph state
 
-MOUNT_PATH="/deps/deep_research/mnt"
+PROJECT_ROOT="${PROJECT_ROOT:-/deps/deep_research}"
+MOUNT_PATH="${MOUNT_PATH:-$PROJECT_ROOT/mnt}"
+AWS_MODE=false
 
 echo "═══════════════════════════════════════════════════════"
 echo "🔧 Entrypoint: Configuring persistent storage..."
 
-# ── Detect and mount storage backend ───────────────────────────────────────
+# ── Detect storage backend ──────────────────────────────────────────────────
 
-if [ -n "$S3_BUCKET_NAME" ] && command -v s3fs &>/dev/null; then
-    # ── AWS mode: mount S3 bucket via s3fs ───────────────────────────────────
+if [ -n "${S3_BUCKET_NAME:-}" ]; then
+    # App Runner does not provide the FUSE device required by s3fs.
+    AWS_MODE=true
     echo "☁️  AWS mode detected (S3_BUCKET_NAME=$S3_BUCKET_NAME)"
     echo "   Region: ${AWS_REGION:-us-east-1}"
-
-    mkdir -p "$MOUNT_PATH"
-
-    # s3fs requires a passwd file (can be empty when using IAM role)
-    touch /etc/passwd-s3fs
-    chmod 640 /etc/passwd-s3fs
-
-    echo "   Mounting s3://${S3_BUCKET_NAME} → $MOUNT_PATH ..."
-    s3fs "$S3_BUCKET_NAME" "$MOUNT_PATH" \
-        -o iam_role=auto \
-        -o url="https://s3.${AWS_REGION:-us-east-1}.amazonaws.com" \
-        -o use_path_request_style \
-        -o allow_other \
-        -o nonempty \
-        -o umask=022 \
-        2>&1 || {
-        echo "⚠️  s3fs mount failed. Directories will remain ephemeral."
-        echo "   Check: IAM role has s3:ListBucket + s3:GetObject + s3:PutObject permissions"
-        rm -rf "$MOUNT_PATH"
-    }
-
-    if mountpoint -q "$MOUNT_PATH" 2>/dev/null; then
-        echo "✅ S3 bucket mounted at $MOUNT_PATH"
-    else
-        echo "⚠️  $MOUNT_PATH is not a mount point — falling back to ephemeral storage"
-    fi
+    mkdir -p "$PROJECT_ROOT/docs" "$PROJECT_ROOT/output" "$PROJECT_ROOT/input"
 
 elif mountpoint -q "$MOUNT_PATH" 2>/dev/null || [ -d "$MOUNT_PATH" ]; then
     # ── Azure mode: File Share already mounted by the platform ───────────────
@@ -68,7 +45,7 @@ echo "════════════════════════�
 
 setup_persistent_dir() {
     local dir_name=$1
-    local local_path="/deps/deep_research/$dir_name"
+    local local_path="$PROJECT_ROOT/$dir_name"
     local mount_path="$MOUNT_PATH/$dir_name"
 
     echo "🔍 Checking persistence for $dir_name..."
@@ -106,15 +83,24 @@ setup_persistent_dir() {
     fi
 }
 
-# Setup persistence for all required directories
-setup_persistent_dir "docs"
-setup_persistent_dir "output"
-setup_persistent_dir "input"
+if ! $AWS_MODE; then
+    setup_persistent_dir "docs"
+    setup_persistent_dir "output"
+    setup_persistent_dir "input"
+fi
 
 echo ""
 echo "📋 Final state:"
-ls -la /deps/deep_research/ | grep -E "^[dl]" || true
+ls -la "$PROJECT_ROOT/" | grep -E "^[dl]" || true
 echo "═══════════════════════════════════════════════════════"
+
+cd "$PROJECT_ROOT"
+if $AWS_MODE; then
+    echo "📥 Downloading generic application files..."
+    python3 -m s3_storage startup
+    echo "📥 Restoring guarded LangGraph snapshot..."
+    python3 -m langgraph_snapshot restore --write-receipt
+fi
 
 # Execute the passed command (e.g., langgraph dev)
 echo "🚀 Starting application: $@"

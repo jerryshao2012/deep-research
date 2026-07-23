@@ -5,7 +5,7 @@ standard API keys) to authorize access to thread endpoints.
 """
 
 import os
-from typing import Set
+from typing import Any, Set
 
 from fastapi import HTTPException
 from langgraph_sdk import Auth
@@ -19,6 +19,50 @@ auth = Auth()
 
 # Track users who have already been logged for first-time OAuth authentication
 _logged_oauth_users: Set[str] = set()
+
+_READ_ONLY_DETAIL = (
+    "AWS demo is temporarily read-only during S3 persistence maintenance."
+)
+
+
+def _reject_if_s3_read_only() -> None:
+    """Reject LangGraph mutations during the AWS read-only rollout."""
+    aws_mode = bool(
+        os.environ.get("S3_BUCKET_NAME") and os.environ.get("AWS_REGION")
+    )
+    read_only = (
+        os.environ.get("LANGGRAPH_S3_READ_ONLY", "").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
+    if aws_mode and read_only:
+        raise Auth.exceptions.HTTPException(
+            status_code=503,
+            detail=_READ_ONLY_DETAIL,
+        )
+
+
+@auth.on.threads.create
+async def on_create_thread(ctx: Any, value: Any) -> None:
+    """Authorize thread creation."""
+    _reject_if_s3_read_only()
+
+
+@auth.on.threads.update
+async def on_update_thread(ctx: Any, value: Any) -> None:
+    """Authorize thread updates."""
+    _reject_if_s3_read_only()
+
+
+@auth.on.threads.delete
+async def on_delete_thread(ctx: Any, value: Any) -> None:
+    """Authorize thread deletion."""
+    _reject_if_s3_read_only()
+
+
+@auth.on.threads.create_run
+async def on_create_run(ctx: Any, value: Any) -> None:
+    """Authorize run creation."""
+    _reject_if_s3_read_only()
 
 
 def authenticate_credential(credential: str) -> Auth.types.MinimalUserDict:

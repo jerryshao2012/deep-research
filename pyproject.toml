@@ -14,6 +14,7 @@ dependencies = [
     "jupyter>=1.0.0",
     "ipykernel>=6.20.0",
     "httpx>=0.28.1",
+    "boto3>=1.35.0",
     "markdownify>=1.2.0",
     "deepagents>=0.5.3",
     "python-dotenv>=1.0.0",
