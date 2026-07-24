@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
-import sys
 from langchain_core.messages import AIMessage, ToolMessage
 
 import research_agent_cli
@@ -238,3 +238,50 @@ def test_cli_main_retries_with_invoke_when_stream_ends_with_placeholder(
     assert fake_agent.stream_calls == 1
     assert fake_agent.invoke_calls == 1
     assert content.startswith("# Presentation: Claude Code Memory Management")
+
+
+@pytest.mark.parametrize(
+    ("todos", "expected"),
+    [
+        ([{"status": "pending"}], True),
+        ([{"status": " PENDING "}], True),
+        ([{"status": " in_PROGRESS "}], True),
+        ([{"status": "completed"}], False),
+        ([{"status": "blocked"}], False),
+        ([{}], False),
+        (["pending"], False),
+    ],
+)
+def test_should_retry_with_invoke_uses_shared_incomplete_todo_policy(
+        todos, expected: bool
+) -> None:
+    result = {
+        "todos": todos,
+        "messages": [AIMessage(content="Final report ready.")],
+    }
+
+    assert research_agent_cli.should_retry_with_invoke(result) is expected
+
+
+def test_should_retry_with_invoke_delegates_incomplete_todos_to_shared_policy(
+        monkeypatch,
+) -> None:
+    todos = [{"status": "custom_status"}]
+    inspected = []
+
+    class Inspection:
+        has_incomplete = True
+
+    def fake_inspect_todos(value):
+        inspected.append(value)
+        return Inspection()
+
+    monkeypatch.setattr(research_agent_cli, "inspect_todos", fake_inspect_todos)
+
+    assert research_agent_cli.should_retry_with_invoke(
+        {
+            "todos": todos,
+            "messages": [AIMessage(content="Final report ready.")],
+        }
+    )
+    assert inspected == [todos]

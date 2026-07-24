@@ -2,7 +2,9 @@
 
 from pathlib import Path
 
-from langchain_core.messages import HumanMessage
+import pytest
+from deepagents.backends.utils import create_file_data
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from agent import ResearchStateMiddleware
 from research_agent import tools
@@ -118,6 +120,135 @@ def test_research_state_middleware_seeds_research_request_file() -> None:
     assert "Generate 5 Q/A pairs" in "".join(result["files"]["/research_request.md"]["content"])
 
 
+def test_research_state_middleware_preserves_state_during_resume_round(
+        monkeypatch,
+) -> None:
+    middleware = ResearchStateMiddleware(
+        config_getter=lambda: {
+            "configurable": {
+                "resume_incomplete_todos": True,
+                "resume_round": 2,
+                "resume_max_rounds": 3,
+            }
+        }
+    )
+    monkeypatch.setattr(
+        middleware,
+        "_extract_parameters_from_user_input",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("resume phrase must not be parsed as parameters")
+        ),
+    )
+    original_request = create_file_data("Original research goal")
+    state = {
+        "messages": [
+            HumanMessage(content="Original research goal"),
+            HumanMessage(content="Please continue!"),
+        ],
+        "files": {"/research_request.md": original_request},
+        "todos": [{"content": "Finish report", "status": "pending"}],
+        "doc_folder": "./docs/original",
+        "skill": "golden-dataset",
+        "no_web": True,
+        "_last_user_msg_hash": "original-message-hash",
+        "verification_round": 2,
+        "verification_feedback": "Keep prior verification feedback.",
+        "research_pass": 4,
+    }
+
+    result = middleware.before_agent(state=state, runtime=None)
+
+    assert result is not None
+    assert "files" not in result
+    assert state["files"]["/research_request.md"] == original_request
+    assert all(
+        not (
+                isinstance(message, AIMessage)
+                and message.content
+                in {
+                    "Starting research…",
+                    "Searching your uploaded documents for relevant information…",
+                }
+        )
+        for message in result.get("messages", [])
+    )
+    assert not {
+        "verification_round",
+        "verification_feedback",
+        "research_pass",
+        "_last_user_msg_hash",
+        "doc_folder",
+        "skill",
+        "no_web",
+    }.intersection(result)
+    assert isinstance(result["messages"][0], SystemMessage)
+    assert "Keep prior verification feedback." in str(result["messages"][0].content)
+
+
+_MISSING_TODOS = object()
+
+
+@pytest.mark.parametrize(
+    "todos",
+    (
+            pytest.param(
+                [{"content": "Finished", "status": "completed"}],
+                id="completed",
+            ),
+            pytest.param(_MISSING_TODOS, id="missing"),
+            pytest.param(
+                ["not a todo", {"content": "Unknown", "status": "blocked"}],
+                id="malformed",
+            ),
+    ),
+)
+def test_research_state_middleware_uses_normal_path_without_incomplete_todos(
+        todos,
+        monkeypatch,
+) -> None:
+    middleware = ResearchStateMiddleware(
+        config_getter=lambda: {
+            "configurable": {"resume_incomplete_todos": True}
+        }
+    )
+    monkeypatch.setattr(
+        middleware,
+        "_extract_parameters_from_user_input",
+        lambda *_args: {"skill": "interview-prep", "no_web": False},
+    )
+    original_request = create_file_data("Original research goal")
+    state = {
+        "messages": [HumanMessage(content="Please continue!")],
+        "files": {"/research_request.md": original_request},
+        "skill": "golden-dataset",
+        "no_web": True,
+        "_last_user_msg_hash": "original-message-hash",
+        "verification_round": 2,
+        "verification_feedback": "Old feedback.",
+        "research_pass": 4,
+    }
+    if todos is not _MISSING_TODOS:
+        state["todos"] = todos
+
+    result = middleware.before_agent(state=state, runtime=None)
+
+    assert result is not None
+    assert "".join(result["files"]["/research_request.md"]["content"]) == (
+        "Please continue!"
+    )
+    assert any(
+        isinstance(message, AIMessage)
+        and message.content == "Starting research…"
+        for message in result["messages"]
+    )
+    assert result["verification_round"] == 0
+    assert result["verification_feedback"] is None
+    assert result["research_pass"] == 0
+    assert result["_last_user_msg_hash"] != "original-message-hash"
+    assert result["skill"] == "interview-prep"
+    assert result["no_web"] is False
+
+
 # ── ls / glob tests ──
 
 def test_ls_lists_files_and_directories(tmp_path: Path) -> None:
@@ -173,7 +304,8 @@ def test_fetch_webpage_content_returns_markdown_for_valid_url() -> None:
 
 
 def test_fetch_webpage_content_handles_invalid_url() -> None:
-    result = fetch_webpage_content.invoke({"url": "https://this-domain-does-not-exist-12345.com", "timeout": 2.0, "state": {}})
+    result = fetch_webpage_content.invoke(
+        {"url": "https://this-domain-does-not-exist-12345.com", "timeout": 2.0, "state": {}})
 
     assert result.startswith("Error fetching content")
 

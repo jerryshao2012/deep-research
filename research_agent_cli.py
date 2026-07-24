@@ -4,21 +4,22 @@ Sets up argument parsers, tracks thread state memory, displays a console spinner
 during processing, and prints final response messages and outputs.
 """
 
+import itertools
 import os
 import re
+import sys
 import threading
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
 
-import itertools
-import sys
-import time
 from deepagents.backends.utils import file_data_to_string
 from dotenv import load_dotenv
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, ToolMessage
 
 from agent import agent, model
+from research_agent.resume import inspect_todos
 from research_agent.utils.cli import build_parser, list_skills
 from research_agent.utils.knowledge_filesystem import normalize_path_for_filesystem_tools
 from utils import str2bool, show_prompt, format_messages
@@ -208,21 +209,6 @@ def _looks_like_incomplete_delegation(content: str) -> bool:
     return any(marker in text for marker in markers)
 
 
-def _has_incomplete_todos(result: dict) -> bool:
-    """Return True when state todos exist and at least one is not completed."""
-    todos = result.get("todos")
-    if not isinstance(todos, list) or not todos:
-        return False
-
-    for todo in todos:
-        if not isinstance(todo, dict):
-            continue
-        status = str(todo.get("status", "")).strip().lower()
-        if status != "completed":
-            return True
-    return False
-
-
 def _truncate_for_log(content: str, max_chars: int = MAX_STREAM_DIAGNOSTIC_CHARS) -> str:
     """Truncate and flatten content for safe inclusion in log/diagnostic messages.
 
@@ -308,7 +294,7 @@ def select_output_content(result: dict, skill: str | None = None) -> str:
 
 def should_retry_with_invoke(result: dict, skill: str | None = None) -> bool:
     """Detect partial streamed states that should be retried via synchronous invoke."""
-    if _has_incomplete_todos(result):
+    if inspect_todos(result.get("todos")).has_incomplete:
         return True
     content = select_output_content(result, skill)
     return _looks_like_incomplete_delegation(content)

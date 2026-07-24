@@ -12,7 +12,9 @@ import os
 import re
 import time
 import traceback
+from collections.abc import Callable
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from deepagents import SubAgent, create_deep_agent
@@ -32,7 +34,7 @@ from langchain_core.messages import (
     SystemMessage,
 )
 from langchain_core.runnables import RunnableConfig
-from pathlib import Path
+from langgraph.config import get_config
 
 from logger_utils import setup_logger
 from model_factory import create_memory_saver, get_configured_model
@@ -41,12 +43,16 @@ from research_agent import (
     RESEARCHER_INSTRUCTIONS,
     SUBAGENT_DELEGATION_INSTRUCTIONS,
 )
+from research_agent.clarification.middleware import ClarificationMiddleware
+from research_agent.clarification.tool import clarify_requirements
 from research_agent.prompts import RESEARCHER_DESCRIPTION
+from research_agent.resume.middleware import ResumeMiddleware
+from research_agent.resume.policy import inspect_todos
 from research_agent.tools import (
     fetch_webpage_content,
     glob,
-    ls,
     llm_wiki_query,
+    ls,
     read_docs_folder,
     read_file,
     tavily_search,
@@ -126,6 +132,27 @@ class ResearchStateMiddleware(AgentMiddleware):
     # Ensure middleware state update are validated against the standard state schema.
     state_schema = ResearchState
 
+    def __init__(
+            self,
+            *,
+            config_getter: Callable[[], dict[str, Any]] = get_config,
+    ) -> None:
+        """Create middleware with an injectable per-run config source."""
+        super().__init__()
+        self._config_getter = config_getter
+
+    def _is_resume_round(self, state: ResearchState) -> bool:
+        try:
+            config = self._config_getter()
+        except RuntimeError:
+            return False
+        configurable = config.get("configurable", {})
+        return (
+                isinstance(configurable, dict)
+                and configurable.get("resume_incomplete_todos") is True
+                and inspect_todos(state.get("todos")).has_incomplete
+        )
+
     @staticmethod
     def _get_current_user_message(messages: list) -> str | None:
         """Return the content of the **last** user/human message in the list."""
@@ -166,60 +193,76 @@ class ResearchStateMiddleware(AgentMiddleware):
         """
         messages = state.get("messages", [])
         current_user_message = self._get_current_user_message(messages)
+        is_resume_round = self._is_resume_round(state)
 
-        # Seed the research request file with the latest user message
-        updates: dict[str, Any] = self._seed_research_request_file(
-            current_user_message, state
-        )
+        updates: dict[str, Any] = {}
+        if not is_resume_round:
+            # Seed the research request file with the latest user message.
+            updates = self._seed_research_request_file(
+                current_user_message,
+                state,
+            )
 
         # ── Instant progress feedback ──────────────────────────────────────
-        has_docs = bool(
-            state.get("doc_folder")
-            or (
-                    state.get("files")
-                    and any(
-                k.startswith("/raw/") or k.startswith("/docs/")
-                for k in (state.get("files") or {})
+        if not is_resume_round:
+            has_docs = bool(
+                state.get("doc_folder")
+                or (
+                        state.get("files")
+                        and any(
+                    k.startswith("/raw/") or k.startswith("/docs/")
+                    for k in (state.get("files") or {})
+                )
+                )
             )
+            status_text = (
+                "Searching your uploaded documents for relevant information…"
+                if has_docs
+                else "Starting research…"
             )
-        )
-        status_text = (
-            "Searching your uploaded documents for relevant information…"
-            if has_docs
-            else "Starting research…"
-        )
-        updates.setdefault("messages", [])
-        if isinstance(updates["messages"], list):
-            updates["messages"] = [AIMessage(content=status_text)] + updates["messages"]
+            updates.setdefault("messages", [])
+            if isinstance(updates["messages"], list):
+                updates["messages"] = [
+                                          AIMessage(content=status_text)
+                                      ] + updates["messages"]
+            else:
+                updates["messages"] = [AIMessage(content=status_text)]
+
+        if not is_resume_round:
+            # ── Verification loop state ────────────────────────────────────
+            # Track the last user message to detect fresh questions and reset
+            # verification state for follow-up turns.
+            msg_hash = (
+                hashlib.md5((current_user_message or "").encode()).hexdigest()
+                if current_user_message
+                else ""
+            )
+            last_hash = state.get("_last_user_msg_hash") or ""
+            is_fresh_message = msg_hash and msg_hash != last_hash
+
+            if (
+                    "verification_round" not in state
+                    or state.get("verification_round") is None
+            ):
+                updates["verification_round"] = 0
+                updates["verification_feedback"] = None
+                updates["research_pass"] = 0
+
+            if is_fresh_message:
+                updates["verification_round"] = 0
+                updates["verification_feedback"] = None
+                updates["research_pass"] = 0
+                updates["_last_user_msg_hash"] = msg_hash
+
+            # Follow-up requests may select new parameters. Resume-only
+            # phrases retain settings from the original research request.
+            extracted_updates = self._extract_parameters_from_user_input(
+                state,
+                messages,
+            )
+            updates.update(extracted_updates)
         else:
-            updates["messages"] = [AIMessage(content=status_text)]
-
-        # ── Verification loop state ────────────────────────────────────────
-        # Track the last user message to detect fresh questions and reset
-        # verification state for follow-up turns.
-        msg_hash = (
-            hashlib.md5((current_user_message or "").encode()).hexdigest()
-            if current_user_message
-            else ""
-        )
-        last_hash = state.get("_last_user_msg_hash") or ""
-        is_fresh_message = msg_hash and msg_hash != last_hash
-
-        if "verification_round" not in state or state.get("verification_round") is None:
-            updates["verification_round"] = 0
-            updates["verification_feedback"] = None
-            updates["research_pass"] = 0
-
-        if is_fresh_message:
-            updates["verification_round"] = 0
-            updates["verification_feedback"] = None
-            updates["research_pass"] = 0
-            updates["_last_user_msg_hash"] = msg_hash
-
-        # Always re-extract parameters from the latest user message so that
-        # follow-up requests (e.g. "use humanizer skill") are picked up.
-        extracted_updates = self._extract_parameters_from_user_input(state, messages)
-        updates.update(extracted_updates)
+            extracted_updates = {}
 
         # Configure OUTPUT_FOLDER based on extracted doc_folder
         if updates.get("doc_folder") or (
@@ -1149,6 +1192,7 @@ checkpointer = create_memory_saver()
 _agent_kwargs: dict[str, Any] = dict(
     model=model,
     tools=[
+        clarify_requirements,
         think_tool,
         read_file,
         write_file,
@@ -1159,7 +1203,11 @@ _agent_kwargs: dict[str, Any] = dict(
     ],
     system_prompt=INSTRUCTIONS,
     subagents=[research_sub_agent],
-    middleware=[ResearchStateMiddleware()],
+    middleware=[
+        ClarificationMiddleware(),
+        ResumeMiddleware(),
+        ResearchStateMiddleware(),
+    ],
     skills=[
         ".deepagents/skills/",
         "./doc/.deepagents/skills/",

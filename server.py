@@ -32,24 +32,35 @@ if not os.environ.get("MEMORY_TYPE", "").strip():
 import asyncio
 import json
 import logging
+import time
 import uuid
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Iterable, Mapping
 from datetime import UTC, datetime
 from typing import Any
 
-import time
-from fastapi import Depends, HTTPException, Request, Query
+from fastapi import Depends, HTTPException, Query, Request
 from fastapi.openapi.utils import get_openapi
+from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
 from langgraph_sdk import Auth
 from pydantic import BaseModel, Field
 
 # Import DB wrapper
 import db
+
 # Import the actual deep_research agent
-from agent import agent, RECURSION_LIMIT
+from agent import RECURSION_LIMIT, agent
+
 # Import shared authentication logic
 from auth import authenticate_credential
 from research_agent.prompts import RESEARCHER_DESCRIPTION
+from research_agent.resume import (
+    build_round_limit_message,
+    get_max_resume_rounds,
+    inspect_todos,
+    is_resume_intent,
+    visible_messages,
+)
+
 # Import the existing app and settings from webapp
 from webapp import app
 
@@ -193,7 +204,25 @@ def _sse_frame(event: str, data: Any, event_id: int | None = None) -> str:
     return f"{id_part}event: {event}\ndata: {payload}\n\n"
 
 
+def _public_state_values(raw_values: Any) -> dict[str, Any]:
+    """Copy state for public output, hiding private keys and messages."""
+    if not isinstance(raw_values, Mapping):
+        return {}
+
+    values = {
+        key: value
+        for key, value in raw_values.items()
+        if not (isinstance(key, str) and key.startswith("_"))
+    }
+    if "messages" in values:
+        raw_messages = values.get("messages")
+        messages = list(raw_messages) if isinstance(raw_messages, (list, tuple)) else []
+        values["messages"] = _serialize_visible_messages(messages)
+    return values
+
+
 def _api_thread(thread: dict[str, Any]) -> dict[str, Any]:
+    raw_values = thread.get("values")
     return {
         "thread_id": thread.get("thread_id"),
         "created_at": thread.get("created_at"),
@@ -202,7 +231,11 @@ def _api_thread(thread: dict[str, Any]) -> dict[str, Any]:
         "metadata": thread.get("metadata") or {},
         "status": thread.get("status") or "idle",
         "config": thread.get("config") or {},
-        "values": thread.get("values") or None,
+        "values": (
+            _public_state_values(raw_values)
+            if isinstance(raw_values, Mapping)
+            else None
+        ),
     }
 
 
@@ -213,7 +246,42 @@ def _map_run_status_for_api(status: str | None) -> str:
     return status or "pending"
 
 
+def _last_user_entry(raw_messages: Any) -> tuple[str, str] | None:
+    """Return normalized role and content for the request's triggering message."""
+    if not isinstance(raw_messages, list):
+        return None
+
+    for raw_message in reversed(raw_messages):
+        if isinstance(raw_message, dict):
+            role = raw_message.get("role")
+            content = raw_message.get("content")
+        else:
+            role = getattr(raw_message, "role", None)
+            content = getattr(raw_message, "content", None)
+
+        if not isinstance(role, str) or role.strip().lower() not in {"user", "human"}:
+            continue
+        if not isinstance(content, str):
+            return None
+        return role.strip().lower(), content
+
+    return None
+
+
+def _last_user_message(raw_messages: Any) -> str:
+    """Return last valid user message content from one request message list."""
+    entry = _last_user_entry(raw_messages)
+    return entry[1] if entry is not None else ""
+
+
 def _api_run(run: dict[str, Any]) -> dict[str, Any]:
+    raw_kwargs = run.get("kwargs") or {}
+    public_kwargs = {
+        key: value
+        for key, value in raw_kwargs.items()
+        if not (isinstance(key, str) and key.startswith("_"))
+    } if isinstance(raw_kwargs, dict) else {}
+
     return {
         "run_id": run.get("run_id"),
         "thread_id": run.get("thread_id"),
@@ -222,7 +290,7 @@ def _api_run(run: dict[str, Any]) -> dict[str, Any]:
         "updated_at": run.get("updated_at") or run.get("created_at"),
         "status": _map_run_status_for_api(run.get("status")),
         "metadata": run.get("metadata") or {},
-        "kwargs": run.get("kwargs") or {},
+        "kwargs": public_kwargs,
         "multitask_strategy": run.get("multitask_strategy") or "enqueue",
         "error": run.get("error"),
     }
@@ -268,7 +336,7 @@ def _build_thread_history_item(thread: dict[str, Any]) -> dict[str, Any]:
             "checkpoint_ns": "",
             "checkpoint_id": checkpoint_id,
         },
-        "values": thread.get("values") or {},
+        "values": _public_state_values(thread.get("values")),
         "metadata": thread.get("metadata") or {},
         "created_at": checkpoint_time,
         "next": [],
@@ -295,11 +363,11 @@ async def _resolve_thread_history(
                 kwargs["before"] = {"configurable": {"thread_id": thread_id, "checkpoint_id": before}}
             async for checkpoint in cp.alist(**kwargs):
                 cpt_config = checkpoint.get("config", {}).get("configurable", {})
-                values = checkpoint.get("values") or checkpoint.get("channel_values")
-                if values:
-                    # Serialize message objects to make the response JSON-safe
-                    msgs = values.get("messages", [])
-                    values["messages"] = [serialize_message(m) for m in msgs]
+                raw_values = (
+                        checkpoint.get("values")
+                        or checkpoint.get("channel_values")
+                )
+                values = _public_state_values(raw_values)
                 items.append({
                     "config": {
                         "configurable": {
@@ -372,6 +440,33 @@ def _get_thread_with_auth(thread_id: str, current_user: Auth.types.MinimalUserDi
     return thread
 
 
+def _stable_message_id(message: Any) -> str:
+    """Build a repeatable public ID for a checkpoint message lacking one."""
+    if isinstance(message, Mapping):
+        message_type = message.get("type") or message.get("role")
+        content = message.get("content")
+        name = message.get("name")
+        tool_call_id = message.get("tool_call_id")
+        tool_calls = message.get("tool_calls")
+    else:
+        message_type = getattr(message, "type", None)
+        content = getattr(message, "content", None)
+        name = getattr(message, "name", None)
+        tool_call_id = getattr(message, "tool_call_id", None)
+        tool_calls = getattr(message, "tool_calls", None)
+    fingerprint = json.dumps(
+        [message_type, content, name, tool_call_id, tool_calls],
+        sort_keys=True,
+        default=str,
+    )
+    return str(
+        uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"deep-research-message:{fingerprint}",
+        )
+    )
+
+
 def serialize_message(m: Any) -> dict[str, Any]:
     """Convert a LangChain message object or a dictionary to the standard
     LangGraph Platform serializable format understood by @langchain/langgraph-sdk.
@@ -397,7 +492,7 @@ def serialize_message(m: Any) -> dict[str, Any]:
             out["type"] = "ai"
         # Ensure unique id
         if "id" not in out or not out["id"]:
-            out["id"] = str(uuid.uuid4())
+            out["id"] = _stable_message_id(m)
         # Fill in missing LangChain serialization fields with defaults
         out.setdefault("name", None)
         out.setdefault("additional_kwargs", {})
@@ -433,7 +528,7 @@ def serialize_message(m: Any) -> dict[str, Any]:
     res: dict[str, Any] = {
         "type": wire_type,
         "content": content,
-        "id": msg_id or str(uuid.uuid4()),
+        "id": msg_id or _stable_message_id(m),
         "name": msg_name if msg_name else None,
         "additional_kwargs": getattr(m, "additional_kwargs", None) or {},
         "response_metadata": getattr(m, "response_metadata", None) or {},
@@ -460,9 +555,147 @@ def serialize_message(m: Any) -> dict[str, Any]:
     return res
 
 
+def _serialize_visible_messages(messages: Iterable[Any]) -> list[dict[str, Any]]:
+    """Serialize copied public messages without changing checkpoint objects."""
+    serialized_messages: list[dict[str, Any]] = []
+    fallback_occurrences: dict[str, int] = {}
+    for message in visible_messages(list(messages)):
+        serialized = serialize_message(message)
+        raw_id = (
+            message.get("id")
+            if isinstance(message, Mapping)
+            else getattr(message, "id", None)
+        )
+        if raw_id is None or not str(raw_id).strip():
+            base_id = _stable_message_id(message)
+            occurrence = fallback_occurrences.get(base_id, 0)
+            fallback_occurrences[base_id] = occurrence + 1
+            serialized["id"] = str(
+                uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"{base_id}:occurrence:{occurrence}",
+                )
+            )
+        serialized_messages.append(serialized)
+    return serialized_messages
+
+
 # ── Run executor ──────────────────────────────────────────────────────────────
 
-async def _stream_run_events(
+async def _current_agent_values(
+        thread_id: str,
+        thread: dict[str, Any],
+) -> dict[str, Any]:
+    """Load checkpoint values, falling back to the public thread snapshot."""
+    thread_values = thread.get("values")
+    fallback = dict(thread_values) if isinstance(thread_values, Mapping) else {}
+    config = {"configurable": {"thread_id": thread_id}}
+
+    try:
+        snapshot = await agent.aget_state(config)
+        snapshot_values = getattr(snapshot, "values", None)
+        values = dict(snapshot_values) if isinstance(snapshot_values, Mapping) else fallback
+    except Exception:
+        values = fallback
+
+    public_messages = thread.get("messages")
+    if isinstance(public_messages, list):
+        values["messages"] = list(public_messages)
+    return values
+
+
+def _agent_input_state(values: dict[str, Any]) -> dict[str, Any]:
+    """Return only state fields accepted by the research agent."""
+    keys = (
+        "messages",
+        "files",
+        "todos",
+        "doc_folder",
+        "skill",
+        "no_web",
+        "wiki_query_complete",
+        "existing_reports",
+    )
+    return {
+        key: values[key]
+        for key in keys
+        if key in values and values[key] is not None
+    }
+
+
+def _persistable_public_values(
+        values: dict[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Serialize visible messages and retain JSON-safe non-message state."""
+    serialized_messages = _serialize_visible_messages(values.get("messages") or [])
+    serializable_values: dict[str, Any] = {}
+    for key, value in values.items():
+        if key == "messages":
+            continue
+        try:
+            json.dumps(value)
+        except (TypeError, ValueError):
+            continue
+        serializable_values[key] = value
+    serializable_values["messages"] = serialized_messages
+    return serialized_messages, serializable_values
+
+
+def _preserve_initial_messages(
+        initial_messages: list[Any],
+        returned_messages: Any,
+) -> list[Any]:
+    """Keep public messages present when an adapter returns only new messages."""
+    if not isinstance(returned_messages, list):
+        return list(initial_messages)
+
+    def identity(message: Any) -> tuple[str, str]:
+        if isinstance(message, Mapping):
+            message_id = message.get("id")
+            message_type = message.get("type") or message.get("role")
+            content = message.get("content")
+            name = message.get("name")
+            tool_call_id = message.get("tool_call_id")
+        else:
+            message_id = getattr(message, "id", None)
+            message_type = getattr(message, "type", None)
+            content = getattr(message, "content", None)
+            name = getattr(message, "name", None)
+            tool_call_id = getattr(message, "tool_call_id", None)
+
+        if message_id is not None and str(message_id).strip():
+            return "id", str(message_id)
+
+        normalized_type = str(message_type or "human").strip().casefold()
+        normalized_type = {
+            "user": "human",
+            "assistant": "ai",
+            "aimessage": "ai",
+        }.get(normalized_type, normalized_type)
+        fingerprint = json.dumps(
+            [normalized_type, content, name, tool_call_id],
+            sort_keys=True,
+            default=str,
+        )
+        return "content", fingerprint
+
+    unmatched_initial: dict[tuple[str, str], int] = {}
+    for message in initial_messages:
+        key = identity(message)
+        unmatched_initial[key] = unmatched_initial.get(key, 0) + 1
+
+    merged = list(initial_messages)
+    for message in returned_messages:
+        key = identity(message)
+        remaining = unmatched_initial.get(key, 0)
+        if remaining:
+            unmatched_initial[key] = remaining - 1
+        else:
+            merged.append(message)
+    return merged
+
+
+async def _stream_run_events_ordinary(
         thread_id: str,
         run_id: str,
         input_state: dict[str, Any],
@@ -504,14 +737,12 @@ async def _stream_run_events(
     seq += 1
 
     # Emit initial values so the UI shows the user's message immediately
-    initial_values = dict(input_state)
-    initial_values["messages"] = [
-        serialize_message(m) for m in input_state.get("messages", [])
-    ]
+    initial_values = _public_state_values(input_state)
     yield _sse_frame("values", initial_values, event_id=seq)
     seq += 1
 
     _tool_start_times: dict[str, float] = {}
+    _streamed_tool_outputs: list[Any] = []
     _chain_end_count = 0  # debug counter
     _debug_events_logged: set[str] = set()  # track which events we've debug-logged
 
@@ -725,7 +956,19 @@ async def _stream_run_events(
                 # completed tool result.
                 output = event.get("data", {}).get("output")
                 if output is not None:
-                    tool_msg = serialize_message(output)
+                    serialized = _serialize_visible_messages([
+                        *list(input_state.get("messages") or []),
+                        *_streamed_tool_outputs,
+                        output,
+                    ])
+                    _streamed_tool_outputs.append(output)
+                    tool_msg = serialized[-1] if serialized else {
+                        "type": "tool",
+                        "id": run_name,
+                        "name": tool_name,
+                        "content": "",
+                        "tool_call_id": run_name,
+                    }
                 else:
                     tool_msg = {
                         "type": "tool",
@@ -755,9 +998,14 @@ async def _stream_run_events(
         if not messages:
             # Fallback: use input_state messages (at least the user will see their own msg)
             messages = input_state.get("messages", [])
+        public_messages = visible_messages(list(messages))
+        serialized_public_messages = _serialize_visible_messages(messages)
 
         # ── Fallback 3: emit any new AI messages that weren't captured during stream ──
-        for m in messages[_initial_msg_count:]:
+        for m, serialized_message in zip(
+                public_messages[_initial_msg_count:],
+                serialized_public_messages[_initial_msg_count:],
+        ):
             m_type = getattr(m, "type", None) if not isinstance(m, dict) else m.get("type")
             if m_type not in ("ai", "AIMessageChunk"):
                 continue
@@ -772,33 +1020,30 @@ async def _stream_run_events(
                 if mid:
                     _emitted_message_ids.add(mid)
                 else:
-                    mid = f"{run_id}-msg-{seq}"
+                    mid = serialized_message["id"]
                     _emitted_message_ids.add(mid)
-                yield _sse_frame("messages", [{
-                    "type": "ai",
-                    "id": mid,
-                    "content": str(c),
-                }], event_id=seq)
+                payload = dict(serialized_message)
+                payload.update({"type": "ai", "id": mid, "content": str(c)})
+                yield _sse_frame("messages", [payload], event_id=seq)
                 seq += 1
 
-        serialized_messages = [serialize_message(m) for m in messages]
-        values_dict["messages"] = serialized_messages
+        values_dict["messages"] = messages
+        public_values = _public_state_values(values_dict)
+        serialized_messages = public_values.get("messages", [])
 
         # Persist final state to DB for thread listing/search
         try:
-            db.update_thread(thread_id, serialized_messages, {
-                "messages": serialized_messages,
-                "files": values_dict.get("files", {}),
-                "doc_folder": values_dict.get("doc_folder"),
-                "skill": values_dict.get("skill"),
-                "no_web": values_dict.get("no_web"),
-                "wiki_query_complete": values_dict.get("wiki_query_complete", False),
-            })
+            _, serializable_result = _persistable_public_values(values_dict)
+            db.update_thread(
+                thread_id,
+                serialized_messages,
+                serializable_result,
+            )
             db.update_run_status(run_id, "success")
         except Exception as _db_err:
             _logger.warning("[stream %s] DB sync failed: %s", run_id, _db_err)
 
-        yield _sse_frame("values", values_dict, event_id=seq)
+        yield _sse_frame("values", public_values, event_id=seq)
         seq += 1
 
         yield _sse_frame("end", {
@@ -828,6 +1073,636 @@ async def _stream_run_events(
         }, event_id=seq)
 
 
+def _message_id(message: Any) -> str:
+    if isinstance(message, Mapping):
+        message_id = message.get("id")
+    else:
+        message_id = getattr(message, "id", None)
+    return str(message_id) if message_id is not None and str(message_id).strip() else ""
+
+
+def _is_final_assistant_message(message: Any) -> bool:
+    if isinstance(message, Mapping):
+        message_type = message.get("type") or message.get("role")
+        tool_calls = message.get("tool_calls")
+    else:
+        message_type = getattr(message, "type", None)
+        tool_calls = getattr(message, "tool_calls", None)
+    normalized_type = str(message_type or "").strip().casefold()
+    return (
+            normalized_type in {"ai", "assistant", "aimessage"}
+            and not tool_calls
+    )
+
+
+def _message_content(message: Any) -> Any:
+    if isinstance(message, Mapping):
+        return message.get("content")
+    return getattr(message, "content", None)
+
+
+def _contains_message_payload(value: Any) -> bool:
+    """Detect nested LangChain or serialized chat messages."""
+    message_discriminators = {
+        "ai",
+        "assistant",
+        "aimessage",
+        "aimessagechunk",
+        "human",
+        "user",
+        "humanmessage",
+        "humanmessagechunk",
+        "tool",
+        "toolmessage",
+        "toolmessagechunk",
+        "system",
+        "systemmessage",
+        "systemmessagechunk",
+    }
+    message_payload_keys = {
+        "content",
+        "tool_calls",
+        "invalid_tool_calls",
+        "tool_call_id",
+        "additional_kwargs",
+        "response_metadata",
+    }
+
+    if isinstance(value, BaseMessage):
+        return True
+    if isinstance(value, Mapping):
+        normalized_keys = {str(key).casefold() for key in value}
+        discriminator = value.get("type") or value.get("role")
+        normalized_discriminator = str(discriminator or "").strip().casefold()
+        if (
+                normalized_discriminator in message_discriminators
+                and normalized_keys.intersection(message_payload_keys)
+        ):
+            return True
+        return any(
+            str(key).casefold() == "messages"
+            or _contains_message_payload(nested)
+            for key, nested in value.items()
+        )
+    if isinstance(value, (list, tuple)):
+        return any(_contains_message_payload(item) for item in value)
+    return False
+
+
+def _is_safe_progress_update(value: Any) -> bool:
+    """Allow explicit progress fields while rejecting message-bearing chunks."""
+    safe_keys = {
+        "progress",
+        "phase",
+        "status",
+        "step",
+        "percent",
+        "current",
+        "total",
+    }
+
+    return (
+            isinstance(value, Mapping)
+            and bool(value)
+            and set(value).issubset(safe_keys)
+            and not _contains_message_payload(value)
+    )
+
+
+async def _load_stream_values(
+        thread_id: str,
+        input_state: dict[str, Any],
+) -> dict[str, Any]:
+    """Load latest checkpoint state and merge request messages without mutation."""
+    thread = db.get_thread(thread_id) or {}
+    raw_thread_values = thread.get("values")
+    fallback = (
+        dict(raw_thread_values)
+        if isinstance(raw_thread_values, Mapping)
+        else {}
+    )
+    try:
+        snapshot = await agent.aget_state(
+            {"configurable": {"thread_id": thread_id}}
+        )
+        snapshot_values = getattr(snapshot, "values", None)
+        values = (
+            dict(snapshot_values)
+            if isinstance(snapshot_values, Mapping)
+            else fallback
+        )
+    except Exception:
+        values = fallback
+
+    checkpoint_messages = values.get("messages")
+    if not isinstance(checkpoint_messages, list):
+        checkpoint_messages = thread.get("messages")
+    if not isinstance(checkpoint_messages, list):
+        checkpoint_messages = []
+    request_messages = input_state.get("messages")
+    if not isinstance(request_messages, list):
+        request_messages = []
+    values["messages"] = _preserve_initial_messages(
+        list(checkpoint_messages),
+        request_messages,
+    )
+    for key, value in input_state.items():
+        if key != "messages":
+            values.setdefault(key, value)
+    return values
+
+
+def _persist_stream_values(
+        thread_id: str,
+        values: dict[str, Any],
+) -> None:
+    serialized_messages, serializable_values = _persistable_public_values(values)
+    db.update_thread(thread_id, serialized_messages, serializable_values)
+
+
+def _cancel_stream_run_if_nonterminal(run_id: str) -> None:
+    """Mark interrupted stream cancelled without overwriting terminal state."""
+    try:
+        run = db.get_run(run_id)
+        status = run.get("status") if run else None
+        if status not in {"success", "error", "cancelled", "timeout"}:
+            db.update_run_status(run_id, "cancelled")
+    except Exception:
+        return
+
+
+async def _stream_run_events(
+        thread_id: str,
+        run_id: str,
+        input_state: dict[str, Any],
+        *,
+        recursion_limit: int = RECURSION_LIMIT,
+) -> AsyncGenerator[str, None]:
+    """Stream one ordinary run or bounded hidden todo-resumption rounds."""
+    logger = logging.getLogger(__name__)
+    seq = 0
+    try:
+        latest_values = await _load_stream_values(thread_id, input_state)
+        run = db.get_run(run_id) or {}
+        run_kwargs = run.get("kwargs")
+        candidate = (
+            run_kwargs.get("_resume_candidate", "")
+            if isinstance(run_kwargs, Mapping)
+            else ""
+        )
+        candidate = candidate if isinstance(candidate, str) else ""
+        inspection = inspect_todos(latest_values.get("todos"))
+        resume_active = (
+                is_resume_intent(candidate)
+                and inspection.has_incomplete
+        )
+    except asyncio.CancelledError:
+        db.update_run_status(run_id, "cancelled")
+        yield _sse_frame(
+            "end",
+            {"run_id": run_id, "status": "interrupted"},
+            event_id=seq,
+        )
+        raise
+    except Exception as exc:
+        try:
+            db.update_run_status(run_id, "error", error=str(exc))
+        except Exception:
+            pass
+        yield _sse_frame(
+            "error",
+            {"detail": str(exc)},
+            event_id=seq,
+        )
+        seq += 1
+        yield _sse_frame(
+            "end",
+            {"run_id": run_id, "status": "error"},
+            event_id=seq,
+        )
+        return
+
+    if not resume_active:
+        async for frame in _stream_run_events_ordinary(
+                thread_id,
+                run_id,
+                input_state,
+                recursion_limit=recursion_limit,
+        ):
+            yield frame
+        return
+
+    max_rounds = get_max_resume_rounds()
+    initial_messages = list(latest_values.get("messages") or [])
+    initial_message_ids = {
+        message_id
+        for message in initial_messages
+        if (message_id := _message_id(message))
+    }
+    initial_message_count = len(initial_messages)
+    emitted_message_ids: set[str] = set()
+    last_config: dict[str, Any] = {
+        "configurable": {"thread_id": thread_id},
+        "recursion_limit": recursion_limit,
+    }
+    rounds_completed = 0
+    end_emitted = False
+
+    try:
+        current_run = db.get_run(run_id)
+        if current_run and current_run.get("status") == "cancelled":
+            end_emitted = True
+            yield _sse_frame(
+                "end",
+                {"run_id": run_id, "status": "interrupted"},
+                event_id=seq,
+            )
+            return
+        db.update_run_status(run_id, "running")
+        yield _sse_frame(
+            "metadata",
+            {
+                "run_id": run_id,
+                "thread_id": thread_id,
+                "assistant_id": "researcher",
+                "status": "running",
+            },
+            event_id=seq,
+        )
+        seq += 1
+        yield _sse_frame(
+            "values",
+            _public_state_values(latest_values),
+            event_id=seq,
+        )
+        seq += 1
+
+        for round_number in range(1, max_rounds + 1):
+            current_run = db.get_run(run_id)
+            if current_run and current_run.get("status") == "cancelled":
+                logger.info(
+                    "resume_stream thread_id=%s run_id=%s round=%d "
+                    "max_rounds=%d incomplete_count=%d malformed_count=%d "
+                    "stop_reason=%s",
+                    thread_id,
+                    run_id,
+                    round_number - 1,
+                    max_rounds,
+                    len(inspection.incomplete),
+                    inspection.malformed_count,
+                    "cancelled",
+                )
+                yield _sse_frame(
+                    "values",
+                    _public_state_values(latest_values),
+                    event_id=seq,
+                )
+                seq += 1
+                end_emitted = True
+                yield _sse_frame(
+                    "end",
+                    {"run_id": run_id, "status": "interrupted"},
+                    event_id=seq,
+                )
+                return
+            last_config = {
+                "configurable": {
+                    "thread_id": thread_id,
+                    "resume_incomplete_todos": True,
+                    "resume_round": round_number,
+                    "resume_max_rounds": max_rounds,
+                },
+                "recursion_limit": recursion_limit,
+            }
+            logger.info(
+                "resume_stream thread_id=%s run_id=%s round=%d max_rounds=%d "
+                "incomplete_count=%d malformed_count=%d stop_reason=%s",
+                thread_id,
+                run_id,
+                round_number,
+                max_rounds,
+                len(inspection.incomplete),
+                inspection.malformed_count,
+                "invoke",
+            )
+
+            tool_start_times: dict[str, float] = {}
+            round_tool_outputs: list[Any] = []
+            async for event in agent.astream_events(
+                    _agent_input_state(latest_values),
+                    config=last_config,
+                    version="v2",
+            ):
+                event_type = event.get("event", "")
+                if event_type == "on_tool_start":
+                    tool_start_times[str(event.get("run_id", ""))] = time.time()
+                    continue
+                if event_type == "on_tool_end":
+                    tool_name = event.get("name", "unknown")
+                    tool_run_id = str(event.get("run_id", ""))
+                    output = event.get("data", {}).get("output")
+                    tool_message = {
+                        "type": "tool",
+                        "id": tool_run_id,
+                        "name": tool_name,
+                        "content": "",
+                        "tool_call_id": tool_run_id,
+                    }
+                    if isinstance(output, ToolMessage):
+                        nested_tool_payload = (
+                            output.content,
+                            output.additional_kwargs,
+                            output.response_metadata,
+                            output.artifact,
+                        )
+                        unsafe_output = any(
+                            _contains_message_payload(value)
+                            for value in nested_tool_payload
+                        )
+                    else:
+                        unsafe_output = _contains_message_payload(output)
+                    if output is not None and not unsafe_output:
+                        round_tool_outputs.append(output)
+                        if isinstance(output, (str, int, float, bool)):
+                            tool_message["content"] = str(output)
+                        else:
+                            serialized = _serialize_visible_messages([
+                                *list(latest_values.get("messages") or []),
+                                *round_tool_outputs,
+                            ])
+                            if serialized:
+                                tool_message = serialized[-1]
+                    yield _sse_frame(
+                        "updates",
+                        {"tools": {"messages": [tool_message]}},
+                        event_id=seq,
+                    )
+                    seq += 1
+                    elapsed = (
+                        time.time() - tool_start_times[tool_run_id]
+                        if tool_run_id in tool_start_times
+                        else None
+                    )
+                    logger.info(
+                        "[stream %s] Tool completed: %s%s",
+                        run_id,
+                        tool_name,
+                        f" ({elapsed:.1f}s)" if elapsed is not None else "",
+                    )
+                    continue
+                if event_type in {"on_custom_event", "on_chain_stream"}:
+                    progress = event.get("data", {}).get("chunk")
+                    if _is_safe_progress_update(progress):
+                        yield _sse_frame(
+                            "updates",
+                            dict(progress),
+                            event_id=seq,
+                        )
+                        seq += 1
+                # All model/chain terminal text stays hidden during resume rounds.
+
+            snapshot = await agent.aget_state(last_config)
+            snapshot_values = getattr(snapshot, "values", None)
+            if not isinstance(snapshot_values, Mapping):
+                raise RuntimeError("resume checkpoint reload returned no state values")
+            round_values = dict(snapshot_values)
+            if "messages" in round_values:
+                round_values["messages"] = _preserve_initial_messages(
+                    list(latest_values.get("messages") or []),
+                    round_values.get("messages"),
+                )
+            latest_values.update(round_values)
+            rounds_completed = round_number
+            inspection = inspect_todos(latest_values.get("todos"))
+
+            # Recovery snapshot after every hidden round.
+            _persist_stream_values(thread_id, latest_values)
+
+            current_run = db.get_run(run_id)
+            if current_run and current_run.get("status") == "cancelled":
+                logger.info(
+                    "resume_stream thread_id=%s run_id=%s round=%d max_rounds=%d "
+                    "incomplete_count=%d malformed_count=%d stop_reason=%s",
+                    thread_id,
+                    run_id,
+                    round_number,
+                    max_rounds,
+                    len(inspection.incomplete),
+                    inspection.malformed_count,
+                    "cancelled",
+                )
+                yield _sse_frame(
+                    "values",
+                    _public_state_values(latest_values),
+                    event_id=seq,
+                )
+                seq += 1
+                end_emitted = True
+                yield _sse_frame(
+                    "end",
+                    {"run_id": run_id, "status": "interrupted"},
+                    event_id=seq,
+                )
+                return
+
+            if not inspection.has_incomplete:
+                logger.info(
+                    "resume_stream thread_id=%s run_id=%s round=%d max_rounds=%d "
+                    "incomplete_count=%d malformed_count=%d stop_reason=%s",
+                    thread_id,
+                    run_id,
+                    round_number,
+                    max_rounds,
+                    len(inspection.incomplete),
+                    inspection.malformed_count,
+                    "complete",
+                )
+                break
+
+            if round_number < max_rounds:
+                logger.info(
+                    "resume_stream thread_id=%s run_id=%s round=%d max_rounds=%d "
+                    "incomplete_count=%d malformed_count=%d stop_reason=%s",
+                    thread_id,
+                    run_id,
+                    round_number,
+                    max_rounds,
+                    len(inspection.incomplete),
+                    inspection.malformed_count,
+                    "continue",
+                )
+                yield _sse_frame(
+                    "metadata",
+                    {
+                        "run_id": run_id,
+                        "thread_id": thread_id,
+                        "status": "running",
+                        "resume_round": round_number + 1,
+                        "resume_max_rounds": max_rounds,
+                        "incomplete_todo_count": len(inspection.incomplete),
+                    },
+                    event_id=seq,
+                )
+                seq += 1
+
+        if inspection.has_incomplete:
+            limit_message = AIMessage(
+                content=build_round_limit_message(inspection, rounds_completed),
+                id=f"{run_id}-resume-limit-{uuid.uuid4()}",
+            )
+            limit_content = limit_message.content
+            limit_message_id = _message_id(limit_message)
+            update_state = getattr(agent, "aupdate_state", None)
+            if callable(update_state):
+                await update_state(last_config, {"messages": [limit_message]})
+                snapshot = await agent.aget_state(last_config)
+                snapshot_values = getattr(snapshot, "values", None)
+                if not isinstance(snapshot_values, Mapping):
+                    raise RuntimeError(
+                        "resume checkpoint reload returned no state values"
+                    )
+                reloaded = dict(snapshot_values)
+                reloaded["messages"] = _preserve_initial_messages(
+                    list(latest_values.get("messages") or []),
+                    reloaded.get("messages"),
+                )
+                if not any(
+                        _message_id(message) == limit_message_id
+                        and _message_content(message) == limit_content
+                        for message in reloaded["messages"]
+                ):
+                    raise RuntimeError(
+                        "resume checkpoint reload omitted round-limit message"
+                    )
+                latest_values.update(reloaded)
+            else:
+                latest_values["messages"] = [
+                    *list(latest_values.get("messages") or []),
+                    limit_message,
+                ]
+            _persist_stream_values(thread_id, latest_values)
+            logger.info(
+                "resume_stream thread_id=%s run_id=%s round=%d max_rounds=%d "
+                "incomplete_count=%d malformed_count=%d stop_reason=%s",
+                thread_id,
+                run_id,
+                rounds_completed,
+                max_rounds,
+                len(inspection.incomplete),
+                inspection.malformed_count,
+                "round_limit",
+            )
+
+        final_messages = list(latest_values.get("messages") or [])
+        serialized_final_messages = iter(
+            _serialize_visible_messages(final_messages)
+        )
+        for index, message in enumerate(final_messages):
+            if not visible_messages([message]):
+                continue
+            serialized = next(serialized_final_messages)
+            if not _is_final_assistant_message(message):
+                continue
+            message_id = _message_id(message)
+            if message_id:
+                is_new = message_id not in initial_message_ids
+            else:
+                is_new = index >= initial_message_count
+            if not is_new or message_id in emitted_message_ids:
+                continue
+            if message_id:
+                emitted_message_ids.add(message_id)
+            yield _sse_frame("messages", [serialized], event_id=seq)
+            seq += 1
+
+        _persist_stream_values(thread_id, latest_values)
+        yield _sse_frame(
+            "values",
+            _public_state_values(latest_values),
+            event_id=seq,
+        )
+        seq += 1
+        db.update_run_status(run_id, "success")
+        end_emitted = True
+        yield _sse_frame(
+            "end",
+            {"run_id": run_id, "status": "success"},
+            event_id=seq,
+        )
+
+    except GeneratorExit:
+        _cancel_stream_run_if_nonterminal(run_id)
+        raise
+    except asyncio.CancelledError:
+        if not end_emitted:
+            try:
+                snapshot = await agent.aget_state(
+                    {"configurable": {"thread_id": thread_id}}
+                )
+                snapshot_values = getattr(snapshot, "values", None)
+                if isinstance(snapshot_values, Mapping):
+                    recovered = dict(snapshot_values)
+                    recovered["messages"] = _preserve_initial_messages(
+                        list(latest_values.get("messages") or []),
+                        recovered.get("messages"),
+                    )
+                    latest_values.update(recovered)
+                    _persist_stream_values(thread_id, latest_values)
+            except Exception:
+                pass
+        _cancel_stream_run_if_nonterminal(run_id)
+        if not end_emitted:
+            yield _sse_frame(
+                "end",
+                {"run_id": run_id, "status": "interrupted"},
+                event_id=seq,
+            )
+        raise
+    except Exception as exc:
+        import traceback
+
+        traceback_text = traceback.format_exc()
+        try:
+            snapshot = await agent.aget_state(
+                {"configurable": {"thread_id": thread_id}}
+            )
+            snapshot_values = getattr(snapshot, "values", None)
+            if isinstance(snapshot_values, Mapping):
+                recovered = dict(snapshot_values)
+                recovered["messages"] = _preserve_initial_messages(
+                    list(latest_values.get("messages") or []),
+                    recovered.get("messages"),
+                )
+                latest_values.update(recovered)
+                _persist_stream_values(thread_id, latest_values)
+        except Exception:
+            pass
+        logger.error(
+            "resume_stream thread_id=%s run_id=%s round=%d max_rounds=%d "
+            "incomplete_count=%d malformed_count=%d stop_reason=%s",
+            thread_id,
+            run_id,
+            rounds_completed,
+            max_rounds,
+            len(inspection.incomplete),
+            inspection.malformed_count,
+            "error",
+        )
+        db.update_run_status(run_id, "error", error=str(exc))
+        yield _sse_frame(
+            "error",
+            {"detail": str(exc), "traceback": traceback_text},
+            event_id=seq,
+        )
+        seq += 1
+        if not end_emitted:
+            yield _sse_frame(
+                "end",
+                {"run_id": run_id, "status": "error"},
+                event_id=seq,
+            )
+
+
 async def _execute_run(run_id: str, thread_id: str) -> None:
     """Invoke the agent and persist the result; called as a fire-and-forget task.
 
@@ -837,45 +1712,169 @@ async def _execute_run(run_id: str, thread_id: str) -> None:
     """
     _logger = logging.getLogger(__name__)
     db.update_run_status(run_id, "running")
+    latest_values: dict[str, Any] = {}
     try:
-        # Load all existing messages and state values on the thread
+        run = db.get_run(run_id)
+        if not run:
+            raise ValueError(f"Run {run_id} not found during run execution")
+
         thread = db.get_thread(thread_id)
         if not thread:
             raise ValueError(f"Thread {thread_id} not found during run execution")
 
-        existing_values = thread.get("values") or {}
+        latest_values = await _current_agent_values(thread_id, thread)
+        existing_values = latest_values
         existing_files = existing_values.get("files") or {}
-        messages = thread.get("messages") or []
+        initial_messages = list(existing_values.get("messages") or [])
 
         # Initialize per-thread cited_response tracking for the middleware
         existing_reports = [k for k in existing_files if k.startswith("/cited_response")]
         from research_agent.utils.knowledge_filesystem import _thread_existing_cited_responses
         _thread_existing_cited_responses[str(thread_id)] = existing_reports
 
-        input_state = {
-            "messages": messages,
-            "files": existing_files,
-            "doc_folder": existing_values.get("doc_folder"),
-            "skill": existing_values.get("skill"),
-            "no_web": existing_values.get("no_web"),
-            "wiki_query_complete": existing_values.get("wiki_query_complete", False),
-            "existing_reports": existing_reports,
-        }
-        input_state = {k: v for k, v in input_state.items() if v is not None}
+        latest_values.setdefault("files", existing_files)
+        latest_values.setdefault("existing_reports", existing_reports)
 
-        # Pass thread_id through config so ResearchStateMiddleware can access it
-        # for wiki lookups, cited_response tracking, and eval logging.
-        config = {
-            "configurable": {"thread_id": str(thread_id)},
-            "recursion_limit": RECURSION_LIMIT,
-        }
-        result = await agent.ainvoke(input_state, config=config)
+        run_kwargs = run.get("kwargs")
+        candidate = (
+            run_kwargs.get("_resume_candidate", "")
+            if isinstance(run_kwargs, dict)
+            else ""
+        )
+        candidate = candidate if isinstance(candidate, str) else ""
+        inspection = inspect_todos(latest_values.get("todos"))
+        resume_active = is_resume_intent(candidate) and inspection.has_incomplete
+        max_rounds = get_max_resume_rounds() if resume_active else 1
+        rounds_completed = 0
+        config: dict[str, Any] = {}
 
-        # Check if this run has been cancelled while executing
-        async with _task_lock:
-            run_data = db.get_run(run_id)
-            if run_data and run_data.get("status") == "cancelled":
-                return
+        for round_number in range(1, max_rounds + 1):
+            configurable: dict[str, Any] = {"thread_id": str(thread_id)}
+            if resume_active:
+                configurable.update(
+                    {
+                        "resume_incomplete_todos": True,
+                        "resume_round": round_number,
+                        "resume_max_rounds": max_rounds,
+                    }
+                )
+            config = {
+                "configurable": configurable,
+                "recursion_limit": RECURSION_LIMIT,
+            }
+            _logger.info(
+                "resume_run thread_id=%s run_id=%s round=%d max_rounds=%d "
+                "incomplete_count=%d malformed_count=%d stop_reason=%s",
+                thread_id,
+                run_id,
+                round_number,
+                max_rounds,
+                len(inspection.incomplete),
+                inspection.malformed_count,
+                "invoke",
+            )
+
+            round_result = await agent.ainvoke(
+                _agent_input_state(latest_values),
+                config=config,
+            )
+            if isinstance(round_result, dict):
+                round_values = dict(round_result)
+                if "messages" in round_values:
+                    round_values["messages"] = _preserve_initial_messages(
+                        initial_messages,
+                        round_values["messages"],
+                    )
+                latest_values.update(round_values)
+                if "todos" not in round_values:
+                    current_values = await _current_agent_values(
+                        thread_id,
+                        {"values": latest_values},
+                    )
+                    latest_values.update(current_values)
+            rounds_completed = round_number
+            inspection = inspect_todos(latest_values.get("todos"))
+
+            async with _task_lock:
+                run_data = db.get_run(run_id)
+                if run_data and run_data.get("status") == "cancelled":
+                    _logger.info(
+                        "resume_run thread_id=%s run_id=%s round=%d max_rounds=%d "
+                        "incomplete_count=%d malformed_count=%d stop_reason=%s",
+                        thread_id,
+                        run_id,
+                        round_number,
+                        max_rounds,
+                        len(inspection.incomplete),
+                        inspection.malformed_count,
+                        "cancelled",
+                    )
+                    return
+
+            if not resume_active or not inspection.has_incomplete:
+                stop_reason = "ordinary" if not resume_active else "complete"
+                _logger.info(
+                    "resume_run thread_id=%s run_id=%s round=%d max_rounds=%d "
+                    "incomplete_count=%d malformed_count=%d stop_reason=%s",
+                    thread_id,
+                    run_id,
+                    round_number,
+                    max_rounds,
+                    len(inspection.incomplete),
+                    inspection.malformed_count,
+                    stop_reason,
+                )
+                break
+
+        if resume_active and inspection.has_incomplete:
+            limit_message = AIMessage(
+                content=build_round_limit_message(inspection, rounds_completed),
+                id=f"{run_id}-resume-limit-{uuid.uuid4()}",
+            )
+            limit_content = limit_message.content
+            limit_message_id = _message_id(limit_message)
+            update_state = getattr(agent, "aupdate_state", None)
+            if callable(update_state):
+                await update_state(config, {"messages": [limit_message]})
+                snapshot = await agent.aget_state(
+                    {"configurable": {"thread_id": thread_id}}
+                )
+                snapshot_values = getattr(snapshot, "values", None)
+                if not isinstance(snapshot_values, Mapping):
+                    raise RuntimeError(
+                        "resume checkpoint reload returned no state values"
+                    )
+                reloaded = dict(snapshot_values)
+                reloaded["messages"] = _preserve_initial_messages(
+                    initial_messages,
+                    reloaded.get("messages"),
+                )
+                if not any(
+                        _message_id(message) == limit_message_id
+                        and _message_content(message) == limit_content
+                        for message in reloaded["messages"]
+                ):
+                    raise RuntimeError(
+                        "resume checkpoint reload omitted round-limit message"
+                    )
+                latest_values.update(reloaded)
+            else:
+                latest_messages = list(latest_values.get("messages") or [])
+                latest_messages.append(limit_message)
+                latest_values["messages"] = latest_messages
+            _logger.info(
+                "resume_run thread_id=%s run_id=%s round=%d max_rounds=%d "
+                "incomplete_count=%d malformed_count=%d stop_reason=%s",
+                thread_id,
+                run_id,
+                rounds_completed,
+                max_rounds,
+                len(inspection.incomplete),
+                inspection.malformed_count,
+                "round_limit",
+            )
+
+        result = latest_values
 
         # ── Citation validation (post-execution) ─────────────────────────
         files = result.get("files", {})
@@ -926,8 +1925,10 @@ async def _execute_run(run_id: str, thread_id: str) -> None:
                     else:
                         setattr(last_msg, "content", report_text)
 
-        # Serialize messages
-        serialized_messages = [serialize_message(m) for m in result.get("messages", [])]
+        # Serialize only public messages; hidden resume-round output remains internal.
+        serialized_messages = _serialize_visible_messages(
+            result.get("messages", [])
+        )
 
         # Sanitize /raw/ references in the final message
         if serialized_messages:
@@ -965,16 +1966,11 @@ async def _execute_run(run_id: str, thread_id: str) -> None:
         if not existing_reports_db:
             existing_reports_db = _thread_existing_cited_responses.get(str(thread_id), [])
 
-        # Persist to DB (for thread listing/search — checkpointer handles state)
-        serializable_result = {
-            "messages": serialized_messages,
-            "files": result.get("files", {}),
-            "doc_folder": result.get("doc_folder"),
-            "skill": result.get("skill"),
-            "no_web": result.get("no_web"),
-            "wiki_query_complete": wiki_query_complete,
-            "existing_reports": existing_reports_db,
-        }
+        # Persist all JSON-safe non-message state for thread listing/search.
+        _, serializable_result = _persistable_public_values(result)
+        serializable_result["messages"] = serialized_messages
+        serializable_result["wiki_query_complete"] = wiki_query_complete
+        serializable_result["existing_reports"] = existing_reports_db
         db.update_thread(thread_id, serialized_messages, serializable_result)
         db.update_run_status(run_id, "success")
 
@@ -982,8 +1978,39 @@ async def _execute_run(run_id: str, thread_id: str) -> None:
         db.update_run_status(run_id, "cancelled")
         raise
     except Exception as exc:
-        import traceback
-        traceback.print_exc()
+        if latest_values:
+            try:
+                serialized_messages, serializable_result = _persistable_public_values(
+                    latest_values
+                )
+                db.update_thread(
+                    thread_id,
+                    serialized_messages,
+                    serializable_result,
+                )
+            except Exception:
+                _logger.warning(
+                    "resume_run thread_id=%s run_id=%s round=%d max_rounds=%d "
+                    "incomplete_count=%d malformed_count=%d stop_reason=%s",
+                    thread_id,
+                    run_id,
+                    0,
+                    0,
+                    0,
+                    0,
+                    "error_state_persist_failed",
+                )
+        _logger.error(
+            "resume_run thread_id=%s run_id=%s round=%d max_rounds=%d "
+            "incomplete_count=%d malformed_count=%d stop_reason=%s",
+            thread_id,
+            run_id,
+            0,
+            0,
+            0,
+            0,
+            "error",
+        )
         db.update_run_status(run_id, "error", error=str(exc))
     finally:
         async with _task_lock:
@@ -1153,11 +2180,7 @@ async def get_thread_state(
             {"configurable": {"thread_id": thread_id}}
         )
         if snapshot and snapshot.values:
-            serialized_messages = [
-                serialize_message(m) for m in snapshot.values.get("messages", [])
-            ]
-            values = dict(snapshot.values)
-            values["messages"] = serialized_messages
+            values = _public_state_values(snapshot.values)
             return {
                 "values": values,
                 "next": list(snapshot.next) if snapshot.next else [],
@@ -1184,7 +2207,7 @@ async def get_thread_state(
     if thread is None:
         raise HTTPException(status_code=404, detail="Thread not found")
     return {
-        "values": thread.get("values") or {},
+        "values": _public_state_values(thread.get("values")),
         "next": [],
         "tasks": [],
     }
@@ -1219,17 +2242,31 @@ async def create_run(
             db.update_thread(thread_id, [], {"messages": []})
 
     messages = body.input.messages
-    user_message = next((m.content for m in messages if m.role == "user"), "")
+    trigger_entry = _last_user_entry(messages)
+    resume_candidate = trigger_entry[1] if trigger_entry is not None else ""
 
-    if user_message:
+    if trigger_entry is not None and resume_candidate:
+        trigger_role, trigger_content = trigger_entry
         existing = thread.get("messages") or []
-        existing.append({"role": "user", "content": user_message})
+        existing.append({"role": trigger_role, "content": trigger_content})
         db.update_thread(thread_id, existing, thread.get("values") or {})
 
     run_id = str(uuid.uuid4())
     now = datetime.now(UTC).isoformat()
     assistant_id = body.assistant_id or "researcher"
-    db.create_run(run_id, thread_id, assistant_id, now, multitask_strategy=multitask_strategy or "enqueue")
+    candidate_kwargs = (
+        {"kwargs": {"_resume_candidate": resume_candidate}}
+        if resume_candidate
+        else {}
+    )
+    db.create_run(
+        run_id,
+        thread_id,
+        assistant_id,
+        now,
+        multitask_strategy=multitask_strategy or "enqueue",
+        **candidate_kwargs,
+    )
 
     # Spawn background task and register it in _active_tasks
     async with _task_lock:
@@ -1271,12 +2308,22 @@ async def stream_run(
 
     run_id = str(uuid.uuid4())
     now = datetime.now(UTC).isoformat()
+    raw_messages: Any = []
+    if isinstance(body.input, dict):
+        raw_messages = body.input.get("messages", [])
+    resume_candidate = _last_user_message(raw_messages)
+    candidate_kwargs = (
+        {"kwargs": {"_resume_candidate": resume_candidate}}
+        if resume_candidate
+        else {}
+    )
 
     # Record the run
     db.create_run(
         run_id, thread_id,
         body.assistant_id or "researcher", now,
         multitask_strategy=body.multitask_strategy or "enqueue",
+        **candidate_kwargs,
     )
 
     # Build input state from current thread values
@@ -1286,16 +2333,14 @@ async def stream_run(
 
     # Parse incoming messages and append to thread messages
     messages = list(thread.get("messages") or [])
-    if isinstance(body.input, dict):
-        raw_messages = body.input.get("messages", [])
-        if isinstance(raw_messages, list):
-            for msg in raw_messages:
-                if isinstance(msg, dict):
-                    messages.append({
-                        "role": str(msg.get("role", "user")),
-                        "content": str(msg.get("content", "")),
-                        "name": msg.get("name"),
-                    })
+    if isinstance(raw_messages, list):
+        for msg in raw_messages:
+            if isinstance(msg, dict):
+                messages.append({
+                    "role": str(msg.get("role", "user")),
+                    "content": str(msg.get("content", "")),
+                    "name": msg.get("name"),
+                })
 
     # Persist the user message to DB immediately so GET /threads/{id} shows it
     db.update_thread(thread_id, messages, existing_values)

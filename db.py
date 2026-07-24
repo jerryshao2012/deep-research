@@ -804,6 +804,9 @@ def create_run(
         assistant_id: str,
         created_at: str,
         multitask_strategy: str | None = None,
+        *,
+        metadata: dict[str, Any] | None = None,
+        kwargs: dict[str, Any] | None = None,
 ) -> None:
     """Insert a new run record with status ``"pending"``.
 
@@ -813,8 +816,12 @@ def create_run(
         assistant_id: The assistant configuration ID.
         created_at: ISO 8601 creation timestamp.
         multitask_strategy: Queueing strategy. Defaults to ``"enqueue"``.
+        metadata: Optional run metadata.
+        kwargs: Optional run arguments.
     """
     strategy = multitask_strategy or "enqueue"
+    metadata = metadata or {}
+    kwargs = kwargs or {}
     db_type = os.environ.get("DB_TYPE", "sqlite").lower()
 
     if db_type == "sqlite":
@@ -829,8 +836,8 @@ def create_run(
                     "pending",
                     created_at,
                     created_at,
-                    json.dumps({}),
-                    json.dumps({}),
+                    json.dumps(metadata),
+                    json.dumps(kwargs),
                     strategy,
                     None,
                 ),
@@ -850,8 +857,8 @@ def create_run(
                         "pending",
                         created_at,
                         created_at,
-                        json.dumps({}),
-                        json.dumps({}),
+                        json.dumps(metadata),
+                        json.dumps(kwargs),
                         strategy,
                         None,
                     ),
@@ -866,8 +873,8 @@ def create_run(
             "status": "pending",
             "created_at": created_at,
             "updated_at": created_at,
-            "metadata": {},
-            "kwargs": {},
+            "metadata": metadata,
+            "kwargs": kwargs,
             "multitask_strategy": strategy,
             "error": None,
         }

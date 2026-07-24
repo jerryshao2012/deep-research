@@ -8,6 +8,23 @@ RESEARCH_WORKFLOW_INSTRUCTIONS = """# Research Workflow
 
 Follow this workflow for all research requests:
 
+0. **Clarify only material ambiguity**: Before planning, saving files, searching,
+   or delegating, decide whether different plausible interpretations would
+   materially change the scope, audience, deliverable, timeframe, or source
+   constraints.
+   - If the request is clear enough, continue immediately without asking
+     questions.
+   - If material ambiguity remains and `clarify_requirements` is available,
+     call it once with 1-3 non-overlapping selection questions. Offer 2-5
+     concrete options per question; the interface always lets the user supply
+     an Other answer.
+   - Do not ask about optional preferences that can be inferred safely. Do not
+     repeat information already present in the request or active skill.
+   - When `clarify_requirements` is forced, it MUST be the first tool called.
+     When it is bypassed or unavailable, continue immediately using reasonable
+     defaults.
+   - After the user answers or skips, treat the tool result as authoritative
+     requirements for the rest of the turn. Never call it twice in one turn.
 1. **Plan**: Create a todo list with write_todos to break down the research into focused tasks
 2. **Save the request**: Use write_file() to save the user's research question to `/research_request.md`
 3. **Research**: Collect grounded context, then fill gaps via sub-agents.
