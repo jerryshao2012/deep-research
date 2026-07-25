@@ -1,394 +1,123 @@
 #!/bin/bash
-# Bi-directional sync between Azure File Share and local ./sync/ folder.
-#
-# Remote (Azure File Share) top-level folders synced:
-#   docs, output, input, .langgraph_api
-#   (all subdirectories are discovered and synced automatically)
-#
-# Local mirror:  ./sync/<folder>/
+# Sync local sync/ directory with Azure Blob Storage.
 #
 # Usage:
-#   ./sync-files.sh                # full bi-directional sync
+#   ./sync-files.sh                # full bi-directional sync (download then upload)
 #   ./sync-files.sh --download     # only download (Azure → local)
 #   ./sync-files.sh --upload       # only upload   (local → Azure)
-#   ./sync-files.sh --verbose      # show raw az CLI output for debugging
 #   ./sync-files.sh --help
 
-set -uo pipefail
+set -euo pipefail
 
-# ── Parse arguments ─────────────────────────────────────────────────
-MODE="sync"   # sync | download | upload
-VERBOSE=false
+# Parse args
+MODE="sync" # sync | download | upload
 
 while [[ $# -gt 0 ]]; do
   case $1 in
-    --download)  MODE="download";  shift ;;
-    --upload)    MODE="upload";    shift ;;
-    --verbose)   VERBOSE=true;     shift ;;
+    --download) MODE="download"; shift ;;
+    --upload)   MODE="upload";   shift ;;
     --help|-h)
       echo "Usage: ./sync-files.sh [OPTIONS]"
       echo ""
-      echo "Bi-directional sync between Azure File Share and local ./sync/ folder."
-      echo ""
       echo "Options:"
-      echo "  --download   Only download from Azure File Share to local"
-      echo "  --upload     Only upload from local to Azure File Share"
-      echo "  --verbose    Show raw Azure CLI output for debugging"
+      echo "  --download   Only download from Azure Blob Storage to local sync/ folder"
+      echo "  --upload     Only upload from local sync/ folder to Azure Blob Storage"
       echo "  --help, -h   Show this help message"
       exit 0
       ;;
     *)
       echo "❌ Unknown option: $1"
-      echo "Use --help for usage information"
       exit 1
       ;;
   esac
 done
 
-# ── Source environment ──────────────────────────────────────────────
 source ./env.sh
 
-SYNC_START_TIME=$(date +%s)
+if [ -f "./.env" ]; then
+  set -a; source "./.env"; set +a
+fi
 
-echo "🔄 Azure File Share ↔ Local Bi-directional Sync"
-echo "   Mode: ${MODE}"
-echo ""
-
-# ── Retrieve storage credentials from Key Vault ─────────────────────
 echo "🔐 Retrieving storage credentials from Key Vault..."
-STORAGE_ACCOUNT_NAME=$(az keyvault secret show \
-  --vault-name "$KV_NAME" \
-  --name STORAGE-ACCOUNT-NAME \
-  --query value -o tsv)
-
-STORAGE_KEY=$(az keyvault secret show \
-  --vault-name "$KV_NAME" \
-  --name STORAGE-ACCOUNT-KEY \
-  --query value -o tsv)
-
-FILE_SHARE_NAME=$(az keyvault secret show \
-  --vault-name "$KV_NAME" \
-  --name FILE-SHARE-NAME \
-  --query value -o tsv)
+STORAGE_ACCOUNT_NAME=$(az keyvault secret show --vault-name "$KV_NAME" --name STORAGE-ACCOUNT-NAME --query value -o tsv)
+STORAGE_KEY=$(az keyvault secret show --vault-name "$KV_NAME" --name STORAGE-ACCOUNT-KEY --query value -o tsv)
+BLOB_CONTAINER_NAME=$(az keyvault secret show --vault-name "$KV_NAME" --name AZURE-STORAGE-CONTAINER-NAME --query value -o tsv 2>/dev/null || echo "deep-research-blobs")
 
 echo "✅ Storage Account: $STORAGE_ACCOUNT_NAME"
-echo "✅ File Share:      $FILE_SHARE_NAME"
+echo "✅ Blob Container:  $BLOB_CONTAINER_NAME"
 echo ""
 
-# ── Local sync root ─────────────────────────────────────────────────
 SYNC_ROOT="./sync"
 mkdir -p "$SYNC_ROOT"
 
-# ── Top-level folders to scan (subfolders discovered automatically) ──
-TOP_FOLDERS=(
-  "docs"
-  "output"
-  "input"
-)
+# Folders to sync
+FOLDERS=("docs" "output" "input" ".langgraph_api")
 
-# ── Counters ────────────────────────────────────────────────────────
-TOTAL_DOWNLOADED=0
-TOTAL_UPLOADED=0
-SKIPPED=0
+if [ "$MODE" != "upload" ]; then
+  echo "📥 Downloading files from Azure Blob Storage..."
+  for folder in "${FOLDERS[@]}"; do
+    echo "  + Downloading $folder/..."
+    az storage blob download-batch \
+      --source "$BLOB_CONTAINER_NAME" \
+      --destination "$SYNC_ROOT" \
+      --pattern "$folder/*" \
+      --account-name "$STORAGE_ACCOUNT_NAME" \
+      --account-key "$STORAGE_KEY" \
+      --no-progress > /dev/null 2>&1 || echo "  ~ No files found under $folder/ on Azure"
+  done
+fi
 
-# ── Helper: recursively discover all subdirectories on Azure ────────
-# Outputs one folder path per line (parent before children, DFS order).
-discover_remote_dirs() {
-  local dir="$1"
-  local json
-  json=$(az storage file list \
-    --path "$dir" \
-    --account-name "$STORAGE_ACCOUNT_NAME" \
-    --account-key "$STORAGE_KEY" \
-    --share-name "$FILE_SHARE_NAME" \
-    -o json 2>/dev/null) || json="[]"
-
-  # Debug: show raw JSON structure for the first folder only
-  if $VERBOSE; then
-    echo "   [debug] az storage file list --path '$dir' returned:" >&2
-    echo "$json" | python3 -c "
-import sys, json
-try:
-    items = json.load(sys.stdin)
-    for item in items:
-        print(f\"   [debug]   name={item.get('name','?')}  type={item.get('type','?')}  keys={list(item.keys())}\")
-except Exception as e:
-    print(f'   [debug]   parse error: {e}')
-" >&2
-  fi
-
-  local dirs
-  dirs=$(echo "$json" | python3 -c "
-import sys, json
-try:
-    items = json.load(sys.stdin)
-    for item in items:
-        t = item.get('type', '')
-        # Handle both 'type' at top level and nested in 'properties'
-        if not t:
-            t = item.get('properties', {}).get('type', '')
-        if t.lower() in ('directory', 'dir'):
-            print(item['name'])
-except:
-    pass
-" 2>/dev/null || true)
-
-  while IFS= read -r d; do
-    [ -n "$d" ] || continue
-    local child
-    if [ -z "$dir" ]; then
-      child="$d"
-    else
-      child="${dir}/${d}"
-    fi
-    echo "$child"
-    discover_remote_dirs "$child"
-  done <<< "$dirs"
-}
-
-# ── Helper: discover all subdirectories locally inside SYNC_ROOT ───
-discover_local_dirs() {
-  local prefix="$1"
-  local local_path="${SYNC_ROOT}/${prefix}"
-  if [ -d "$local_path" ]; then
-    find "$local_path" -mindepth 1 -type d 2>/dev/null | while IFS= read -r d; do
-      rel="${d#${SYNC_ROOT}/}"
-      [ -n "$rel" ] && echo "$rel"
-    done
-  fi
-}
-
-}
-
-# ── Build full folder list (top-level + all discovered subfolders) ──
-echo "🔍 Discovering remote folder structure..."
-ALL_FOLDERS=()
-for top in "${TOP_FOLDERS[@]}"; do
-  ALL_FOLDERS+=("$top")
-  while IFS= read -r sub; do
-    [ -n "$sub" ] || continue
-    ALL_FOLDERS+=("$sub")
-  done < <(discover_remote_dirs "$top")
-
-  while IFS= read -r sub; do
-    [ -n "$sub" ] || continue
-    ALL_FOLDERS+=("$sub")
-  done < <(discover_local_dirs "$top")
-done
-
-# De-duplicate while preserving order
-SYNC_FOLDERS=()
-for f in "${ALL_FOLDERS[@]}"; do
-  already=false
-  if [ ${#SYNC_FOLDERS[@]} -gt 0 ]; then
-    for existing in "${SYNC_FOLDERS[@]}"; do
-      if [[ "$existing" == "$f" ]]; then
-        already=true
-        break
-      fi
-    done
-  fi
-  if ! $already; then
-    SYNC_FOLDERS+=("$f")
-  fi
-done
-echo "   Found ${#SYNC_FOLDERS[@]} folder(s): ${SYNC_FOLDERS[*]}"
-echo ""
-
-# ── Helper: list remote files in a folder, one name per line ────────
-# Uses az storage file list + python3 JSON parsing (reliable, bash 3.x safe).
-# Returns empty string if folder doesn't exist or is empty.
-list_remote_files() {
-  local folder="$1"
-  local json
-  json=$(az storage file list \
-    --path "$folder" \
-    --account-name "$STORAGE_ACCOUNT_NAME" \
-    --account-key "$STORAGE_KEY" \
-    --share-name "$FILE_SHARE_NAME" \
-    -o json 2>/dev/null) || json="[]"
-
-  echo "$json" | python3 -c "
-import sys, json
-try:
-    items = json.load(sys.stdin)
-    for item in items:
-        t = item.get('type', '')
-        if not t:
-            t = item.get('properties', {}).get('type', '')
-        if t.lower() == 'file':
-            print(item['name'])
-except:
-    pass
-" 2>/dev/null || true
-}
-
-# ── Helper: download a single file from Azure File Share ────────────
-download_file() {
-  local folder="$1"
-  local filename="$2"
-  local dest_dir="$3"
-
-  if $VERBOSE; then
-    echo "   [debug] downloading ${folder}/${filename}"
-  fi
-
-  az storage file download \
-    --share-name "$FILE_SHARE_NAME" \
-    --path "${folder}/${filename}" \
-    --dest "${dest_dir}/${filename}" \
-    --account-name "$STORAGE_ACCOUNT_NAME" \
-    --account-key "$STORAGE_KEY" \
-    --no-overwrite >/dev/null 2>&1 || {
-      if $VERBOSE; then
-        echo "   ⚠️  failed to download ${filename} (retrying without --no-overwrite)"
-      fi
-      # Retry without --no-overwrite in case the flag is the issue
-      az storage file download \
-        --share-name "$FILE_SHARE_NAME" \
-        --path "${folder}/${filename}" \
-        --dest "${dest_dir}/${filename}" \
+if [ "$MODE" != "download" ]; then
+  echo "📤 Uploading files to Azure Blob Storage..."
+  for folder in "${FOLDERS[@]}"; do
+    if [ -d "$SYNC_ROOT/$folder" ]; then
+      echo "  + Uploading $folder/..."
+      az storage blob upload-batch \
+        --destination "$BLOB_CONTAINER_NAME" \
+        --source "$SYNC_ROOT/$folder" \
+        --destination-path "$folder" \
         --account-name "$STORAGE_ACCOUNT_NAME" \
         --account-key "$STORAGE_KEY" \
-        >/dev/null 2>&1 || echo "   ⚠️  failed to download ${filename}"
-    }
-}
-
-# ── Helper: upload a single file to Azure File Share ────────────────
-upload_file() {
-  local folder="$1"
-  local local_path="$2"
-  local filename="$3"
-
-  if $VERBOSE; then
-    echo "   [debug] uploading ${filename} to ${folder}/"
-  fi
-
-  az storage file upload \
-    --source "$local_path" \
-    --path "$folder" \
-    --account-name "$STORAGE_ACCOUNT_NAME" \
-    --account-key "$STORAGE_KEY" \
-    --share-name "$FILE_SHARE_NAME" >/dev/null 2>&1 || \
-    echo "   ⚠️  failed to upload ${filename}"
-}
-
-# ═════════════════════════════════════════════════════════════════════
-# Main sync loop
-# ═════════════════════════════════════════════════════════════════════
-echo "📦 Starting bi-directional sync..."
-echo ""
-
-for folder in "${SYNC_FOLDERS[@]}"; do
-  local_folder="${SYNC_ROOT}/${folder}"
-
-  # ── Get remote file list (works for all folder types) ────────────
-  remote_names=$(list_remote_files "$folder")
-
-  if [ -n "$remote_names" ]; then
-    remote_count=$(echo "$remote_names" | wc -l)
-    remote_count=${remote_count//[[:space:]]/}
-  else
-    remote_count=0
-  fi
-
-  # ── Get local file list ───────────────────────────────────────────
-  local_files=()
-  if [ -d "$local_folder" ]; then
-    while IFS= read -r lf; do
-      [ -f "$lf" ] && local_files+=("$lf")
-    done < <(find "$local_folder" -maxdepth 1 -type f 2>/dev/null)
-  fi
-  local_count=${#local_files[@]}
-
-  # Skip if both remote and local are empty
-  if [ "$remote_count" -eq 0 ] && [ "$local_count" -eq 0 ]; then
-    echo "⏭️  ${folder}/  — empty on server and local, skipping"
-    SKIPPED=$(( SKIPPED + 1 ))
-    continue
-  fi
-
-  # ── PHASE 1: Download ──────────────────────────────────────────
-  if [[ "$MODE" != "upload" ]]; then
-    mkdir -p "$local_folder"
-    downloaded=0
-
-    if [ "$remote_count" -gt 0 ]; then
-      while IFS= read -r fname; do
-        [ -n "$fname" ] || continue
-        dest="${local_folder}/${fname}"
-        if [ ! -f "$dest" ]; then
-          download_file "$folder" "$fname" "$local_folder"
-          downloaded=$(( downloaded + 1 ))
-        fi
-      done <<< "$remote_names"
+        --overwrite true \
+        --no-progress > /dev/null
+    else
+      echo "  ~ Skipping local directory $folder/ (does not exist)"
     fi
-
-    echo "📁 ${folder}/  — 📥 ${downloaded} new / ${remote_count} server files (${local_count} local)"
-    TOTAL_DOWNLOADED=$(( TOTAL_DOWNLOADED + downloaded ))
-  else
-    echo "📁 ${folder}/  — (${remote_count} server files, ${local_count} local files)"
-  fi
-
-  # ── PHASE 2: Upload files missing on Azure ─────────────────────
-  if [[ "$MODE" != "download" ]]; then
-    if [ "$local_count" -gt 0 ]; then
-      for local_file in "${local_files[@]}"; do
-        [ -f "$local_file" ] || continue
-        fname=$(basename "$local_file")
-        if [ "$remote_count" -eq 0 ] || ! echo "$remote_names" | grep -qxF "$fname"; then
-          echo "   ↑ uploading: ${folder}/${fname}"
-          upload_file "$folder" "$local_file" "$fname"
-          TOTAL_UPLOADED=$(( TOTAL_UPLOADED + 1 ))
-        fi
-      done
-    fi
-  fi
-done
-
-# ── Sync database file (deep_research.db) ───────────────────────────
-if [[ "$MODE" != "download" ]] && [ -f "./deep_research.db" ]; then
-  echo "   ↑ uploading database file: deep_research.db"
-  upload_file "" "./deep_research.db" "deep_research.db"
-  TOTAL_UPLOADED=$(( TOTAL_UPLOADED + 1 ))
+  done
 fi
 
-if [[ "$MODE" != "upload" ]]; then
-  db_remote=$(list_remote_files "" | grep -x "deep_research.db" || true)
-  if [ -n "$db_remote" ]; then
-    echo "   📥 downloading database file: deep_research.db"
-    download_file "" "deep_research.db" "$SYNC_ROOT"
-    TOTAL_DOWNLOADED=$(( TOTAL_DOWNLOADED + 1 ))
+# Sync database file (deep_research.db)
+if [ "$MODE" != "upload" ]; then
+  echo "📥 Downloading database file: deep_research.db..."
+  if az storage blob exists --container-name "$BLOB_CONTAINER_NAME" --name "deep_research.db" --account-name "$STORAGE_ACCOUNT_NAME" --account-key "$STORAGE_KEY" --query "exists" -o tsv 2>/dev/null | grep -q "true"; then
+    az storage blob download \
+      --container-name "$BLOB_CONTAINER_NAME" \
+      --name "deep_research.db" \
+      --file "./deep_research.db" \
+      --account-name "$STORAGE_ACCOUNT_NAME" \
+      --account-key "$STORAGE_KEY" --no-progress >/dev/null 2>&1 || true
+    cp "./deep_research.db" "$SYNC_ROOT/deep_research.db" 2>/dev/null || true
+    echo "  + Downloaded deep_research.db successfully"
+  else
+    echo "  ~ No remote database file found"
   fi
 fi
 
-# ── Count total files in sync root ──────────────────────────────────
-TOTAL_LOCAL=$(find "$SYNC_ROOT" -type f 2>/dev/null | wc -l)
-TOTAL_LOCAL=${TOTAL_LOCAL//[[:space:]]/}
-
-# ── Summary ─────────────────────────────────────────────────────────
-SYNC_END_TIME=$(date +%s)
-SYNC_DURATION=$(( SYNC_END_TIME - SYNC_START_TIME ))
-
-echo ""
-echo "═══════════════════════════════════════════════════════"
-echo "✅ Sync complete! (${SYNC_DURATION}s)"
-echo "═══════════════════════════════════════════════════════"
-echo "   📥 Files downloaded:       ${TOTAL_DOWNLOADED}"
-echo "   📤 Files uploaded to Azure: ${TOTAL_UPLOADED}"
-echo "   ⏭️  Folders skipped:        ${SKIPPED}"
-echo "   📂 Total files in ./sync/:  ${TOTAL_LOCAL}"
-echo ""
-echo "   Local sync root: $(pwd)/${SYNC_ROOT}"
-echo ""
-echo "📂 Per-folder breakdown:"
-for f in "${SYNC_FOLDERS[@]}"; do
-  if [ -d "${SYNC_ROOT}/${f}" ]; then
-    cnt=$(find "${SYNC_ROOT}/${f}" -maxdepth 1 -type f 2>/dev/null | wc -l)
-    cnt=${cnt//[[:space:]]/}
-    echo "   ${f}/  (${cnt} files)"
-  else
-    echo "   ${f}/  (skipped)"
+if [ "$MODE" != "download" ]; then
+  if [ -f "./deep_research.db" ]; then
+    echo "📤 Uploading database file: deep_research.db..."
+    az storage blob upload \
+      --container-name "$BLOB_CONTAINER_NAME" \
+      --name "deep_research.db" \
+      --file "./deep_research.db" \
+      --account-name "$STORAGE_ACCOUNT_NAME" \
+      --account-key "$STORAGE_KEY" \
+      --overwrite true --no-progress >/dev/null
+    echo "  + Uploaded deep_research.db successfully"
   fi
-done
+fi
+
+echo ""
+echo "═══════════════════════════════════════════════════════"
+echo "✅ Sync complete!"
 echo "═══════════════════════════════════════════════════════"

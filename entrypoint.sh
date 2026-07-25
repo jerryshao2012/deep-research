@@ -9,6 +9,7 @@ set -e
 PROJECT_ROOT="${PROJECT_ROOT:-/deps/deep_research}"
 MOUNT_PATH="${MOUNT_PATH:-$PROJECT_ROOT/mnt}"
 AWS_MODE=false
+AZURE_BLOB_MODE=false
 
 echo "═══════════════════════════════════════════════════════"
 echo "🔧 Entrypoint: Configuring persistent storage..."
@@ -22,16 +23,22 @@ if [ -n "${S3_BUCKET_NAME:-}" ]; then
     echo "   Region: ${AWS_REGION:-us-east-1}"
     mkdir -p "$PROJECT_ROOT/docs" "$PROJECT_ROOT/output" "$PROJECT_ROOT/input"
 
+elif [ -n "${AZURE_STORAGE_CONTAINER_NAME:-}" ]; then
+    # Azure Blob Storage mode (Free Tier)
+    AZURE_BLOB_MODE=true
+    echo "🔵 Azure Blob Storage mode detected (AZURE_STORAGE_CONTAINER_NAME=$AZURE_STORAGE_CONTAINER_NAME)"
+    mkdir -p "$PROJECT_ROOT/docs" "$PROJECT_ROOT/output" "$PROJECT_ROOT/input"
+
 elif mountpoint -q "$MOUNT_PATH" 2>/dev/null || [ -d "$MOUNT_PATH" ]; then
     # ── Azure mode: File Share already mounted by the platform ───────────────
     if mountpoint -q "$MOUNT_PATH" 2>/dev/null; then
-        echo "🔵 Azure mode detected (File Share mounted at $MOUNT_PATH)"
+        echo "🔵 Azure File Share mode detected (mounted at $MOUNT_PATH)"
     else
         echo "🔵 Mount path exists at $MOUNT_PATH (local dev or pre-mounted)"
     fi
 else
     echo "⚠️  No persistent storage backend detected."
-    echo "   Set S3_BUCKET_NAME (AWS) or mount Azure File Share at $MOUNT_PATH."
+    echo "   Set S3_BUCKET_NAME (AWS), AZURE_STORAGE_CONTAINER_NAME (Azure Blob), or mount Azure File Share at $MOUNT_PATH."
     echo "   Directories will be ephemeral."
 fi
 
@@ -83,7 +90,7 @@ setup_persistent_dir() {
     fi
 }
 
-if ! $AWS_MODE; then
+if ! $AWS_MODE && ! $AZURE_BLOB_MODE; then
     setup_persistent_dir "docs"
     setup_persistent_dir "output"
     setup_persistent_dir "input"
@@ -100,6 +107,9 @@ if $AWS_MODE; then
     python3 -m s3_storage startup
     echo "📥 Restoring guarded LangGraph snapshot..."
     python3 -m langgraph_snapshot restore --write-receipt
+elif $AZURE_BLOB_MODE; then
+    echo "📥 Downloading generic application files from Azure Blob Storage..."
+    python3 -m azure_storage startup
 fi
 
 # Execute the passed command (e.g., langgraph dev)

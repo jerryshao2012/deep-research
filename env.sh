@@ -15,4 +15,4 @@ export AGENT_NAME="deep-research-agent-$SEED"
 export KV_NAME="kv-deep-agents-$SEED"
 
 # 4. Agent URL
-export DEEP_RESEARCH_AGENT_URL="https://deep-research-agent-0312.salmonrock-b46ff20d.canadacentral.azurecontainerapps.io"
+export DEEP_RESEARCH_AGENT_URL="https://deep-research-agent-0312.wonderfulpond-ab06e6af.canadacentral.azurecontainerapps.io"

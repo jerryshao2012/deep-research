@@ -53,8 +53,11 @@ echo "🚀 Starting Deep Research Agent build..."
 # 1. Set Azure Subscription
 start_step "Set Azure Subscription"
 AZURE_SUBSCRIPTION_ID="66fadccd-d26d-4dd0-b108-46b3c581cdb3"
-az account set --subscription $AZURE_SUBSCRIPTION_ID
-echo "✅ Subscription set to $AZURE_SUBSCRIPTION_ID"
+if az account set --subscription $AZURE_SUBSCRIPTION_ID 2>/dev/null; then
+  echo "✅ Subscription set to $AZURE_SUBSCRIPTION_ID"
+else
+  echo "⚠️  Warning: Could not set Azure subscription $AZURE_SUBSCRIPTION_ID."
+fi
 end_step
 
 # 2. Create resource group
@@ -62,19 +65,13 @@ start_step "Resource Group Setup"
 if az group show --name $RESOURCE_GROUP &> /dev/null; then
   echo "✅ Resource group '$RESOURCE_GROUP' already exists. Skipping creation."
 else
-  az group create --name $RESOURCE_GROUP --location $LOCATION
+  echo "⚠️  Warning: Resource group '$RESOURCE_GROUP' check/creation bypassed (subscription may be disabled)."
 fi
 end_step
 
 # 3. Azure Provider Registration
 start_step "Azure Provider Registration"
-echo "📝 Registering required Azure providers..."
-az provider register -n Microsoft.OperationalInsights --wait
-az provider register -n Microsoft.App --wait
-az provider register -n Microsoft.KeyVault --wait
-az provider register -n Microsoft.Storage --wait
-az provider register -n Microsoft.ManagedIdentity --wait
-echo "✅ Providers registered."
+echo "📝 Skipping Azure provider registration check (subscription may be disabled)..."
 end_step
 
 # 4. Check Docker Hub Username
@@ -91,7 +88,7 @@ if [ -n "$DOCKER_HUB_PAT" ]; then
     container system start --disable-kernel-install
   fi
   echo "🔐 Logging into Docker Hub..."
-  echo "$DOCKER_HUB_PAT" | container registry login -u "$DOCKER_HUB_USERNAME" --password-stdin
+  echo "$DOCKER_HUB_PAT" | container registry login -u "$DOCKER_HUB_USERNAME" --password-stdin docker.io
 fi
 end_step
 

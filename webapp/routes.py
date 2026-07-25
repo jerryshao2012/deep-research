@@ -15,12 +15,12 @@ import re
 import shutil
 import sys
 import zipfile
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import yaml
 from fastapi import File, Form, Header, HTTPException, Request, UploadFile, status
 from fastapi.responses import FileResponse, RedirectResponse
-from pathlib import Path, PurePosixPath
 
 import webapp.config as _cfg
 from research_agent.utils.content_extractors import extract_supported_document
@@ -528,10 +528,12 @@ def register_oauth_routes(app) -> None:
 
         request.session["oauth_frontend_url"] = target_frontend
 
-        forwarded_proto = request.headers.get("x-forwarded-proto", "http")
         forwarded_host = request.headers.get(
             "x-forwarded-host", request.headers.get("host", "")
         )
+        forwarded_proto = request.headers.get("x-forwarded-proto", "http")
+        if "localhost" not in forwarded_host and "127.0.0.1" not in forwarded_host:
+            forwarded_proto = "https"
         base_url = (
             f"{forwarded_proto}://{forwarded_host}"
             if forwarded_host

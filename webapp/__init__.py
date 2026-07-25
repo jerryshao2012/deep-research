@@ -176,6 +176,55 @@ def _start_generic_s3_upload_daemon(
     return _GenericS3Daemon(stop_event=stop_event, thread=thread)
 
 
+class _GenericAzureDaemon(NamedTuple):
+    stop_event: threading.Event
+    thread: threading.Thread
+
+
+def _generic_azure_upload_loop(
+    stop_event: threading.Event,
+    interval_seconds: float,
+) -> None:
+    """Periodically mirror generic runtime folders to Azure Blob Storage."""
+    from azure_storage import _resolve_tracked_folders, upload_directory_sync
+
+    while not stop_event.wait(interval_seconds):
+        try:
+            for blob_prefix, local_path in _resolve_tracked_folders():
+                if stop_event.is_set():
+                    return
+                upload_directory_sync(local_path, blob_prefix)
+        except Exception:
+            logger.exception("generic Azure upload cycle failed; retrying")
+
+
+def _generic_azure_sync_interval_seconds() -> float:
+    raw_interval = os.environ.get("AZURE_STORAGE_SYNC_INTERVAL_SECONDS", "5")
+    try:
+        interval_seconds = float(raw_interval)
+    except ValueError as exc:
+        raise ValueError("AZURE_STORAGE_SYNC_INTERVAL_SECONDS must be a number") from exc
+    if not math.isfinite(interval_seconds) or interval_seconds <= 0:
+        raise ValueError("AZURE_STORAGE_SYNC_INTERVAL_SECONDS must be finite and greater than zero")
+    return interval_seconds
+
+
+def _start_generic_azure_upload_daemon(
+    interval_seconds: float | None = None,
+) -> _GenericAzureDaemon:
+    if interval_seconds is None:
+        interval_seconds = _generic_azure_sync_interval_seconds()
+    stop_event = threading.Event()
+    thread = threading.Thread(
+        target=_generic_azure_upload_loop,
+        args=(stop_event, interval_seconds),
+        name="generic-azure-upload",
+        daemon=True,
+    )
+    thread.start()
+    return _GenericAzureDaemon(stop_event=stop_event, thread=thread)
+
+
 def _join_persistence_workers(
     workers: list[threading.Thread],
     *,
@@ -193,7 +242,7 @@ def _join_persistence_workers(
         names = ", ".join(alive)
         raise PersistenceWorkerShutdownError(
             "persistence workers did not stop within "
-            f"{timeout_seconds:g}s; in-flight S3 work remains: {names}"
+            f"{timeout_seconds:g}s; in-flight work remains: {names}"
         )
 
 
@@ -203,6 +252,21 @@ def _stop_generic_s3_upload_daemon(
     timeout_seconds: float = _PERSISTENCE_WORKER_SHUTDOWN_TIMEOUT_SECONDS,
 ) -> None:
     """Stop generic worker or fail after bounded in-flight S3 grace period."""
+    if daemon is None:
+        return
+    daemon.stop_event.set()
+    _join_persistence_workers(
+        [daemon.thread],
+        timeout_seconds=timeout_seconds,
+    )
+
+
+def _stop_generic_azure_upload_daemon(
+    daemon: _GenericAzureDaemon | None,
+    *,
+    timeout_seconds: float = _PERSISTENCE_WORKER_SHUTDOWN_TIMEOUT_SECONDS,
+) -> None:
+    """Stop generic worker or fail after bounded in-flight Azure grace period."""
     if daemon is None:
         return
     daemon.stop_event.set()
@@ -234,6 +298,7 @@ async def _lifespan(app: FastAPI):
     """Startup / shutdown hooks."""
     _runtime_lease = None
     _generic_s3_daemon = None
+    _generic_azure_daemon = None
     try:
         import db
         db.init_db()
@@ -303,16 +368,27 @@ async def _lifespan(app: FastAPI):
                     sync_interval_seconds
                 )
 
+        from azure_storage import is_azure_storage_enabled
+
+        if is_azure_storage_enabled():
+            sync_interval_seconds = _generic_azure_sync_interval_seconds()
+            _generic_azure_daemon = _start_generic_azure_upload_daemon(
+                sync_interval_seconds
+            )
+
         yield
     finally:
         if _generic_s3_daemon is not None:
             _generic_s3_daemon.stop_event.set()
+        if _generic_azure_daemon is not None:
+            _generic_azure_daemon.stop_event.set()
         if _runtime_lease is not None:
             _runtime_lease.stop_event.set()
 
         shutdown_errors: list[PersistenceWorkerShutdownError] = []
         for stop_worker, worker in (
             (_stop_generic_s3_upload_daemon, _generic_s3_daemon),
+            (_stop_generic_azure_upload_daemon, _generic_azure_daemon),
             (_stop_runtime_controller, _runtime_lease),
         ):
             try:

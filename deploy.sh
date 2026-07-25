@@ -93,6 +93,16 @@ az account set --subscription $AZURE_SUBSCRIPTION_ID
 echo "✅ Subscription set to $AZURE_SUBSCRIPTION_ID"
 end_step
 
+# 1.5. Resource Group Setup
+start_step "Resource Group Setup"
+if az group show --name $RESOURCE_GROUP &> /dev/null; then
+  echo "✅ Resource group '$RESOURCE_GROUP' already exists. Skipping creation."
+else
+  echo "✨ Creating Resource group '$RESOURCE_GROUP'..."
+  az group create --name $RESOURCE_GROUP --location $LOCATION
+fi
+end_step
+
 # 2. Verify image exists in ACR
 start_step "Verify Container Image"
 if [ ! -f .build_version ]; then
@@ -161,48 +171,74 @@ if [ -n "$DOCKER_HUB_PAT" ]; then
 fi
 end_step
 
-# 5. Setup Persistent Storage
+# 5. Setup Persistent Storage (Azure Blob Storage for Free Tier)
 start_step "Persistent Storage Setup"
 echo ""
-echo "📦 Setting up Azure Files persistent storage..."
+echo "📦 Setting up Azure Blob Storage container..."
 STORAGE_ACCOUNT_NAME="stdeepagents"
-FILE_SHARE_NAME="deep-research-files"
-MOUNT_PATH="/deps/deep_research/mnt"
+BLOB_CONTAINER_NAME="deep-research-blobs"
 
 EXISTING_STORAGE=$(az storage account list --resource-group $RESOURCE_GROUP --query "[?starts_with(name, 'stdeepagents')].name" -o tsv 2>/dev/null || echo "")
 if [ -n "$EXISTING_STORAGE" ]; then
   echo "✅ Found existing storage account: $EXISTING_STORAGE"
   STORAGE_ACCOUNT_NAME=$EXISTING_STORAGE
   STORAGE_KEY=$(az storage account keys list --account-name $STORAGE_ACCOUNT_NAME --resource-group $RESOURCE_GROUP --query '[0].value' -o tsv)
-  EXISTING_SHARE=$(az storage share list --account-name $STORAGE_ACCOUNT_NAME --account-key $STORAGE_KEY --query "[?name=='$FILE_SHARE_NAME'].name" -o tsv 2>/dev/null || echo "")
-  if [ -n "$EXISTING_SHARE" ]; then
-    echo "✅ File share '$FILE_SHARE_NAME' already exists. Skipping creation."
+  EXISTING_CONTAINER=$(az storage container list --account-name $STORAGE_ACCOUNT_NAME --account-key $STORAGE_KEY --query "[?name=='$BLOB_CONTAINER_NAME'].name" -o tsv 2>/dev/null || echo "")
+  if [ -n "$EXISTING_CONTAINER" ]; then
+    echo "✅ Blob container '$BLOB_CONTAINER_NAME' already exists. Skipping creation."
   else
-    echo "📁 Creating File Share: $FILE_SHARE_NAME (100GB quota)"
-    az storage share create --name $FILE_SHARE_NAME --account-name $STORAGE_ACCOUNT_NAME --account-key $STORAGE_KEY --quota 100
+    echo "📁 Creating Blob Container: $BLOB_CONTAINER_NAME"
+    az storage container create --name $BLOB_CONTAINER_NAME --account-name $STORAGE_ACCOUNT_NAME --account-key $STORAGE_KEY
   fi
 else
   echo "🗄️  Creating Storage Account: $STORAGE_ACCOUNT_NAME"
-  az storage account create --name $STORAGE_ACCOUNT_NAME --resource-group $RESOURCE_GROUP --location $LOCATION --sku Standard_LRS --kind StorageV2 --access-tier Cool --allow-blob-public-access false
+  az storage account create --name $STORAGE_ACCOUNT_NAME --resource-group $RESOURCE_GROUP --location $LOCATION --sku Standard_LRS --kind StorageV2 --access-tier Hot --allow-blob-public-access false
   STORAGE_KEY=$(az storage account keys list --account-name $STORAGE_ACCOUNT_NAME --resource-group $RESOURCE_GROUP --query '[0].value' -o tsv)
-  echo "📁 Creating File Share: $FILE_SHARE_NAME (100GB quota)"
-  az storage share create --name $FILE_SHARE_NAME --account-name $STORAGE_ACCOUNT_NAME --account-key $STORAGE_KEY --quota 100
+  echo "📁 Creating Blob Container: $BLOB_CONTAINER_NAME"
+  az storage container create --name $BLOB_CONTAINER_NAME --account-name $STORAGE_ACCOUNT_NAME --account-key $STORAGE_KEY
 fi
-
-for dir in "docs" "docs/policy" "output" "output/eval_history" "input"; do
-  if ! az storage directory exists --share-name $FILE_SHARE_NAME --path "$dir" --account-name $STORAGE_ACCOUNT_NAME --account-key $STORAGE_KEY --query "exists" -o tsv 2>/dev/null; then
-    echo "  + Creating directory '$dir'"
-    az storage directory create --share-name $FILE_SHARE_NAME --name "$dir" --account-name $STORAGE_ACCOUNT_NAME --account-key $STORAGE_KEY
-  fi
-done
-
-echo "💡 Tip: Run './sync-files.sh' separately for bi-directional file sync with Azure File Share"
 
 echo "🔐 Storing storage credentials in Key Vault..."
 az keyvault secret set --vault-name $KV_NAME --name STORAGE-ACCOUNT-NAME --value $STORAGE_ACCOUNT_NAME > /dev/null
 az keyvault secret set --vault-name $KV_NAME --name STORAGE-ACCOUNT-KEY --value $STORAGE_KEY > /dev/null
-az keyvault secret set --vault-name $KV_NAME --name FILE-SHARE-NAME --value $FILE_SHARE_NAME > /dev/null
+az keyvault secret set --vault-name $KV_NAME --name AZURE-STORAGE-CONTAINER-NAME --value $BLOB_CONTAINER_NAME > /dev/null
 echo "✅ Persistent storage setup complete"
+end_step
+
+# 5.5 Setup Cosmos DB
+start_step "Cosmos DB Setup"
+COSMOSDB_ACCOUNT_NAME="cosmos-deepagents-$SEED"
+COSMOS_LOCATION="eastus"
+echo "🗄️  Setting up Cosmos DB account: $COSMOSDB_ACCOUNT_NAME in region $COSMOS_LOCATION..."
+EXISTING_COSMOS=$(az cosmosdb list --resource-group $RESOURCE_GROUP --query "[?name=='$COSMOSDB_ACCOUNT_NAME'].name" -o tsv 2>/dev/null || echo "")
+if [ -n "$EXISTING_COSMOS" ]; then
+  echo "✅ Cosmos DB account '$COSMOSDB_ACCOUNT_NAME' already exists."
+else
+  echo "✨ Creating Cosmos DB account '$COSMOSDB_ACCOUNT_NAME' with Free Tier enabled in $COSMOS_LOCATION..."
+  if ! az cosmosdb create \
+    --name "$COSMOSDB_ACCOUNT_NAME" \
+    --resource-group "$RESOURCE_GROUP" \
+    --enable-free-tier true \
+    --default-consistency-level Session \
+    --locations regionName="$COSMOS_LOCATION" failoverPriority=0 isZoneRedundant=False; then
+    
+    echo "⚠️  Failed to create with Free Tier (already used in subscription?). Trying to create standard Cosmos DB account..."
+    az cosmosdb create \
+      --name "$COSMOSDB_ACCOUNT_NAME" \
+      --resource-group "$RESOURCE_GROUP" \
+      --default-consistency-level Session \
+      --locations regionName="$COSMOS_LOCATION" failoverPriority=0 isZoneRedundant=False
+  fi
+fi
+
+echo "🔑 Retrieving Cosmos DB endpoint and keys..."
+COSMOSDB_ENDPOINT=$(az cosmosdb show --name "$COSMOSDB_ACCOUNT_NAME" --resource-group "$RESOURCE_GROUP" --query documentEndpoint -o tsv)
+COSMOSDB_KEY=$(az cosmosdb keys list --name "$COSMOSDB_ACCOUNT_NAME" --resource-group "$RESOURCE_GROUP" --query primaryMasterKey -o tsv)
+
+echo "🔐 Storing Cosmos DB credentials in Key Vault..."
+az keyvault secret set --vault-name $KV_NAME --name COSMOSDB-ENDPOINT --value "$COSMOSDB_ENDPOINT" > /dev/null
+az keyvault secret set --vault-name $KV_NAME --name COSMOSDB-KEY --value "$COSMOSDB_KEY" > /dev/null
+echo "✅ Cosmos DB setup complete"
 end_step
 
 # 6. Deploy or update agent
@@ -299,8 +335,8 @@ properties:
       - name: storage-account-key
         keyVaultUrl: https://${KV_NAME}.vault.azure.net/secrets/STORAGE-ACCOUNT-KEY
         identity: ${USER_IDENTITY_ID}
-      - name: file-share-name
-        keyVaultUrl: https://${KV_NAME}.vault.azure.net/secrets/FILE-SHARE-NAME
+      - name: azure-storage-container-name
+        keyVaultUrl: https://${KV_NAME}.vault.azure.net/secrets/AZURE-STORAGE-CONTAINER-NAME
         identity: ${USER_IDENTITY_ID}
       - name: google-api-key
         keyVaultUrl: https://${KV_NAME}.vault.azure.net/secrets/GOOGLE-API-KEY
@@ -308,15 +344,17 @@ properties:
       - name: docker-hub-pat
         keyVaultUrl: https://${KV_NAME}.vault.azure.net/secrets/DOCKER-HUB-PAT
         identity: ${USER_IDENTITY_ID}
+      - name: cosmosdb-endpoint
+        keyVaultUrl: https://${KV_NAME}.vault.azure.net/secrets/COSMOSDB-ENDPOINT
+        identity: ${USER_IDENTITY_ID}
+      - name: cosmosdb-key
+        keyVaultUrl: https://${KV_NAME}.vault.azure.net/secrets/COSMOSDB-KEY
+        identity: ${USER_IDENTITY_ID}
     registries:
       - server: docker.io
         username: ${DOCKER_HUB_USERNAME}
         passwordSecretRef: docker-hub-pat
   template:
-    volumes:
-      - name: persistent-storage
-        storageName: azure-file-storage
-        storageType: AzureFile
     containers:
       - name: deep-research-agent
         image: "${DOCKER_HUB_USERNAME}/deep-research-agent:${BUILD_VERSION}"
@@ -364,22 +402,28 @@ properties:
             value: "2.0"
           - name: MODEL_RETRY_JITTER
             value: "true"
+          - name: DB_TYPE
+            value: cosmosdb
           - name: MEMORY_TYPE
             value: ""
+          - name: COSMOSDB_ENDPOINT
+            secretRef: cosmosdb-endpoint
+          - name: COSMOSDB_KEY
+            secretRef: cosmosdb-key
           - name: COSMOSDB_DB_NAME
             value: deep-research-checkpoints
           - name: COSMOSDB_CONTAINER_NAME
             value: checkpoints
           - name: REPORTS_OUTPUT_FOLDER
-            value: ${MOUNT_PATH}/output
+            value: /deps/deep_research/output
           - name: EVAL_HISTORY_FILE
-            value: ${MOUNT_PATH}/output/eval_history/server_runs.jsonl
+            value: /deps/deep_research/output/eval_history/server_runs.jsonl
           - name: DOC_FOLDER
-            value: ${MOUNT_PATH}/docs
+            value: /deps/deep_research/docs
           - name: WIKI_BASE_DIR
-            value: ${MOUNT_PATH}
+            value: /deps/deep_research
           - name: INPUT_FOLDER
-            value: ${MOUNT_PATH}/input
+            value: /deps/deep_research/input
           - name: SQLITE_DB_PATH
             value: /deps/deep_research/deep_research.db
           - name: TAVILY_API_KEY
@@ -392,13 +436,10 @@ properties:
             secretRef: storage-account-name
           - name: STORAGE_ACCOUNT_KEY
             secretRef: storage-account-key
-          - name: FILE_SHARE_NAME
-            secretRef: file-share-name
+          - name: AZURE_STORAGE_CONTAINER_NAME
+            secretRef: azure-storage-container-name
           - name: GOOGLE_API_KEY
             secretRef: google-api-key
-        volumeMounts:
-          - volumeName: persistent-storage
-            mountPath: $MOUNT_PATH
     scale:
       minReplicas: 0
       maxReplicas: 1
