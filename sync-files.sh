@@ -53,6 +53,22 @@ mkdir -p "$SYNC_ROOT"
 # Folders to sync
 FOLDERS=("docs" "output" "input" ".langgraph_api")
 
+if [ "$MODE" != "download" ]; then
+  echo "🔄 Preparing sync folder from local workspace root..."
+  for folder in "${FOLDERS[@]}"; do
+    if [ -d "./$folder" ]; then
+      mkdir -p "$SYNC_ROOT/$folder"
+      rsync -a --delete "./$folder/" "$SYNC_ROOT/$folder/"
+      echo "  + Mirrored local $folder/ to $SYNC_ROOT/$folder/"
+    fi
+  done
+  if [ -f "./deep_research.db" ]; then
+    rsync -a "./deep_research.db" "$SYNC_ROOT/deep_research.db"
+    echo "  + Mirrored local deep_research.db to $SYNC_ROOT/deep_research.db"
+  fi
+  echo ""
+fi
+
 if [ "$MODE" != "upload" ]; then
   echo "📥 Downloading files from Azure Blob Storage..."
   for folder in "${FOLDERS[@]}"; do
@@ -93,10 +109,9 @@ if [ "$MODE" != "upload" ]; then
     az storage blob download \
       --container-name "$BLOB_CONTAINER_NAME" \
       --name "deep_research.db" \
-      --file "./deep_research.db" \
+      --file "$SYNC_ROOT/deep_research.db" \
       --account-name "$STORAGE_ACCOUNT_NAME" \
       --account-key "$STORAGE_KEY" --no-progress >/dev/null 2>&1 || true
-    cp "./deep_research.db" "$SYNC_ROOT/deep_research.db" 2>/dev/null || true
     echo "  + Downloaded deep_research.db successfully"
   else
     echo "  ~ No remote database file found"
@@ -104,16 +119,32 @@ if [ "$MODE" != "upload" ]; then
 fi
 
 if [ "$MODE" != "download" ]; then
-  if [ -f "./deep_research.db" ]; then
+  if [ -f "$SYNC_ROOT/deep_research.db" ]; then
     echo "📤 Uploading database file: deep_research.db..."
     az storage blob upload \
       --container-name "$BLOB_CONTAINER_NAME" \
       --name "deep_research.db" \
-      --file "./deep_research.db" \
+      --file "$SYNC_ROOT/deep_research.db" \
       --account-name "$STORAGE_ACCOUNT_NAME" \
       --account-key "$STORAGE_KEY" \
       --overwrite true --no-progress >/dev/null
     echo "  + Uploaded deep_research.db successfully"
+  fi
+fi
+
+if [ "$MODE" != "upload" ]; then
+  echo ""
+  echo "🔄 Updating local workspace root from sync folder..."
+  for folder in "${FOLDERS[@]}"; do
+    if [ -d "$SYNC_ROOT/$folder" ]; then
+      mkdir -p "./$folder"
+      rsync -a --delete "$SYNC_ROOT/$folder/" "./$folder/"
+      echo "  + Updated local $folder/ from $SYNC_ROOT/$folder/"
+    fi
+  done
+  if [ -f "$SYNC_ROOT/deep_research.db" ]; then
+    rsync -a "$SYNC_ROOT/deep_research.db" "./deep_research.db"
+    echo "  + Updated local deep_research.db from $SYNC_ROOT/deep_research.db"
   fi
 fi
 

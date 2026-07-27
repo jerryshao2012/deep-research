@@ -205,42 +205,6 @@ az keyvault secret set --vault-name $KV_NAME --name AZURE-STORAGE-CONTAINER-NAME
 echo "✅ Persistent storage setup complete"
 end_step
 
-# 5.5 Setup Cosmos DB
-start_step "Cosmos DB Setup"
-COSMOSDB_ACCOUNT_NAME="cosmos-deepagents-$SEED"
-COSMOS_LOCATION="eastus"
-echo "🗄️  Setting up Cosmos DB account: $COSMOSDB_ACCOUNT_NAME in region $COSMOS_LOCATION..."
-EXISTING_COSMOS=$(az cosmosdb list --resource-group $RESOURCE_GROUP --query "[?name=='$COSMOSDB_ACCOUNT_NAME'].name" -o tsv 2>/dev/null || echo "")
-if [ -n "$EXISTING_COSMOS" ]; then
-  echo "✅ Cosmos DB account '$COSMOSDB_ACCOUNT_NAME' already exists."
-else
-  echo "✨ Creating Cosmos DB account '$COSMOSDB_ACCOUNT_NAME' with Free Tier enabled in $COSMOS_LOCATION..."
-  if ! az cosmosdb create \
-    --name "$COSMOSDB_ACCOUNT_NAME" \
-    --resource-group "$RESOURCE_GROUP" \
-    --enable-free-tier true \
-    --default-consistency-level Session \
-    --locations regionName="$COSMOS_LOCATION" failoverPriority=0 isZoneRedundant=False; then
-    
-    echo "⚠️  Failed to create with Free Tier (already used in subscription?). Trying to create standard Cosmos DB account..."
-    az cosmosdb create \
-      --name "$COSMOSDB_ACCOUNT_NAME" \
-      --resource-group "$RESOURCE_GROUP" \
-      --default-consistency-level Session \
-      --locations regionName="$COSMOS_LOCATION" failoverPriority=0 isZoneRedundant=False
-  fi
-fi
-
-echo "🔑 Retrieving Cosmos DB endpoint and keys..."
-COSMOSDB_ENDPOINT=$(az cosmosdb show --name "$COSMOSDB_ACCOUNT_NAME" --resource-group "$RESOURCE_GROUP" --query documentEndpoint -o tsv)
-COSMOSDB_KEY=$(az cosmosdb keys list --name "$COSMOSDB_ACCOUNT_NAME" --resource-group "$RESOURCE_GROUP" --query primaryMasterKey -o tsv)
-
-echo "🔐 Storing Cosmos DB credentials in Key Vault..."
-az keyvault secret set --vault-name $KV_NAME --name COSMOSDB-ENDPOINT --value "$COSMOSDB_ENDPOINT" > /dev/null
-az keyvault secret set --vault-name $KV_NAME --name COSMOSDB-KEY --value "$COSMOSDB_KEY" > /dev/null
-echo "✅ Cosmos DB setup complete"
-end_step
-
 # 6. Deploy or update agent
 start_step "Container App Deployment"
 echo "🚀 Deploying agent..."
@@ -344,12 +308,6 @@ properties:
       - name: docker-hub-pat
         keyVaultUrl: https://${KV_NAME}.vault.azure.net/secrets/DOCKER-HUB-PAT
         identity: ${USER_IDENTITY_ID}
-      - name: cosmosdb-endpoint
-        keyVaultUrl: https://${KV_NAME}.vault.azure.net/secrets/COSMOSDB-ENDPOINT
-        identity: ${USER_IDENTITY_ID}
-      - name: cosmosdb-key
-        keyVaultUrl: https://${KV_NAME}.vault.azure.net/secrets/COSMOSDB-KEY
-        identity: ${USER_IDENTITY_ID}
     registries:
       - server: docker.io
         username: ${DOCKER_HUB_USERNAME}
@@ -376,6 +334,8 @@ properties:
             value: deep-research-production
           - name: ENABLE_EVAL_TRACKING
             value: "true"
+          - name: ALLOW_ALL_THREADS
+            value: "false"
           - name: MODEL_TPM
             value: "120000"
           - name: MODEL_RPM
@@ -403,17 +363,9 @@ properties:
           - name: MODEL_RETRY_JITTER
             value: "true"
           - name: DB_TYPE
-            value: cosmosdb
+            value: sqlite
           - name: MEMORY_TYPE
             value: ""
-          - name: COSMOSDB_ENDPOINT
-            secretRef: cosmosdb-endpoint
-          - name: COSMOSDB_KEY
-            secretRef: cosmosdb-key
-          - name: COSMOSDB_DB_NAME
-            value: deep-research-checkpoints
-          - name: COSMOSDB_CONTAINER_NAME
-            value: checkpoints
           - name: REPORTS_OUTPUT_FOLDER
             value: /deps/deep_research/output
           - name: EVAL_HISTORY_FILE

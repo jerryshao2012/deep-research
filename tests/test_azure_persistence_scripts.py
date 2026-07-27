@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -7,6 +8,17 @@ import pytest
 import azure_storage
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_azure_deploy_uses_sqlite_without_cosmos() -> None:
+    source = (PROJECT_ROOT / "deploy.sh").read_text(encoding="utf-8")
+
+    assert re.search(
+        r"(?m)^\s*-\s+name:\s+DB_TYPE\s*\n\s+value:\s+sqlite\s*$",
+        source,
+    )
+    for forbidden in ("az cosmosdb", "COSMOSDB_", "cosmosdb-", "value: cosmosdb"):
+        assert forbidden not in source
 
 
 def test_generic_azure_sync_includes_langgraph_state(monkeypatch) -> None:
