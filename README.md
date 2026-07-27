@@ -297,7 +297,7 @@ uv sync --reinstall
 
 LangGraph server will open a new browser window with the Studio interface, which you can submit your search query to:
 
-<img width="1915" alt="Screenshot 2026-04-03 at 10 27 11 AM" src="./resources/Screenshot 2026-04-03 at 10 27 11 AM.png" />
+<img width="1915" alt="Screenshot 2026-04-03 at 10 27 11 AM" src="resources/LangSmith_Integration 2026-04-03 at 10 27 11 AM.png" />
 
 You can also connect the LangGraph server to a [UI specifically designed for deepagents](https://github.com/jerryshao2012/bmo-deepagent-ui.git):
 
@@ -340,7 +340,7 @@ Then follow the instructions in the [deep-agents-ui README](https://github.com/l
 
 This provides a user-friendly chat interface and visualization of files in state.
 
-<img width="1917" alt="Screenshot 2026-04-03 at 12:44 11 PM" src="resources/Screenshot 2026-04-03 at 12 44 11 PM.png" />
+<img width="1917" alt="Screenshot 2026-04-03 at 12:44 11 PM" src="resources/Deep_Research 2026-04-03 at 12 44 11 PM.png" />
 
 Example:
 ```text
