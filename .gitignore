@@ -65,6 +65,7 @@ setup.md
 *.bak
 .langgraph_api/
 .build_version
+.container-build-context.*
 
 # Project data
 docs/

@@ -10,6 +10,19 @@ import azure_storage
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_azure_build_stages_context_without_git_metadata() -> None:
+    source = (PROJECT_ROOT / "build.sh").read_text(encoding="utf-8")
+
+    assert "set -o pipefail" in source
+    assert 'mktemp -d "$SCRIPT_DIR/.container-build-context.XXXXXX"' in source
+    assert "git ls-files --cached --others --exclude-standard -z" in source
+    assert "tar --null -T - -cf -" in source
+    assert 'tar -xf - -C "$BUILD_CONTEXT_DIR"' in source
+    assert 'cp .env.docker "$BUILD_CONTEXT_DIR/.env.docker"' in source
+    assert 'container build --platform linux/amd64 -t $FULL_IMAGE_NAME "$BUILD_CONTEXT_DIR"' in source
+    assert "trap cleanup_build_context EXIT" in source
+
+
 def test_azure_deploy_uses_sqlite_without_cosmos() -> None:
     source = (PROJECT_ROOT / "deploy.sh").read_text(encoding="utf-8")
 

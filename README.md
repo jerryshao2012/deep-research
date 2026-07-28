@@ -952,7 +952,7 @@ To configure OAuth client credentials for local development and production, foll
 
 | Configuration Item | Local Development | Production (Azure) |
 |-------------------|-------------------|-------------------|
-| **Frontend URL** | `http://localhost:3000` | `https://deepagent-ui.salmonrock-b46ff20d.canadacentral.azurecontainerapps.io` |
+| **Frontend URL** | `http://localhost:3000` | `https://bmo-deepagent-ui-0312.azurewebsites.net` |
 | **Backend Callback** | `http://localhost:2024/auth/callback/google` | `https://deep-research-agent-0312.salmonrock-b46ff20d.canadacentral.azurecontainerapps.io/auth/callback/google` |
 | **Authorized JS Origins** | `http://localhost:3000` | Your frontend HTTPS URL |
 | **Authorized Redirect URIs** | `http://localhost:2024/auth/callback/google` | Your backend HTTPS URL + `/auth/callback/google` |
@@ -967,7 +967,7 @@ To configure OAuth client credentials for local development and production, foll
 | Configuration Item | Local Development | Production (Azure) |
 |-------------------|-------------------|-------------------|
 | **Application Name** | `BMO Deep Agent Local` | `BMO Deep Agent` |
-| **Homepage URL** | `http://localhost:3000` | `https://deepagent-ui.salmonrock-b46ff20d.canadacentral.azurecontainerapps.io` |
+| **Homepage URL** | `http://localhost:3000` | `https://bmo-deepagent-ui-0312.azurewebsites.net` |
 | **Authorization Callback URL** | `http://localhost:2024/auth/callback/github` | `https://deep-research-agent-0312.salmonrock-b46ff20d.canadacentral.azurecontainerapps.io/auth/callback/github` |
 | **Device Flow** | Optional | Optional |
 
@@ -988,7 +988,7 @@ To configure OAuth client credentials for local development and production, foll
 9. Add a name (e.g., "BMO Deep Agent").
 10. **Configure Authorized JavaScript origins** (required for browser-based OAuth flows):
     - For Local Development: `http://localhost:3000`
-    - For Production: Add your frontend URL for Azure (e.g., `https://deepagent-ui.salmonrock-b46ff20d.canadacentral.azurecontainerapps.io`)
+    - For Production: Add your frontend URL for Azure (e.g., `https://bmo-deepagent-ui-0312.azurewebsites.net`)
     - For Production: Add your frontend URL for AWS (e.g., `https://d600y3wyk0xvf.cloudfront.net`)
 11. **Configure Authorized redirect URIs** (must match your backend callback endpoints exactly):
     - For Local Development: `http://localhost:2024/auth/callback/google`
@@ -1022,7 +1022,7 @@ To configure OAuth client credentials for local development and production, foll
 1. Repeat the same process to create a production OAuth app.
 2. Fill in the application details:
    - **Application name**: `BMO Deep Agent`
-     - **Homepage URL**: `https://deepagent-ui.salmonrock-b46ff20d.canadacentral.azurecontainerapps.io` (your frontend URL)
+     - **Homepage URL**: `https://bmo-deepagent-ui-0312.azurewebsites.net` (your frontend URL)
      - **Authorization callback URL**: `https://deep-research-agent-0312.salmonrock-b46ff20d.canadacentral.azurecontainerapps.io/auth/callback/github` (your backend URL)
      - **Enable Device Flow**: Optional - check this if needed for your deployment
 

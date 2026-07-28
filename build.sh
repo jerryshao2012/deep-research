@@ -1,9 +1,11 @@
 #!/bin/bash
 set -e
+set -o pipefail
 
 # Timer tracking
 TOTAL_START_TIME=$(date +%s)
 STEP_TIMES=()
+BUILD_CONTEXT_DIR=""
 
 # Function to track step timing
 start_step() {
@@ -33,6 +35,12 @@ print_timing_summary() {
   echo "───────────────────────────────────────────────────────"
   echo "   Total build time: ${TOTAL_DURATION}s"
   echo "═══════════════════════════════════════════════════════"
+}
+
+cleanup_build_context() {
+  if [[ "$BUILD_CONTEXT_DIR" == "$SCRIPT_DIR"/.container-build-context.* ]] && [ -d "$BUILD_CONTEXT_DIR" ]; then
+    rm -rf -- "$BUILD_CONTEXT_DIR"
+  fi
 }
 
 # Configuration
@@ -109,6 +117,12 @@ echo "🔨 Building Container image with tags: latest, $BUILD_VERSION"
 # Ensure we're in the correct directory (where Dockerfile is located)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
+BUILD_CONTEXT_DIR="$(mktemp -d "$SCRIPT_DIR/.container-build-context.XXXXXX")"
+trap cleanup_build_context EXIT
+git ls-files --cached --others --exclude-standard -z \
+  | tar --null -T - -cf - \
+  | tar -xf - -C "$BUILD_CONTEXT_DIR"
+cp .env.docker "$BUILD_CONTEXT_DIR/.env.docker"
 # The container tool requires the full registry host in the image name for pushing.
 FULL_IMAGE_NAME="docker.io/$DOCKER_HUB_USERNAME/deep-research-agent:latest"
 # Ensure container service is started
@@ -117,7 +131,9 @@ if ! container system status &>/dev/null; then
   container system start --disable-kernel-install
 fi
 
-container build --platform linux/amd64 -t $FULL_IMAGE_NAME .
+container build --platform linux/amd64 -t $FULL_IMAGE_NAME "$BUILD_CONTEXT_DIR"
+cleanup_build_context
+BUILD_CONTEXT_DIR=""
 container image push $FULL_IMAGE_NAME
 if [ $? -ne 0 ]; then
   echo "❌ Container push failed for '$FULL_IMAGE_NAME'."
