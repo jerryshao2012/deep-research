@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Test that SkillRegistry works with 0 legacy skills (all migrated to .deepagents/skills/)."""
 
-from pathlib import Path
-
 import sys
+from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 

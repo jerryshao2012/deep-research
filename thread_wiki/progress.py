@@ -33,10 +33,10 @@ _registry_lock = asyncio.Lock()
 
 
 async def register_ingest(
-    thread_id: str,
-    task: asyncio.Task,
-    *,
-    wiki_dir: Path | None = None,
+        thread_id: str,
+        task: asyncio.Task,
+        *,
+        wiki_dir: Path | None = None,
 ) -> IngestProgress:
     """Register a new ingest task for a thread, replacing any stale entry.
 
@@ -56,10 +56,10 @@ async def register_ingest(
             abandoned = await load_progress(wiki_dir)
 
         if abandoned is not None and abandoned.phase not in (
-            IngestPhase.READY,
-            IngestPhase.ERROR,
-            IngestPhase.CANCELLED,
-            IngestPhase.IDLE,
+                IngestPhase.READY,
+                IngestPhase.ERROR,
+                IngestPhase.CANCELLED,
+                IngestPhase.IDLE,
         ):
             max_retry = get_max_retry()
             if abandoned.retry_count >= max_retry:
@@ -109,7 +109,7 @@ async def get_progress(thread_id: str) -> IngestProgress | None:
 
 
 async def cancel_ingest(
-    thread_id: str, *, reason: str = "Cancelled by client."
+        thread_id: str, *, reason: str = "Cancelled by client."
 ) -> bool:
     """Cancel an active ingest for the given thread.
 
@@ -149,7 +149,7 @@ def is_cancelled_sync(cancel_event: asyncio.Event) -> bool:
 
 
 async def check_cancellation(
-    cancel_event: asyncio.Event, *, phase_name: str = ""
+        cancel_event: asyncio.Event, *, phase_name: str = ""
 ) -> None:
     """Raise ``asyncio.CancelledError`` if cancellation has been requested.
 
@@ -193,6 +193,7 @@ async def save_progress(progress: IngestProgress, wiki_dir: Path) -> None:
         "source_count": progress.source_count,
         "sources_processed": progress.sources_processed,
         "error": progress.error,
+        "code_analysis": progress.code_analysis,
         "retry_count": progress.retry_count,
         "started_at": progress.started_at,
         "completed_at": progress.completed_at,
@@ -254,6 +255,7 @@ async def load_progress(wiki_dir: Path) -> IngestProgress | None:
         source_count=data.get("source_count", 0),
         sources_processed=data.get("sources_processed", 0),
         error=data.get("error"),
+        code_analysis=data.get("code_analysis"),
         retry_count=data.get("retry_count", 0),
         started_at=data.get("started_at", ""),
         completed_at=data.get("completed_at"),

@@ -93,9 +93,9 @@ def test_pipeline_integration():
     from humanize_report import humanize_report
 
     def evaluate_and_report_golden_dataset(
-        csv_path: Path,
-        payload: dict,
-        elapsed_seconds: float | None = None
+            csv_path: Path,
+            payload: dict,
+            elapsed_seconds: float | None = None
     ) -> tuple[Path, str, str]:
         # Step 1: Run quality metrics
         metrics_csv_path_str = str(csv_path.with_name(f"{csv_path.stem}-with-metrics{csv_path.suffix}"))

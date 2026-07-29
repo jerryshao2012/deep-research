@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import json
 import tempfile
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
-from pathlib import Path
 
 from research_agent.utils.learning import (
     _topic_bucket,
@@ -54,12 +55,21 @@ def history_dir():
     """Create a temporary directory with synthetic eval history."""
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
+        now = datetime.now(timezone.utc)
         records = [
-            _make_record("2026-07-01T10:00:00Z", 0.85, 12000, 55.0),
-            _make_record("2026-07-02T10:00:00Z", 0.90, 11000, 50.0),
-            _make_record("2026-07-03T10:00:00Z", 0.88, 13000, 65.0),
-            _make_record("2026-07-04T10:00:00Z", 0.92, 10000, 48.0),
-            _make_record("2026-07-05T10:00:00Z", 0.95, 9000, 42.0),
+            _make_record(
+                (now - timedelta(days=4)).isoformat(), 0.85, 12000, 55.0
+            ),
+            _make_record(
+                (now - timedelta(days=3)).isoformat(), 0.90, 11000, 50.0
+            ),
+            _make_record(
+                (now - timedelta(days=2)).isoformat(), 0.88, 13000, 65.0
+            ),
+            _make_record(
+                (now - timedelta(days=1)).isoformat(), 0.92, 10000, 48.0
+            ),
+            _make_record(now.isoformat(), 0.95, 9000, 42.0),
         ]
         jsonl_path = tmp_path / "server_runs.jsonl"
         with jsonl_path.open("w") as f:

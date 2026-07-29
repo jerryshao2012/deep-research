@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from research_agent.utils.cli import build_parser
 from research_agent.utils.eval_tracking import (
     append_jsonl,
     build_manifest,

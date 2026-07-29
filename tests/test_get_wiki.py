@@ -1,40 +1,56 @@
-"""Tests for wiki content retrieval."""
+"""Opt-in live integration test for wiki content retrieval."""
+
+from __future__ import annotations
 
 import asyncio
-import concurrent.futures
+import os
 from pathlib import Path
 
-from thread_wiki.models import ThreadWikiPaths
-from thread_wiki.service import run_query
+import pytest
 
-thread_id = "019eec4d-ddf5-7353-bcab-94c41ce68205"
-question = "What was BMO's overall financial performance in fiscal 2025, and how did key metrics such as net income, EPS, and ROE change compared to fiscal 2024?"
-
-print("1. Resolving paths")
-base_dir = Path("/agent.py").resolve().parent
-paths = ThreadWikiPaths.resolve(thread_id, base_dir)
-
-print(f"2. Checking index.md at {paths.wiki_content / 'index.md'}")
-index_path = paths.wiki_content / "index.md"
-if not index_path.exists():
-    print("index.md does not exist")
-else:
-    print("index.md exists")
-
-topic = f"Thread {thread_id[:8]}"
+_RUN_LIVE_WIKI_TESTS = os.getenv("RUN_LIVE_WIKI_TESTS", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+}
 
 
-def _run_coro():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        return loop.run_until_complete(run_query(paths, topic, question, file_results=False))
-    finally:
-        loop.close()
+@pytest.mark.skipif(
+    not _RUN_LIVE_WIKI_TESTS,
+    reason="Set RUN_LIVE_WIKI_TESTS=true to run the live model-backed wiki query.",
+)
+def test_live_wiki_query() -> None:
+    """Query a real prepared wiki only when explicitly enabled."""
+    from thread_wiki.models import ThreadWikiPaths
+    from thread_wiki.service import run_query
 
+    thread_id = os.getenv(
+        "WIKI_TEST_THREAD_ID",
+        "019eec4d-ddf5-7353-bcab-94c41ce68205",
+    )
+    question = os.getenv(
+        "WIKI_TEST_QUESTION",
+        (
+            "What was BMO's overall financial performance in fiscal 2025, "
+            "and how did key metrics change compared to fiscal 2024?"
+        ),
+    )
+    base_dir = Path(os.getenv("WIKI_TEST_BASE_DIR", str(Path.cwd()))).resolve()
+    paths = ThreadWikiPaths.resolve(thread_id, base_dir)
+    index_path = paths.wiki_content / "index.md"
 
-print("3. Running thread pool executor")
-with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-    result = pool.submit(_run_coro).result(timeout=60)
-print(f"4. Result: {result.answer if result else 'None'}")
-print(f"5. Result length: {len(result.answer) if result else 'None'}")
+    assert index_path.is_file(), (
+        f"Live wiki fixture is not ready: {index_path}. "
+        "Set WIKI_TEST_BASE_DIR and WIKI_TEST_THREAD_ID to a prepared wiki."
+    )
+
+    result = asyncio.run(
+        run_query(
+            paths,
+            f"Thread {thread_id[:8]}",
+            question,
+            file_results=False,
+        )
+    )
+
+    assert result.answer.strip()

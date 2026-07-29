@@ -27,6 +27,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import networkx as nx
 from deepagents import create_deep_agent
 from deepagents.backends import CompositeBackend, FilesystemBackend
 from deepagents.middleware.filesystem import FilesystemPermission
@@ -36,6 +37,14 @@ from networkx.algorithms.community import louvain_communities
 from model_factory import get_configured_model
 from research_agent.utils.text_search import (
     load_or_build_search_index,
+)
+from .code_ingestion import (
+    SUPPORTED_CODE_SUFFIXES,
+    analyze_code_sources,
+    analyze_embedded_code_sources,
+    build_repository_index,
+    detect_code_language,
+    write_code_artifacts,
 )
 from .models import (
     CommunityInfo,
@@ -48,12 +57,11 @@ from .models import (
     SourceCitation,
     ThreadWikiPaths,
     WikiQueryResult,
+    parse_frontmatter,
 )
-from .models import parse_frontmatter
 from .progress import remove_progress_snapshot, save_progress
 
 if TYPE_CHECKING:
-    import networkx as nx  # noqa: F401
     from langchain_core.documents import Document  # noqa: F401
 
     from .models import WikiPageMetadata  # noqa: F401
@@ -67,7 +75,9 @@ _ALLOWED_TEXT_SUFFIXES = {".md", ".txt", ".json", ".yaml", ".yml", ".csv"}
 # Binary formats: require content_extractors for text extraction.
 _BINARY_EXTRACT_SUFFIXES = {".pdf", ".docx", ".pptx", ".xlsx"}
 # All supported source types.
-_ALLOWED_SOURCE_SUFFIXES = _ALLOWED_TEXT_SUFFIXES | _BINARY_EXTRACT_SUFFIXES
+_ALLOWED_SOURCE_SUFFIXES = (
+        _ALLOWED_TEXT_SUFFIXES | _BINARY_EXTRACT_SUFFIXES | set(SUPPORTED_CODE_SUFFIXES)
+)
 
 # Context budget: proportional allocation of the LLM's context window.
 # Mirrors LLM Wiki's approach: 5% index, 50% wiki pages, 15% response reserve,
@@ -151,7 +161,11 @@ def _total_raw_size(raw_dir: Path) -> int:
         return 0
     total = 0
     for path in raw_dir.rglob("*"):
-        if path.is_file():
+        try:
+            relative_parts = path.relative_to(raw_dir).parts
+        except ValueError:
+            continue
+        if path.is_file() and "_code" not in relative_parts:
             try:
                 total += len(path.read_text(encoding="utf-8"))
             except Exception:
@@ -408,7 +422,12 @@ def _fallback_pdf_extract(file_path: Path) -> str:
     return ""
 
 
-def _stage_sources(source_paths: list[Path], raw_dir: Path) -> list[Path]:
+def _stage_sources(
+        source_paths: list[Path],
+        raw_dir: Path,
+        *,
+        source_root: Path | None = None,
+) -> list[Path]:
     """Copy source files into the wiki's raw directory, de-duplicating.
 
     Text-based formats (.md, .txt, .json, .yaml, .yml, .csv) are read directly.
@@ -422,7 +441,7 @@ def _stage_sources(source_paths: list[Path], raw_dir: Path) -> list[Path]:
     staged: list[Path] = []
 
     # Separate text and binary sources — text is instant, binary is CPU-bound.
-    text_sources: list[tuple[Path, Path, str, str, str]] = []
+    text_sources: list[tuple[Path, Path, str, str, bool]] = []
     binary_sources: list[tuple[Path, Path]] = []
 
     for source in source_paths:
@@ -431,23 +450,43 @@ def _stage_sources(source_paths: list[Path], raw_dir: Path) -> list[Path]:
             continue
 
         suffix = source.suffix.lower()
-        if suffix not in _ALLOWED_SOURCE_SUFFIXES:
+        code_detection = detect_code_language(source)
+        if suffix not in _ALLOWED_SOURCE_SUFFIXES and code_detection is None:
             logger.warning("Unsupported source type (%s), skipping: %s", suffix, source)
             continue
 
+        relative = Path(source.name)
+        if source_root is not None:
+            try:
+                relative = source.resolve().relative_to(source_root.resolve())
+            except ValueError:
+                logger.warning("Source is outside source root, flattening: %s", source)
+        destination_parent = raw_dir / relative.parent
+        destination_parent.mkdir(parents=True, exist_ok=True)
+
         is_binary = suffix in _BINARY_EXTRACT_SUFFIXES
         if is_binary:
-            destination = raw_dir / f"{source.name}.md"
+            destination = destination_parent / f"{source.name}.md"
             stem = f"{source.stem}.{suffix.lstrip('.')}"
             binary_sources.append((source, destination))
         else:
-            destination = raw_dir / source.name
+            destination = destination_parent / source.name
             out_suffix = source.suffix
             stem = source.stem
-            text_sources.append((source, destination, stem, out_suffix, ""))
+            text_sources.append(
+                (source, destination, stem, out_suffix, code_detection is not None)
+            )
 
     # Process text sources sequentially (instant I/O).
-    for source, destination, stem, out_suffix, _ in text_sources:
+    for source, destination, stem, out_suffix, is_code in text_sources:
+        if is_code:
+            try:
+                destination.write_bytes(source.read_bytes())
+            except OSError:
+                logger.exception("Failed to stage code source: %s", source)
+                continue
+            staged.append(destination)
+            continue
         try:
             text = source.read_text(encoding="utf-8")
         except UnicodeDecodeError:
@@ -456,7 +495,7 @@ def _stage_sources(source_paths: list[Path], raw_dir: Path) -> list[Path]:
 
         counter = 2
         while destination.exists():
-            destination = raw_dir / f"{stem}-{counter}{out_suffix}"
+            destination = destination.parent / f"{stem}-{counter}{out_suffix}"
             counter += 1
 
         destination.write_text(text, encoding="utf-8")
@@ -471,7 +510,7 @@ def _stage_sources(source_paths: list[Path], raw_dir: Path) -> list[Path]:
             stem = f"{src.stem}.{src.suffix.lstrip('.')}"
             counter = 2
             while dest.exists():
-                dest = raw_dir / f"{stem}-{counter}.md"
+                dest = dest.parent / f"{stem}-{counter}.md"
                 counter += 1
             dest.write_text(text, encoding="utf-8")
             return (dest, stem)
@@ -2136,6 +2175,32 @@ def _build_chunked_processing_instructions(
     return "\n".join(lines)
 
 
+def _build_code_processing_instructions(artifact_names: list[str]) -> str:
+    """Build deterministic guidance for AST-derived semantic code chunks."""
+    semantic_chunks = sorted(
+        name
+        for name in artifact_names
+        if name != "_code/repository-index.md"
+    )
+    lines = [
+        "AST-AWARE CODE PROCESSING:",
+        "1) Read `/raw/_code/repository-index.md` first as a navigation aid.",
+        "2) Read semantic chunks in the source order listed below.",
+        "3) Use parent, symbol, import, signature, and exact line-range metadata "
+        "to synthesize repository behavior.",
+        "4) Derived files under `/raw/_code/` are never evidence: never cite "
+        "`/raw/_code/`.",
+        "5) Always cite original `/raw/` code files with line ranges, for example "
+        "`(/raw/pkg/app.py, lines 10-24)`.",
+        "",
+        "Semantic chunks:",
+    ]
+    lines.extend(f"- /raw/{name}" for name in semantic_chunks)
+    if not semantic_chunks:
+        lines.append("- None (recognized code used text fallback)")
+    return "\n".join(lines)
+
+
 # ── Cascade deletion ──────────────────────────────────────────────────────────
 
 _SOURCE_REF_RE = re.compile(r"/raw/([A-Za-z0-9._/\-]+)", re.IGNORECASE)
@@ -2363,16 +2428,84 @@ async def run_ingest(
             progress.mark_complete("No source files found to ingest.")
             return "No source files found."
 
-        staged = await asyncio.to_thread(_stage_sources, source_files, paths.raw_dir)
-        staged_names = [p.name for p in staged]
+        staged = await asyncio.to_thread(
+            _stage_sources,
+            source_files,
+            paths.raw_dir,
+            source_root=paths.docs_dir,
+        )
+        staged_names = [
+            path.relative_to(paths.raw_dir).as_posix() for path in staged
+        ]
         progress.sources_processed = len(staged)
-        progress.source_names = [s.name for s in source_files]
+        progress.source_names = [
+            path.relative_to(paths.docs_dir).as_posix() for path in source_files
+        ]
+
+        # Parse recognized code locally and regenerate one run-scoped artifact
+        # set. Tree-sitter parses source bytes only; uploaded code is never
+        # imported or executed.
+        code_paths = [
+            path for path in staged if detect_code_language(path) is not None
+        ]
+        code_analyses = await asyncio.to_thread(
+            analyze_code_sources,
+            code_paths,
+            root=paths.raw_dir,
+        )
+        document_paths = [
+            path
+            for path in staged
+            if path not in code_paths and path.suffix.lower() in {".md", ".txt"}
+        ]
+        embedded_code_analyses = await asyncio.to_thread(
+            analyze_embedded_code_sources,
+            document_paths,
+            root=paths.raw_dir,
+        )
+        semantic_analyses = [*code_analyses, *embedded_code_analyses]
+        repository_index = await asyncio.to_thread(
+            build_repository_index,
+            semantic_analyses,
+        )
+        code_summary = await asyncio.to_thread(
+            write_code_artifacts,
+            paths.raw_dir,
+            paths.wiki_dir,
+            semantic_analyses,
+            repository_index,
+        )
+        progress.code_analysis = code_summary if semantic_analyses else None
+
+        parsed_code_sources = {
+            item.source_path
+            for item in code_analyses
+            if item.status in {"parsed", "partial"}
+        }
+        processing_names = [
+            name for name in staged_names if name not in parsed_code_sources
+        ]
+        code_artifact_names: list[str] = []
+        if semantic_analyses:
+            code_artifact_names = [
+                path.relative_to(paths.raw_dir).as_posix()
+                for path in sorted(
+                    (paths.raw_dir / "_code").glob("*.md"),
+                    key=lambda item: (
+                        item.name != "repository-index.md",
+                        item.name,
+                    ),
+                )
+            ]
+            processing_names.extend(code_artifact_names)
 
         # Detect and chunk large sources (>80K chars by default).
         # Chunk files are written alongside the originals in raw/ and
         # the review prompt includes chunk-aware processing instructions.
         chunked_sources: dict[str, list[dict]] = {}
-        for name in staged_names:
+        for name in [
+            item for item in processing_names if not item.startswith("_code/")
+        ]:
             chunks = await asyncio.to_thread(
                 _chunk_large_source, paths.raw_dir, name
             )
@@ -2382,9 +2515,13 @@ async def run_ingest(
                 for ch in chunks:
                     chunk_name = ch.get("chunk_path", "")
                     if chunk_name:
-                        chunk_name = Path(chunk_name).name
+                        chunk_name = (
+                            Path(chunk_name)
+                            .relative_to(paths.raw_dir)
+                            .as_posix()
+                        )
                         if chunk_name not in staged_names:
-                            staged_names.append(chunk_name)
+                            processing_names.append(chunk_name)
 
         if chunked_sources:
             logger.info(
@@ -2434,12 +2571,17 @@ async def run_ingest(
                 f" and {len(staged_names) - 5} more..." if len(staged_names) > 5 else ""
             ),
         )
-        review_prompt = _build_ingest_review_prompt(topic, staged_names, note)
+        review_prompt = _build_ingest_review_prompt(topic, processing_names, note)
 
         # Append chunked-source instructions when large sources were split.
         if chunked_sources:
             chunk_instructions = _build_chunked_processing_instructions(chunked_sources)
             review_prompt = f"{review_prompt}\n\n{chunk_instructions}"
+        if semantic_analyses:
+            code_instructions = _build_code_processing_instructions(
+                code_artifact_names
+            )
+            review_prompt = f"{review_prompt}\n\n{code_instructions}"
         _INGEST_PHASE_TIMEOUT = int(
             __import__("os").getenv("WIKI_INGEST_PHASE_TIMEOUT_SECONDS", "600")
         )
@@ -2479,8 +2621,10 @@ async def run_ingest(
             "Merging wiki updates..." if merge else "Applying wiki updates...",
         )
         apply_prompt = _build_ingest_apply_prompt(
-            topic, staged_names, review_summary, note, merge=merge
+            topic, processing_names, review_summary, note, merge=merge
         )
+        if semantic_analyses:
+            apply_prompt = f"{apply_prompt}\n\n{code_instructions}"
         try:
             apply_result = await asyncio.wait_for(
                 asyncio.to_thread(
@@ -2518,7 +2662,9 @@ async def run_ingest(
         def _post_ingest_review_sync() -> None:
             """Run post-ingest review synchronously in a daemon thread."""
             try:
-                review_prompt_bg = _build_review_prompt(topic, staged_names, note)
+                review_prompt_bg = _build_review_prompt(topic, processing_names, note)
+                if semantic_analyses:
+                    review_prompt_bg = f"{review_prompt_bg}\n\n{code_instructions}"
                 review_raw = _run_agent(
                     paths.wiki_dir,
                     review_prompt_bg,
@@ -2583,14 +2729,73 @@ async def run_ingest(
         raise
 
 
-def _extract_citations(answer: str) -> list[SourceCitation]:
+def _validated_line_range(
+        raw_dir: Path | None,
+        raw_path: str,
+        line_start: int | None,
+        line_end: int | None,
+) -> tuple[int | None, int | None]:
+    """Return a source-backed line range, or no range when it is invalid."""
+    if line_start is None:
+        return None, None
+    line_end = line_start if line_end is None else line_end
+    if line_start < 1 or line_end < line_start:
+        return None, None
+    if raw_dir is None:
+        return line_start, line_end
+    try:
+        source = (raw_dir / raw_path.removeprefix("/raw/")).resolve()
+        source.relative_to(raw_dir.resolve())
+        line_count = len(source.read_text(encoding="utf-8-sig").splitlines())
+    except (OSError, UnicodeError, ValueError):
+        return None, None
+    if line_end > line_count:
+        return None, None
+    return line_start, line_end
+
+
+def _resolve_derived_code_citation(
+        raw_dir: Path | None,
+        raw_path: str,
+) -> tuple[str, int | None, int | None]:
+    """Map an accidental derived-chunk citation to its original code source."""
+    if raw_dir is None or not raw_path.startswith("/raw/_code/"):
+        return raw_path, None, None
+    try:
+        artifact = (raw_dir / raw_path.removeprefix("/raw/")).resolve()
+        artifact.relative_to((raw_dir / "_code").resolve())
+        content = artifact.read_text(encoding="utf-8")
+    except (OSError, UnicodeError, ValueError):
+        return raw_path, None, None
+    source_match = re.search(
+        r"Original source:\s*`(/raw/[A-Za-z0-9._/\-]+)`",
+        content,
+        re.IGNORECASE,
+    )
+    lines_match = re.search(r"Lines:\s*(\d+)\s*-\s*(\d+)", content)
+    if source_match is None:
+        return raw_path, None, None
+    mapped_path = source_match.group(1)
+    start = int(lines_match.group(1)) if lines_match else None
+    end = int(lines_match.group(2)) if lines_match else None
+    start, end = _validated_line_range(raw_dir, mapped_path, start, end)
+    return mapped_path, start, end
+
+
+def _extract_citations(
+        answer: str,
+        *,
+        raw_dir: Path | None = None,
+) -> list[SourceCitation]:
     """Extract cited source paths, pages, locators, and web URLs from the answer text."""
     if not answer:
         return []
 
     citations: list[SourceCitation] = []
     seen_web_urls: set[str] = set()
-    seen_raw_citations: set[tuple[str, int | None, str | None]] = set()
+    seen_raw_citations: set[
+        tuple[str, int | None, str | None, int | None, int | None]
+    ] = set()
 
     # 1. Parse Sources block and numbered web citations
     # Example: [1] AI Research: https://example.com/ai
@@ -2640,9 +2845,14 @@ def _extract_citations(answer: str) -> list[SourceCitation]:
     xlsx_re = re.compile(
         r"^\s*[,(\[\s]?\s*(Sheet:\s*[^,\n)]+?,\s*(?:row|col)\s*\d+)\b", re.IGNORECASE
     )
+    line_re = re.compile(
+        r"^\s*[,(\[\s]?\s*(?:lines?|L)\.?\s*(\d+)"
+        r"(?:\s*[-–]\s*(?:L)?\s*(\d+))?\b",
+        re.IGNORECASE,
+    )
 
     for match in raw_path_re.finditer(answer):
-        raw_path = "/raw/" + match.group(1)
+        raw_path = "/raw/" + match.group(1).rstrip(".,;:")
 
         # Look at context immediately following the raw path
         start_idx = match.end()
@@ -2658,11 +2868,27 @@ def _extract_citations(answer: str) -> list[SourceCitation]:
 
         page: int | None = None
         locator: str | None = None
+        line_start: int | None = None
+        line_end: int | None = None
 
+        line_match = line_re.search(tail)
+        if line_match:
+            line_start = int(line_match.group(1))
+            line_end = (
+                int(line_match.group(2))
+                if line_match.group(2)
+                else line_start
+            )
+            line_start, line_end = _validated_line_range(
+                raw_dir,
+                raw_path,
+                line_start,
+                line_end,
+            )
         page_match = page_re.search(tail)
-        if page_match:
+        if line_match is None and page_match:
             page = int(page_match.group(1))
-        else:
+        elif line_match is None:
             slide_match = slide_re.search(tail)
             if slide_match:
                 locator = slide_match.group(1)
@@ -2671,7 +2897,15 @@ def _extract_citations(answer: str) -> list[SourceCitation]:
                 if xlsx_match:
                     locator = xlsx_match.group(1)
 
-        key = (raw_path, page, locator)
+        if raw_path.startswith("/raw/_code/"):
+            raw_path, derived_start, derived_end = _resolve_derived_code_citation(
+                raw_dir,
+                raw_path,
+            )
+            if derived_start is not None:
+                line_start, line_end = derived_start, derived_end
+
+        key = (raw_path, page, locator, line_start, line_end)
         if key not in seen_raw_citations:
             seen_raw_citations.add(key)
             citations.append(
@@ -2680,6 +2914,8 @@ def _extract_citations(answer: str) -> list[SourceCitation]:
                     raw_path=raw_path,
                     page=page,
                     locator=locator,
+                    line_start=line_start,
+                    line_end=line_end,
                 )
             )
 
@@ -2755,7 +2991,7 @@ async def run_query(
             )
             filed_path = target
 
-    citations = _extract_citations(answer)
+    citations = _extract_citations(answer, raw_dir=paths.raw_dir)
 
     return WikiQueryResult(
         answer=answer, filed_path=filed_path, sources_cited=citations

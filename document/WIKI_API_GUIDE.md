@@ -10,6 +10,10 @@ This guide documents the repository's active `thread_wiki` implementation. It is
 - Extracted source text and generated wiki pages are stored under `./docs/threads-wiki/<thread-id>/`.
 - Ingest uses an LLM to review sources, update wiki pages, maintain links, and refresh the wiki index.
 - Query uses the generated wiki and staged source text to produce grounded answers with source citations.
+- Recognized whole source-code files use local Tree-sitter parsing, semantic
+  chunks, repository indexing, and original-file line citations.
+- Public Git repository URLs can be imported and sent through the same ingest
+  and query flow.
 - No embedding model, vector index, or vector database is required by Thread Wiki.
 - No alternative RAG backend or backend-selection configuration is currently exposed. SAG is not integrated.
 
@@ -40,6 +44,14 @@ Upload documents → Auto-ingest → Wiki knowledge base → Query / Research ag
 | JSON | `.json` | Direct read |
 | YAML | `.yaml`, `.yml` | Direct read |
 | CSV | `.csv` | Direct read |
+| Source code | `.py`, `.pyw`, `.js`, `.mjs`, `.cjs`, `.jsx`, `.ts`, `.mts`, `.cts`, `.tsx`, `.java`, `.go`, `.rs`, `.c`, `.h`, `.cc`, `.cpp`, `.cxx`, `.hh`, `.hpp`, `.hxx`, `.cs`, `.rb`, `.php` | Tree-sitter semantic parsing; safe text fallback |
+| Extensionless scripts | Python, Node, Ruby, or PHP shebang | Tree-sitter semantic parsing |
+
+Explicit supported language-tagged code fences receive a separate semantic
+overlay while the containing document keeps normal ingestion behavior. They do
+not participate in repository symbol/import resolution. Untagged or uncertain
+blocks remain plain document content. See
+[AST-Aware Code Ingestion](CODE_INGESTION_AST.md) for details.
 
 ---
 
@@ -78,7 +90,49 @@ curl -X POST http://localhost:2024/threads/abc-123/wiki/ingest \
   -d '{"note": "Initial document batch"}'
 ```
 
-### 2. Get Wiki Ingest Status
+### 2. Import a Public Git Repository
+
+`POST /threads/{thread_id}/wiki/import/git`
+
+Shallow-clone an anonymous public HTTPS GitHub, GitLab, or Bitbucket repository,
+then run normal mixed-document and AST-aware ingest. Private credentials,
+submodules, LFS downloads, and source execution are not supported.
+
+**Request body:**
+
+```json
+{
+  "url": "https://github.com/example/project.git",
+  "ref": "main",
+  "topic": "Example project",
+  "note": "Focus on architecture"
+}
+```
+
+`ref`, `topic`, and `note` are optional.
+
+**Response:**
+
+```json
+{
+  "thread_id": "abc-123",
+  "status": "started",
+  "message": "Repository import and wiki ingest started. Poll /wiki/status or stream /wiki/progress for updates.",
+  "repository_url": "https://github.com/example/project.git",
+  "ref": "main"
+}
+```
+
+**Example:**
+
+```bash
+curl -X POST http://localhost:2024/threads/abc-123/wiki/import/git \
+  -H 'x-api-key: your_api_key' \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://github.com/example/project.git","ref":"main"}'
+```
+
+### 3. Get Wiki Ingest Status
 
 `GET /threads/{thread_id}/wiki/status`
 
@@ -97,7 +151,19 @@ Poll the current ingest progress. Use this for periodic polling.
   "started_at": "2026-06-21T10:30:00+00:00",
   "completed_at": null,
   "is_active": true,
-  "wiki_ready": false
+  "wiki_ready": false,
+  "code_analysis": {
+    "detected_files": 2,
+    "parsed_files": 1,
+    "partially_parsed_files": 1,
+    "fallback_files": 0,
+    "embedded_blocks": 1,
+    "parsed_embedded_blocks": 1,
+    "fallback_embedded_blocks": 0,
+    "symbol_count": 14,
+    "internal_import_count": 2,
+    "warnings": []
+  }
 }
 ```
 
@@ -106,6 +172,7 @@ Poll the current ingest progress. Use this for periodic polling.
 |-------|----------|-------------|
 | `idle` | 0% | No ingest has been run |
 | `initializing` | 5% | Creating wiki scaffold |
+| `importing` | 10% | Cloning and validating a public Git repository |
 | `staging_sources` | 15% | Collecting and staging source files |
 | `analyzing` | 40% | LLM review/analysis pass (read-only) |
 | `applying` | 70% | LLM apply pass (writing wiki pages) |
@@ -120,7 +187,7 @@ curl -H 'x-api-key: your_api_key' \
   'http://localhost:2024/threads/abc-123/wiki/status'
 ```
 
-### 3. Stream Ingest Progress (SSE)
+### 4. Stream Ingest Progress (SSE)
 
 `GET /threads/{thread_id}/wiki/progress`
 
@@ -155,7 +222,7 @@ source.addEventListener('end', (event) => {
 });
 ```
 
-### 4. Cancel Ingest
+### 5. Cancel Ingest
 
 `POST /threads/{thread_id}/wiki/ingest/cancel`
 
@@ -176,7 +243,7 @@ curl -X POST http://localhost:2024/threads/abc-123/wiki/ingest/cancel \
   -H 'x-api-key: your_api_key'
 ```
 
-### 5. Query Wiki
+### 6. Query Wiki
 
 `POST /threads/{thread_id}/wiki/query`
 
@@ -205,7 +272,9 @@ Query the thread's wiki knowledge base. Returns a grounded answer with citations
       "raw_path": "/raw/document.pdf.md",
       "page": 42,
       "locator": null,
-      "url": null
+      "url": null,
+      "line_start": null,
+      "line_end": null
     }
   ]
 }
@@ -217,6 +286,11 @@ Each `SourceCitation` object contains:
 - `page`: page number when derivable (for PDFs)
 - `locator`: free-form locator (slide number, sheet+row, heading text, or web source title)
 - `url`: URL (for `web` kind)
+- `line_start` and `line_end`: validated 1-based line range for original code
+  sources
+
+Code answers use citations such as `(/raw/src/app.py, lines 10-24)`. Derived
+`/raw/_code/` artifacts are navigation aids and are never returned as evidence.
 
 **Example:**
 ```bash
@@ -226,7 +300,7 @@ curl -X POST http://localhost:2024/threads/abc-123/wiki/query \
   -d '{"question": "Summarize the main themes across all uploaded documents"}'
 ```
 
-### 6. Run Lint Reconciliation
+### 7. Run Lint Reconciliation
 
 `POST /threads/{thread_id}/wiki/lint`
 

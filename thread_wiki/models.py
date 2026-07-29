@@ -20,6 +20,7 @@ class IngestPhase(StrEnum):
 
     IDLE = "idle"
     INITIALIZING = "initializing"
+    IMPORTING = "importing"
     STAGING_SOURCES = "staging_sources"
     ANALYZING = "analyzing"
     APPLYING = "applying"
@@ -35,6 +36,7 @@ class IngestPhase(StrEnum):
 ACTIVE_PHASES = frozenset(
     {
         IngestPhase.INITIALIZING,
+        IngestPhase.IMPORTING,
         IngestPhase.STAGING_SOURCES,
         IngestPhase.ANALYZING,
         IngestPhase.APPLYING,
@@ -57,6 +59,7 @@ TERMINAL_PHASES = frozenset(
 PHASE_PROGRESS = {
     IngestPhase.IDLE: 0,
     IngestPhase.INITIALIZING: 5,
+    IngestPhase.IMPORTING: 10,
     IngestPhase.STAGING_SOURCES: 15,
     IngestPhase.ANALYZING: 40,
     IngestPhase.APPLYING: 70,
@@ -81,6 +84,7 @@ class IngestProgress:
     source_names: list[str] = field(default_factory=list)
     current_source: str = ""
     error: str | None = None
+    code_analysis: dict | None = None
     review_report: ReviewReport | None = None
     retry_count: int = 0
     started_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
@@ -88,7 +92,7 @@ class IngestProgress:
     phase_started_at: str | None = None
 
     def advance(
-        self, phase: IngestPhase, detail: str = "", *, extra_progress: int = 0
+            self, phase: IngestPhase, detail: str = "", *, extra_progress: int = 0
     ) -> None:
         """Advance to a new phase, updating progress percentage."""
         self.phase = phase
@@ -157,6 +161,7 @@ class IngestProgress:
             "source_names": self.source_names,
             "current_source": self.current_source,
             "error": self.error,
+            "code_analysis": self.code_analysis,
             "started_at": self.started_at,
             "completed_at": self.completed_at,
             "is_active": self.is_active(),
@@ -238,6 +243,8 @@ class SourceCitation:
     page: int | None = None
     locator: str | None = None
     url: str | None = None
+    line_start: int | None = None
+    line_end: int | None = None
 
 
 def _resolve_wiki_base_dir(fallback_dir: Path) -> Path:
@@ -285,7 +292,7 @@ class ThreadWikiPaths:
 
     @classmethod
     def resolve(
-        cls, thread_id: str, base_dir: Path, *, docs_base: Path | None = None
+            cls, thread_id: str, base_dir: Path, *, docs_base: Path | None = None
     ) -> ThreadWikiPaths:
         """Resolve paths for a given thread ID relative to a base directory.
 
@@ -393,7 +400,7 @@ def parse_frontmatter(content: str) -> tuple[WikiPageMetadata, str]:
         return metadata, body
 
     yaml_str = content[3:end_idx].strip()
-    body = content[end_idx + 4 :].lstrip("\n")
+    body = content[end_idx + 4:].lstrip("\n")
 
     try:
         frontmatter = yaml.safe_load(yaml_str)
@@ -466,10 +473,10 @@ class ReviewReport:
     def total_items(self) -> int:
         """Total number of curation items across all categories."""
         return (
-            len(self.missing_pages)
-            + len(self.duplicate_suggestions)
-            + len(self.research_questions)
-            + len(self.gaps)
+                len(self.missing_pages)
+                + len(self.duplicate_suggestions)
+                + len(self.research_questions)
+                + len(self.gaps)
         )
 
     @property
@@ -558,10 +565,10 @@ class RelevanceEdge:
         if self.total_score == 0.0:
             w = self.WEIGHTS
             self.total_score = (
-                self.direct_links * w["direct_links"]
-                + self.source_overlap * w["source_overlap"]
-                + self.common_neighbors * w["common_neighbors"]
-                + self.type_affinity * w["type_affinity"]
+                    self.direct_links * w["direct_links"]
+                    + self.source_overlap * w["source_overlap"]
+                    + self.common_neighbors * w["common_neighbors"]
+                    + self.type_affinity * w["type_affinity"]
             )
 
 

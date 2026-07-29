@@ -162,7 +162,7 @@ def test_search_returns_correct_page_for_query() -> None:
         ),
         Document(
             page_content="Q4 2024 revenue reached $500M, up 12% year-over-year. "
-            "Cloud services drove the increase in earnings.",
+                         "Cloud services drove the increase in earnings.",
             metadata={"source_path": "/raw/report.pdf.md", "page": 2},
         ),
         Document(

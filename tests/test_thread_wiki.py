@@ -5,6 +5,7 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
+
 # ── Phase 1.1: Purpose.md ────────────────────────────────────────────────────
 
 
@@ -232,7 +233,7 @@ def test_ingest_progress_retry_count():
 
 
 def make_wiki_page(
-    path: Path, title: str, category: str, sources: list[str], body: str
+        path: Path, title: str, category: str, sources: list[str], body: str
 ) -> None:
     """Helper to write a wiki page with frontmatter."""
     path.parent.mkdir(parents=True, exist_ok=True)

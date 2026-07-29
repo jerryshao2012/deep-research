@@ -25,7 +25,14 @@ from pydantic import BaseModel, Field
 from research_agent.utils.knowledge_filesystem import clear_thread_cache
 
 from . import progress as progress_tracker
-from .models import ThreadWikiPaths, WikiQueryResult
+from .code_ingestion import load_code_analysis_summary
+from .git_import import (
+    GitImportError,
+    import_public_git_repository,
+    validate_git_ref,
+    validate_git_repo_url,
+)
+from .models import IngestPhase, ThreadWikiPaths, WikiQueryResult
 from .service import run_ingest, run_lint, run_query
 
 logger = logging.getLogger(__name__)
@@ -56,6 +63,15 @@ class WikiIngestRequest(BaseModel):
     topic: str | None = None
 
 
+class WikiGitImportRequest(BaseModel):
+    """Request body for public Git repository import and wiki ingest."""
+
+    url: str
+    ref: str | None = None
+    note: str | None = None
+    topic: str | None = None
+
+
 class WikiQueryRequestModel(BaseModel):
     """Request body for querying the wiki."""
 
@@ -76,6 +92,13 @@ class WikiIngestResponse(BaseModel):
     thread_id: str
     status: str
     message: str
+
+
+class WikiGitImportResponse(WikiIngestResponse):
+    """Response from queuing repository import and wiki ingest."""
+
+    repository_url: str
+    ref: str | None = None
 
 
 class ReviewItemOut(BaseModel):
@@ -99,6 +122,29 @@ class ReviewReportOut(BaseModel):
     is_empty: bool = True
 
 
+class CodeWarningOut(BaseModel):
+    """Safe warning produced by AST-aware code ingestion."""
+
+    source_path: str
+    code: str
+    message: str
+
+
+class CodeAnalysisSummaryOut(BaseModel):
+    """Bounded public summary of repository code analysis."""
+
+    detected_files: int = 0
+    parsed_files: int = 0
+    partially_parsed_files: int = 0
+    fallback_files: int = 0
+    embedded_blocks: int = 0
+    parsed_embedded_blocks: int = 0
+    fallback_embedded_blocks: int = 0
+    symbol_count: int = 0
+    internal_import_count: int = 0
+    warnings: list[CodeWarningOut] = Field(default_factory=list)
+
+
 class WikiStatusResponse(BaseModel):
     """Response for wiki ingest status."""
 
@@ -114,6 +160,7 @@ class WikiStatusResponse(BaseModel):
     is_active: bool
     wiki_ready: bool
     review_report: ReviewReportOut | None = None
+    code_analysis: CodeAnalysisSummaryOut | None = None
 
 
 class SourceCitationOut(BaseModel):
@@ -124,6 +171,8 @@ class SourceCitationOut(BaseModel):
     page: int | None = None
     locator: str | None = None
     url: str | None = None
+    line_start: int | None = None
+    line_end: int | None = None
 
 
 class WikiQueryResponse(BaseModel):
@@ -229,9 +278,9 @@ def _wiki_is_ready(paths: ThreadWikiPaths) -> bool:
     response_model=WikiIngestResponse,
 )
 async def trigger_wiki_ingest(
-    thread_id: str,
-    body: WikiIngestRequest = WikiIngestRequest(),
-    current_user=Depends(_wiki_get_current_user),
+        thread_id: str,
+        body: WikiIngestRequest = WikiIngestRequest(),
+        current_user=Depends(_wiki_get_current_user),
 ) -> WikiIngestResponse:
     """Trigger wiki ingest for a thread's uploaded documents.
 
@@ -278,11 +327,11 @@ async def trigger_wiki_ingest(
 
 
 async def _run_ingest_background(
-    paths: ThreadWikiPaths,
-    topic: str,
-    note: str | None,
-    progress_obj,
-    cancel_event: asyncio.Event,
+        paths: ThreadWikiPaths,
+        topic: str,
+        note: str | None,
+        progress_obj,
+        cancel_event: asyncio.Event,
 ) -> None:
     """Background ingest worker with directly injected progress and cancel objects."""
     try:
@@ -295,13 +344,129 @@ async def _run_ingest_background(
         await progress_tracker.cleanup_terminal(paths.thread_id)
 
 
+@router.post(
+    "/threads/{thread_id}/wiki/import/git",
+    response_model=WikiGitImportResponse,
+)
+async def import_git_repository_to_wiki(
+        thread_id: str,
+        body: WikiGitImportRequest,
+        current_user=Depends(_wiki_get_current_user),
+) -> WikiGitImportResponse:
+    """Import a public repository, then run normal AST-aware wiki ingest."""
+    paths = _resolve_paths(thread_id)
+    try:
+        repository = validate_git_repo_url(body.url)
+        checked_ref = validate_git_ref(body.ref)
+    except GitImportError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    topic = _topic_from_thread(thread_id, body.topic)
+
+    await progress_tracker.cancel_ingest(
+        thread_id,
+        reason="Replaced by Git repository import.",
+    )
+    placeholder_task: asyncio.Task = asyncio.create_task(asyncio.sleep(0))
+    prog = await progress_tracker.register_ingest(
+        thread_id,
+        placeholder_task,
+        wiki_dir=paths.wiki_dir,
+    )
+    cancel_event = progress_tracker._active_ingests[thread_id].cancel_event
+    task = asyncio.create_task(
+        _run_git_import_background(
+            paths,
+            topic,
+            body.note,
+            repository.url,
+            checked_ref,
+            prog,
+            cancel_event,
+        ),
+        name=f"wiki-git-import-{thread_id}",
+    )
+    progress_tracker._active_ingests[thread_id] = progress_tracker._IngestEntry(
+        progress=prog,
+        task=task,
+        cancel_event=cancel_event,
+    )
+    prog.advance(IngestPhase.IMPORTING, "Repository import queued.")
+
+    return WikiGitImportResponse(
+        thread_id=thread_id,
+        status="started",
+        message=(
+            "Repository import and wiki ingest started. Poll /wiki/status or "
+            "stream /wiki/progress for updates."
+        ),
+        repository_url=repository.url,
+        ref=checked_ref,
+    )
+
+
+async def _run_git_import_background(
+        paths: ThreadWikiPaths,
+        topic: str,
+        note: str | None,
+        repository_url: str,
+        ref: str | None,
+        progress_obj,
+        cancel_event: asyncio.Event,
+) -> None:
+    """Clone a validated repository and hand it to the standard ingest flow."""
+    try:
+        progress_obj.advance(
+            IngestPhase.IMPORTING,
+            "Cloning and validating public repository...",
+        )
+        await progress_tracker.save_progress(progress_obj, paths.wiki_dir)
+        result = await asyncio.to_thread(
+            import_public_git_repository,
+            paths.docs_dir,
+            repository_url,
+            ref=ref,
+        )
+        await progress_tracker.check_cancellation(
+            cancel_event,
+            phase_name="repository_import",
+        )
+        progress_obj.detail = (
+            f"Imported {result.file_count} repository files; starting wiki ingest."
+        )
+        await run_ingest(
+            paths,
+            topic,
+            progress_obj,
+            cancel_event,
+            note=note,
+        )
+    except asyncio.CancelledError:
+        progress_obj.mark_cancelled()
+        await progress_tracker.save_progress(progress_obj, paths.wiki_dir)
+        logger.info("Repository import cancelled for thread %s", paths.thread_id)
+    except GitImportError as exc:
+        progress_obj.mark_error(str(exc))
+        await progress_tracker.save_progress(progress_obj, paths.wiki_dir)
+        logger.warning(
+            "Repository import failed for thread %s: %s",
+            paths.thread_id,
+            exc,
+        )
+    except Exception:
+        progress_obj.mark_error("Repository import failed.")
+        await progress_tracker.save_progress(progress_obj, paths.wiki_dir)
+        logger.exception("Repository import failed for thread %s", paths.thread_id)
+    finally:
+        await progress_tracker.cleanup_terminal(paths.thread_id)
+
+
 @router.get(
     "/threads/{thread_id}/wiki/status",
     response_model=WikiStatusResponse,
 )
 async def get_wiki_status(
-    thread_id: str,
-    current_user=Depends(_wiki_get_current_user),
+        thread_id: str,
+        current_user=Depends(_wiki_get_current_user),
 ) -> WikiStatusResponse:
     """Get current wiki ingest status and progress for a thread."""
     paths = ThreadWikiPaths.resolve(thread_id, _BASE_DIR)
@@ -310,6 +475,7 @@ async def get_wiki_status(
     if prog is None:
         # No active ingest — check if wiki is already built.
         ready = _wiki_is_ready(paths)
+        code_analysis = load_code_analysis_summary(paths.wiki_dir)
         return WikiStatusResponse(
             thread_id=thread_id,
             phase="ready" if ready else "idle",
@@ -322,6 +488,7 @@ async def get_wiki_status(
             completed_at=None,
             is_active=False,
             wiki_ready=ready,
+            code_analysis=code_analysis,
         )
 
     review_out = None
@@ -354,13 +521,14 @@ async def get_wiki_status(
         is_active=prog.is_active(),
         wiki_ready=_wiki_is_ready(paths),
         review_report=review_out,
+        code_analysis=prog.code_analysis,
     )
 
 
 @router.get("/threads/{thread_id}/wiki/progress")
 async def stream_wiki_progress(
-    thread_id: str,
-    current_user=Depends(_wiki_get_current_user),
+        thread_id: str,
+        current_user=Depends(_wiki_get_current_user),
 ):
     """SSE stream for real-time ingest progress updates.
 
@@ -430,7 +598,7 @@ async def stream_wiki_progress(
 
             # Send heartbeat if no event was emitted for a while.
             if not emitted and (
-                _time.monotonic() - last_emit_time >= _HEARTBEAT_INTERVAL
+                    _time.monotonic() - last_emit_time >= _HEARTBEAT_INTERVAL
             ):
                 yield _sse_frame(
                     "heartbeat",
@@ -453,8 +621,8 @@ async def stream_wiki_progress(
     "/threads/{thread_id}/wiki/ingest/cancel",
 )
 async def cancel_wiki_ingest(
-    thread_id: str,
-    current_user=Depends(_wiki_get_current_user),
+        thread_id: str,
+        current_user=Depends(_wiki_get_current_user),
 ) -> dict[str, Any]:
     """Cancel an in-progress wiki ingest for a thread.
 
@@ -476,9 +644,9 @@ async def cancel_wiki_ingest(
     response_model=WikiQueryResponse,
 )
 async def llm_wiki_query(
-    thread_id: str,
-    body: WikiQueryRequestModel,
-    current_user=Depends(_wiki_get_current_user),
+        thread_id: str,
+        body: WikiQueryRequestModel,
+        current_user=Depends(_wiki_get_current_user),
 ) -> WikiQueryResponse:
     """Query the thread's wiki knowledge base.
 
@@ -513,6 +681,8 @@ async def llm_wiki_query(
                 page=c.page,
                 locator=c.locator,
                 url=c.url,
+                line_start=c.line_start,
+                line_end=c.line_end,
             )
             for c in result.sources_cited
         ],
@@ -524,9 +694,9 @@ async def llm_wiki_query(
     response_model=WikiLintResponse,
 )
 async def lint_wiki(
-    thread_id: str,
-    body: WikiLintRequest = WikiLintRequest(),
-    current_user=Depends(_wiki_get_current_user),
+        thread_id: str,
+        body: WikiLintRequest = WikiLintRequest(),
+        current_user=Depends(_wiki_get_current_user),
 ) -> WikiLintResponse:
     """Run lint reconciliation on the thread's wiki.
 
@@ -552,8 +722,8 @@ async def lint_wiki(
     response_model=GraphInsightsResponse,
 )
 async def get_wiki_insights(
-    thread_id: str,
-    current_user=Depends(_wiki_get_current_user),
+        thread_id: str,
+        current_user=Depends(_wiki_get_current_user),
 ) -> GraphInsightsResponse:
     """Get knowledge graph insights for a thread's wiki.
 
@@ -653,8 +823,8 @@ class WikiGraphResponse(BaseModel):
     response_model=WikiGraphResponse,
 )
 async def get_wiki_graph(
-    thread_id: str,
-    current_user=Depends(_wiki_get_current_user),
+        thread_id: str,
+        current_user=Depends(_wiki_get_current_user),
 ) -> WikiGraphResponse:
     """Get the wiki knowledge graph as nodes and edges for visualization.
 
@@ -687,8 +857,8 @@ async def get_wiki_graph(
     "/threads/{thread_id}/wiki",
 )
 async def delete_thread_wiki(
-    thread_id: str,
-    current_user=Depends(_wiki_get_current_user),
+        thread_id: str,
+        current_user=Depends(_wiki_get_current_user),
 ) -> dict[str, Any]:
     """Delete a thread's LLM wiki workspace and uploaded documents."""
     # 1. Cancel any active ingest for this thread.
@@ -772,8 +942,8 @@ def _count_files(node: dict[str, Any]) -> int:
     "/threads/{thread_id}/wiki/tree",
 )
 async def get_thread_wiki_tree(
-    thread_id: str,
-    current_user=Depends(_wiki_get_current_user),
+        thread_id: str,
+        current_user=Depends(_wiki_get_current_user),
 ) -> dict[str, Any]:
     """Get the full directory tree structure for a thread's wiki workspace."""
     paths = ThreadWikiPaths.resolve(thread_id, _BASE_DIR)
@@ -798,11 +968,11 @@ async def get_thread_wiki_tree(
     "/threads/{thread_id}/wiki/file",
 )
 async def get_thread_wiki_file(
-    thread_id: str,
-    path: str = Query(
-        ..., description="Relative file path inside threads-wiki/<thread_id>"
-    ),
-    current_user=Depends(_wiki_get_current_user),
+        thread_id: str,
+        path: str = Query(
+            ..., description="Relative file path inside threads-wiki/<thread_id>"
+        ),
+        current_user=Depends(_wiki_get_current_user),
 ) -> dict[str, Any]:
     """Read and return the text content of a specific file in the thread's wiki workspace."""
     paths = ThreadWikiPaths.resolve(thread_id, _BASE_DIR)
@@ -830,7 +1000,7 @@ async def get_thread_wiki_file(
         )
 
     if not (await asyncio.to_thread(target_file.exists)) or not (
-        await asyncio.to_thread(target_file.is_file)
+            await asyncio.to_thread(target_file.is_file)
     ):
         raise HTTPException(
             status_code=404,
@@ -840,7 +1010,7 @@ async def get_thread_wiki_file(
     size = await asyncio.to_thread(lambda: target_file.stat().st_size)
 
     if target_file.suffix.lower() in {".pkl"} or (
-        len(rel_path.parts) > 0 and rel_path.parts[0] == "index"
+            len(rel_path.parts) > 0 and rel_path.parts[0] == "index"
     ):
         return {
             "thread_id": thread_id,

@@ -13,7 +13,7 @@
 - [🛡️ Rate Limit Handling](#-rate-limit-handling)
 - [Multi-Agent Complex Workflows Evaluation & Regression Tracking](#multi-agent-complex-workflows-evaluation--regression-tracking)
   - [Iterative Report Refinement (Verification Loop)](#iterative-report-refinement-verification-loop)
-- [📖 Thread Wiki (Document RAG)](#-thread-wiki-document-rag)
+- [📖 Thread Wiki (Document and Code RAG)](#-thread-wiki-document-and-code-rag)
 
 ## 🚀 Quickstart
 
@@ -77,6 +77,12 @@ export WIKI_INDEX_REPAIR_TIMEOUT_SECONDS=180
 export WIKI_QUERY_TIMEOUT_SECONDS=120
 export WIKI_LINT_TIMEOUT_SECONDS=60
 export WIKI_INGEST_MAX_WAIT_SECONDS=600
+export WIKI_CODE_AST_ENABLED=true
+export WIKI_EMBEDDED_CODE_AST_ENABLED=true
+export WIKI_CODE_PARSE_MAX_BYTES=2097152
+export WIKI_GIT_IMPORT_TIMEOUT_SECONDS=120
+export WIKI_GIT_IMPORT_MAX_FILES=5000
+export WIKI_GIT_IMPORT_MAX_BYTES=104857600
 
 # Evaluation Tracking (for langgraph dev server)
 # Enable automatic metrics logging during development (default: true)
@@ -575,18 +581,22 @@ curl -H 'X-API-Key: your_secure_api_key_here' http://localhost:8000/storage/info
 
 ---
 
-## 📖 Thread Wiki (Document RAG)
+## 📖 Thread Wiki (Document and Code RAG)
 
-The Thread Wiki feature provides **per-thread RAG without a vector database**. When documents are uploaded to a thread folder (`docs/threads/<thread-id>/`), they are automatically ingested into a wiki knowledge base at `docs/threads-wiki/<thread-id>/`. The deep research agent then automatically queries this wiki for grounded context when answering questions.
+Thread Wiki provides **per-thread RAG without a vector database**. Uploaded
+documents and imported public Git repositories are ingested into a wiki at
+`docs/threads-wiki/<thread-id>/`; the research agent queries that wiki for
+grounded context. Recognized whole source files use local Tree-sitter semantic
+parsing. Normal documents keep existing behavior while explicit supported
+language-tagged fences receive a semantic overlay tied to original document
+lines.
 
 ### Architecture
 
 ```
-Upload documents         Auto-ingest            Wiki workspace          Research agent
-docs/threads/<id>/  →   LLM review+apply   →   docs/threads-wiki/<id>/  →  Wiki context injected
-  .pdf, .docx,              (background)         wiki/, raw/, log.md         into agent runs
-  .pptx, .xlsx,
-  .md, .txt, .csv
+Upload documents / Git URL       Code-aware ingest            Wiki workspace          Research agent
+docs/threads/<id>/          →   AST + LLM review/apply   →   docs/threads-wiki/<id>/  →  Wiki context
+                                  (background)                 wiki/, raw/, manifest
 ```
 
 ### Supported File Types
@@ -598,18 +608,24 @@ docs/threads/<id>/  →   LLM review+apply   →   docs/threads-wiki/<id>/  → 
 | PowerPoint | `.pptx` | python-pptx (slides + speaker notes) |
 | Excel | `.xlsx` | openpyxl (sheets → text) |
 | Text | `.md`, `.txt`, `.json`, `.yaml`, `.yml`, `.csv` | Direct read |
+| Source code | Python, JavaScript/JSX, TypeScript/TSX, Java, Go, Rust, C/C++, C#, Ruby, PHP | Tree-sitter semantic parsing with text fallback |
 
 ### Automatic Behaviors
 
 - **Auto-ingest on upload**: Uploading to `threads/<thread-id>/` triggers background wiki ingest automatically.
 - **Auto-cancel + lint on delete**: Deleting documents cancels any active ingest and runs lint reconciliation to clean up stale wiki references.
 - **Wiki context in research agent**: When a thread has a ready wiki, the research agent automatically queries it for context relevant to the user's question. The wiki knowledge is injected as grounded context alongside web search and other tools.
+- **Original code citations**: Code answers cite `/raw/...` files with validated
+  line ranges; derived `_code/` chunks are never evidence.
+- **Safe public Git import**: Anonymous HTTPS GitHub, GitLab, and Bitbucket
+  repositories can be shallow-cloned and auto-ingested without executing code.
 
 ### Wiki API Endpoints
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/threads/{id}/wiki/ingest` | POST | Trigger wiki ingest for uploaded documents |
+| `/threads/{id}/wiki/import/git` | POST | Import a public Git repository and auto-ingest |
 | `/threads/{id}/wiki/status` | GET | Poll ingest progress (phase, percentage) |
 | `/threads/{id}/wiki/progress` | GET | SSE stream for real-time ingest progress |
 | `/threads/{id}/wiki/ingest/cancel` | POST | Cancel an in-progress ingest |
@@ -619,7 +635,7 @@ docs/threads/<id>/  →   LLM review+apply   →   docs/threads-wiki/<id>/  → 
 ### Ingest Lifecycle
 
 ```
-idle → initializing (5%) → staging_sources (15%) → analyzing (40%) → applying (70%) → refreshing_index (90%) → ready (100%)
+idle → importing (10%, Git only) → initializing (5%) → staging_sources (15%) → analyzing (40%) → applying (70%) → refreshing_index (90%) → ready (100%)
                                                                                                                   ↓
                                                                                                         error / cancelled
 ```
@@ -637,6 +653,15 @@ curl -X POST http://localhost:2024/threads/abc-123/wiki/ingest \
 curl -H 'x-api-key: your_api_key' \
   'http://localhost:2024/threads/abc-123/wiki/status'
 # {"phase": "analyzing", "progress": 40, "is_active": true, "wiki_ready": false}
+```
+
+**Import a public Git repository:**
+
+```bash
+curl -X POST http://localhost:2024/threads/abc-123/wiki/import/git \
+  -H 'x-api-key: your_api_key' \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://github.com/example/project.git","ref":"main"}'
 ```
 
 **Stream progress via SSE:**
@@ -659,7 +684,9 @@ curl -X POST http://localhost:2024/threads/abc-123/wiki/ingest/cancel \
   -H 'x-api-key: your_api_key'
 ```
 
-> **Full API reference**: See [WIKI_API_GUIDE.md](./document/WIKI_API_GUIDE.md) for detailed request/response schemas, frontend integration examples, and troubleshooting.
+> **References**: See [WIKI_API_GUIDE.md](./document/WIKI_API_GUIDE.md) for API
+> schemas and [CODE_INGESTION_AST.md](./document/CODE_INGESTION_AST.md) for code
+> architecture, security, fallback behavior, and limitations.
 
 #### Configuration
 
@@ -672,6 +699,14 @@ UPLOAD_API_KEY=your_secure_api_key_here
 # Host and port for the document upload API server
 UPLOAD_HOST=0.0.0.0
 UPLOAD_PORT=8000
+
+# AST-aware whole-source parsing and public Git import limits
+WIKI_CODE_AST_ENABLED=true
+WIKI_EMBEDDED_CODE_AST_ENABLED=true
+WIKI_CODE_PARSE_MAX_BYTES=2097152
+WIKI_GIT_IMPORT_TIMEOUT_SECONDS=120
+WIKI_GIT_IMPORT_MAX_FILES=5000
+WIKI_GIT_IMPORT_MAX_BYTES=104857600
 ```
 
 To generate a secure API key:

@@ -19,8 +19,8 @@ from fastapi.testclient import TestClient
     ],
 )
 def test_langgraph_mutations_return_503_in_read_only_mode(
-    handler_name: str,
-    monkeypatch: pytest.MonkeyPatch,
+        handler_name: str,
+        monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import auth
 
@@ -46,8 +46,8 @@ def test_langgraph_mutations_return_503_in_read_only_mode(
     ],
 )
 def test_langgraph_mutations_remain_allowed_outside_read_only_mode(
-    handler_name: str,
-    monkeypatch: pytest.MonkeyPatch,
+        handler_name: str,
+        monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import auth
 
@@ -58,7 +58,7 @@ def test_langgraph_mutations_remain_allowed_outside_read_only_mode(
 
 
 def test_read_only_flag_does_not_change_non_aws_auth(
-    monkeypatch: pytest.MonkeyPatch,
+        monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import auth
 
@@ -86,8 +86,8 @@ def test_read_only_flag_does_not_change_non_aws_auth(
     ],
 )
 def test_read_only_route_matrix_contains_persistent_custom_mutations(
-    method: str,
-    path: str,
+        method: str,
+        path: str,
 ) -> None:
     import webapp
 
@@ -119,8 +119,8 @@ def test_read_only_route_matrix_contains_persistent_custom_mutations(
     ],
 )
 def test_read_only_route_matrix_does_not_block_unrelated_or_read_routes(
-    method: str,
-    path: str,
+        method: str,
+        path: str,
 ) -> None:
     import webapp
 
@@ -128,7 +128,7 @@ def test_read_only_route_matrix_does_not_block_unrelated_or_read_routes(
 
 
 def test_custom_app_returns_503_only_for_protected_mutation(
-    monkeypatch: pytest.MonkeyPatch,
+        monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import webapp
 
@@ -153,7 +153,7 @@ def test_custom_app_returns_503_only_for_protected_mutation(
 
 
 def test_custom_app_allows_mutations_when_read_only_is_disabled(
-    monkeypatch: pytest.MonkeyPatch,
+        monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import webapp
 
@@ -165,7 +165,7 @@ def test_custom_app_allows_mutations_when_read_only_is_disabled(
 
 
 def test_aws_read_write_lifespan_claims_writer_before_serving(
-    monkeypatch: pytest.MonkeyPatch,
+        monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import langgraph_snapshot
     import s3_storage
@@ -215,7 +215,7 @@ def test_aws_read_write_lifespan_claims_writer_before_serving(
 
 
 def test_writer_claim_failure_prevents_lifespan_from_serving(
-    monkeypatch: pytest.MonkeyPatch,
+        monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import langgraph_snapshot
     import webapp
@@ -240,15 +240,15 @@ def test_writer_claim_failure_prevents_lifespan_from_serving(
             pytest.fail("lifespan yielded after writer claim failure")
 
     with pytest.raises(
-        langgraph_snapshot.SnapshotPublishError,
-        match="writer epoch conflict",
+            langgraph_snapshot.SnapshotPublishError,
+            match="writer epoch conflict",
     ):
         asyncio.run(exercise())
     assert daemon_started is False
 
 
 def test_lifespan_does_not_run_late_snapshot_restore(
-    monkeypatch: pytest.MonkeyPatch,
+        monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import langgraph_snapshot
     import s3_storage
@@ -276,7 +276,7 @@ def test_lifespan_does_not_run_late_snapshot_restore(
 
 
 def test_read_only_runtime_starts_when_s3_denies_every_write(
-    monkeypatch: pytest.MonkeyPatch,
+        monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import langgraph_snapshot
     import s3_storage
@@ -306,7 +306,7 @@ def test_read_only_runtime_starts_when_s3_denies_every_write(
 
 
 def test_non_aws_lifespan_does_not_start_s3_controllers(
-    monkeypatch: pytest.MonkeyPatch,
+        monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import langgraph_snapshot
     import webapp
@@ -333,8 +333,8 @@ def test_non_aws_lifespan_does_not_start_s3_controllers(
 
 
 def test_generic_s3_upload_loop_mirrors_only_tracked_folders(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path,
 ) -> None:
     import s3_storage
     import webapp
@@ -369,8 +369,8 @@ def test_generic_s3_upload_loop_mirrors_only_tracked_folders(
 
 
 def test_generic_s3_upload_loop_retries_after_cycle_exception(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path,
 ) -> None:
     import s3_storage
     import webapp
@@ -409,8 +409,8 @@ def test_generic_s3_upload_loop_retries_after_cycle_exception(
 
 
 def test_sleeping_persistence_workers_stop_promptly(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path,
 ) -> None:
     import langgraph_snapshot
     import webapp
@@ -497,8 +497,8 @@ def test_blocked_runtime_worker_shutdown_is_bounded_and_explicit() -> None:
     started = time.monotonic()
     try:
         with pytest.raises(
-            webapp.PersistenceWorkerShutdownError,
-            match="blocked-s3",
+                webapp.PersistenceWorkerShutdownError,
+                match="blocked-s3",
         ):
             webapp._stop_runtime_controller(lease, timeout_seconds=0.05)
     finally:
@@ -529,8 +529,8 @@ def test_blocked_generic_worker_shutdown_is_bounded_and_explicit() -> None:
     started = time.monotonic()
     try:
         with pytest.raises(
-            webapp.PersistenceWorkerShutdownError,
-            match="blocked-generic",
+                webapp.PersistenceWorkerShutdownError,
+                match="blocked-generic",
         ):
             webapp._stop_generic_s3_upload_daemon(
                 daemon,
@@ -544,7 +544,7 @@ def test_blocked_generic_worker_shutdown_is_bounded_and_explicit() -> None:
 
 
 def test_invalid_generic_sync_interval_prevents_writer_claim(
-    monkeypatch: pytest.MonkeyPatch,
+        monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import langgraph_snapshot
     import webapp

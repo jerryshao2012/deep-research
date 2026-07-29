@@ -29,10 +29,10 @@ class _DownloadClient:
         return _DownloadPaginator(self._keys)
 
     def download_file(
-        self,
-        bucket: str,
-        key: str,
-        destination: str,
+            self,
+            bucket: str,
+            key: str,
+            destination: str,
     ) -> None:
         self.downloads.append((bucket, key, destination))
         Path(destination).write_text("downloaded", encoding="utf-8")
@@ -56,9 +56,9 @@ def test_generic_s3_sync_excludes_langgraph_state(monkeypatch) -> None:
     ],
 )
 def test_partial_s3_configuration_disables_optional_helpers(
-    monkeypatch,
-    tmp_path,
-    environment_update,
+        monkeypatch,
+        tmp_path,
+        environment_update,
 ) -> None:
     monkeypatch.delenv("S3_BUCKET_NAME", raising=False)
     monkeypatch.delenv("AWS_REGION", raising=False)
@@ -134,9 +134,9 @@ def client(service, region_name=None):
     ],
 )
 def test_s3_storage_startup_cli_requires_complete_aws_configuration(
-    tmp_path,
-    environment_update,
-    missing_name,
+        tmp_path,
+        environment_update,
+        missing_name,
 ) -> None:
     environment = os.environ.copy()
     environment.pop("S3_BUCKET_NAME", None)
@@ -167,9 +167,9 @@ def test_s3_storage_startup_cli_requires_complete_aws_configuration(
     ],
 )
 def test_download_prefix_rejects_unsafe_object_suffixes(
-    monkeypatch,
-    tmp_path,
-    key,
+        monkeypatch,
+        tmp_path,
+        key,
 ) -> None:
     client = _DownloadClient([key])
     monkeypatch.setenv("S3_BUCKET_NAME", "demo-bucket")
@@ -184,8 +184,8 @@ def test_download_prefix_rejects_unsafe_object_suffixes(
 
 
 def test_download_prefix_accepts_normal_nested_object(
-    monkeypatch,
-    tmp_path,
+        monkeypatch,
+        tmp_path,
 ) -> None:
     client = _DownloadClient(["docs/threads/thread-1/wiki/index.md"])
     monkeypatch.setenv("S3_BUCKET_NAME", "demo-bucket")
@@ -203,8 +203,8 @@ def test_download_prefix_accepts_normal_nested_object(
 
 
 def test_download_prefix_rejects_destination_resolved_outside_root(
-    monkeypatch,
-    tmp_path,
+        monkeypatch,
+        tmp_path,
 ) -> None:
     client = _DownloadClient(["docs/linked/file.txt"])
     tracked_root = tmp_path / "docs"
@@ -409,7 +409,7 @@ def test_manual_aws_sync_uses_project_runtime_directories() -> None:
 
 
 def test_manual_verbose_upload_runs_without_optional_aws_args(
-    tmp_path,
+        tmp_path,
 ) -> None:
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -465,9 +465,9 @@ exit 0
     calls = call_log.read_text(encoding="utf-8")
     assert f"aws s3 sync {PROJECT_ROOT / 'docs'}" in calls
     assert (
-        "python -m langgraph_snapshot publish "
-        f"--source {PROJECT_ROOT / '.langgraph_api'}"
-    ) in calls
+               "python -m langgraph_snapshot publish "
+               f"--source {PROJECT_ROOT / '.langgraph_api'}"
+           ) in calls
     assert "aws s3 sync" in calls
     assert "aws s3 sync" not in "\n".join(
         line for line in calls.splitlines() if ".langgraph_api" in line
@@ -564,10 +564,10 @@ def test_aws_container_uses_frozen_uv_runtime() -> None:
     assert "/deps/deep_research/.venv/bin/python" in source
     assert "/deps/deep_research/.venv/bin/langgraph" in source
     for module in (
-        "boto3",
-        "langgraph_api",
-        "langgraph_runtime_inmem",
-        "langgraph_snapshot",
+            "boto3",
+            "langgraph_api",
+            "langgraph_runtime_inmem",
+            "langgraph_snapshot",
     ):
         assert f"import {module}" in source
 
@@ -590,8 +590,8 @@ def test_aws_container_removes_state_created_by_langgraph_cli_smoke() -> None:
     assert "/deps/deep_research/..langgraph_api.publish-*" in source
     assert "/deps/deep_research/..langgraph_api.canonical-*" in source
     assert (
-        "/deps/deep_research/..langgraph_api.restore-receipt.json.*"
-        in source
+            "/deps/deep_research/..langgraph_api.restore-receipt.json.*"
+            in source
     )
 
 
@@ -603,8 +603,8 @@ def test_aws_container_pins_python_patch_and_linux_amd64_digest() -> None:
         "sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b"
     )
     assert (
-        "sha256:72d3d75f2639ab82b34b29390ad3d6e0827c775befee94edda8e9976818f488d"
-        in source
+            "sha256:72d3d75f2639ab82b34b29390ad3d6e0827c775befee94edda8e9976818f488d"
+            in source
     )
 
 
@@ -653,8 +653,8 @@ def test_aws_deploy_defaults_to_read_only_snapshot_rollout() -> None:
     for name, value in expected_environment.items():
         assert f'"{name}": "{value}"' in source
     assert (
-        '"LANGGRAPH_S3_READ_ONLY": "${LANGGRAPH_S3_READ_ONLY}"'
-        in source
+            '"LANGGRAPH_S3_READ_ONLY": "${LANGGRAPH_S3_READ_ONLY}"'
+            in source
     )
 
 
@@ -663,8 +663,8 @@ def test_aws_deploy_enforces_singleton_and_http_health_check() -> None:
 
     assert "create-auto-scaling-configuration" in source
     assert (
-        'AUTOSCALING_CONFIGURATION_NAME="deep-research-singleton-${SEED}"'
-        in source
+            'AUTOSCALING_CONFIGURATION_NAME="deep-research-singleton-${SEED}"'
+            in source
     )
     assert "describe-auto-scaling-configuration" in source
     assert "AutoScalingConfiguration.[Status,MinSize,MaxSize]" in source
@@ -692,10 +692,10 @@ def test_aws_deploy_enforces_singleton_and_http_health_check() -> None:
     ],
 )
 def test_aws_deploy_readiness_check_requires_ok_2xx(
-    tmp_path,
-    status_code,
-    curl_exit,
-    expected_returncode,
+        tmp_path,
+        status_code,
+        curl_exit,
+        expected_returncode,
 ) -> None:
     source = (PROJECT_ROOT / "deploy-aws.sh").read_text(encoding="utf-8")
     function_start = source.index("verify_app_runner_readiness() {")
@@ -774,9 +774,9 @@ def _extract_shell_function(source: str, name: str) -> str:
     ],
 )
 def test_aws_deploy_waits_for_exact_operation_terminal_status(
-    tmp_path,
-    operation_status,
-    expected_returncode,
+        tmp_path,
+        operation_status,
+        expected_returncode,
 ) -> None:
     source = (PROJECT_ROOT / "deploy-aws.sh").read_text(encoding="utf-8")
     function_source = _extract_shell_function(
@@ -848,7 +848,7 @@ def test_aws_deploy_captures_every_operation_id() -> None:
 
 
 def test_aws_deploy_replaces_inactive_singleton_configuration(
-    tmp_path,
+        tmp_path,
 ) -> None:
     source = (PROJECT_ROOT / "deploy-aws.sh").read_text(encoding="utf-8")
     function_source = _extract_shell_function(
@@ -905,7 +905,7 @@ esac
 
 
 def test_aws_deploy_reuses_lowercase_active_singleton_configuration(
-    tmp_path,
+        tmp_path,
 ) -> None:
     source = (PROJECT_ROOT / "deploy-aws.sh").read_text(encoding="utf-8")
     function_source = _extract_shell_function(
@@ -969,10 +969,10 @@ esac
     ],
 )
 def test_aws_deploy_requires_expected_health_version(
-    tmp_path,
-    deployed_version,
-    expected_version,
-    expected_returncode,
+        tmp_path,
+        deployed_version,
+        expected_version,
+        expected_returncode,
 ) -> None:
     source = (PROJECT_ROOT / "deploy-aws.sh").read_text(encoding="utf-8")
     function_source = _extract_shell_function(
@@ -1037,11 +1037,11 @@ def test_aws_deploy_registers_temp_files_for_exit_cleanup() -> None:
 
     assert "trap cleanup_temp_files EXIT" in source
     for variable in (
-        "TRUST_POLICY_FILE",
-        "INSTANCE_TRUST_FILE",
-        "INSTANCE_POLICY_FILE",
-        "S3_POLICY_FILE",
-        "SOURCE_CONFIG_FILE",
+            "TRUST_POLICY_FILE",
+            "INSTANCE_TRUST_FILE",
+            "INSTANCE_POLICY_FILE",
+            "S3_POLICY_FILE",
+            "SOURCE_CONFIG_FILE",
     ):
         creation = source.index(f"{variable}=$(mktemp)")
         registration = source.index(
@@ -1052,7 +1052,7 @@ def test_aws_deploy_registers_temp_files_for_exit_cleanup() -> None:
 
 
 def test_aws_deploy_exit_trap_removes_registered_temp_file(
-    tmp_path,
+        tmp_path,
 ) -> None:
     source = (PROJECT_ROOT / "deploy-aws.sh").read_text(encoding="utf-8")
     cleanup_source = _extract_shell_function(source, "cleanup_temp_files")
@@ -1085,13 +1085,13 @@ def test_aws_deploy_injects_google_oauth_credentials() -> None:
     source = (PROJECT_ROOT / "deploy-aws.sh").read_text(encoding="utf-8")
 
     assert (
-        '"GOOGLE_CLIENT_ID": '
-        '"${SECRET_ARN}:GOOGLE-CLIENT-ID::"'
-    ) in source
+               '"GOOGLE_CLIENT_ID": '
+               '"${SECRET_ARN}:GOOGLE-CLIENT-ID::"'
+           ) in source
     assert (
-        '"GOOGLE_CLIENT_SECRET": '
-        '"${SECRET_ARN}:GOOGLE-CLIENT-SECRET::"'
-    ) in source
+               '"GOOGLE_CLIENT_SECRET": '
+               '"${SECRET_ARN}:GOOGLE-CLIENT-SECRET::"'
+           ) in source
 
 
 def test_aws_deploy_configures_cloudfront_frontend_origin() -> None:
@@ -1103,9 +1103,9 @@ def test_aws_deploy_configures_cloudfront_frontend_origin() -> None:
     )
 
     assert (
-        'export FRONTEND_URLS="${FRONTEND_URLS:-'
-        'https://d600y3wyk0xvf.cloudfront.net}"'
-    ) in environment_source
+               'export FRONTEND_URLS="${FRONTEND_URLS:-'
+               'https://d600y3wyk0xvf.cloudfront.net}"'
+           ) in environment_source
     assert '"FRONTEND_URLS": "${FRONTEND_URLS}"' in deploy_source
 
 

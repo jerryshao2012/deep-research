@@ -52,6 +52,7 @@ def mock_extractors_modules(monkeypatch):
     # Reload the module under test so the lazy `import pymupdf4llm` inside
     # _extract_pdf_text picks up our mock.
     import importlib
+
     import research_agent.utils.content_extractors as mod
     importlib.reload(mod)
 
@@ -359,7 +360,9 @@ class TestTurnAwareReportNaming:
     """Tests for turn-aware report naming and dynamic path resolution."""
 
     def test_normalize_citations_for_comparison(self) -> None:
-        from research_agent.utils.knowledge_filesystem import normalize_citations_for_comparison
+        from research_agent.utils.knowledge_filesystem import (
+            normalize_citations_for_comparison,
+        )
 
         t1 = "This is a report with citation (/raw/bmo_ar2025.pdf.md, p. 3)."
         t2 = "This is a report with citation (/bmo_ar2025.pdf, p. 3)."
@@ -370,15 +373,20 @@ class TestTurnAwareReportNaming:
         assert normalize_citations_for_comparison(t3) == normalize_citations_for_comparison(t4)
 
     def test_get_target_report_path_empty_state(self) -> None:
-        from research_agent.utils.knowledge_filesystem import get_target_cited_response_path
+        from research_agent.utils.knowledge_filesystem import (
+            get_target_cited_response_path,
+        )
 
         content = "Some report content"
         # If no reports exist at the start of the turn, return /cited_response.md
         assert get_target_cited_response_path(content, {}, []) == "/cited_response.md"
 
     def test_get_target_report_path_inplace_update(self) -> None:
-        from research_agent.utils.knowledge_filesystem import get_target_cited_response_path
         from deepagents.backends.utils import create_file_data
+
+        from research_agent.utils.knowledge_filesystem import (
+            get_target_cited_response_path,
+        )
 
         content = "Some report content with citation (/raw/bmo_ar2025.pdf.md, p. 3)"
         sanitized_content = "Some report content with citation (/bmo_ar2025.pdf, p. 3)"
@@ -392,8 +400,11 @@ class TestTurnAwareReportNaming:
         assert get_target_cited_response_path(sanitized_content, state_files, existing_reports) == "/cited_response.md"
 
     def test_get_target_report_path_new_report(self) -> None:
-        from research_agent.utils.knowledge_filesystem import get_target_cited_response_path
         from deepagents.backends.utils import create_file_data
+
+        from research_agent.utils.knowledge_filesystem import (
+            get_target_cited_response_path,
+        )
 
         old_content = "Report 1 content"
         new_content = "Report 2 content"
@@ -417,8 +428,11 @@ class TestTurnAwareReportNaming:
                                               existing_reports_gap) == "/cited_response_3.md"
 
     def test_get_target_report_path_reuse_turn_path(self) -> None:
-        from research_agent.utils.knowledge_filesystem import get_target_cited_response_path
         from deepagents.backends.utils import create_file_data
+
+        from research_agent.utils.knowledge_filesystem import (
+            get_target_cited_response_path,
+        )
 
         old_content = "Report 1 content"
         new_content_1 = "New Report first draft"
@@ -435,8 +449,11 @@ class TestTurnAwareReportNaming:
         assert get_target_cited_response_path(new_content_2, state_files, existing_reports) == "/cited_response_1.md"
 
     def test_get_active_report_path(self) -> None:
-        from research_agent.utils.knowledge_filesystem import get_active_cited_response_path
         from deepagents.backends.utils import create_file_data
+
+        from research_agent.utils.knowledge_filesystem import (
+            get_active_cited_response_path,
+        )
 
         state_files = {
             "/cited_response.md": create_file_data("1"),
@@ -453,9 +470,12 @@ class TestTurnAwareReportNaming:
                                                             "/cited_response_2.md"]) == "/cited_response_2.md"
 
     def test_after_model_wiki_query_complete_fallback(self) -> None:
-        from agent import ResearchStateMiddleware
-        from research_agent.utils.knowledge_filesystem import _thread_wiki_query_complete
         from langchain_core.messages import AIMessage
+
+        from agent import ResearchStateMiddleware
+        from research_agent.utils.knowledge_filesystem import (
+            _thread_wiki_query_complete,
+        )
 
         middleware = ResearchStateMiddleware()
 
@@ -483,10 +503,11 @@ class TestTurnAwareReportNaming:
         # No tool calls → guard not triggered → still no meaningful updates
         assert updates is None
 
-    def test_before_agent_wiki_query_complete_registration(self) -> None:
-        from agent import ResearchStateMiddleware
-        from research_agent.utils.knowledge_filesystem import _thread_wiki_query_complete
+    def test_before_agent_does_not_run_implicit_wiki_query(self) -> None:
+        """Wiki retrieval is an explicit agent tool, not middleware work."""
         from langchain_core.messages import HumanMessage
+
+        from agent import ResearchStateMiddleware
 
         middleware = ResearchStateMiddleware()
         state = {
@@ -496,20 +517,18 @@ class TestTurnAwareReportNaming:
         }
         runtime = {"configurable": {"thread_id": "thread-def"}}
 
-        import unittest.mock as mock
-        with mock.patch.object(middleware, "_get_wiki_context_sync", return_value=(None, None)):
-            middleware.before_agent(state, runtime)
+        updates = middleware.before_agent(state, runtime)
 
-        # By default, wiki_query_complete is set to False in updates if no wiki context matches
-        assert _thread_wiki_query_complete.get("thread-def") is False
+        assert updates is not None
+        assert "wiki_query_complete" not in updates
+        assert "_wiki_answer_text" not in updates
 
-    def test_after_model_wiki_complete_strips_write_todos(self) -> None:
-        """When wiki_query_complete=True, ALL tool calls (including read_file) must be stripped
-        and the wiki answer text must be injected as the final AIMessage to prevent the
-        infinite loop described in the bug report."""
-        from agent import ResearchStateMiddleware
+    def test_after_model_does_not_treat_wiki_tool_output_as_final(self) -> None:
+        """Legacy wiki flags must not bypass report synthesis and verification."""
         from deepagents.backends.utils import create_file_data
         from langchain_core.messages import AIMessage
+
+        from agent import ResearchStateMiddleware
 
         middleware = ResearchStateMiddleware()
 
@@ -531,19 +550,8 @@ class TestTurnAwareReportNaming:
         runtime = {"configurable": {"thread_id": "thread-wiki-loop"}}
 
         updates = middleware.after_model(state, runtime)
-        # The wiki guard should have injected a final AIMessage with the wiki answer text
-        assert updates is not None
-        assert "messages" in updates
-        override_msgs = updates["messages"]
-        assert len(override_msgs) == 1
-        final_msg = override_msgs[0]
-        # No tool calls should remain (agent will stop)
-        final_tool_calls = getattr(final_msg, "tool_calls", None) or []
-        assert final_tool_calls == []
-        # The wiki answer text must be the message content
-        assert final_msg.content == wiki_answer
-        # jump_to="end" must be set so the framework routing exits immediately
-        assert updates.get("jump_to") == "end"
+        assert not updates or "jump_to" not in updates
+        assert not updates or "messages" not in updates
 
     def test_after_model_has_can_jump_to_end(self) -> None:
         """after_model must declare can_jump_to=['end'] so the framework
@@ -554,13 +562,12 @@ class TestTurnAwareReportNaming:
         can_jump = getattr(ResearchStateMiddleware.after_model, "__can_jump_to__", None)
         assert can_jump == ["end"]
 
-    def test_before_model_wiki_complete_fast_exit(self) -> None:
-        """When wiki_query_complete=True, before_model must jump straight to
-        END without running the model, so the model never gets a chance to call
-        read_doc_folder (the root cause of the infinite loop)."""
-        from agent import ResearchStateMiddleware
+    def test_before_model_ignores_legacy_wiki_complete_flag(self) -> None:
+        """Wiki findings remain research input and cannot skip synthesis."""
         from deepagents.backends.utils import create_file_data
         from langchain_core.messages import HumanMessage
+
+        from agent import ResearchStateMiddleware
 
         middleware = ResearchStateMiddleware()
         wiki_answer = "The definitive wiki answer."
@@ -574,13 +581,9 @@ class TestTurnAwareReportNaming:
 
         updates = middleware.before_model(state, runtime)
         assert updates is not None
-        # Must signal the framework to terminate the loop immediately
-        assert updates.get("jump_to") == "end"
-        # Must inject the terminal AIMessage so the chat reply is correct
-        assert "messages" in updates
-        final_msg = updates["messages"][0]
-        assert final_msg.content == wiki_answer
-        assert (getattr(final_msg, "tool_calls", None) or []) == []
+        assert "jump_to" not in updates
+        assert "messages" not in updates
+        assert "chat_start_time" in updates
 
     def test_before_model_has_can_jump_to_end(self) -> None:
         """before_model must declare can_jump_to=['end'] so the framework
@@ -593,8 +596,9 @@ class TestTurnAwareReportNaming:
     def test_before_model_no_wiki_runs_normally(self) -> None:
         """When wiki_query_complete is not True, before_model must behave as
         before (initialize chat_start_time) and NOT jump to end."""
-        from agent import ResearchStateMiddleware
         from langchain_core.messages import HumanMessage
+
+        from agent import ResearchStateMiddleware
 
         middleware = ResearchStateMiddleware()
         state = {
@@ -609,11 +613,11 @@ class TestTurnAwareReportNaming:
         assert "jump_to" not in updates
         assert "chat_start_time" in updates
 
-    def test_build_system_instruction_wiki_complete_fastpath(self) -> None:
-        """When wiki_query_complete=True, _build_system_instruction must include
-        the WikiCompleteAnswer block telling the agent to skip the workflow."""
-        from agent import ResearchStateMiddleware
+    def test_build_system_instruction_uses_normal_wiki_workflow(self) -> None:
+        """Legacy wiki state cannot bypass planning and report synthesis."""
         from deepagents.backends.utils import create_file_data
+
+        from agent import ResearchStateMiddleware
 
         state = {
             "files": {"/cited_response.md": create_file_data("wiki answer")},
@@ -621,7 +625,7 @@ class TestTurnAwareReportNaming:
             "no_web": True,
         }
         instruction = ResearchStateMiddleware._build_system_instruction(state)
-        assert "<WikiCompleteAnswer>" in instruction
-        assert "read_file" in instruction
+        assert "<WikiCompleteAnswer>" not in instruction
+        assert "<PlanDirective>" in instruction
+        assert "write_todos" in instruction
         assert "/cited_response.md" in instruction
-        assert "Do NOT call `write_todos`" in instruction

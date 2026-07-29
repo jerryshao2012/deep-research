@@ -96,13 +96,13 @@ class FakeS3Client:
         }
 
     def put_object(
-        self,
-        *,
-        Bucket: str,
-        Key: str,
-        Body: bytes,
-        IfMatch: str | None = None,
-        IfNoneMatch: str | None = None,
+            self,
+            *,
+            Bucket: str,
+            Key: str,
+            Body: bytes,
+            IfMatch: str | None = None,
+            IfNoneMatch: str | None = None,
     ) -> dict[str, str]:
         self.calls.append(
             {
@@ -158,26 +158,26 @@ class FakeS3Client:
         Path(Filename).write_bytes(self.objects[Key])
 
     def list_objects_v2(
-        self,
-        *,
-        Bucket: str,
-        Prefix: str,
-        ContinuationToken: str | None = None,
+            self,
+            *,
+            Bucket: str,
+            Prefix: str,
+            ContinuationToken: str | None = None,
     ) -> dict[str, object]:
         self.calls.append({"operation": "list_objects_v2", "key": Prefix})
         if Bucket != BUCKET:
             raise AssertionError(f"unexpected bucket: {Bucket}")
         keys = sorted(key for key in self.objects if key.startswith(Prefix))
         if (
-            Prefix == f"{GENERATION_PREFIX}/"
-            and self.on_next_generation_list is not None
+                Prefix == f"{GENERATION_PREFIX}/"
+                and self.on_next_generation_list is not None
         ):
             callback = self.on_next_generation_list
             self.on_next_generation_list = None
             assert callable(callback)
             callback()
         offset = int(ContinuationToken or "0")
-        page = keys[offset : offset + 2]
+        page = keys[offset: offset + 2]
         next_offset = offset + len(page)
         result: dict[str, object] = {
             "Contents": [{"Key": key, "Size": len(self.objects[key])} for key in page],
@@ -188,10 +188,10 @@ class FakeS3Client:
         return result
 
     def delete_objects(
-        self,
-        *,
-        Bucket: str,
-        Delete: dict[str, object],
+            self,
+            *,
+            Bucket: str,
+            Delete: dict[str, object],
     ) -> dict[str, object]:
         self.calls.append({"operation": "delete_objects", "delete": Delete})
         if Bucket != BUCKET:
@@ -210,18 +210,18 @@ class FakeS3Client:
 
 
 def thread(
-    thread_id: str | UUID,
-    *,
-    updated_at: str | datetime = UPDATED_AT,
+        thread_id: str | UUID,
+        *,
+        updated_at: str | datetime = UPDATED_AT,
 ) -> dict[str, object]:
     return {"thread_id": thread_id, "updated_at": updated_at}
 
 
 def make_snapshot(
-    tmp_path: Path,
-    *,
-    threads: list[object],
-    runs: list[object] | None = None,
+        tmp_path: Path,
+        *,
+        threads: list[object],
+        runs: list[object] | None = None,
 ) -> Path:
     snapshot = tmp_path / "snapshot"
     snapshot.mkdir(parents=True)
@@ -255,8 +255,8 @@ def test_boto3_runtime_dependency_is_importable() -> None:
 
 
 def generation_metadata(
-    thread_ids: tuple[str, ...],
-    thread_versions: dict[str, str],
+        thread_ids: tuple[str, ...],
+        thread_versions: dict[str, str],
 ) -> GenerationMetadata:
     return GenerationMetadata(
         generation="generation",
@@ -302,7 +302,7 @@ def test_metadata_models_are_deeply_immutable() -> None:
 
 
 def test_validate_snapshot_returns_thread_versions_and_checksums(
-    tmp_path: Path,
+        tmp_path: Path,
 ) -> None:
     snapshot = make_snapshot(
         tmp_path,
@@ -334,17 +334,17 @@ def test_validate_snapshot_returns_thread_versions_and_checksums(
 
 
 def test_validate_snapshot_reads_each_pickle_once(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     snapshot = make_snapshot(tmp_path, threads=[thread("t1")])
     read_counts: Counter[str] = Counter()
     original_open = Path.open
 
     def counting_open(
-        file_path: Path,
-        *args: object,
-        **kwargs: object,
+            file_path: Path,
+            *args: object,
+            **kwargs: object,
     ) -> object:
         mode = kwargs.get("mode", args[0] if args else "r")
         if file_path.parent == snapshot and file_path.suffix == ".pckl" and mode == "rb":
@@ -362,7 +362,7 @@ def test_validate_snapshot_reads_each_pickle_once(
 
 
 def test_validate_snapshot_rejects_empty_catalog_when_required(
-    tmp_path: Path,
+        tmp_path: Path,
 ) -> None:
     snapshot = make_snapshot(tmp_path, threads=[])
 
@@ -371,7 +371,7 @@ def test_validate_snapshot_rejects_empty_catalog_when_required(
 
 
 def test_validate_snapshot_accepts_empty_catalog_when_not_required(
-    tmp_path: Path,
+        tmp_path: Path,
 ) -> None:
     snapshot = make_snapshot(tmp_path, threads=[])
 
@@ -382,7 +382,7 @@ def test_validate_snapshot_accepts_empty_catalog_when_not_required(
 
 
 def test_validate_snapshot_requires_keyword_for_non_empty_policy(
-    tmp_path: Path,
+        tmp_path: Path,
 ) -> None:
     snapshot = make_snapshot(tmp_path, threads=[thread("t1")])
 
@@ -418,8 +418,8 @@ def test_validate_snapshot_rejects_missing_ops_catalog(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("status", ["pending", "running"])
 def test_validate_snapshot_rejects_active_run(
-    tmp_path: Path,
-    status: str,
+        tmp_path: Path,
+        status: str,
 ) -> None:
     snapshot = make_snapshot(
         tmp_path,
@@ -441,8 +441,8 @@ def test_validate_snapshot_rejects_active_run(
     ],
 )
 def test_validate_snapshot_rejects_malformed_run(
-    tmp_path: Path,
-    run: object,
+        tmp_path: Path,
+        run: object,
 ) -> None:
     snapshot = make_snapshot(
         tmp_path,
@@ -455,7 +455,7 @@ def test_validate_snapshot_rejects_malformed_run(
 
 
 def test_validate_snapshot_normalizes_uuid_and_dict_thread_entries(
-    tmp_path: Path,
+        tmp_path: Path,
 ) -> None:
     uuid_id = UUID("5b9ce899-6aeb-4e95-8807-5b9ddb16dd82")
     snapshot = make_snapshot(
@@ -508,17 +508,17 @@ def test_candidate_rejects_timestamp_rollback() -> None:
     [
         (("t1",), {"t1": UPDATED_AT}),
         (
-            ("t1", "t2"),
-            {
-                "t1": "2026-07-23T10:00:01+00:00",
-                "t2": "2026-07-23T10:00:00+00:00",
-            },
+                ("t1", "t2"),
+                {
+                    "t1": "2026-07-23T10:00:01+00:00",
+                    "t2": "2026-07-23T10:00:00+00:00",
+                },
         ),
     ],
 )
 def test_candidate_allows_equal_or_newer_state(
-    candidate_ids: tuple[str, ...],
-    candidate_versions: dict[str, str],
+        candidate_ids: tuple[str, ...],
+        candidate_versions: dict[str, str],
 ) -> None:
     previous = generation_metadata(("t1",), {"t1": UPDATED_AT})
     candidate = generation_metadata(candidate_ids, candidate_versions)
@@ -544,7 +544,7 @@ def test_load_pointer_returns_validated_manifest_and_etag() -> None:
 
 
 def test_publish_uploads_generation_before_conditional_pointer(
-    tmp_path: Path,
+        tmp_path: Path,
 ) -> None:
     client = FakeS3Client()
     snapshot = make_snapshot(tmp_path, threads=[thread("t1")])
@@ -588,7 +588,7 @@ def test_publish_uploads_generation_before_conditional_pointer(
 
 
 def test_publish_uploads_only_staged_bytes_when_source_mutates(
-    tmp_path: Path,
+        tmp_path: Path,
 ) -> None:
     client = FakeS3Client()
     snapshot = make_snapshot(tmp_path, threads=[thread("t1")])
@@ -675,7 +675,7 @@ def test_stale_writer_etag_cannot_move_pointer(tmp_path: Path) -> None:
 
 
 def test_conditional_request_conflict_409_is_snapshot_conflict(
-    tmp_path: Path,
+        tmp_path: Path,
 ) -> None:
     client = FakeS3Client()
     snapshot = make_snapshot(tmp_path, threads=[thread("t1")])
@@ -716,7 +716,7 @@ def test_empty_bucket_bootstrap_uses_if_none_match_star(tmp_path: Path) -> None:
 
 
 def test_publish_contract_accepts_positional_fencing_arguments(
-    tmp_path: Path,
+        tmp_path: Path,
 ) -> None:
     client = FakeS3Client()
     snapshot = make_snapshot(tmp_path, threads=[thread("t1")])
@@ -727,7 +727,7 @@ def test_publish_contract_accepts_positional_fencing_arguments(
 
 
 def test_publish_enforces_monotonic_state_unless_allow_shrink(
-    tmp_path: Path,
+        tmp_path: Path,
 ) -> None:
     client = FakeS3Client()
     first = make_snapshot(
@@ -765,7 +765,7 @@ def test_publish_enforces_monotonic_state_unless_allow_shrink(
 
 
 def test_canonical_prefix_is_migrated_to_first_generation(
-    tmp_path: Path,
+        tmp_path: Path,
 ) -> None:
     client = FakeS3Client()
     canonical = make_snapshot(tmp_path / "canonical", threads=[thread("t1")])
@@ -783,7 +783,7 @@ def test_canonical_prefix_is_migrated_to_first_generation(
 
 
 def test_prior_pointer_plus_invalid_generations_fails_closed(
-    tmp_path: Path,
+        tmp_path: Path,
 ) -> None:
     client = FakeS3Client()
     canonical = make_snapshot(tmp_path / "canonical", threads=[thread("t1")])
@@ -830,7 +830,7 @@ def test_prior_pointer_plus_invalid_generations_fails_closed(
     ],
 )
 def test_unknown_or_incomplete_root_schema_is_rejected(
-    pointer: dict[str, object],
+        pointer: dict[str, object],
 ) -> None:
     client = FakeS3Client()
     client.seed(ROOT_MANIFEST_KEY, json.dumps(pointer).encode())
@@ -841,8 +841,8 @@ def test_unknown_or_incomplete_root_schema_is_rejected(
 
 @pytest.mark.parametrize("invalid_schema", [999, True])
 def test_unknown_generation_schema_is_rejected(
-    tmp_path: Path,
-    invalid_schema: object,
+        tmp_path: Path,
+        invalid_schema: object,
 ) -> None:
     client = FakeS3Client()
     snapshot = make_snapshot(tmp_path, threads=[thread("t1")])
@@ -897,8 +897,8 @@ def test_restore_falls_back_to_previous_generation(tmp_path: Path) -> None:
 
 
 def test_restore_read_error_is_normalized_and_falls_back_to_previous(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = FakeS3Client()
     first = make_snapshot(tmp_path / "first", threads=[thread("t1")])
@@ -928,8 +928,8 @@ def test_restore_read_error_is_normalized_and_falls_back_to_previous(
     def fail_first_staged_read(path: Path) -> bytes:
         nonlocal failed_once
         if (
-            not failed_once
-            and path.parent.name.startswith(f".{target.name}.restore-")
+                not failed_once
+                and path.parent.name.startswith(f".{target.name}.restore-")
         ):
             failed_once = True
             raise OSError("injected staged read failure")
@@ -945,8 +945,8 @@ def test_restore_read_error_is_normalized_and_falls_back_to_previous(
 
 
 def test_restore_rolls_back_existing_directory_on_install_failure(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = FakeS3Client()
     snapshot = make_snapshot(tmp_path / "source", threads=[thread("t1")])
@@ -974,11 +974,11 @@ def test_restore_rolls_back_existing_directory_on_install_failure(
 
     monkeypatch.setattr(Path, "rename", fail_install)
     with pytest.raises(
-        SnapshotRestoreError,
-        match=(
-            r"snapshot install failed "
-            r"\(OSError: \[Errno 18\] Invalid cross-device link\)"
-        ),
+            SnapshotRestoreError,
+            match=(
+                    r"snapshot install failed "
+                    r"\(OSError: \[Errno 18\] Invalid cross-device link\)"
+            ),
     ) as error:
         restore_snapshot(client, BUCKET, target)
 
@@ -990,8 +990,8 @@ def test_restore_rolls_back_existing_directory_on_install_failure(
 
 
 def test_backup_cleanup_failure_does_not_fail_successful_install(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = FakeS3Client()
     snapshot = make_snapshot(tmp_path / "source", threads=[thread("t1")])
@@ -1022,8 +1022,8 @@ def test_backup_cleanup_failure_does_not_fail_successful_install(
 
 
 def test_runtime_version_mismatch_is_rejected_before_unpickling(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = FakeS3Client()
     snapshot = make_snapshot(tmp_path, threads=[thread("t1")])
@@ -1067,8 +1067,8 @@ def test_aws_image_runtime_contract_matches_snapshot_runtime() -> None:
 
 
 def test_publish_rejects_runtime_that_cannot_load_in_pinned_aws_image(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = FakeS3Client()
     source = make_snapshot(tmp_path, threads=[thread("t1")])
@@ -1085,8 +1085,8 @@ def test_publish_rejects_runtime_that_cannot_load_in_pinned_aws_image(
 
 
 def test_checksum_mismatch_is_rejected_before_unpickling(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = FakeS3Client()
     snapshot = make_snapshot(tmp_path, threads=[thread("t1")])
@@ -1116,7 +1116,7 @@ def test_checksum_mismatch_is_rejected_before_unpickling(
 
 
 def test_restore_without_pointer_or_canonical_state_fails_clearly(
-    tmp_path: Path,
+        tmp_path: Path,
 ) -> None:
     client = FakeS3Client()
 
@@ -1125,8 +1125,8 @@ def test_restore_without_pointer_or_canonical_state_fails_clearly(
 
 
 def test_restore_receipt_fences_claim_to_exact_restored_pointer(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = FakeS3Client()
     source_a = make_snapshot(tmp_path / "a", threads=[thread("t1")])
@@ -1163,7 +1163,7 @@ def test_restore_receipt_fences_claim_to_exact_restored_pointer(
             call
             for call in client.calls
             if call["operation"] == "put_object"
-            and call["key"] == ROOT_MANIFEST_KEY
+               and call["key"] == ROOT_MANIFEST_KEY
         ]
     )
     monkeypatch.setattr(
@@ -1194,15 +1194,15 @@ def test_restore_receipt_fences_claim_to_exact_restored_pointer(
             call
             for call in client.calls
             if call["operation"] == "put_object"
-            and call["key"] == ROOT_MANIFEST_KEY
+               and call["key"] == ROOT_MANIFEST_KEY
         ]
     ) == root_writes_before
     assert receipt.is_file()
 
 
 def test_fallback_restore_cannot_claim_corrupt_active_generation(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = FakeS3Client()
     source_a = make_snapshot(tmp_path / "a", threads=[thread("t1")])
@@ -1236,7 +1236,7 @@ def test_fallback_restore_cannot_claim_corrupt_active_generation(
             call
             for call in client.calls
             if call["operation"] == "put_object"
-            and call["key"] == ROOT_MANIFEST_KEY
+               and call["key"] == ROOT_MANIFEST_KEY
         ]
     )
     monkeypatch.setattr(
@@ -1266,15 +1266,15 @@ def test_fallback_restore_cannot_claim_corrupt_active_generation(
             call
             for call in client.calls
             if call["operation"] == "put_object"
-            and call["key"] == ROOT_MANIFEST_KEY
+               and call["key"] == ROOT_MANIFEST_KEY
         ]
     ) == root_writes_before
     assert receipt.is_file()
 
 
 def test_unchanged_restore_receipt_claims_and_is_consumed(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = FakeS3Client()
     source = make_snapshot(tmp_path / "source", threads=[thread("t1")])
@@ -1313,8 +1313,8 @@ def test_unchanged_restore_receipt_claims_and_is_consumed(
 
 @pytest.mark.parametrize("receipt_payload", [None, b"{not-json"])
 def test_required_restore_receipt_missing_or_malformed_fails_before_s3(
-    tmp_path: Path,
-    receipt_payload: bytes | None,
+        tmp_path: Path,
+        receipt_payload: bytes | None,
 ) -> None:
     client = FakeS3Client()
     receipt = tmp_path / "restore-receipt.json"
@@ -1335,8 +1335,8 @@ def test_required_restore_receipt_missing_or_malformed_fails_before_s3(
 
 
 def test_aws_read_write_infers_required_restore_receipt(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = FakeS3Client()
     monkeypatch.setenv("S3_BUCKET_NAME", BUCKET)
@@ -1354,7 +1354,7 @@ def test_aws_read_write_infers_required_restore_receipt(
 
 
 def test_restore_receipt_cannot_be_reused_for_another_source(
-    tmp_path: Path,
+        tmp_path: Path,
 ) -> None:
     client = FakeS3Client()
     source = make_snapshot(tmp_path / "source", threads=[thread("t1")])
@@ -1383,7 +1383,7 @@ def test_restore_receipt_cannot_be_reused_for_another_source(
 
 
 def test_read_only_controller_ignores_restore_receipt_without_s3_writes(
-    tmp_path: Path,
+        tmp_path: Path,
 ) -> None:
     client = FakeS3Client()
     missing_receipt = tmp_path / "missing-receipt.json"
@@ -1444,8 +1444,8 @@ def test_claim_writer_epoch_preserves_generation_pointers(tmp_path: Path) -> Non
 
 
 def test_failed_writer_claim_aborts_runtime_controller(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = FakeS3Client()
     source = make_snapshot(tmp_path, threads=[thread("t1")])
@@ -1475,8 +1475,8 @@ def test_failed_writer_claim_aborts_runtime_controller(
 
 
 def test_runtime_controller_uses_configured_logical_writer_epoch(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = FakeS3Client()
     source = make_snapshot(tmp_path, threads=[thread("t1")])
@@ -1509,7 +1509,7 @@ def test_runtime_controller_uses_configured_logical_writer_epoch(
 
 
 def test_successful_publish_advances_lease_etag_without_self_fencing(
-    tmp_path: Path,
+        tmp_path: Path,
 ) -> None:
     client = FakeS3Client()
     source = make_snapshot(tmp_path, threads=[thread("t1")])
@@ -1561,7 +1561,7 @@ def test_successful_publish_advances_lease_etag_without_self_fencing(
 
 
 def test_monitor_runs_during_upload_but_waits_for_cas_etag_update(
-    tmp_path: Path,
+        tmp_path: Path,
 ) -> None:
     client = FakeS3Client()
     source = make_snapshot(tmp_path, threads=[thread("t1")])
@@ -1653,7 +1653,7 @@ def test_monitor_runs_during_upload_but_waits_for_cas_etag_update(
 
 
 def test_publisher_requires_two_fingerprints_twelve_seconds_apart(
-    tmp_path: Path,
+        tmp_path: Path,
 ) -> None:
     client = FakeS3Client()
     source = make_snapshot(tmp_path, threads=[thread("t1")])
@@ -1704,7 +1704,7 @@ def test_publisher_requires_two_fingerprints_twelve_seconds_apart(
 
 
 def test_publisher_rejects_stability_window_below_twelve_seconds(
-    tmp_path: Path,
+        tmp_path: Path,
 ) -> None:
     client = FakeS3Client()
     source = make_snapshot(tmp_path, threads=[thread("t1")])
@@ -1734,9 +1734,9 @@ def test_publisher_rejects_stability_window_below_twelve_seconds(
 
 @pytest.mark.parametrize("from_environment", [False, True])
 def test_runtime_controller_rejects_stability_below_twelve_before_s3_claim(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    from_environment: bool,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        from_environment: bool,
 ) -> None:
     client = FakeS3Client()
     kwargs: dict[str, object] = {}
@@ -1771,9 +1771,9 @@ def test_runtime_controller_rejects_stability_below_twelve_before_s3_claim(
     ],
 )
 def test_runtime_controller_validates_all_intervals_before_s3(
-    tmp_path: Path,
-    parameter: str,
-    value: float,
+        tmp_path: Path,
+        parameter: str,
+        value: float,
 ) -> None:
     client = FakeS3Client()
 
@@ -1798,10 +1798,10 @@ def test_runtime_controller_validates_all_intervals_before_s3(
     ],
 )
 def test_runtime_controller_validates_interval_environment_before_s3(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    name: str,
-    value: str,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        name: str,
+        value: str,
 ) -> None:
     client = FakeS3Client()
     monkeypatch.setenv(name, value)
@@ -1818,8 +1818,8 @@ def test_runtime_controller_validates_interval_environment_before_s3(
 
 
 def test_thread_helpers_validate_intervals_before_spawning(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = FakeS3Client()
     lease = RuntimeLease(writer_epoch="writer-1", etag='"etag-1"')
@@ -1908,7 +1908,7 @@ def test_fence_loss_terminates_process(tmp_path: Path) -> None:
 
 
 def test_fence_monitor_adopts_etag_from_same_logical_writer(
-    tmp_path: Path,
+        tmp_path: Path,
 ) -> None:
     client = FakeS3Client()
     source = make_snapshot(tmp_path, threads=[thread("t1")])
@@ -1951,8 +1951,8 @@ def test_fence_monitor_adopts_etag_from_same_logical_writer(
 
 
 def test_publisher_retries_same_logical_writer_cas_race(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = FakeS3Client()
     source = make_snapshot(tmp_path, threads=[thread("t1")])
@@ -2050,7 +2050,7 @@ def test_same_thread_older_updated_at_is_not_published(tmp_path: Path) -> None:
 
 
 def test_publish_rejects_matching_etag_owned_by_different_writer_epoch(
-    tmp_path: Path,
+        tmp_path: Path,
 ) -> None:
     client = FakeS3Client()
     source = make_snapshot(tmp_path, threads=[thread("t1")])
@@ -2087,8 +2087,8 @@ def test_publish_rejects_matching_etag_owned_by_different_writer_epoch(
 
 
 def test_changing_source_during_staging_is_rejected(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = FakeS3Client()
     source = make_snapshot(tmp_path, threads=[thread("t1")])
@@ -2113,8 +2113,8 @@ def test_changing_source_during_staging_is_rejected(
 
 
 def test_mixed_pickle_set_during_staging_is_rejected(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = FakeS3Client()
     source = make_snapshot(tmp_path, threads=[thread("t1")])
@@ -2138,9 +2138,9 @@ def test_mixed_pickle_set_during_staging_is_rejected(
 
 
 def _seed_valid_generation(
-    client: FakeS3Client,
-    generation: str,
-    created_at: str,
+        client: FakeS3Client,
+        generation: str,
+        created_at: str,
 ) -> None:
     file_key = f"{GENERATION_PREFIX}/{generation}/.langgraph_ops.pckl"
     manifest = {
@@ -2191,7 +2191,7 @@ def test_retention_keeps_active_previous_and_five_recent() -> None:
         key.split("/")[-2]
         for key in client.objects
         if key.startswith(f"{GENERATION_PREFIX}/")
-        and key.endswith("/manifest.json")
+           and key.endswith("/manifest.json")
     }
     assert remaining_manifests == {
         "protected-active",
@@ -2207,7 +2207,7 @@ def test_retention_keeps_active_previous_and_five_recent() -> None:
 def test_retention_aborts_if_pointer_changes_during_scan() -> None:
     client = FakeS3Client()
     for index, generation in enumerate(
-        ["old-active", "takeover-active", "deletable"]
+            ["old-active", "takeover-active", "deletable"]
     ):
         _seed_valid_generation(
             client,
@@ -2271,7 +2271,7 @@ def test_retention_uses_manifest_created_at_despite_generation_clock_skew() -> N
         key.split("/")[-2]
         for key in client.objects
         if key.endswith("/manifest.json")
-        and key.startswith(f"{GENERATION_PREFIX}/")
+           and key.startswith(f"{GENERATION_PREFIX}/")
     }
     assert remaining_manifests == {
         "active",
@@ -2301,8 +2301,8 @@ def test_retention_surfaces_delete_objects_errors() -> None:
 
 
 def test_cli_publish_uploads_then_claims_epoch_and_allows_shrink(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = FakeS3Client()
     current = make_snapshot(
@@ -2330,7 +2330,7 @@ def test_cli_publish_uploads_then_claims_epoch_and_allows_shrink(
         call
         for call in client.calls
         if call["operation"] == "put_object"
-        and call["key"] == ROOT_MANIFEST_KEY
+           and call["key"] == ROOT_MANIFEST_KEY
     ]
     assert root_writes[-2]["if_match"] == old_etag
     assert isinstance(root_writes[-1]["if_match"], str)
@@ -2340,17 +2340,17 @@ def test_cli_publish_uploads_then_claims_epoch_and_allows_shrink(
         index
         for index, call in enumerate(client.calls)
         if index > client.calls.index(root_writes[-3])
-        and call["operation"] in {"upload_file", "put_object"}
-        and call["key"] != ROOT_MANIFEST_KEY
+           and call["operation"] in {"upload_file", "put_object"}
+           and call["key"] != ROOT_MANIFEST_KEY
     ]
     assert prepared_write_indexes
     assert max(prepared_write_indexes) < claim_index
 
 
 def test_cli_inspect_source_checks_pinned_image_runtime_without_s3(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
 ) -> None:
     source = make_snapshot(tmp_path / "source", threads=[thread("t1")])
     monkeypatch.delenv("S3_BUCKET_NAME", raising=False)
@@ -2371,9 +2371,9 @@ def test_cli_inspect_source_checks_pinned_image_runtime_without_s3(
 
 
 def test_cli_returns_nonzero_on_publish_failure(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
 ) -> None:
     client = FakeS3Client()
     current = make_snapshot(tmp_path / "current", threads=[thread("t1")])
@@ -2400,18 +2400,18 @@ def test_cli_returns_nonzero_on_publish_failure(
     assert "failed" in captured.err.lower()
     assert client.objects[ROOT_MANIFEST_KEY] == pointer_before
     assert (
-        sum(
-            call["operation"] == "put_object"
-            and call["key"] == ROOT_MANIFEST_KEY
-            for call in client.calls
-        )
-        == root_writes_before
+            sum(
+                call["operation"] == "put_object"
+                and call["key"] == ROOT_MANIFEST_KEY
+                for call in client.calls
+            )
+            == root_writes_before
     )
 
 
 def test_cli_invalid_source_does_not_claim_writer_epoch(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = FakeS3Client()
     current = make_snapshot(tmp_path / "current", threads=[thread("t1")])
@@ -2436,10 +2436,10 @@ def test_cli_invalid_source_does_not_claim_writer_epoch(
     assert exit_code != 0
     assert client.objects[ROOT_MANIFEST_KEY] == pointer_before
     assert (
-        sum(
-            call["operation"] == "put_object"
-            and call["key"] == ROOT_MANIFEST_KEY
-            for call in client.calls
-        )
-        == root_writes_before
+            sum(
+                call["operation"] == "put_object"
+                and call["key"] == ROOT_MANIFEST_KEY
+                for call in client.calls
+            )
+            == root_writes_before
     )
