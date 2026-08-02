@@ -73,6 +73,8 @@ def test_read_only_flag_does_not_change_non_aws_auth(
     ("method", "path"),
     [
         ("POST", "/documents/upload"),
+        ("POST", "/markdown-threads/123456/images"),
+        ("DELETE", "/markdown-threads/123456/images"),
         ("DELETE", "/documents/example.pdf"),
         ("DELETE", "/documents/folder/threads/demo"),
         ("POST", "/threads/thread-1/wiki/ingest"),

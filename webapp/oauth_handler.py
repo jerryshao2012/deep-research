@@ -257,7 +257,7 @@ async def handle_github_callback(request: Request) -> dict:
 
 
 async def get_oauth_login_url(
-    request: Request, provider: str, redirect_uri: str
+        request: Request, provider: str, redirect_uri: str
 ) -> str:
     """Generate OAuth login URL for the specified provider."""
     if provider == "google":
@@ -279,7 +279,7 @@ async def get_oauth_login_url(
         target_domain = None
         for d in github_ids.keys():
             if d != "default" and (
-                domain == d or domain.endswith("." + d) or d.endswith("." + domain)
+                    domain == d or domain.endswith("." + d) or d.endswith("." + domain)
             ):
                 target_domain = d
                 break

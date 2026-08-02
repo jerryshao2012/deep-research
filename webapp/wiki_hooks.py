@@ -53,7 +53,7 @@ async def trigger_wiki_auto_ingest(thread_id: str) -> None:
 
 
 async def _wiki_ingest_background(
-    paths, topic: str, progress_obj, cancel_event
+        paths, topic: str, progress_obj, cancel_event
 ) -> None:
     """Run wiki ingest in the background; swallows all exceptions."""
     from thread_wiki import progress as wiki_progress
@@ -73,8 +73,8 @@ async def _wiki_ingest_background(
 
 
 async def trigger_wiki_delete_hooks(
-    thread_id: str,
-    deleted_filename: str | None = None,
+        thread_id: str,
+        deleted_filename: str | None = None,
 ) -> None:
     """Cancel any active ingest, cascade-delete source references, and launch lint."""
     try:

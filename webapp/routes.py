@@ -26,6 +26,7 @@ import webapp.config as _cfg
 from research_agent.utils.content_extractors import extract_supported_document
 from research_agent.utils.skill_registry import get_skill_registry
 from webapp.auth_helpers import is_authenticated
+from webapp.markdown_images import register_markdown_image_routes
 from webapp.model_diagnostics import run_model_diagnostics
 from webapp.utils import (
     detect_media_type,
@@ -1137,6 +1138,7 @@ def register_all_routes(app) -> None:
     register_health_routes(app)
     register_storage_routes(app)
     register_document_routes(app)
+    register_markdown_image_routes(app)
     register_oauth_routes(app)
     register_skills_routes(app)
     register_chat_thread_routes(app)

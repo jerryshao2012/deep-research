@@ -88,6 +88,8 @@ _READ_ONLY_DETAIL = (
     "AWS demo is temporarily read-only during S3 persistence maintenance."
 )
 _PROTECTED_S3_MUTATIONS = (
+    ("POST", re.compile(r"^/markdown-threads/[0-9]{6}/images/?$")),
+    ("DELETE", re.compile(r"^/markdown-threads/[0-9]{6}/images/?$")),
     ("POST", re.compile(r"^/documents/upload/?$")),
     ("DELETE", re.compile(r"^/documents(?:/.*)?$")),
     (
@@ -108,8 +110,8 @@ def _s3_read_only_enabled() -> bool:
         os.environ.get("S3_BUCKET_NAME") and os.environ.get("AWS_REGION")
     )
     read_only = (
-        os.environ.get("LANGGRAPH_S3_READ_ONLY", "").strip().lower()
-        in {"1", "true", "yes", "on"}
+            os.environ.get("LANGGRAPH_S3_READ_ONLY", "").strip().lower()
+            in {"1", "true", "yes", "on"}
     )
     return aws_mode and read_only
 
@@ -133,8 +135,8 @@ class PersistenceWorkerShutdownError(RuntimeError):
 
 
 def _generic_s3_upload_loop(
-    stop_event: threading.Event,
-    interval_seconds: float,
+        stop_event: threading.Event,
+        interval_seconds: float,
 ) -> None:
     """Periodically mirror generic runtime folders without LangGraph state."""
     from s3_storage import _resolve_tracked_folders, upload_directory_sync
@@ -161,7 +163,7 @@ def _generic_s3_sync_interval_seconds() -> float:
 
 
 def _start_generic_s3_upload_daemon(
-    interval_seconds: float | None = None,
+        interval_seconds: float | None = None,
 ) -> _GenericS3Daemon:
     if interval_seconds is None:
         interval_seconds = _generic_s3_sync_interval_seconds()
@@ -182,8 +184,8 @@ class _GenericAzureDaemon(NamedTuple):
 
 
 def _generic_azure_upload_loop(
-    stop_event: threading.Event,
-    interval_seconds: float,
+        stop_event: threading.Event,
+        interval_seconds: float,
 ) -> None:
     """Periodically mirror generic runtime folders to Azure Blob Storage."""
     from azure_storage import _resolve_tracked_folders, upload_directory_sync
@@ -210,7 +212,7 @@ def _generic_azure_sync_interval_seconds() -> float:
 
 
 def _start_generic_azure_upload_daemon(
-    interval_seconds: float | None = None,
+        interval_seconds: float | None = None,
 ) -> _GenericAzureDaemon:
     if interval_seconds is None:
         interval_seconds = _generic_azure_sync_interval_seconds()
@@ -226,9 +228,9 @@ def _start_generic_azure_upload_daemon(
 
 
 def _join_persistence_workers(
-    workers: list[threading.Thread],
-    *,
-    timeout_seconds: float,
+        workers: list[threading.Thread],
+        *,
+        timeout_seconds: float,
 ) -> None:
     timeout_seconds = float(timeout_seconds)
     if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
@@ -247,9 +249,9 @@ def _join_persistence_workers(
 
 
 def _stop_generic_s3_upload_daemon(
-    daemon: _GenericS3Daemon | None,
-    *,
-    timeout_seconds: float = _PERSISTENCE_WORKER_SHUTDOWN_TIMEOUT_SECONDS,
+        daemon: _GenericS3Daemon | None,
+        *,
+        timeout_seconds: float = _PERSISTENCE_WORKER_SHUTDOWN_TIMEOUT_SECONDS,
 ) -> None:
     """Stop generic worker or fail after bounded in-flight S3 grace period."""
     if daemon is None:
@@ -262,9 +264,9 @@ def _stop_generic_s3_upload_daemon(
 
 
 def _stop_generic_azure_upload_daemon(
-    daemon: _GenericAzureDaemon | None,
-    *,
-    timeout_seconds: float = _PERSISTENCE_WORKER_SHUTDOWN_TIMEOUT_SECONDS,
+        daemon: _GenericAzureDaemon | None,
+        *,
+        timeout_seconds: float = _PERSISTENCE_WORKER_SHUTDOWN_TIMEOUT_SECONDS,
 ) -> None:
     """Stop generic worker or fail after bounded in-flight Azure grace period."""
     if daemon is None:
@@ -277,9 +279,9 @@ def _stop_generic_azure_upload_daemon(
 
 
 def _stop_runtime_controller(
-    lease: object | None,
-    *,
-    timeout_seconds: float = _PERSISTENCE_WORKER_SHUTDOWN_TIMEOUT_SECONDS,
+        lease: object | None,
+        *,
+        timeout_seconds: float = _PERSISTENCE_WORKER_SHUTDOWN_TIMEOUT_SECONDS,
 ) -> None:
     """Stop snapshot workers or fail after bounded in-flight S3 grace period."""
     if lease is None:
@@ -387,9 +389,9 @@ async def _lifespan(app: FastAPI):
 
         shutdown_errors: list[PersistenceWorkerShutdownError] = []
         for stop_worker, worker in (
-            (_stop_generic_s3_upload_daemon, _generic_s3_daemon),
-            (_stop_generic_azure_upload_daemon, _generic_azure_daemon),
-            (_stop_runtime_controller, _runtime_lease),
+                (_stop_generic_s3_upload_daemon, _generic_s3_daemon),
+                (_stop_generic_azure_upload_daemon, _generic_azure_daemon),
+                (_stop_runtime_controller, _runtime_lease),
         ):
             try:
                 stop_worker(worker)
@@ -419,8 +421,8 @@ app = FastAPI(
 @app.middleware("http")
 async def _enforce_s3_read_only(request: Request, call_next):
     if _s3_read_only_enabled() and _is_protected_s3_mutation(
-        request.method,
-        request.url.path,
+            request.method,
+            request.url.path,
     ):
         return JSONResponse(
             status_code=503,
@@ -437,6 +439,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Content-Disposition"],
 )
 
 # Session middleware (for OAuth)
