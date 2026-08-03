@@ -57,7 +57,7 @@ env*.sh
 sync-files*.sh
 
 # Documentation
-document/
+documents/
 README.md
 AGENTS.md
 CLAUDE.md
