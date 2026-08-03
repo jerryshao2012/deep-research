@@ -741,6 +741,10 @@ mandatory: configure at least one Google or GitHub OAuth provider before setting
 `PASSKEY_ENABLED=true`. For a single-replica demo, SQLite is supported when its
 database is stored on a persistent Azure File mount:
 
+See the cross-stack [Passkey Authentication guide](https://github.com/jerryshao2012/bmo-deepagent-ui/blob/main/docs/passkey-authentication.md)
+for enrollment, identifier-free sign-in, management/reauthentication sequence
+diagrams, trust boundaries, and multi-domain RP behavior.
+
 ```env
 DB_TYPE=sqlite
 SQLITE_DB_PATH=/mnt/auth/auth.db
