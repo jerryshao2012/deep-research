@@ -26,6 +26,7 @@ import webapp.config as _cfg
 from research_agent.utils.content_extractors import extract_supported_document
 from research_agent.utils.skill_registry import get_skill_registry
 from webapp.auth_helpers import is_authenticated
+from webapp.features.threads.infrastructure import InMemoryThreadRepository
 from webapp.markdown_images import register_markdown_image_routes
 from webapp.model_diagnostics import run_model_diagnostics
 from webapp.passkeys import register_passkey_routes, safe_oauth_return_path
@@ -1056,46 +1057,8 @@ def register_skills_routes(app) -> None:
 
 # ── Chat Thread State (simplified LangGraph protocol, in-memory) ────────────────
 
-# In-memory store for thread state.  Mirrors the LangGraph /threads/{id}/state
-# protocol so the frontend cross-deployment sync can use the same API shape.
-#
-# Each entry: {"values": dict, "last_access": float, "created": float}
-_chat_thread_state: dict[str, dict[str, Any]] = {}
-
-_MAX_THREADS = 1000
 _MAX_VALUE_SIZE = 2_000_000  # 2 MB per value
-_TTL_SECONDS = 3 * 24 * 3600  # 3 days
-
-
-def _touch_thread(thread_id: str) -> None:
-    """Record that *thread_id* was just accessed (creates entry if missing)."""
-    now = __import__("time").time()
-    entry = _chat_thread_state.get(thread_id)
-    if entry is None:
-        _chat_thread_state[thread_id] = {
-            "values": {},
-            "last_access": now,
-            "created": now,
-        }
-    else:
-        entry["last_access"] = now
-
-
-def _cleanup_expired() -> None:
-    """Remove threads that haven't been accessed in _TTL_SECONDS.
-
-    Called lazily on every GET / POST so the store never grows unbounded.
-    """
-    cutoff = __import__("time").time() - _TTL_SECONDS
-    expired = [
-        tid
-        for tid, entry in _chat_thread_state.items()
-        if entry.get("last_access", 0) < cutoff
-    ]
-    for tid in expired:
-        del _chat_thread_state[tid]
-    if expired:
-        logger.info("chat_thread_state: expired %d thread(s)", len(expired))
+_chat_thread_repository = InMemoryThreadRepository()
 
 
 def register_chat_thread_routes(app) -> None:
@@ -1104,10 +1067,7 @@ def register_chat_thread_routes(app) -> None:
     @app.get("/chat_threads/{thread_id}/state")
     async def get_chat_thread_state(thread_id: str):
         """Return thread state values.  No auth — thread ID is the access key."""
-        _cleanup_expired()
-        _touch_thread(thread_id)
-        entry = _chat_thread_state.get(thread_id, {})
-        return {"values": entry.get("values", {})}
+        return {"values": _chat_thread_repository.get_values(thread_id)}
 
     @app.post("/chat_threads/{thread_id}/state")
     async def update_chat_thread_state(thread_id: str, body: dict[str, Any]):
@@ -1116,8 +1076,6 @@ def register_chat_thread_routes(app) -> None:
         Expects JSON body: ``{"values": {key: value, ...}}``.
         Merges with existing values so partial updates are safe.
         """
-        _cleanup_expired()
-
         incoming = body.get("values") if isinstance(body, dict) else None
         if not isinstance(incoming, dict):
             raise HTTPException(
@@ -1134,26 +1092,7 @@ def register_chat_thread_routes(app) -> None:
                     detail=f"Value for '{key}' exceeds {_MAX_VALUE_SIZE} bytes.",
                 )
 
-        _touch_thread(thread_id)
-        entry = _chat_thread_state[thread_id]
-        current = entry.get("values", {})
-        current.update(incoming)
-        entry["values"] = current
-
-        # Evict oldest entries if over the max-threads limit
-        if len(_chat_thread_state) > _MAX_THREADS:
-            sorted_entries = sorted(
-                _chat_thread_state.items(),
-                key=lambda kv: kv[1].get("last_access", 0),
-            )
-            to_evict = sorted_entries[: len(_chat_thread_state) - _MAX_THREADS]
-            for tid, _ in to_evict:
-                del _chat_thread_state[tid]
-            logger.info(
-                "chat_thread_state: evicted %d oldest thread(s) (max=%d)",
-                len(to_evict),
-                _MAX_THREADS,
-            )
+        _chat_thread_repository.merge_values(thread_id, incoming)
 
         logger.debug(
             "chat_thread_state updated: thread=%s keys=%s",
