@@ -1,0 +1,31 @@
+name: Architecture and contracts
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --extra dev --frozen
+      - run: uv run python scripts/check_architecture.py
+      - run: uv run python scripts/snapshot_openapi.py --check
+      - run: >-
+          uv run python -m pytest
+          tests/test_architecture_boundaries.py
+          tests/test_auth_architecture.py
+          tests/test_thread_architecture.py
+          tests/test_wiki_architecture.py -q
+      - run: >-
+          uv run ruff check webapp/features
+          scripts/check_architecture.py scripts/snapshot_openapi.py
+          tests/test_architecture_boundaries.py tests/test_auth_architecture.py
+          tests/test_thread_architecture.py tests/test_wiki_architecture.py
+      - run: >-
+          uv run --extra dev mypy --follow-imports=skip --ignore-missing-imports
+          webapp/features/auth/application webapp/features/threads/application
+          webapp/features/wiki/application

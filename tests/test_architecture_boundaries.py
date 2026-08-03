@@ -17,6 +17,12 @@ def test_architecture_policy_and_contract_snapshot_are_versioned() -> None:
     assert (repo_root / "docs" / "architecture" / "clean-architecture.md").is_file()
     assert (repo_root / "contracts" / "custom-api.openapi.json").is_file()
     assert (repo_root / "scripts" / "snapshot_openapi.py").is_file()
+    workflow = (repo_root / ".github" / "workflows" / "architecture.yml").read_text(
+        encoding="utf-8"
+    )
+    assert "scripts/check_architecture.py" in workflow
+    assert "scripts/snapshot_openapi.py --check" in workflow
+    assert "tests/test_architecture_boundaries.py" in workflow
 
 
 def test_deprecated_server_is_not_a_production_entrypoint() -> None:
