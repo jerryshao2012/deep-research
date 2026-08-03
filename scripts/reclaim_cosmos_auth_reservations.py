@@ -34,7 +34,7 @@ def _parser() -> argparse.ArgumentParser:
         "--include-committed-missing",
         action="store_true",
         help=(
-            "Also reclaim missing-document committed markers with no lease age; "
+            "Also reclaim missing-documents committed markers with no lease age; "
             "requires quiescence and an absence point-read."
         ),
     )

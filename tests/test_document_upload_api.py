@@ -1,4 +1,4 @@
-"""Tests for document upload API endpoints."""
+"""Tests for documents upload API endpoints."""
 
 from fastapi.testclient import TestClient
 

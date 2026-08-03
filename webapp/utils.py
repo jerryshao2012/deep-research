@@ -1,6 +1,6 @@
 """Shared filesystem utility helpers for the FastAPI webapp.
 
-Provides functions for resolving relative folders safely under document roots,
+Provides functions for resolving relative folders safely under documents roots,
 performing thread-level folder sanitization, and handling directory cleanups.
 """
 

@@ -1,7 +1,7 @@
 """Event-driven background hooks for automatic thread wiki management.
 
 Launches fire-and-forget asynchronous tasks to auto-ingest newly uploaded documents
-or run database lint reconciliation sweeps after document delete events.
+or run database lint reconciliation sweeps after documents delete events.
 """
 
 from __future__ import annotations

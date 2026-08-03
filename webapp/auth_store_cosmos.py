@@ -1000,7 +1000,7 @@ class CosmosAuthStore:
             include_committed_missing: bool = False,
             apply: bool = False,
     ) -> dict[str, Any]:
-        """Inspect or reclaim old missing-document reservations while quiesced.
+        """Inspect or reclaim old missing-documents reservations while quiesced.
 
         Every writer replica must be stopped before calling this method. Cosmos
         cannot atomically fence a paused writer across account and credential or

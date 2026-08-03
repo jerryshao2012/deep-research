@@ -153,7 +153,7 @@ class TestExtractPdfTextPageChunks:
 
 
 class TestExtractCitationsRaw:
-    """Tests for raw document citation parsing."""
+    """Tests for raw documents citation parsing."""
 
     def test_raw_path_with_page(self) -> None:
         answer = "Revenue was $42B (Source: /raw/report.pdf.md, p. 12)."

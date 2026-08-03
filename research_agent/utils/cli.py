@@ -1,6 +1,6 @@
 """Command-line interface (CLI) argument parsing and validation helpers.
 
-Constructs options for model configurations, document folders, web search flags,
+Constructs options for model configurations, documents folders, web search flags,
 SSL validations, list_skills summaries, and text search integrations.
 """
 

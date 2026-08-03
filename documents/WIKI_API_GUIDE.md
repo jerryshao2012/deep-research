@@ -87,7 +87,7 @@ Trigger (or re-trigger) wiki ingest for a thread's uploaded documents. If an ing
 curl -X POST http://localhost:2024/threads/abc-123/wiki/ingest \
   -H 'x-api-key: your_api_key' \
   -H 'Content-Type: application/json' \
-  -d '{"note": "Initial document batch"}'
+  -d '{"note": "Initial documents batch"}'
 ```
 
 ### 2. Import a Public Git Repository
@@ -264,12 +264,12 @@ Query the thread's wiki knowledge base. Returns a grounded answer with citations
 **Response:**
 ```json
 {
-  "answer": "Based on the ingested documents, the key findings are...\n\nSources: (Source: /raw/document.pdf.md, p. 42)",
+  "answer": "Based on the ingested documents, the key findings are...\n\nSources: (Source: /raw/documents.pdf.md, p. 42)",
   "filed_path": "/wiki/query/key-findings-about-topic-x.md",
   "sources_cited": [
     {
       "kind": "raw",
-      "raw_path": "/raw/document.pdf.md",
+      "raw_path": "/raw/documents.pdf.md",
       "page": 42,
       "locator": null,
       "url": null,

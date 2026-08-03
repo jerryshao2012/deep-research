@@ -86,7 +86,11 @@ class PostgresAuthStore:
                 JSONB
                 NOT
                 NULL
-                DEFAULT '{}'::jsonb,
+                DEFAULT
+                '{}'
+                :
+                :
+                jsonb,
                 webauthn_user_handle
                 TEXT
                 NOT
@@ -357,7 +361,7 @@ class PostgresAuthStore:
         statement = """SELECT s.*, a.provider, a.email, a.name, a.avatar_url, a.profile_json
                        FROM auth_sessions s
                                 JOIN auth_accounts a ON a.identity = s.identity
-                       WHERE s.token_hash=%s"""
+                       WHERE s.token_hash = %s"""
         with (
             self.pool.connection() as connection,
             connection.cursor(row_factory=_postgres_dict_row()) as cursor,

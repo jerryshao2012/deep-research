@@ -72,7 +72,7 @@ async def test_validate_web_citations() -> None:
 
         def get_cached_side_effect(url):
             if "profit" in url:
-                return "This document shows quarterly profit was $10B."
+                return "This documents shows quarterly profit was $10B."
             return None
 
         mock_get_cached.side_effect = get_cached_side_effect

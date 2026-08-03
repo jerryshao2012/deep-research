@@ -44,7 +44,6 @@ env/
 .vscode/
 .claude/
 .codex/
-.github/
 .kun-canvas/
 .kunsdd/
 *.swp

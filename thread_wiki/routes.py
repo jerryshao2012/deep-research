@@ -5,7 +5,7 @@ Provides endpoints for:
 - Querying ingest progress (polling + SSE streaming)
 - Cancelling an in-progress ingest
 - Querying the wiki knowledge base
-- Running lint reconciliation after document deletions
+- Running lint reconciliation after documents deletions
 """
 
 from __future__ import annotations
@@ -23,7 +23,6 @@ from langgraph_sdk.auth.types import MinimalUserDict
 from pydantic import BaseModel, Field
 
 from research_agent.utils.knowledge_filesystem import clear_thread_cache
-
 from . import progress as progress_tracker
 from .code_ingestion import load_code_analysis_summary
 from .git_import import (
@@ -700,7 +699,7 @@ async def lint_wiki(
 ) -> WikiLintResponse:
     """Run lint reconciliation on the thread's wiki.
 
-    Use this after document deletions to reconcile stale references,
+    Use this after documents deletions to reconcile stale references,
     remove orphan pages, and refresh cross-links.
     """
     paths = _resolve_paths(thread_id)

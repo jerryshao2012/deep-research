@@ -52,7 +52,7 @@ class TestDelegationStrategy:
     """Validate that delegation strategy is clearly documented."""
 
     def test_subagent_delegation_has_default_strategy_section(self) -> None:
-        """Should document the default single-agent approach."""
+        """Should documents the default single-agent approach."""
         assert "DEFAULT" in SUBAGENT_DELEGATION_INSTRUCTIONS.upper()
         assert "1 sub-agent" in SUBAGENT_DELEGATION_INSTRUCTIONS
 
@@ -86,7 +86,7 @@ class TestDelegationStrategy:
                "avoid" in SUBAGENT_DELEGATION_INSTRUCTIONS.lower()
 
     def test_delegation_parallel_execution_limits_documented(self) -> None:
-        """Should clearly document parallel execution limits."""
+        """Should clearly documents parallel execution limits."""
         assert "Parallel Execution Limits" in SUBAGENT_DELEGATION_INSTRUCTIONS
         assert "max_concurrent_research_units" in SUBAGENT_DELEGATION_INSTRUCTIONS or \
                "parallel sub-agent" in SUBAGENT_DELEGATION_INSTRUCTIONS
@@ -112,7 +112,7 @@ class TestHardLimits:
                "search" in RESEARCHER_INSTRUCTIONS.lower()
 
     def test_hard_limits_document_stopping_criteria(self) -> None:
-        """Should document when to stop searching."""
+        """Should documents when to stop searching."""
         assert "Stop Immediately When" in RESEARCHER_INSTRUCTIONS or \
                "stop" in RESEARCHER_INSTRUCTIONS.lower()
         # Should mention stopping conditions
@@ -130,7 +130,7 @@ class TestHardLimits:
                "last 2 searches" in RESEARCHER_INSTRUCTIONS
 
     def test_subagent_delegation_has_research_limits(self) -> None:
-        """Should document research iteration limits in delegation instructions."""
+        """Should documents research iteration limits in delegation instructions."""
         assert "Research Limits" in SUBAGENT_DELEGATION_INSTRUCTIONS
         assert "max_researcher_iterations" in SUBAGENT_DELEGATION_INSTRUCTIONS or \
                "iteration" in SUBAGENT_DELEGATION_INSTRUCTIONS.lower()
@@ -211,7 +211,7 @@ class TestReportWritingGuidelines:
     """Validate that report writing guidelines are clearly documented."""
 
     def test_workflow_includes_report_writing_guidelines(self) -> None:
-        """Should document report writing guidelines."""
+        """Should documents report writing guidelines."""
         assert "Report Writing Guidelines" in RESEARCH_WORKFLOW_INSTRUCTIONS
 
     def test_report_guidelines_document_citation_format(self) -> None:
@@ -237,17 +237,17 @@ class TestExecutionRules:
     """Validate critical execution rules are documented."""
 
     def test_workflow_documents_never_ask_for_results_rule(self) -> None:
-        """Should document rule against asking user for results."""
+        """Should documents rule against asking user for results."""
         assert "NEVER ask" in RESEARCH_WORKFLOW_INSTRUCTIONS or \
                "Do NOT ask" in RESEARCH_WORKFLOW_INSTRUCTIONS
 
     def test_workflow_documents_immediate_action_rule(self) -> None:
-        """Should document rule against pausing for narrative."""
+        """Should documents rule against pausing for narrative."""
         assert "pause" in RESEARCH_WORKFLOW_INSTRUCTIONS.lower() or \
                "immediately" in RESEARCH_WORKFLOW_INSTRUCTIONS.lower()
 
     def test_workflow_documents_complete_tasks_rule(self) -> None:
-        """Should document rule to always complete tasks."""
+        """Should documents rule to always complete tasks."""
         assert "write_todos" in RESEARCH_WORKFLOW_INSTRUCTIONS or \
                "complete" in RESEARCH_WORKFLOW_INSTRUCTIONS.lower()
 

@@ -982,7 +982,7 @@ class ResearchStateMiddleware(AgentMiddleware):
                     potential_path = p
 
         if not potential_path:
-            # Look for unquoted paths that contain common document folder names
+            # Look for unquoted paths that contain common documents folder names
             # Matches ./path/to/dir, /path/to/dir, or path/to/dir
             unquoted_match = re.search(
                 r"((?:\.?/)?[\\w/.-]+(?:[/\\][\\w/.-]+)+)", user_message
@@ -1180,7 +1180,7 @@ except Exception as e:
 RECURSION_LIMIT = int(os.environ.get("GRAPH_RECURSION_LIMIT", "200"))
 
 # Create the agent
-# Orchestrator owns document/filesystem tools.
+# Orchestrator owns documents/filesystem tools.
 # Web discovery can still be delegated to `research-agent` via task().
 # The `skills` parameter auto-creates SkillsMiddleware backed by the agent's
 # internal FilesystemBackend — all skills live in .deepagents/skills/.

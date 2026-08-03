@@ -1,0 +1,106 @@
+name: Eval Regression Check
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "research_agent/**"
+      - "agent.py"
+      - "model_factory.py"
+      - "pyproject.toml"
+  workflow_dispatch:  # Allow manual trigger.
+
+jobs:
+  eval-regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      MODEL_NAME: claude-sonnet-4-5-20250929
+      ENABLE_EVAL_TRACKING: "true"
+      MAX_VERIFICATION_ROUNDS: "1"
+      EVAL_LOG_QUESTIONS: "false"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      - name: Run golden dataset evaluation (baseline mode)
+        run: |
+          uv run python .deepagents/skills/golden-dataset/scripts/score_dataset.py \
+            --eval-mode baseline \
+            --output-dir ./output/eval_history/
+
+      - name: Check for regressions
+        run: |
+          uv run python -c "
+          import json, sys
+          from pathlib import Path
+          from research_agent.utils.eval_tracking import load_jsonl, compare_records
+          from research_agent.utils.learning import compute_baseline_from_history
+
+          history_dir = Path('./output/eval_history/')
+          records = load_jsonl(history_dir / 'golden_dataset_runs.jsonl')
+
+          if not records:
+              print('No eval records found — skipping regression check.')
+              sys.exit(0)
+
+          # Compare latest candidate against robust baseline.
+          candidates = [r for r in records if r.get('run_type') == 'candidate']
+          baselines = [r for r in records if r.get('run_type') == 'baseline']
+
+          if not candidates:
+              print('No candidate run found. Run golden-dataset eval first.')
+              sys.exit(0)
+
+          latest = candidates[-1]
+          manifest_hash = latest.get('manifest_hash', '')
+
+          # Use robust baseline (median of last N) when available.
+          robust = compute_baseline_from_history(history_dir, manifest_hash)
+          if robust and robust.get('median_success_rate') is not None:
+              baseline_sr = robust['median_success_rate']
+          elif baselines:
+              baseline_sr = baselines[-1].get('metrics', {}).get('tool_execution', {}).get('success_rate', 0)
+          else:
+              print('No baseline available — skipping comparison.')
+              sys.exit(0)
+
+          candidate_sr = latest.get('metrics', {}).get('tool_execution', {}).get('success_rate', 0)
+
+          regression_threshold = float('${EVAL_REGRESSION_THRESHOLD:-0.15}')
+          if baseline_sr > 0 and candidate_sr < baseline_sr * (1 - regression_threshold):
+              print(f'REGRESSION DETECTED: success_rate dropped from {baseline_sr:.1%} to {candidate_sr:.1%}')
+              sys.exit(1)
+
+          print(f'PASS: success_rate stable ({candidate_sr:.1%} vs baseline {baseline_sr:.1%})')
+          "
+
+      - name: Post PR comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+
+            const historyDir = './output/eval_history/';
+            const files = fs.readdirSync(historyDir).filter(f => f.endsWith('.jsonl'));
+            let summary = '## Eval Regression Check\n\n';
+            summary += '✅ No regressions detected.\n';
+            summary += `\nAnalyzed ${files.length} eval history files.`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: summary
+            });

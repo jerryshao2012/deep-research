@@ -346,11 +346,11 @@ def save_research_to_file(research_content, filename=None, output_folder=None):
 def derive_output_folder(doc_folder: str | None) -> Path:
     """Resolve the output directory for research results.
 
-    If a document folder is configured, a subdirectory named after it is
+    If a documents folder is configured, a subdirectory named after it is
     created inside ``REPORTS_OUTPUT_FOLDER``.
 
     Args:
-        doc_folder: Path to the document folder, or ``None``.
+        doc_folder: Path to the documents folder, or ``None``.
 
     Returns:
         The resolved output directory as a ``Path``.
@@ -367,7 +367,7 @@ def configure_output_folder(doc_folder: str | None) -> Path:
     that sub-agents and filesystem tools can discover the correct paths.
 
     Args:
-        doc_folder: Path to the document folder, or ``None``.
+        doc_folder: Path to the documents folder, or ``None``.
 
     Returns:
         The normalized output directory path.

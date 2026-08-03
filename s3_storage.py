@@ -15,7 +15,7 @@ Usage in webapp.py / the LangGraph Platform app:
     # On startup (inside lifespan)
     startup_sync()
 
-    # After document upload
+    # After documents upload
     fire_and_forget_upload(str(destination), s3_key)
 
     # After agent run completes

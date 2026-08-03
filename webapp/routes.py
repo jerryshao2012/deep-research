@@ -109,7 +109,7 @@ def register_storage_routes(app) -> None:
 
 
 def register_document_routes(app) -> None:
-    """Register document CRUD endpoints (view, extract, upload, list, download, delete)."""
+    """Register documents CRUD endpoints (view, extract, upload, list, download, delete)."""
 
     @app.get("/documents/view/{filename}")
     async def view_document(
@@ -118,7 +118,7 @@ def register_document_routes(app) -> None:
             folder: str = "policy",
             x_api_key: str | None = Header(None),
     ):
-        """Serve a document for inline viewing (browser renders instead of downloading)."""
+        """Serve a documents for inline viewing (browser renders instead of downloading)."""
         if not await is_authenticated(x_api_key, request):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -156,7 +156,7 @@ def register_document_routes(app) -> None:
             folder: str = "policy",
             x_api_key: str | None = Header(None),
     ) -> dict:
-        """Extract text/markdown content from a document for preview."""
+        """Extract text/markdown content from a documents for preview."""
         if not await is_authenticated(x_api_key, request):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -202,7 +202,7 @@ def register_document_routes(app) -> None:
             logger.error(f"Document extraction failed for '{safe_name}': {e}")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Failed to extract document content: {e}",
+                detail=f"Failed to extract documents content: {e}",
             )
 
     @app.post("/documents/upload", status_code=status.HTTP_201_CREATED)
@@ -1107,7 +1107,7 @@ def register_chat_thread_routes(app) -> None:
 
 
 def register_all_routes(app) -> None:
-    """Register health, storage, document, OAuth, skills, and chat-thread routes on *app*."""
+    """Register health, storage, documents, OAuth, skills, and chat-thread routes on *app*."""
     register_health_routes(app)
     register_storage_routes(app)
     register_document_routes(app)

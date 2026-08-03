@@ -13,7 +13,7 @@ class WikiRepository(Protocol):
     def get_page(self, thread_id: str, path: str) -> Mapping[str, Any] | None: ...
 
     def save_page(
-        self, thread_id: str, path: str, page: Mapping[str, Any]
+            self, thread_id: str, path: str, page: Mapping[str, Any]
     ) -> None: ...
 
     def list_pages(self, thread_id: str) -> Sequence[Mapping[str, Any]]: ...
@@ -35,7 +35,7 @@ class SearchIndex(Protocol):
     def index(self, thread_id: str, documents: Sequence[Mapping[str, Any]]) -> None: ...
 
     def search(
-        self, thread_id: str, query: str, *, limit: int = 10
+            self, thread_id: str, query: str, *, limit: int = 10
     ) -> Sequence[Mapping[str, Any]]: ...
 
 
@@ -43,7 +43,7 @@ class ModelRunner(Protocol):
     """Model invocation boundary for wiki generation and lint workflows."""
 
     async def generate(
-        self, prompt: str, *, context: Mapping[str, Any] | None = None
+            self, prompt: str, *, context: Mapping[str, Any] | None = None
     ) -> str: ...
 
 

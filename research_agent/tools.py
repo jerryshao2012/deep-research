@@ -1,4 +1,4 @@
-"""Strategic research tools for web exploration and local document analysis.
+"""Strategic research tools for web exploration and local documents analysis.
 
 Exposes tools for web search (tavily_search, fetch_webpage_content), strategic
 planning (think_tool), and local workspace interactions (ls, glob, read_file,
@@ -187,7 +187,7 @@ def read_docs_folder(
     You can then use the `specific_files` argument to read particular documents of interest.
 
     Args:
-        folder_path: The absolute or relative path to the folder containing document files.
+        folder_path: The absolute or relative path to the folder containing documents files.
         specific_files: Optional list of filenames within the folder to read specifically.
             If provided, only these files will be processed, bypassing general limits.
         state: LangGraph state (injected automatically, do not supply).
@@ -232,7 +232,7 @@ def write_file(
         r"/raw/([A-Za-z0-9._\-]+\.(?:pdf|docx|pptx|xlsx))\b", r"/\1", content
     )
 
-    # ── Normalize document sources in /final_report.md ──────────────────
+    # ── Normalize documents sources in /final_report.md ──────────────────
     # The model sometimes invents descriptive titles ("BMO 2025 Annual
     # Report") instead of using the file paths from wiki/cited_response
     # output ("/bmo_ar2025.pdf").  Scan the Sources section and replace
@@ -247,9 +247,9 @@ def write_file(
 
 
 def _normalize_document_sources(content: str, state: dict | None) -> str:
-    """Replace descriptive document titles with file paths in Sources section.
+    """Replace descriptive documents titles with file paths in Sources section.
 
-    Scans the state files dict for known document paths and cited_response
+    Scans the state files dict for known documents paths and cited_response
     content to build a mapping, then rewrites source lines that use invented
     titles (e.g. "BMO 2025 Annual Report, p. 51") to use the actual file
     path (e.g. "/bmo_ar2025.pdf, p. 51").
@@ -259,7 +259,7 @@ def _normalize_document_sources(content: str, state: dict | None) -> str:
 
     files_dict = state.get("files", {}) or {}
 
-    # ── Collect known document file paths ───────────────────────────────
+    # ── Collect known documents file paths ───────────────────────────────
     known_docs: dict[str, str] = {}  # normalized-stem → /path
     for fpath in files_dict:
         clean = fpath.lstrip("/")
@@ -480,7 +480,7 @@ def llm_wiki_query(
         question: str,
         state: Annotated[dict, InjectedState],
 ) -> str:
-    """Query the thread's ingested document wiki for grounded answers.
+    """Query the thread's ingested documents wiki for grounded answers.
 
     Use this tool during the Research phase to search the knowledge base built
     from uploaded documents (PDFs, DOCX, etc.).  The wiki contains synthesized
@@ -498,7 +498,7 @@ def llm_wiki_query(
         question: Natural-language question to ask against the wiki.
 
     Returns:
-        Raw wiki findings with document citations — must be synthesized into
+        Raw wiki findings with documents citations — must be synthesized into
         the final report, not output directly.
     """
     # Resolve thread_id from doc_folder in state.
@@ -510,7 +510,7 @@ def llm_wiki_query(
     if not thread_id:
         return (
             "Error: Cannot determine thread for wiki query. "
-            "No document folder is configured for this session."
+            "No documents folder is configured for this session."
         )
 
     # tools.py lives in research_agent/ — go up one level to project root.
@@ -519,7 +519,7 @@ def llm_wiki_query(
 
     if not paths.wiki_content.exists():
         return (
-            "The document wiki has not been built yet for this session. "
+            "The documents wiki has not been built yet for this session. "
             "Use `read_docs_folder` or `read_file` on /raw/ files to access "
             "documents directly while the wiki is being ingested."
         )

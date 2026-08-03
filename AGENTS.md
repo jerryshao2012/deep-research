@@ -19,7 +19,7 @@ export MODEL_NAME=glm-4.7-flash:latest    # or: claude-3-5-sonnet, gpt-4, etc.
 # Basic research query
 uv run python research_agent_cli.py "What is quantum computing?"
 
-# With document context and specific skill
+# With documents context and specific skill
 uv run python research_agent_cli.py "Topic" --doc-folder ./docs --skill golden-dataset
 
 # Track evaluation baseline for regression testing

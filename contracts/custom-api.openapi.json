@@ -1509,7 +1509,7 @@
     },
     "/documents/extract/{filename}": {
       "get": {
-        "description": "Extract text/markdown content from a document for preview.",
+        "description": "Extract text/markdown content from a documents for preview.",
         "operationId": "extract_document_documents_extract__filename__get",
         "parameters": [
           {
@@ -1753,7 +1753,7 @@
     },
     "/documents/view/{filename}": {
       "get": {
-        "description": "Serve a document for inline viewing (browser renders instead of downloading).",
+        "description": "Serve a documents for inline viewing (browser renders instead of downloading).",
         "operationId": "view_document_documents_view__filename__get",
         "parameters": [
           {
@@ -2683,7 +2683,7 @@
     },
     "/threads/{thread_id}/wiki/lint": {
       "post": {
-        "description": "Run lint reconciliation on the thread's wiki.\n\nUse this after document deletions to reconcile stale references,\nremove orphan pages, and refresh cross-links.",
+        "description": "Run lint reconciliation on the thread's wiki.\n\nUse this after documents deletions to reconcile stale references,\nremove orphan pages, and refresh cross-links.",
         "operationId": "lint_wiki_threads__thread_id__wiki_lint_post",
         "parameters": [
           {

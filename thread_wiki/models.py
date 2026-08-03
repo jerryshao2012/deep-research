@@ -231,7 +231,7 @@ class SourceCitation:
     """A single source reference parsed from an answer.
 
     Citation kinds:
-    - ``raw``: an uploaded document raw path, e.g. ``/raw/report.pdf.md``.
+    - ``raw``: an uploaded documents raw path, e.g. ``/raw/report.pdf.md``.
       ``page`` carries the PDF page number when derivable.
     - ``web``: a web URL, with ``url`` set and ``locator`` holding the title.
     - ``section``: a ``file#Heading`` reference, with ``locator`` holding the

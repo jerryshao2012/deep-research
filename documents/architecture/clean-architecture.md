@@ -31,8 +31,8 @@ only through that feature's public package entrypoint.
 | `skills` | discovery, validation, installation, removal |
 
 Existing deployables remain unchanged. `webapp` is custom FastAPI composition,
-`agent.py` is LangGraph composition, and `model_factory.py` selects model and
-checkpoint adapters. Deprecated `server.py` is frozen: production entrypoints
+`../../agent.py` is LangGraph composition, and `../../model_factory.py` selects model and
+checkpoint adapters. Deprecated `../../server.py` is frozen: production entrypoints
 must use official LangGraph Platform plus the custom FastAPI application.
 
 ## Compatibility
@@ -40,7 +40,7 @@ must use official LangGraph Platform plus the custom FastAPI application.
 HTTP paths, request/response bodies, cookies, SSE event shapes, authentication
 headers, and persisted formats remain stable during extraction. Typed
 application errors are mapped back to current wire responses at interface
-adapters. `contracts/custom-api.openapi.json` records the active custom API.
+adapters. `../../contracts/custom-api.openapi.json` records the active custom API.
 
 ## Implemented dependency map
 
@@ -58,7 +58,7 @@ adapters. `contracts/custom-api.openapi.json` records the active custom API.
 
 FastAPI route functions remain edge controllers: validate wire input, invoke
 ports, and preserve existing response bodies and status codes. Deprecated
-`server.py` remains compatibility-test-only because `tests/test_server.py`
+`../../server.py` remains compatibility-test-only because `../../tests/test_server.py`
 still exercises it; production Docker, entrypoint, and LangGraph configs have
 zero consumers.
 

@@ -693,10 +693,10 @@ curl -X POST http://localhost:2024/threads/abc-123/wiki/ingest/cancel \
 Add these variables to your `.env` file:
 
 ```properties
-# API Key for document upload endpoint authentication
+# API Key for documents upload endpoint authentication
 UPLOAD_API_KEY=your_secure_api_key_here
 
-# Host and port for the document upload API server
+# Host and port for the documents upload API server
 UPLOAD_HOST=0.0.0.0
 UPLOAD_PORT=8000
 

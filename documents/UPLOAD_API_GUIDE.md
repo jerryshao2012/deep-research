@@ -43,7 +43,7 @@ Upload a single file:
 curl -X POST http://localhost:2024/documents/upload \
   -H 'X-API-Key: your_generated_key_here' \
   -F 'folder=policy' \
-  -F 'files=@document.pdf'
+  -F 'files=@documents.pdf'
 ```
 
 Upload multiple files:
@@ -65,8 +65,8 @@ api_key = "your_generated_key_here"
 url = "http://localhost:2024/documents/upload"
 
 # Upload single file
-with open('document.pdf', 'rb') as f:
-    files = {'files': ('document.pdf', f, 'application/pdf')}
+with open('documents.pdf', 'rb') as f:
+    files = {'files': ('documents.pdf', f, 'application/pdf')}
     data = {'folder': 'policy'}
     headers = {'X-API-Key': api_key}
     

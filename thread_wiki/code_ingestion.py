@@ -38,7 +38,7 @@ class CodeDetection:
 
 @dataclass(slots=True, frozen=True)
 class EmbeddedCodeBlock:
-    """Explicit language-tagged code fence inside an ordinary document."""
+    """Explicit language-tagged code fence inside an ordinary documents."""
 
     source_path: str
     language: str
@@ -946,7 +946,7 @@ def analyze_embedded_code_sources(
         enabled: bool | None = None,
         max_bytes: int | None = None,
 ) -> list[CodeFileAnalysis]:
-    """Analyze supported explicit code fences while retaining document origins."""
+    """Analyze supported explicit code fences while retaining documents origins."""
     embedded_enabled = (
         _env_flag("WIKI_CODE_AST_ENABLED", True)
         and _env_flag("WIKI_EMBEDDED_CODE_AST_ENABLED", True)
@@ -981,7 +981,7 @@ def analyze_embedded_code_sources(
                 detection_method=detection.method,
                 warning_code="embedded_ast_disabled",
                 message=(
-                    "Embedded-code AST processing is disabled; document text "
+                    "Embedded-code AST processing is disabled; documents text "
                     "remains available."
                 ),
                 sha256=sha256,
@@ -995,7 +995,7 @@ def analyze_embedded_code_sources(
                 warning_code="embedded_source_too_large",
                 message=(
                     f"Embedded code exceeds AST parse limit of {byte_limit} "
-                    "bytes; document text remains available."
+                    "bytes; documents text remains available."
                 ),
                 sha256=sha256,
                 size_bytes=len(source),
@@ -1019,7 +1019,7 @@ def analyze_embedded_code_sources(
                     warning_code="embedded_parser_failure",
                     message=(
                         "Embedded-code parser unavailable or failed "
-                        f"({type(exc).__name__}); document text remains available."
+                        f"({type(exc).__name__}); documents text remains available."
                     ),
                     sha256=sha256,
                     size_bytes=len(source),

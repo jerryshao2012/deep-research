@@ -28,7 +28,7 @@ Follow this workflow for all research requests:
 1. **Plan**: Create a todo list with write_todos to break down the research into focused tasks
 2. **Save the request**: Use write_file() to save the user's research question to `/research_request.md`
 3. **Research**: Collect grounded context, then fill gaps via sub-agents.
-   - **If documents are available**: Use `llm_wiki_query` to search the ingested document knowledge base.  Results are automatically saved to ``/cited_response.md`` (first call), ``/cited_response_1.md`` (second call), etc.  Read these files when synthesizing ``/final_report.md`` — cite individual document paths (e.g., ``/the_uploaded_document.pdf, p. 38``), not "the wiki."
+   - **If documents are available**: Use `llm_wiki_query` to search the ingested documents knowledge base.  Results are automatically saved to ``/cited_response.md`` (first call), ``/cited_response_1.md`` (second call), etc.  Read these files when synthesizing ``/final_report.md`` — cite individual documents paths (e.g., ``/the_uploaded_document.pdf, p. 38``), not "the wiki."
    - If the wiki results are incomplete, fill gaps with `read_file` (on /wiki/ or /raw/ files), `read_doc_folder`, `ls`, and `glob`.
    - **For web research**: Delegate to sub-agents via `task()`. Sub-agents are web-only (`tavily_search` and `fetch_webpage_content`).
    - In every task() prompt, instruct the sub-agent to read `/research_request.md` first and treat it as source-of-truth intent.
@@ -37,7 +37,7 @@ Follow this workflow for all research requests:
      * What information was found across all sub-agents?
      * What gaps remain compared to the success criteria in your plan?
      * Should any sub-agent be re-tasked with a refined query to fill critical gaps?
-4. **Synthesize**: Read all ``/cited_response*.md`` files and sub-agent findings. Consolidate citations — each unique source (document path + page, or URL) gets one citation number across all findings. Write the comprehensive final report to ``/final_report.md``.
+4. **Synthesize**: Read all ``/cited_response*.md`` files and sub-agent findings. Consolidate citations — each unique source (documents path + page, or URL) gets one citation number across all findings. Write the comprehensive final report to ``/final_report.md``.
 5. **Gap-Filling Pass** (if needed): Before final delivery, check if the report meets ALL success criteria from your plan. If not:
    - Identify the top 1-2 remaining gaps
    - Launch targeted sub-agent tasks to fill those specific gaps
@@ -88,7 +88,7 @@ Simply list items with details - no introduction needed:
 - Cite sources inline using [1], [2], [3] format
 - Assign each unique source a single citation number across ALL findings
 - End report with a ``### Sources`` section.  Leave a blank line after the heading, then list each source as ``1.``, ``2.``, etc. (ordered list).  Each item MUST be on its own line.
-- **For uploaded documents**: copy the EXACT file path and page number from the wiki query or cited_response output.  Every document source MUST start with ``/`` (e.g., ``/the_uploaded_document.pdf, p. 51``).  Never translate a file path into a human-readable title.
+- **For uploaded documents**: copy the EXACT file path and page number from the wiki query or cited_response output.  Every documents source MUST start with ``/`` (e.g., ``/the_uploaded_document.pdf, p. 51``).  Never translate a file path into a human-readable title.
 - **For web sources**: cite the page title and URL — e.g., ``AI Research Paper: https://example.com/paper``
 - Number sources sequentially without gaps (1,2,3,4...)
 
@@ -100,7 +100,7 @@ Simply list items with details - no introduction needed:
   1. /the_uploaded_document.pdf, p. 51
   2. /the_uploaded_document.pdf, p. 155
 
-  **Full example (mixed document + web sources):**
+  **Full example (mixed documents + web sources):**
 
   Some important finding [1]. Another key insight [2]. Data from annual report [3].
 
@@ -118,7 +118,7 @@ Simply list items with details - no introduction needed:
 5. **Write the file FIRST**: You MUST call the `write_file` tool to save the report to `/final_report.md`. Do NOT skip the `write_file` step.
 6. **Final reply**: After successfully writing `/final_report.md` and marking all tasks completed, your final conversational reply should be a SHORT confirmation (e.g., "I have saved the report to /final_report.md"). DO NOT paste the report content in the chat.
 7. **Tool output is NEVER a final answer**: The output of ANY tool (including `llm_wiki_query`, `read_file`, `tavily_search`) is raw research material. You MUST plan with `write_todos`, synthesize all findings, and write `/final_report.md`. Never output tool results directly as your final response.
-8. **Cite specific sources, not tools**: ``llm_wiki_query`` returns findings with document paths and page numbers (e.g., ``/the_uploaded_document.pdf, p. 38``). When writing ``/final_report.md``, cite these individual document paths — do NOT write "according to the wiki" or use a single catch-all reference. The findings are also persisted to ``/cited_response*.md`` files for reference.
+8. **Cite specific sources, not tools**: ``llm_wiki_query`` returns findings with documents paths and page numbers (e.g., ``/the_uploaded_document.pdf, p. 38``). When writing ``/final_report.md``, cite these individual documents paths — do NOT write "according to the wiki" or use a single catch-all reference. The findings are also persisted to ``/cited_response*.md`` files for reference.
 """
 
 RESEARCHER_INSTRUCTIONS = """You are a research assistant conducting research on the user's input topic. For context, today's date is {date}.

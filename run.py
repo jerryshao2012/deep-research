@@ -29,7 +29,7 @@ _DEPRECATION_MSG = """
 ║  This starts the full LangGraph Platform with all endpoints, streaming,      ║
 ║  checkpointing, and the Studio UI at http://127.0.0.1:2024.                  ║
 ║                                                                              ║
-║  For document uploads (port 8000), use:                                      ║
+║  For documents uploads (port 8000), use:                                      ║
 ║                                                                              ║
 ║    uv run python -m webapp                                                   ║
 ║                                                                              ║
@@ -42,7 +42,7 @@ def main() -> None:
 
     This launcher for the custom ``server.py`` is no longer supported.
     Use ``langgraph dev`` for the LangGraph Platform server and
-    ``uv run python -m webapp`` for the document upload API.
+    ``uv run python -m webapp`` for the documents upload API.
     """
     print(_DEPRECATION_MSG, file=sys.stderr)
     sys.exit(1)

@@ -122,7 +122,7 @@ def test_load_missing_index() -> None:
 
 
 def test_page_level_precision() -> None:
-    """Multi-page document: query should return the correct page with metadata."""
+    """Multi-page documents: query should return the correct page with metadata."""
     content = (
         "<!-- page: 1 -->\n## Page 1\n"
         "Introduction and overview of the company.\n\n"
@@ -252,7 +252,7 @@ def test_prf_expands_semantic_matches() -> None:
 
     # "income growth" matches page 10 initially.  PRF mines expansion terms
     # from page 10's content (e.g. "statement", "strong", "organization")
-    # which may help surface page 20 ("revenue" document) that a pure
+    # which may help surface page 20 ("revenue" documents) that a pure
     # keyword search would miss.
     results = idx.search("income growth", k=3, use_prf=True)
     assert len(results) >= 1
@@ -280,7 +280,7 @@ def test_search_without_prf_is_strict_keyword() -> None:
     # Without PRF: "revenue" doesn't match "income" or "operations..."
     # Stemming: "revenue" → "revenu", doesn't match "incom" or "oper"
     results_no_prf = idx.search("revenue", k=2, use_prf=False)
-    # Without PRF, no document contains "revenue" → may return nothing or very low.
+    # Without PRF, no documents contains "revenue" → may return nothing or very low.
     assert len(results_no_prf) == 0 or all(r[1] < 5.0 for r in results_no_prf)
 
     # With PRF: "income from operations grew" is the best match initially,

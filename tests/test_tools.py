@@ -40,7 +40,7 @@ def test_read_docs_folder_reports_unsupported_and_empty_cases(tmp_path: Path) ->
         state={"doc_folder": str(tmp_path)}
     )
 
-    assert "No supported document files found" in result
+    assert "No supported documents files found" in result
 
 
 # ── read_file tests ──

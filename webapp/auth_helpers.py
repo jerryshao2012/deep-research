@@ -14,8 +14,8 @@ import webapp.config as _cfg
 
 
 async def is_authenticated(
-    x_api_key: str | None,
-    request: Request | None = None,
+        x_api_key: str | None,
+        request: Request | None = None,
 ) -> bool:
     """Return True when the request carries a valid API key or OAuth session token.
 
@@ -38,8 +38,8 @@ async def is_authenticated(
             if auth_header and auth_header.startswith("Bearer "):
                 token = auth_header[7:]
         if token and await asyncio.to_thread(
-            _cfg.user_manager.validate_session,
-            token,
+                _cfg.user_manager.validate_session,
+                token,
         ):
             return True
 

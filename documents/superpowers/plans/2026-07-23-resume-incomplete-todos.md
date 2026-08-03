@@ -13,17 +13,17 @@
 ## File Map
 
 - Create `research_agent/resume/__init__.py`: public resume-policy and middleware exports.
-- Create `research_agent/resume/policy.py`: deterministic phrase grammar, todo inspection, configuration parsing, hidden-message detection, safety-limit response.
-- Create `research_agent/resume/middleware.py`: non-persisted model instruction and intermediate-message tagging.
-- Create `tests/test_resume.py`: policy and middleware unit tests.
+- Create `../../../research_agent/resume/policy.py`: deterministic phrase grammar, todo inspection, configuration parsing, hidden-message detection, safety-limit response.
+- Create `../../../research_agent/resume/middleware.py`: non-persisted model instruction and intermediate-message tagging.
+- Create `../../../tests/test_resume.py`: policy and middleware unit tests.
 - Modify `agent.py:8-35, 125-246, 1141-1168`: make existing state setup resume-aware and register resume middleware.
 - Modify `db.py:801-874`: persist private per-run kwargs without a schema migration.
 - Modify `server.py:196-228, 254-330, 375-460, 465-828, 831-990, 1142-1190, 1193-1332`: bind candidate text, coordinate rounds, filter intermediate messages, preserve todos, and emit progress.
 - Modify `research_agent_cli.py:211-223, 309-314`: reuse shared todo inspection.
-- Modify `tests/test_server.py`: background-run binding, looping, cancellation, and safety-limit tests.
-- Modify `tests/test_frontend_api_contract.py`: streaming loop, progress, transcript filtering, and normal-flow compatibility tests.
-- Modify `tests/test_tools.py`: ensure resume rounds preserve original request state and suppress persisted startup messages.
-- Modify `.env.example`: document `MAX_RESUME_ROUNDS=3`.
+- Modify `../../../tests/test_server.py`: background-run binding, looping, cancellation, and safety-limit tests.
+- Modify `../../../tests/test_frontend_api_contract.py`: streaming loop, progress, transcript filtering, and normal-flow compatibility tests.
+- Modify `../../../tests/test_tools.py`: ensure resume rounds preserve original request state and suppress persisted startup messages.
+- Modify `../../../.env.example`: document `MAX_RESUME_ROUNDS=3`.
 
 No frontend source change is required; existing composer submissions already reach `/threads/{thread_id}/runs/stream`.
 
@@ -31,8 +31,8 @@ No frontend source change is required; existing composer submissions already rea
 
 **Files:**
 - Create: `research_agent/resume/__init__.py`
-- Create: `research_agent/resume/policy.py`
-- Create: `tests/test_resume.py`
+- Create: `../../../research_agent/resume/policy.py`
+- Create: `../../../tests/test_resume.py`
 
 - [ ] **Step 1: Write failing phrase-classifier parameter tests**
 
@@ -246,10 +246,10 @@ git commit -m "feat: add incomplete todo resume policy"
 ### Task 2: Ephemeral Resume Middleware
 
 **Files:**
-- Create: `research_agent/resume/middleware.py`
+- Create: `../../../research_agent/resume/middleware.py`
 - Modify: `research_agent/resume/__init__.py`
 - Modify: `agent.py:68-75, 1141-1168`
-- Test: `tests/test_resume.py`
+- Test: `../../../tests/test_resume.py`
 
 - [ ] **Step 1: Write failing middleware instruction tests**
 
@@ -348,12 +348,12 @@ class ResumeMiddleware(AgentMiddleware):
 Implement sync and async wrappers like `ClarificationMiddleware`. Implement `after_model` with `@hook_config(can_jump_to=["end"])`; copy the final `AIMessage` with the same ID and merged `response_metadata` only when resume config is active, no tool calls exist, and `inspect_todos(state.get("todos")).has_incomplete`.
 
 Import `PlanningState` from `langchain.agents.middleware.todo`. Do not import
-`ResearchState` from `agent.py`; that would create a circular dependency when
-`agent.py` imports `ResumeMiddleware`.
+`ResearchState` from `../../../agent.py`; that would create a circular dependency when
+`../../../agent.py` imports `ResumeMiddleware`.
 
 - [ ] **Step 5: Write failing tests for existing state middleware during resume rounds**
 
-In `tests/test_tools.py`, inject resume config into `ResearchStateMiddleware`.
+In `../../../tests/test_tools.py`, inject resume config into `ResearchStateMiddleware`.
 Seed `/research_request.md` with the original goal, set the latest human message
 to `Please continue!`, and assert:
 
@@ -376,7 +376,7 @@ Add `config_getter=get_config` dependency injection to
   existing state.
 
 Do not store resume flags in `ResearchState`. Add `from langgraph.config import
-get_config` in `agent.py`.
+get_config` in `../../../agent.py`.
 
 - [ ] **Step 7: Register middleware after clarification and before research-state middleware**
 
@@ -415,8 +415,8 @@ git commit -m "feat: inject resume instructions per run"
 **Files:**
 - Modify: `db.py:801-874`
 - Modify: `server.py:216-228, 1193-1242, 1258-1302`
-- Test: `tests/test_server.py`
-- Test: `tests/test_frontend_api_contract.py`
+- Test: `../../../tests/test_server.py`
+- Test: `../../../tests/test_frontend_api_contract.py`
 
 - [ ] **Step 1: Write failing DB and endpoint tests**
 
@@ -493,7 +493,7 @@ git commit -m "feat: bind resume intent to triggering run"
 
 **Files:**
 - Modify: `server.py:831-990`
-- Test: `tests/test_server.py`
+- Test: `../../../tests/test_server.py`
 
 - [ ] **Step 1: Write failing multi-round background test**
 
@@ -599,7 +599,7 @@ git commit -m "feat: complete remaining todos in bounded runs"
 
 **Files:**
 - Modify: `server.py:196-206, 254-330, 375-460, 465-828, 1142-1190, 1258-1332`
-- Test: `tests/test_frontend_api_contract.py`
+- Test: `../../../tests/test_frontend_api_contract.py`
 
 - [ ] **Step 1: Write failing streaming completion-loop test**
 
@@ -749,9 +749,9 @@ git commit -m "feat: stream bounded todo resumption"
 
 **Files:**
 - Modify: `research_agent_cli.py:211-223, 309-314`
-- Modify: `tests/test_research_agent_cli_e2e.py`
-- Modify: `.env.example`
-- Test: `tests/test_resume.py`
+- Modify: `../../../tests/test_research_agent_cli_e2e.py`
+- Modify: `../../../.env.example`
+- Test: `../../../tests/test_resume.py`
 
 - [ ] **Step 1: Write failing CLI shared-policy test**
 
@@ -781,7 +781,7 @@ def should_retry_with_invoke(result: dict, skill: str | None = None) -> bool:
 
 - [ ] **Step 4: Document environment setting**
 
-Add to `.env.example` near graph/model execution settings:
+Add to `../../../.env.example` near graph/model execution settings:
 
 ```bash
 # Maximum agent rounds for a user-triggered incomplete-todo resume (default: 3)

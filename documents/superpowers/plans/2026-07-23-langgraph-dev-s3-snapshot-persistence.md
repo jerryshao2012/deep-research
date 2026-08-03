@@ -4,11 +4,11 @@
 
 **Goal:** Keep AWS App Runner on `langgraph dev` while making its demo thread catalog recoverable from guarded, immutable S3 snapshot generations that cannot be replaced by empty or stale in-memory state.
 
-**Architecture:** Add a focused `langgraph_snapshot.py` module for snapshot validation, immutable generation publication, manifest CAS fencing, restore, and CLI operations. Keep `s3_storage.py` responsible only for documents/output/input. Restore LangGraph snapshot before process import; start guarded publisher after runtime startup; enforce read-only rollout through LangGraph auth handlers and FastAPI middleware.
+**Architecture:** Add a focused `../../../langgraph_snapshot.py` module for snapshot validation, immutable generation publication, manifest CAS fencing, restore, and CLI operations. Keep `../../../s3_storage.py` responsible only for documents/output/input. Restore LangGraph snapshot before process import; start guarded publisher after runtime startup; enforce read-only rollout through LangGraph auth handlers and FastAPI middleware.
 
 **Tech Stack:** Python 3.12, boto3/S3, LangGraph in-memory runtime pickle files, FastAPI, AWS App Runner, pytest, shell integration tests.
 
-**Spec:** `docs/superpowers/specs/2026-07-23-langgraph-dev-s3-snapshot-persistence-design.md`
+**Spec:** `..-23-langgraph-dev-s3-snapshot-persistence-design.md`
 
 **Workspace note:** Implementation remains in current workspace because relevant files already contain staged/uncommitted persistence work. Before each edit, inspect the targeted diff and preserve unrelated changes. Use `git commit --only -- <paths>` so pre-staged files are not accidentally included.
 
@@ -16,25 +16,25 @@
 
 ## File Structure
 
-- Create `langgraph_snapshot.py`: all guarded LangGraph snapshot validation, restore, publish, fencing, background publisher, and CLI behavior.
-- Create `tests/test_langgraph_snapshot.py`: unit tests using a deterministic fake S3 client and synthetic pickle snapshots.
-- Create `tests/test_aws_read_only_mode.py`: read-only auth and FastAPI mutation-blocking tests.
-- Modify `s3_storage.py`: generic runtime-file synchronization only; remove `.langgraph_api` and unsafe raw database snapshot behavior.
-- Modify `entrypoint.sh`: synchronous guarded restore before `langgraph dev`; fail closed.
+- Create `../../../langgraph_snapshot.py`: all guarded LangGraph snapshot validation, restore, publish, fencing, background publisher, and CLI behavior.
+- Create `../../../tests/test_langgraph_snapshot.py`: unit tests using a deterministic fake S3 client and synthetic pickle snapshots.
+- Create `../../../tests/test_aws_read_only_mode.py`: read-only auth and FastAPI mutation-blocking tests.
+- Modify `../../../s3_storage.py`: generic runtime-file synchronization only; remove `.langgraph_api` and unsafe raw database snapshot behavior.
+- Modify `../../../entrypoint.sh`: synchronous guarded restore before `langgraph dev`; fail closed.
 - Modify `webapp/__init__.py`: no late startup restore; start generic sync and guarded publisher; add custom-route read-only middleware.
-- Modify `auth.py`: reject LangGraph thread create/update/delete/run actions during read-only rollout.
-- Modify `sync-files-aws.sh`: prohibit raw `.langgraph_api` upload and source documents/wiki from project runtime folders.
-- Modify `tests/test_aws_persistence_scripts.py`: shell/config regression tests.
-- Modify `.dockerignore`: include `uv.lock` in AWS build context.
+- Modify `../../../auth.py`: reject LangGraph thread create/update/delete/run actions during read-only rollout.
+- Modify `../../../sync-files-aws.sh`: prohibit raw `.langgraph_api` upload and source documents/wiki from project runtime folders.
+- Modify `../../../tests/test_aws_persistence_scripts.py`: shell/config regression tests.
+- Modify `../../../.dockerignore`: include `../../../uv.lock` in AWS build context.
 - Modify `Dockerfile-aws`: install exact locked dependencies and retain `langgraph dev --no-reload`.
-- Modify `deploy-aws.sh`: snapshot/read-only settings, health route, single-instance configuration, and guarded rollout helpers.
-- Modify `document/AWS_DEPLOY.md`: demo persistence and first-deployment maintenance procedure.
+- Modify `../../../deploy-aws.sh`: snapshot/read-only settings, health route, single-instance configuration, and guarded rollout helpers.
+- Modify `../../AWS_DEPLOY.md`: demo persistence and first-deployment maintenance procedure.
 
 ### Task 1: Snapshot validation model
 
 **Files:**
-- Create: `langgraph_snapshot.py`
-- Create: `tests/test_langgraph_snapshot.py`
+- Create: `../../../langgraph_snapshot.py`
+- Create: `../../../tests/test_langgraph_snapshot.py`
 
 - [ ] **Step 1: Write failing validation tests**
 
@@ -118,8 +118,8 @@ git commit --only -m "feat: validate LangGraph snapshot generations" -- langgrap
 ### Task 2: Immutable S3 generation publication and restore
 
 **Files:**
-- Modify: `langgraph_snapshot.py`
-- Modify: `tests/test_langgraph_snapshot.py`
+- Modify: `../../../langgraph_snapshot.py`
+- Modify: `../../../tests/test_langgraph_snapshot.py`
 
 - [ ] **Step 1: Write failing S3 generation tests**
 
@@ -183,8 +183,8 @@ git commit --only -m "feat: publish immutable LangGraph snapshots" -- langgraph_
 ### Task 3: Writer epoch, stable publisher, and fence monitor
 
 **Files:**
-- Modify: `langgraph_snapshot.py`
-- Modify: `tests/test_langgraph_snapshot.py`
+- Modify: `../../../langgraph_snapshot.py`
+- Modify: `../../../tests/test_langgraph_snapshot.py`
 
 - [ ] **Step 1: Write failing publisher tests**
 
@@ -233,7 +233,7 @@ def start_fence_monitor(..., interval_seconds: float = 2.0, terminate=os._exit) 
 
 Read-only mode returns without claim/publisher. Normal mode claims writer epoch
 before readiness and aborts startup if claim fails. It never restores files;
-`entrypoint.sh` is the sole restore path and runs before LangGraph import.
+`../../../entrypoint.sh` is the sole restore path and runs before LangGraph import.
 Publisher and monitor share `RuntimeLease`; successful pointer CAS atomically
 updates the lease ETag before the monitor's next comparison so the process
 cannot fence itself. Publisher requires idle catalog and stable fingerprints
@@ -274,22 +274,22 @@ git commit --only -m "feat: fence LangGraph snapshot writers" -- langgraph_snaps
 ### Task 4: Separate generic S3 sync from LangGraph state
 
 **Files:**
-- Modify: `s3_storage.py`
-- Modify: `entrypoint.sh`
-- Modify: `sync-files-aws.sh`
-- Modify: `tests/test_aws_persistence_scripts.py`
+- Modify: `../../../s3_storage.py`
+- Modify: `../../../entrypoint.sh`
+- Modify: `../../../sync-files-aws.sh`
+- Modify: `../../../tests/test_aws_persistence_scripts.py`
 
 - [ ] **Step 1: Replace old shell expectations with failing guard tests**
 
 Add assertions that:
 
 - `_resolve_tracked_folders()` excludes `.langgraph_api`.
-- `entrypoint.sh` invokes `python -m langgraph_snapshot restore` before `exec "$@"`.
+- `../../../entrypoint.sh` invokes `python -m langgraph_snapshot restore` before `exec "$@"`.
 - restore failure stops startup.
 - `python -m s3_storage startup` dispatches and returns nonzero on a required
   download failure.
-- `sync-files-aws.sh --upload` never performs raw S3 copy to `.langgraph_api/`.
-- upload sources `docs/threads` and `docs/threads-wiki` from project-root `docs`.
+- `sync-files-aws.sh --upload` never performs raw S3 copy to `../../../.langgraph_api`.
+- upload sources `../../../docs/threads` and `../../../docs/threads-wiki` from project-root `docs`.
 - Docker command retains `--no-reload`.
 
 - [ ] **Step 2: Verify RED**
@@ -304,7 +304,7 @@ Expected: failures showing current raw `.langgraph_api` synchronization.
 
 Remove `.langgraph_api` from generic tracked folders and periodic scanner. Keep docs/output/input uploads. Remove late/unsafe raw DB copying if it is not used by `langgraph dev`.
 
-Change `entrypoint.sh` AWS order:
+Change `../../../entrypoint.sh` AWS order:
 
 ```bash
 python3 -m s3_storage startup
@@ -337,9 +337,9 @@ git commit --only -m "fix: guard AWS LangGraph state synchronization" -- s3_stor
 ### Task 5: Read-only rollout and application lifecycle
 
 **Files:**
-- Modify: `auth.py`
+- Modify: `../../../auth.py`
 - Modify: `webapp/__init__.py`
-- Create: `tests/test_aws_read_only_mode.py`
+- Create: `../../../tests/test_aws_read_only_mode.py`
 
 - [ ] **Step 1: Write failing read-only tests**
 
@@ -369,7 +369,7 @@ Expected: update/delete/run handlers and middleware missing; lifespan still perf
 
 - [ ] **Step 3: Implement read-only guards**
 
-Add `_reject_if_s3_read_only()` to `auth.py`; call it from thread create/update/delete/create_run authorization handlers before ownership logic.
+Add `_reject_if_s3_read_only()` to `../../../auth.py`; call it from thread create/update/delete/create_run authorization handlers before ownership logic.
 
 Add FastAPI middleware to return HTTP 503 only for an explicit protected-route
 matrix: document upload/delete, wiki ingest/mutation, and thread-state mutation
@@ -399,16 +399,16 @@ git commit --only -m "feat: enforce read-only App Runner rollout" -- auth.py web
 ### Task 6: Freeze AWS runtime and deployment configuration
 
 **Files:**
-- Modify: `.dockerignore`
+- Modify: `../../../.dockerignore`
 - Modify: `Dockerfile-aws`
-- Modify: `deploy-aws.sh`
-- Modify: `tests/test_aws_persistence_scripts.py`
+- Modify: `../../../deploy-aws.sh`
+- Modify: `../../../tests/test_aws_persistence_scripts.py`
 
 - [ ] **Step 1: Write failing source-contract tests**
 
 Assert:
 
-- `.dockerignore` does not exclude `uv.lock`.
+- `../../../.dockerignore` does not exclude `../../../uv.lock`.
 - `Dockerfile-aws` installs `uv`, uses `uv sync --frozen`, puts
   `/deps/deep_research/.venv/bin` on `PATH`, and keeps the exact
   `langgraph dev --no-reload` command.
@@ -425,7 +425,7 @@ Expected: frozen-install and rollout configuration assertions fail.
 
 - [ ] **Step 3: Implement frozen build and configuration**
 
-Include `uv.lock`, install with frozen resolution, set:
+Include `../../../uv.lock`, install with frozen resolution, set:
 
 ```dockerfile
 ENV PATH="/deps/deep_research/.venv/bin:$PATH"
@@ -519,7 +519,7 @@ Expected: no whitespace errors; unrelated dirty files remain untouched.
 ### Task 8: Guarded AWS migration and deployment
 
 **Files:**
-- Modify: `document/AWS_DEPLOY.md`
+- Modify: `../../AWS_DEPLOY.md`
 
 - [ ] **Step 1: Document first guarded rollout**
 
@@ -554,7 +554,7 @@ Verify nonzero S3 key counts.
 While service remains paused, delete `docs/threads/<thread_id>/` and
 `docs/threads-wiki/<thread_id>/` prefixes for the six approved trash IDs only.
 List each prefix before deletion, then verify zero keys afterward. Do not use a
-recursive delete against `docs/threads/` or `docs/threads-wiki/` roots.
+recursive delete against `../../../docs/threads` or `../../../docs/threads-wiki` roots.
 
 - [ ] **Step 6: Apply temporary IAM deny and resume current service**
 
@@ -588,5 +588,5 @@ Create one demo thread, wait for immutable generation publication, restart App R
 - [ ] **Step 11: Final commit**
 
 ```bash
-git commit --only -m "docs: document guarded AWS demo persistence" -- document/AWS_DEPLOY.md
+git commit --only -m "docs: document guarded AWS demo persistence" -- documents/AWS_DEPLOY.md
 ```

@@ -132,10 +132,10 @@ class SimpleLocalEmbeddings(Embeddings):
         """Embed a batch of documents.
 
         Args:
-            texts: A list of document strings to embed.
+            texts: A list of documents strings to embed.
 
         Returns:
-            A list of embedding vectors, one per input document.
+            A list of embedding vectors, one per input documents.
         """
         return [self._embed(t) for t in texts]
 

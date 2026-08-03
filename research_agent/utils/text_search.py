@@ -669,5 +669,5 @@ def load_or_build_search_index(
 def search_index(
         query: str, index: HybridSearchIndex, k: int = 5
 ) -> list[tuple[Document, float]]:
-    """Search a hybrid index; returns top-k (document, relevance-score) results."""
+    """Search a hybrid index; returns top-k (documents, relevance-score) results."""
     return index.search(query, k=k)

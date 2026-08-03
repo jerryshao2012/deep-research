@@ -18,10 +18,10 @@ class AuthStore(Protocol):
     """Backend-neutral contract implemented by auth persistence adapters."""
 
     def create_session(
-        self,
-        user_data: Mapping[str, Any],
-        provider: str,
-        auth_method: str = "oauth",
+            self,
+            user_data: Mapping[str, Any],
+            provider: str,
+            auth_method: str = "oauth",
     ) -> str: ...
 
     def validate_session(self, session_token: str) -> dict[str, Any] | None: ...
@@ -35,7 +35,7 @@ class AuthStore(Protocol):
     def get_account(self, identity: str) -> AccountRecord | None: ...
 
     def list_credentials(
-        self, identity: str, rp_id: str | None = None
+            self, identity: str, rp_id: str | None = None
     ) -> list[CredentialRecord]: ...
 
     def get_credential(self, credential_id: str) -> CredentialRecord | None: ...
@@ -47,7 +47,7 @@ class AuthStore(Protocol):
     def update_credential_state(self, credential_id: str, **kwargs: Any) -> bool: ...
 
     def rename_credential(
-        self, identity: str, credential_id: str, label: str
+            self, identity: str, credential_id: str, label: str
     ) -> bool: ...
 
     def delete_credential(self, identity: str, credential_id: str) -> bool: ...
@@ -57,7 +57,7 @@ class AuthStore(Protocol):
     def claim_challenge(self, ceremony_id: str) -> ChallengeRecord | None: ...
 
     def consume_rate_limit(
-        self, scope: str, key: str, window_start: int, limit: int
+            self, scope: str, key: str, window_start: int, limit: int
     ) -> bool: ...
 
     def close(self) -> None: ...

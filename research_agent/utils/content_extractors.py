@@ -238,20 +238,20 @@ def _extract_xlsx_text(file_path: Path) -> str:
 
 
 def extract_supported_document(file_path: Path) -> str:
-    """Extract text content from a supported document file.
+    """Extract text content from a supported documents file.
 
     Dispatches to the appropriate extractor based on file extension.
     Supports PDF, plain text, Markdown, DOCX, PPTX, and XLSX.
 
     Args:
-        file_path: Path to the document file.
+        file_path: Path to the documents file.
 
     Returns:
         Extracted text content, with format-specific sentinels for page
         numbers, slide numbers, headings, or sheet/row coordinates.
 
     Raises:
-        ValueError: If the file extension is not a supported document type.
+        ValueError: If the file extension is not a supported documents type.
     """
     suffix = file_path.suffix.lower()
     if suffix == ".pdf":
@@ -264,4 +264,4 @@ def extract_supported_document(file_path: Path) -> str:
         return _extract_pptx_text(file_path)
     if suffix == ".xlsx":
         return _extract_xlsx_text(file_path)
-    raise ValueError(f"Unsupported document type: {suffix}")
+    raise ValueError(f"Unsupported documents type: {suffix}")

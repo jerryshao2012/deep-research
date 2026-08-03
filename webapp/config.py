@@ -102,6 +102,7 @@ _frontend_origins: list[str] = [
     "https://smith.langchain.com",
     "https://bmo-deepagent-ui.vercel.app",
     "https://bmo-deepagent-qqkdniiw0-agentic-ui.vercel.app",
+    "https://bmo-deepagent-ui-0312.azurewebsites.net/"
 ]
 
 _env_frontend_urls = os.environ.get("FRONTEND_URLS", "")

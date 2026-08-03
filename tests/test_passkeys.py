@@ -1345,16 +1345,16 @@ def test_label_normalization_rejects_non_scalar_unicode(label):
 
 def test_label_normalization_matches_ecmascript_trim_without_trimming_u0085():
     assert (
-        passkeys_module._normalize_passkey_label(
-            "\ufeff\u00a0Laptop\u3000\ufeff", allow_default=False
-        )
-        == "Laptop"
+            passkeys_module._normalize_passkey_label(
+                "\ufeff\u00a0Laptop\u3000\ufeff", allow_default=False
+            )
+            == "Laptop"
     )
     assert (
-        passkeys_module._normalize_passkey_label(
-            "\u0085Laptop\u0085", allow_default=False
-        )
-        == "\u0085Laptop\u0085"
+            passkeys_module._normalize_passkey_label(
+                "\u0085Laptop\u0085", allow_default=False
+            )
+            == "\u0085Laptop\u0085"
     )
 
 
@@ -1916,16 +1916,16 @@ def test_list_rename_and_revoke_require_recent_auth(passkey_service):
     ("device_type", "transports", "created_at", "expected"),
     [
         (
-            "multi_device",
-            ["internal"],
-            datetime(2026, 8, 3, tzinfo=UTC).timestamp(),
-            "Synced passkey · Aug 3, 2026",
+                "multi_device",
+                ["internal"],
+                datetime(2026, 8, 3, tzinfo=UTC).timestamp(),
+                "Synced passkey · Aug 3, 2026",
         ),
         (
-            "single_device",
-            ["usb"],
-            datetime(2026, 8, 3, tzinfo=UTC).timestamp(),
-            "Security key · Aug 3, 2026",
+                "single_device",
+                ["usb"],
+                datetime(2026, 8, 3, tzinfo=UTC).timestamp(),
+                "Security key · Aug 3, 2026",
         ),
     ],
 )
@@ -2135,10 +2135,10 @@ def _proxy_headers(*, token: str | None = None, origin: str | None = None):
     [
         ("list_credentials", "get", "/auth/passkeys", []),
         (
-            "registration_options",
-            "post",
-            "/auth/passkeys/registration/options",
-            {"ceremony_id": "ceremony", "options": {}},
+                "registration_options",
+                "post",
+                "/auth/passkeys/registration/options",
+                {"ceremony_id": "ceremony", "options": {}},
         ),
     ],
 )

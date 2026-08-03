@@ -1,7 +1,7 @@
-"""Knowledge filesystem configuration and document management tools.
+"""Knowledge filesystem configuration and documents management tools.
 
 Defines safety limits for file operations (max sizes, read limits) and provides
-routines for listing, globbing, reading, and querying document workspace sections.
+routines for listing, globbing, reading, and querying documents workspace sections.
 """
 
 from __future__ import annotations
@@ -300,12 +300,12 @@ def _get_extracted_path(
 def _resolve_doc_output_subfolder(
         folder: Path
 ) -> Path:
-    """Resolve the output subfolder for extracted document content.
+    """Resolve the output subfolder for extracted documents content.
 
     Ensures extracted files land inside the configured ``OUTPUT_FOLDER``.
 
     Args:
-        folder: The source document folder.
+        folder: The source documents folder.
 
     Returns:
         The resolved output directory as a ``Path``.
@@ -324,10 +324,10 @@ def _save_extracted_content(
         content: str,
         output_folder: Path | None = None
 ) -> str:
-    """Save extracted document text to a cached file for reuse.
+    """Save extracted documents text to a cached file for reuse.
 
     Args:
-        original_file_path: Path to the source document.
+        original_file_path: Path to the source documents.
         content: Extracted text content to save.
         output_folder: Target directory. Defaults to ``OUTPUT_FOLDER``.
 
@@ -756,7 +756,7 @@ def read_docs_folder_impl(
     You can then use the `specific_files` argument to read particular documents of interest.
 
     Args:
-        folder_path: The absolute or relative path to the folder containing document files.
+        folder_path: The absolute or relative path to the folder containing documents files.
         specific_files: Optional list of filenames within the folder to read specifically.
             If provided, only these files will be processed, bypassing general limits.
         state: LangGraph state (injected automatically, do not supply).
@@ -771,7 +771,7 @@ def read_docs_folder_impl(
     is_thread_docs, wiki_content_path = _check_thread_wiki_ready(folder_path)
     if is_thread_docs and wiki_content_path:
         logger.info(
-            "[read_doc_folder] Skipping raw document extraction for thread docs folder '%s' "
+            "[read_doc_folder] Skipping raw documents extraction for thread docs folder '%s' "
             "— wiki is already built. Redirecting agent to wiki at '%s'.",
             folder_path,
             wiki_content_path,
@@ -798,7 +798,7 @@ def read_docs_folder_impl(
 
     if not configured_doc_folder:
         return (
-            "Error: No document folder has been configured for this research task. "
+            "Error: No documents folder has been configured for this research task. "
             "Pass --doc-folder <path> when invoking the CLI, or include the folder path "
             "(e.g. '--doc-folder ./docs/policy/') in your message when using the API. "
             "Do NOT attempt to read from any other filesystem path."
@@ -838,7 +838,7 @@ def read_docs_folder_impl(
     supported_files = sorted(all_candidates)
 
     if not supported_files:
-        return f"No supported document files found in {folder_path}. Supported types: .pdf, .txt, .md, .docx, .pptx, .xlsx."
+        return f"No supported documents files found in {folder_path}. Supported types: .pdf, .txt, .md, .docx, .pptx, .xlsx."
 
     if specific_set:
         files_to_process = [f for f in supported_files if f.name in specific_set]
@@ -884,7 +884,7 @@ def read_docs_folder_impl(
             except Exception as exc:
                 logger.error(f"Failed to read existing extract {target_path}: {exc}. Re-extracting...")
 
-        logger.info(f"Processing document: {file_path.name}...")
+        logger.info(f"Processing documents: {file_path.name}...")
         try:
             content = extract_supported_document(file_path)
             saved_path = _save_extracted_content(file_path, content, output_folder=output_subfolder)

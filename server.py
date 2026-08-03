@@ -12,7 +12,7 @@
 
     This file is kept for reference only and will be removed in a future release.
 
-    For document uploads (port 8000), run::
+    For documents uploads (port 8000), run::
 
         uv run python -m webapp
 """
@@ -71,7 +71,7 @@ _task_lock = asyncio.Lock()
 
 
 def custom_openapi() -> dict[str, Any]:
-    """Build an explicit OpenAPI document for the async subagent server."""
+    """Build an explicit OpenAPI documents for the async subagent server."""
     if app.openapi_schema:
         return app.openapi_schema
 

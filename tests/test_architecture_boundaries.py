@@ -14,7 +14,7 @@ def test_repository_provides_architecture_checker() -> None:
 
 def test_architecture_policy_and_contract_snapshot_are_versioned() -> None:
     repo_root = Path(__file__).resolve().parents[1]
-    assert (repo_root / "docs" / "architecture" / "clean-architecture.md").is_file()
+    assert (repo_root / "documents" / "architecture" / "clean-architecture.md").is_file()
     assert (repo_root / "contracts" / "custom-api.openapi.json").is_file()
     assert (repo_root / "scripts" / "snapshot_openapi.py").is_file()
     workflow = (repo_root / ".github" / "workflows" / "architecture.yml").read_text(
@@ -77,7 +77,7 @@ def test_domain_and_application_reject_outward_dependencies(tmp_path: Path) -> N
 
 
 def test_features_consume_other_features_through_public_entrypoints(
-    tmp_path: Path,
+        tmp_path: Path,
 ) -> None:
     _write(
         tmp_path,

@@ -60,7 +60,7 @@ def _imports(tree: ast.AST) -> list[tuple[str, tuple[str, ...]]]:
 
 
 def _cycle_violations(
-    graph: dict[str, set[str]], module_paths: dict[str, Path], root_dir: Path
+        graph: dict[str, set[str]], module_paths: dict[str, Path], root_dir: Path
 ) -> list[dict[str, str]]:
     state: dict[str, str] = {}
     stack: list[str] = []
@@ -133,9 +133,9 @@ def check_architecture(root_dir: Path | None = None) -> list[dict[str, str]]:
                             }
                         )
                     if (
-                        target_feature == feature
-                        and layer == "application"
-                        and target_layer in {"interfaces", "infrastructure"}
+                            target_feature == feature
+                            and layer == "application"
+                            and target_layer in {"interfaces", "infrastructure"}
                     ):
                         violations.append(
                             {
@@ -145,9 +145,9 @@ def check_architecture(root_dir: Path | None = None) -> list[dict[str, str]]:
                             }
                         )
                     if (
-                        target_feature == feature
-                        and layer == "domain"
-                        and target_layer != "domain"
+                            target_feature == feature
+                            and layer == "domain"
+                            and target_layer != "domain"
                     ):
                         violations.append(
                             {

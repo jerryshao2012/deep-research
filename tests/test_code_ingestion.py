@@ -58,7 +58,7 @@ def test_extensionless_shebang_detection_does_not_classify_markdown(
     script = tmp_path / "build"
     script.write_text("#!/usr/bin/env python3\nprint('ok')\n", encoding="utf-8")
     markdown = tmp_path / "notes.md"
-    markdown.write_text("```python\nprint('not a code document')\n```\n", encoding="utf-8")
+    markdown.write_text("```python\nprint('not a code documents')\n```\n", encoding="utf-8")
 
     detected = detect_code_language(script)
     assert detected is not None

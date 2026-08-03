@@ -169,7 +169,7 @@ For reference, here are equivalent cURL commands:
 # Health check
 curl http://localhost:8000/health
 
-# Upload document
+# Upload documents
 curl -X POST http://localhost:8000/documents/upload \
   -H "X-API-Key: your-api-key" \
   -F "folder=policy" \
@@ -179,12 +179,12 @@ curl -X POST http://localhost:8000/documents/upload \
 curl http://localhost:8000/documents/list?folder=policy \
   -H "X-API-Key: your-api-key"
 
-# Download document
+# Download documents
 curl http://localhost:8000/documents/download/test.pdf?folder=policy \
   -H "X-API-Key: your-api-key" \
   -o downloaded.pdf
 
-# Delete document
+# Delete documents
 curl -X DELETE "http://localhost:8000/documents/test.pdf?folder=policy" \
   -H "X-API-Key: your-api-key"
 

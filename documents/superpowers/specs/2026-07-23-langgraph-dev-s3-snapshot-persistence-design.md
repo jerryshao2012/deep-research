@@ -17,7 +17,7 @@ partial `.langgraph_api` snapshot.
 
 ## Root Cause
 
-The in-memory LangGraph runtime loads `.langgraph_api/.langgraph_ops.pckl` once
+The in-memory LangGraph runtime loads `../../../.langgraph_api/.langgraph_ops.pckl` once
 at startup. If the file is missing, copied too late, corrupt, or incompatible,
 the runtime starts with an empty thread list. Its persistence loop writes that
 memory state to disk every ten seconds. The existing five-second S3 upload loop
@@ -30,7 +30,7 @@ the deployment does not configure `LANGGRAPH_THREAD_TTL`.
 
 ### Startup restore
 
-`entrypoint.sh` restores LangGraph state before starting the Python process.
+`../../../entrypoint.sh` restores LangGraph state before starting the Python process.
 The restore operation:
 
 1. Downloads the S3 snapshot manifest.
@@ -42,7 +42,7 @@ The restore operation:
 5. Replaces the local directory on the same filesystem by renaming the current
    directory aside, renaming staging into place, and rolling back on failure.
 6. Falls back to the manifest's previous generation, then the existing
-   canonical `.langgraph_api/` prefix during the
+   canonical `../../../.langgraph_api` prefix during the
    initial migration when no generation manifest exists.
 7. Fails startup instead of launching with empty state when S3 contains a
    previously valid non-empty snapshot that cannot be restored.
@@ -127,7 +127,7 @@ validated non-empty snapshot or a genuinely new demo with no prior manifest.
 
 Pickles are valid only for the runtime that created them. The AWS image must
 install from a frozen lock file instead of resolving lower-bound dependencies
-during every build. The Docker build includes `uv.lock`, uses frozen
+during every build. The Docker build includes `../../../uv.lock`, uses frozen
 installation, and records exact `langgraph-api`, `langgraph-runtime-inmem`,
 `langgraph`, and Python versions in each manifest. Startup refuses incompatible
 snapshots instead of deleting them or booting empty.
@@ -146,14 +146,14 @@ This matches the existing cleanup workflow for the six empty demo threads.
 
 ### Documents and wiki
 
-`docs/`, `output/`, and `input/` retain file-level background uploads.
+`../../../docs`, `../../../output`, and `../../../input` retain file-level background uploads.
 Generated thread documents and wiki files remain under their existing S3
 prefixes. Upload uses project-root runtime folders rather than assuming the
-files already exist under `sync-aws/`. `.langgraph_api` is removed from the
+files already exist under `../../../sync-aws`. `.langgraph_api` is removed from the
 generic folder mirror and is handled only by the validated generation
 publisher.
 
-`sync-files-aws.sh` must refuse direct `.langgraph_api` overwrite and delegate
+`../../../sync-files-aws.sh` must refuse direct `.langgraph_api` overwrite and delegate
 that prefix to the guarded snapshot publisher. Document and wiki upload must
 include `docs/threads/<thread_id>/` and
 `docs/threads-wiki/<thread_id>/` from the project runtime tree.
@@ -208,7 +208,7 @@ be restored by accident.
 - Corrupt active generation falls back to previous generation.
 - Existing local directory replacement rolls back after failure.
 - Canonical prefix migration produces initial manifest.
-- `sync-files-aws.sh` cannot bypass guarded `.langgraph_api` publication.
+- `../../../sync-files-aws.sh` cannot bypass guarded `.langgraph_api` publication.
 - Document and wiki uploads remain unchanged.
 - Nested document listing and wiki endpoints survive restart.
 - Integration check creates a thread, waits for publication, restarts the local

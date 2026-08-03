@@ -1,9 +1,9 @@
 ---
 title: "Source Document Title"
 category: source
-summary: "Brief summary of this source document's content and relevance."
-tags: []
-sources: [/raw/filename.pdf.md]
+summary: "Brief summary of this source documents's content and relevance."
+tags: [ ]
+sources: [ /raw/filename.pdf.md ]
 updated: YYYY-MM-DD
 ---
 

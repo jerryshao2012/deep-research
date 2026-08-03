@@ -102,7 +102,7 @@ _LARGE_SOURCE_CHAR_THRESHOLD = 200_000
 
 # Content chunking: when a staged source exceeds the max chunk size, it is split
 # into overlapping chunks for reliable LLM processing.  Chunk boundaries follow
-# natural document structure (page, slide, heading sentinels).
+# natural documents structure (page, slide, heading sentinels).
 _WIKI_MAX_CHUNK_CHARS = int(__import__("os").getenv("WIKI_MAX_CHUNK_CHARS", "40000"))
 _WIKI_CHUNK_OVERLAP_CHARS = int(
     __import__("os").getenv("WIKI_CHUNK_OVERLAP_CHARS", "2000")
@@ -214,13 +214,13 @@ Page structure (MANDATORY — every wiki page):
 Structured category directories:
 - `/wiki/entities/` — named entities: companies, people, products, organizations
 - `/wiki/concepts/` — abstract concepts, definitions, frameworks, methodologies
-- `/wiki/sources/` — per-document summaries with bibliographic metadata
+- `/wiki/sources/` — per-documents summaries with bibliographic metadata
 - `/wiki/comparisons/` — side-by-side analyses, named `<topic-a>-vs-<topic-b>.md`
 - `/wiki/synthesis/` — cross-source integration, overviews, theses
 - `/wiki/query/` — durable Q&A responses filed for future reference
 
 Contradiction tracking:
-- When two sources disagree on a claim, document the conflict using this callout
+- When two sources disagree on a claim, documents the conflict using this callout
   in the relevant wiki page(s):
   ```
   > **Contradiction** (unresolved as of YYYY-MM-DD): Source A claims X
@@ -233,7 +233,7 @@ Contradiction tracking:
   source material and update resolution status.
 
 Re-ingestion (merge mode):
-- When a source document is re-ingested and a `/wiki/sources/<slug>.md` page
+- When a source documents is re-ingested and a `/wiki/sources/<slug>.md` page
   already exists, append a `## Re-ingest YYYY-MM-DD` section at the bottom
   rather than overwriting.  Preserve the original analysis and note what
   changed in the new section.
@@ -316,12 +316,12 @@ def _purpose_md(topic: str) -> str:
     """Build default purpose.md content — directional intent for the wiki.
 
     Mirrors LLM Wiki's purpose.md concept: a human-authored (or human-reviewed)
-    document that guides the LLM during every ingest and query.  The LLM reads
+    documents that guides the LLM during every ingest and query.  The LLM reads
     it for context and can suggest refinements, but the human owns the final text.
     """
     return (
         f"# Purpose: {topic} Wiki\n\n"
-        "This document captures the **directional intent** behind this wiki — why it\n"
+        "This documents captures the **directional intent** behind this wiki — why it\n"
         "exists, what questions it should answer, and what constitutes good coverage.\n\n"
         "## Goals\n"
         "- Build a comprehensive, accurate knowledge base about this topic.\n"
@@ -335,7 +335,7 @@ def _purpose_md(topic: str) -> str:
         "- _(Summarize the current understanding. Update as the wiki grows.)_\n\n"
         "## Usage Notes\n"
         "- This file is **human-curated**: the LLM may suggest edits, but you decide.\n"
-        "- Review and update this document periodically as the wiki matures.\n"
+        "- Review and update this documents periodically as the wiki matures.\n"
         "- The LLM reads this before every ingest and query for directional guidance.\n"
     )
 
@@ -378,7 +378,7 @@ def _ensure_scaffold(wiki_dir: Path, topic: str) -> None:
 
 
 def _extract_binary_source(file_path: Path) -> str:
-    """Extract text from a binary document using content_extractors.
+    """Extract text from a binary documents using content_extractors.
 
     Supports PDF, DOCX, PPTX, and XLSX formats. Falls back to a graceful
     error message if extraction fails rather than raising.
@@ -977,7 +977,7 @@ def _run_agent(
 
     @tool
     def retrieve_wiki_documents(query: str, k: int = 5) -> str:
-        """Retrieve top-k relevant document snippets from the raw documents text search index.
+        """Retrieve top-k relevant documents snippets from the raw documents text search index.
 
         Use this tool when you need to search large raw source documents in `/raw/`
         for specific facts.  Returns ranked snippets with source file paths, page
@@ -1031,7 +1031,7 @@ def _run_agent(
                                     or score > term_results[doc_id][1]
                             ):
                                 term_results[doc_id] = (doc, score)
-                    # Merge, keeping the best score per document.
+                    # Merge, keeping the best score per documents.
                     seen_ids = {id(d) for d, _ in results}
                     for doc_id, (doc, score) in term_results.items():
                         if doc_id not in seen_ids:
@@ -1042,7 +1042,7 @@ def _run_agent(
 
             if not results:
                 return (
-                    "No matching document snippets found for query. "
+                    "No matching documents snippets found for query. "
                     "Try reading `/raw/` files directly with the read_file tool, "
                     "or refine your search terms."
                 )
@@ -1089,7 +1089,7 @@ def _run_agent(
 
     # Apply a conservative recursion limit to prevent infinite tool-calling
     # loops.  Index repair and lint passes should complete in < 30 turns;
-    # ingest review + apply may need more for large document sets.
+    # ingest review + apply may need more for large documents sets.
     _WIKI_AGENT_RECURSION_LIMIT = int(
         __import__("os").getenv("WIKI_AGENT_RECURSION_LIMIT", "100")
     )
@@ -1232,8 +1232,8 @@ def _build_ingest_apply_prompt(
 
 _DOCUMENT_CITATION_RULES = """\
 Document citation format rules (MANDATORY):
-- Cite raw document sources as plain text: (/raw/filename.pdf.md, p. N) or (Source: /raw/filename.pdf.md, p. N)
-- NEVER use markdown link syntax for document paths. The following is WRONG: ([/filename.pdf](p. N))
+- Cite raw documents sources as plain text: (/raw/filename.pdf.md, p. N) or (Source: /raw/filename.pdf.md, p. N)
+- NEVER use markdown link syntax for documents paths. The following is WRONG: ([/filename.pdf](p. N))
   The correct form is: (/raw/filename.pdf.md, p. N)
 - For web URLs you MAY use markdown links: [Title](https://example.com)
 - Page number formatting (CRITICAL — follow EXACTLY):
@@ -1265,7 +1265,7 @@ def _build_query_prompt(topic: str, question: str) -> str:
             "Every factual claim MUST include a source reference.\n"
             "8) Decide whether this answer should be filed as a durable wiki page.\n\n"
             "ANTI-HALLUCINATION RULES (MANDATORY):\n"
-            "- NEVER conclude 'no information available' or 'the document does not mention X' without first:\n"
+            "- NEVER conclude 'no information available' or 'the documents does not mention X' without first:\n"
             "  a) Searching `/raw/` documents using `retrieve_wiki_documents` with at least 3 query variations\n"
             "  b) Reading the top-ranked results from each search\n"
             "  c) If still nothing found, searching for related/adjacent terms (e.g. if 'acquisition' "
@@ -2165,7 +2165,7 @@ def _build_chunked_processing_instructions(
             "1) Read chunks in order (chunk001, chunk002, ...).",
             "2) Extract key claims, entities, and concepts from each chunk.",
             "3) After reading all chunks, synthesize your analysis as if you had "
-            "read the entire document.",
+            "read the entire documents.",
             "4) In your output, cite the source file (e.g., /raw/report.pdf.md) "
             "rather than individual chunk files.",
             "5) Note any information that appears to span chunk boundaries and "
@@ -2943,7 +2943,7 @@ async def run_query(
     except TimeoutError:
         logger.error("Wiki query timed out after %ds", _QUERY_TIMEOUT)
         return WikiQueryResult(
-            answer="The wiki query timed out. The document may be too large to process in the available time.",
+            answer="The wiki query timed out. The documents may be too large to process in the available time.",
             filed_path=None,
             sources_cited=[],
         )
@@ -3010,7 +3010,7 @@ async def run_lint(
     2. Semantic contradiction detection (read-only) — systematic page comparison
     3. Mutating repair — applies fixes with both structural and semantic findings as context
 
-    Use this after document deletions to reconcile stale references.
+    Use this after documents deletions to reconcile stale references.
     """
     # Pass 1: Run graph analysis for structural health insights.
     graph_report = await asyncio.to_thread(_analyze_graph, paths.wiki_dir)

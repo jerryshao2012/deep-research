@@ -29,11 +29,11 @@ class InMemoryThreadRepository(ThreadRepository):
     """Bounded, expiring in-memory thread state repository."""
 
     def __init__(
-        self,
-        *,
-        max_threads: int = 1_000,
-        ttl_seconds: float = 3 * 24 * 3600,
-        clock: Clock | None = None,
+            self,
+            *,
+            max_threads: int = 1_000,
+            ttl_seconds: float = 3 * 24 * 3600,
+            clock: Clock | None = None,
     ) -> None:
         """Initialize bounded repository with an injectable clock."""
         self._max_threads = max_threads

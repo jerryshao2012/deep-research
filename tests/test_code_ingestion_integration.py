@@ -155,7 +155,7 @@ def test_mixed_ingest_uses_ast_chunks_without_changing_document_path(
         "def run():\n    return 1\n",
         encoding="utf-8",
     )
-    (docs_dir / "notes.md").write_text("# Notes\n\nOrdinary document.\n", encoding="utf-8")
+    (docs_dir / "notes.md").write_text("# Notes\n\nOrdinary documents.\n", encoding="utf-8")
     wiki_dir = tmp_path / "wiki-root"
     paths = ThreadWikiPaths(
         thread_id="thread-1",
@@ -209,7 +209,7 @@ def test_document_with_fenced_code_keeps_document_and_adds_semantic_chunk(
     docs_dir.mkdir()
     (docs_dir / "guide.md").write_text(
         "# Guide\n\n"
-        "Explanation remains document content.\n\n"
+        "Explanation remains documents content.\n\n"
         "```python\n"
         "def embedded():\n"
         "    return 1\n"
