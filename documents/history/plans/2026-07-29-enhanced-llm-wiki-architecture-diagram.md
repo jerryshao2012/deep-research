@@ -22,8 +22,8 @@ and do not use operating-system mouse, keyboard, or screen control.
 ### Task 1: Launch canvas and establish visual frame
 
 **Files:**
-- Create: `../../diagrams/enhanced-llm-wiki-architecture.drawio`
-- Create: `../../diagrams/enhanced-llm-wiki-architecture.png`
+- Create: `../../architecture/diagrams/enhanced-llm-wiki-architecture.drawio`
+- Create: `../../architecture/diagrams/enhanced-llm-wiki-architecture.png`
 
 - [ ] **Step 1: Launch live draw.io**
 
@@ -220,8 +220,8 @@ graph cells.
 ### Task 5: Save, validate, export, and review
 
 **Files:**
-- Create: `../../diagrams/enhanced-llm-wiki-architecture.drawio`
-- Create: `../../diagrams/enhanced-llm-wiki-architecture.png`
+- Create: `../../architecture/diagrams/enhanced-llm-wiki-architecture.drawio`
+- Create: `../../architecture/diagrams/enhanced-llm-wiki-architecture.png`
 
 - [ ] **Step 1: Save live graph**
 
@@ -229,7 +229,7 @@ Call `drawio_live_save_snapshot` only after all visible geometry exists, with:
 
 `output_path`:
 
-`/Users/jerryshao/Documents/projects/IBM/ai/deep-research/document/diagrams/enhanced-llm-wiki-architecture.drawio`
+`/Users/jerryshao/Documents/projects/IBM/ai/deep-research/documents/architecture/diagrams/enhanced-llm-wiki-architecture.drawio`
 
 - [ ] **Step 2: Validate source**
 
@@ -237,13 +237,13 @@ Call `drawio_validate` with:
 
 `input_path`:
 
-`/Users/jerryshao/Documents/projects/IBM/ai/deep-research/document/diagrams/enhanced-llm-wiki-architecture.drawio`
+`/Users/jerryshao/Documents/projects/IBM/ai/deep-research/documents/architecture/diagrams/enhanced-llm-wiki-architecture.drawio`
 
 Expected: valid draw.io document with no structural errors.
 
 Call `drawio_inspect` on:
 
-`/Users/jerryshao/Documents/projects/IBM/ai/deep-research/document/diagrams/enhanced-llm-wiki-architecture.drawio`
+`/Users/jerryshao/Documents/projects/IBM/ai/deep-research/documents/architecture/diagrams/enhanced-llm-wiki-architecture.drawio`
 
 Expected: planned vertex and edge IDs exist, labels are editable text, and
 geometry is stable after serialization.
@@ -253,9 +253,9 @@ geometry is stable after serialization.
 Call `drawio_export` with:
 
 - `input_path`:
-  `/Users/jerryshao/Documents/projects/IBM/ai/deep-research/document/diagrams/enhanced-llm-wiki-architecture.drawio`
+  `/Users/jerryshao/Documents/projects/IBM/ai/deep-research/documents/architecture/diagrams/enhanced-llm-wiki-architecture.drawio`
 - `output_path`:
-  `/Users/jerryshao/Documents/projects/IBM/ai/deep-research/document/diagrams/enhanced-llm-wiki-architecture.png`
+  `/Users/jerryshao/Documents/projects/IBM/ai/deep-research/documents/architecture/diagrams/enhanced-llm-wiki-architecture.png`
 - `format="png"`
 - `embed=false`
 - `width=2000`

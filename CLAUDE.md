@@ -35,7 +35,7 @@ uv run pytest tests/ --cov=research_agent --cov-report=html  # coverage
 uv run ruff check .
 uv run mypy research_agent/
 
-# Deployment guides: see documents/AZURE_DEPLOY.md, documents/AWS_DEPLOY.md, and documents/VERCEL_DEPLOY.md
+# Deployment guides: see documents/deployment/azure/README.md, documents/deployment/aws.md, and documents/deployment/vercel.md
 ```
 
 ## Architecture

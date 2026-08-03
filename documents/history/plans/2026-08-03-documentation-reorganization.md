@@ -90,6 +90,7 @@ HISTORY = DOCUMENTS / "history"
 EXTERNAL_SCHEMES = {"http", "https", "mailto"}
 LINK_RE = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*#*\s*$", re.MULTILINE)
+FENCE_RE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})(.*)$")
 PLAIN_TEXT_NAMES = {".dockerignore", ".env.example", ".gitignore", "AGENTS.md", "CLAUDE.md"}
 LEGACY_PATHS = ("document" + "/", "docs" + "/superpowers/")
 
@@ -127,15 +128,48 @@ def _reader_guides() -> list[Path]:
     ]
 
 
+def _markdown_headings(markdown: str) -> list[tuple[str, str]]:
+    headings: list[tuple[str, str]] = []
+    fence_character = ""
+    fence_length = 0
+    for line in markdown.splitlines():
+        fence = FENCE_RE.match(line)
+        if fence_character:
+            if fence:
+                marker, suffix = fence.groups()
+                if (
+                    marker[0] == fence_character
+                    and len(marker) >= fence_length
+                    and not suffix.strip()
+                ):
+                    fence_character = ""
+                    fence_length = 0
+            continue
+        if fence:
+            marker, info = fence.groups()
+            if marker[0] == "~" or "`" not in info:
+                fence_character = marker[0]
+                fence_length = len(marker)
+                continue
+        heading = HEADING_RE.match(line)
+        if heading:
+            headings.append(heading.groups())
+    return headings
+
+
 def _github_slugs(markdown: str) -> set[str]:
     counts: dict[str, int] = {}
     slugs: set[str] = set()
-    for _, heading in HEADING_RE.findall(markdown):
-        base = re.sub(r"[^\w\- ]", "", heading.lower()).strip().replace(" ", "-")
-        base = re.sub(r"-+", "-", base)
+    for _, heading in _markdown_headings(markdown):
+        base = re.sub(r"[^\w\s-]", "", heading.lower())
+        base = re.sub(r"\s", "-", base)
         count = counts.get(base, 0)
+        candidate = base if count == 0 else f"{base}-{count}"
+        while candidate in slugs:
+            count += 1
+            candidate = f"{base}-{count}"
         counts[base] = count + 1
-        slugs.add(base if count == 0 else f"{base}-{count}")
+        slugs.add(candidate)
     return slugs
 
 
@@ -155,14 +189,60 @@ def _local_link_targets(path: Path) -> list[tuple[Path, str]]:
 
 Add tests named:
 
-```python
+`````python
+def test_markdown_headings_ignore_fenced_code_blocks() -> None:
+    markdown = """# Actual heading
+
+   ````shell
+# Backtick comment
+   ````
+
+~~~ python
+# Tilde comment
+~~~~
+
+## Actual section
+"""
+
+    assert _markdown_headings(markdown) == [
+        ("#", "Actual heading"),
+        ("##", "Actual section"),
+    ]
+    assert _github_slugs(markdown) == {"actual-heading", "actual-section"}
+
+
+def test_github_slugs_match_punctuation_and_duplicate_behavior() -> None:
+    markdown = """## 🚀 Quickstart
+## Multi-Agent Complex Workflows: Evaluation & Regression Tracking
+## Repeated heading
+## Repeated heading
+## Foo
+## Foo
+## Foo-1
+"""
+
+    assert _github_slugs(markdown) == {
+        "-quickstart",
+        "multi-agent-complex-workflows-evaluation--regression-tracking",
+        "repeated-heading",
+        "repeated-heading-1",
+        "foo",
+        "foo-1",
+        "foo-1-1",
+    }
+
+
 def test_root_readme_is_concise() -> None:
     assert len((ROOT / "README.md").read_text(encoding="utf-8").splitlines()) <= 250
 
 
 def test_reader_guides_have_one_h1() -> None:
     for path in _reader_guides():
-        h1s = re.findall(r"^# [^#].+$", path.read_text(encoding="utf-8"), re.MULTILINE)
+        h1s = [
+            heading
+            for level, heading in _markdown_headings(path.read_text(encoding="utf-8"))
+            if level == "#"
+        ]
         assert len(h1s) == 1, path.relative_to(ROOT)
 
 
@@ -217,13 +297,13 @@ def test_legacy_documentation_paths_are_absent() -> None:
 
 def test_documents_have_no_duplicate_copy_names() -> None:
     assert not list(DOCUMENTS.rglob("* 2.md"))
-```
+`````
 
 - [ ] **Step 3: Run tests to verify current failures**
 
 Run: `uv run pytest tests/test_documentation.py -q`
 
-Expected: failures for README length, missing index, legacy paths, and existing heading/link inconsistencies. Duplicate-name failure appears only when the stale wiki copy still exists.
+Expected before documentation changes: four failures for README length, unresolved legacy-path links, missing index, and legacy-path references. Heading parsing, GitHub slug regression, and single-H1 checks pass; duplicate-name failure appears only when the stale wiki copy still exists.
 
 - [ ] **Step 4: Commit only the contract test**
 

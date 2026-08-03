@@ -1,6 +1,11 @@
 # AST-Aware Code Ingestion
 
-## Overview
+Use this deep dive when operating, debugging, or extending Thread Wiki ingestion
+for source repositories and code embedded in ordinary documents. It explains
+runtime detection, safety, artifacts, citations, limits, and recovery for
+maintainers who need more detail than the architecture overview or API guide.
+
+## Choose the ingestion path
 
 AST-aware ingestion enhances the existing Thread Wiki. It does not create a
 separate wiki type or query endpoint.
@@ -14,7 +19,7 @@ separate wiki type or query endpoint.
 - Wiki answers cite original `/raw/...` source files and validated 1-based line
   ranges, never derived semantic artifacts.
 
-## Data Flow
+## Follow the data flow
 
 ```text
 Upload or public Git URL
@@ -45,7 +50,7 @@ Tree-sitter returns a concrete syntax tree with exact byte and point ranges.
 `thread_wiki.code_ingestion` normalizes selected nodes into an AST-like,
 language-independent model suitable for repository analysis.
 
-## Detection
+## Identify the source type
 
 File extension takes precedence. A shebang is inspected only when a file has no
 extension.
@@ -73,7 +78,7 @@ the service does not guess from prose or indentation.
 For `.h`, both C and C++ grammars parse the source. The tree with fewer error
 and missing nodes wins; an exact tie selects C.
 
-## Normalized Schema
+## Inspect the normalized schema
 
 `CodeFileAnalysis` records source path, hash, byte size, language, detection
 method, parser and grammar versions, parse status, units, imports, and warnings.
@@ -98,7 +103,7 @@ Embedded analyses use `origin_kind: embedded`, retain block number and original
 document line range, and have independent public counts. Their symbols and
 imports never enter repository-level resolution.
 
-## Artifact Layout
+## Inspect generated artifacts
 
 ```text
 docs/threads-wiki/<thread-id>/
@@ -121,7 +126,7 @@ hashes, parser metadata, hierarchy, ranges, imports, artifacts, symbols, and
 resolved internal imports. Public API warnings are deterministically ordered
 and capped at 50.
 
-## Prompt and Citation Rules
+## Enforce prompt and citation rules
 
 For code ingestion, the LLM must:
 
@@ -135,7 +140,7 @@ If a generated answer nevertheless cites a derived artifact, the response
 layer maps it back to the artifact's original source and validates its line
 range against current source length. Invalid ranges are omitted.
 
-## Configuration
+## Configure limits and switches
 
 | Variable | Default | Purpose |
 |---|---:|---|
@@ -151,11 +156,13 @@ range against current source length. Invalid ranges are omitted.
 All Tree-sitter core and grammar wheels are pinned in `pyproject.toml` and
 `uv.lock`; ingestion performs no parser download at runtime.
 
-## Public Git Repository Import
+## Import a public Git repository
 
 `POST /threads/{thread_id}/wiki/import/git` accepts an anonymous public HTTPS
 GitHub, GitLab, or Bitbucket URL plus an optional branch or tag. Import runs as
 the `importing` progress phase, then starts the same mixed-document ingest flow.
+Current route path resolution requires `docs/threads/<thread-id>/` to exist
+before clone starts; a Git-only import for a new thread returns `404`.
 
 ```json
 {
@@ -172,7 +179,7 @@ submodules, LFS downloads, hooks, symlinks, VCS metadata, dependency trees, and
 build-output trees are excluded. Repository limits are checked before an
 existing import is replaced. Private repository credentials are not supported.
 
-## Fallback and Recovery
+## Recover with safe fallback
 
 Usable units from recoverable trees are retained with status `partial`.
 Existing text chunking is used when:
@@ -188,7 +195,7 @@ Warnings use stable codes such as `ast_disabled`, `source_too_large`,
 `syntax_error`. Ingest progress snapshots include the public code-analysis
 summary, so status remains consistent after process restart.
 
-## Troubleshooting
+## Troubleshoot ingestion
 
 - `fallback_files` increased: inspect warning codes in `/wiki/status`, then the
   full `.code_ingest_manifest.json`.
@@ -203,7 +210,7 @@ summary, so status remains consistent after process restart.
 - Need document-only behavior: set `WIKI_EMBEDDED_CODE_AST_ENABLED=false`;
   fenced blocks remain available through ordinary document ingestion.
 
-## Limitations
+## Know the limits
 
 - No raw AST JSON is exposed.
 - No source execution, compilation, package installation, or dependency fetch.
@@ -211,3 +218,10 @@ summary, so status remains consistent after process restart.
 - No private Git authentication, submodule checkout, or Git LFS content.
 - Only explicit supported language-tagged fences are parsed; heuristic code
   detection in prose, untagged blocks, or document typography is out of scope.
+
+## Related documentation
+
+- [Architecture overview](overview.md)
+- [Enhanced wiki diagram](diagrams/enhanced-llm-wiki-architecture.png)
+- [Wiki diagram design specification](wiki-diagram-design.md)
+- [Thread Wiki API](../api/wiki.md)

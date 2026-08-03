@@ -253,21 +253,21 @@ docker run --env TAVILY_API_KEY=<key> deep-research:latest \
 ```
 
 ### Cloud Deployment Options
-- **Azure Container Apps**: See [AZURE_DEPLOY.md](document/AZURE_DEPLOY.md) for complete walkthrough:
+- **Azure Container Apps**: See [Azure deployment](documents/deployment/azure/README.md) for the complete walkthrough:
 ```bash
 source ./env.sh
 bash build.sh      # Build, test, push to ACR
 bash deploy.sh     # Deploy to Azure Container Apps
 ```
 
-- **AWS App Runner & ECR**: See [AWS_DEPLOY.md](document/AWS_DEPLOY.md) for complete walkthrough:
+- **AWS App Runner & ECR**: See [AWS deployment](documents/deployment/aws.md) for the complete walkthrough:
 ```bash
 source ./env-aws.sh
 bash build-aws.sh   # Build and push to ECR
 bash deploy-aws.sh  # Deploy to AWS App Runner
 ```
 
-- **Vercel UI & Serverless**: See [VERCEL_DEPLOY.md](document/VERCEL_DEPLOY.md) for frontend deployment and CORS configuration.
+- **Vercel UI & Serverless**: See [Vercel deployment](documents/deployment/vercel.md) for companion frontend deployment and backend connection guidance.
 
 ---
 
@@ -385,9 +385,9 @@ New tools should:
 
 When enhancing this agent:
 1. **Read [README.md](README.md)** for architecture and quickstart
-2. **Read [TEST_PROMPTS_VALIDATION_GUIDE.md](document/TEST_PROMPTS_VALIDATION_GUIDE.md)** for prompt validation guidelines
-3. **Read [PROMPT_ENHANCEMENT_GUIDE.md](document/PROMPT_ENHANCEMENT_GUIDE.md)** for prompt enhancement guidelines
-4. **Read [UPGRADE_GUIDE.md](document/UPGRADE_GUIDE.md)** for upload API documentation
+2. **Read [prompt validation](documents/development/prompt-validation.md)** for prompt validation guidelines
+3. **Read [extending the agent](documents/development/extending-the-agent.md#change-orchestration-prompts)** for prompt enhancement guidelines
+4. **Read [Document Upload API](documents/api/upload.md)** for upload API documentation
 5. **Check [agent.py](agent.py)** to understand orchestration logic
 6. **Review [research_agent/prompts.py](research_agent/prompts.py)** for current instructions
 7. **Write tests first** (see [tests/conftest.py](tests/conftest.py) for fixtures)

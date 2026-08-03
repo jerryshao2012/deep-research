@@ -28,7 +28,7 @@
 - Modify `../../../.dockerignore`: include `../../../uv.lock` in AWS build context.
 - Modify `Dockerfile-aws`: install exact locked dependencies and retain `langgraph dev --no-reload`.
 - Modify `../../../deploy-aws.sh`: snapshot/read-only settings, health route, single-instance configuration, and guarded rollout helpers.
-- Modify `../../AWS_DEPLOY.md`: demo persistence and first-deployment maintenance procedure.
+- Modify `../../deployment/aws.md`: demo persistence and first-deployment maintenance procedure.
 
 ### Task 1: Snapshot validation model
 
@@ -519,7 +519,7 @@ Expected: no whitespace errors; unrelated dirty files remain untouched.
 ### Task 8: Guarded AWS migration and deployment
 
 **Files:**
-- Modify: `../../AWS_DEPLOY.md`
+- Modify: `../../deployment/aws.md`
 
 - [ ] **Step 1: Document first guarded rollout**
 
@@ -588,5 +588,5 @@ Create one demo thread, wait for immutable generation publication, restart App R
 - [ ] **Step 11: Final commit**
 
 ```bash
-git commit --only -m "docs: document guarded AWS demo persistence" -- documents/AWS_DEPLOY.md
+git commit --only -m "docs: document guarded AWS demo persistence" -- documents/deployment/aws.md
 ```
