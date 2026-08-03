@@ -1,0 +1,2920 @@
+{
+  "components": {
+    "schemas": {
+      "Body_upload_documents_documents_upload_post": {
+        "properties": {
+          "files": {
+            "items": {
+              "contentMediaType": "application/octet-stream",
+              "type": "string"
+            },
+            "title": "Files",
+            "type": "array"
+          },
+          "folder": {
+            "default": "policy",
+            "title": "Folder",
+            "type": "string"
+          }
+        },
+        "required": [
+          "files"
+        ],
+        "title": "Body_upload_documents_documents_upload_post",
+        "type": "object"
+      },
+      "Body_upload_skill_skills_upload_post": {
+        "properties": {
+          "file": {
+            "anyOf": [
+              {
+                "contentMediaType": "application/octet-stream",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "File"
+          },
+          "files": {
+            "anyOf": [
+              {
+                "items": {
+                  "contentMediaType": "application/octet-stream",
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Files"
+          },
+          "paths": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Paths"
+          }
+        },
+        "title": "Body_upload_skill_skills_upload_post",
+        "type": "object"
+      },
+      "CodeAnalysisSummaryOut": {
+        "description": "Bounded public summary of repository code analysis.",
+        "properties": {
+          "detected_files": {
+            "default": 0,
+            "title": "Detected Files",
+            "type": "integer"
+          },
+          "embedded_blocks": {
+            "default": 0,
+            "title": "Embedded Blocks",
+            "type": "integer"
+          },
+          "fallback_embedded_blocks": {
+            "default": 0,
+            "title": "Fallback Embedded Blocks",
+            "type": "integer"
+          },
+          "fallback_files": {
+            "default": 0,
+            "title": "Fallback Files",
+            "type": "integer"
+          },
+          "internal_import_count": {
+            "default": 0,
+            "title": "Internal Import Count",
+            "type": "integer"
+          },
+          "parsed_embedded_blocks": {
+            "default": 0,
+            "title": "Parsed Embedded Blocks",
+            "type": "integer"
+          },
+          "parsed_files": {
+            "default": 0,
+            "title": "Parsed Files",
+            "type": "integer"
+          },
+          "partially_parsed_files": {
+            "default": 0,
+            "title": "Partially Parsed Files",
+            "type": "integer"
+          },
+          "symbol_count": {
+            "default": 0,
+            "title": "Symbol Count",
+            "type": "integer"
+          },
+          "warnings": {
+            "items": {
+              "$ref": "#/components/schemas/CodeWarningOut"
+            },
+            "title": "Warnings",
+            "type": "array"
+          }
+        },
+        "title": "CodeAnalysisSummaryOut",
+        "type": "object"
+      },
+      "CodeWarningOut": {
+        "description": "Safe warning produced by AST-aware code ingestion.",
+        "properties": {
+          "code": {
+            "title": "Code",
+            "type": "string"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "source_path": {
+            "title": "Source Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_path",
+          "code",
+          "message"
+        ],
+        "title": "CodeWarningOut",
+        "type": "object"
+      },
+      "CommunityOut": {
+        "description": "A knowledge community.",
+        "properties": {
+          "cohesion": {
+            "title": "Cohesion",
+            "type": "number"
+          },
+          "id": {
+            "title": "Id",
+            "type": "integer"
+          },
+          "size": {
+            "title": "Size",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "cohesion",
+          "size"
+        ],
+        "title": "CommunityOut",
+        "type": "object"
+      },
+      "GraphEdgeOut": {
+        "description": "An edge (link) in the wiki knowledge graph.",
+        "properties": {
+          "source": {
+            "title": "Source",
+            "type": "string"
+          },
+          "target": {
+            "title": "Target",
+            "type": "string"
+          },
+          "weight": {
+            "default": 1.0,
+            "title": "Weight",
+            "type": "number"
+          }
+        },
+        "required": [
+          "source",
+          "target"
+        ],
+        "title": "GraphEdgeOut",
+        "type": "object"
+      },
+      "GraphInsightOut": {
+        "description": "A single knowledge graph insight.",
+        "properties": {
+          "description": {
+            "title": "Description",
+            "type": "string"
+          },
+          "insight_type": {
+            "title": "Insight Type",
+            "type": "string"
+          },
+          "pages": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Pages",
+            "type": "array"
+          },
+          "score": {
+            "default": 0.0,
+            "title": "Score",
+            "type": "number"
+          },
+          "suggested_action": {
+            "default": "",
+            "title": "Suggested Action",
+            "type": "string"
+          }
+        },
+        "required": [
+          "insight_type",
+          "pages",
+          "description"
+        ],
+        "title": "GraphInsightOut",
+        "type": "object"
+      },
+      "GraphInsightsResponse": {
+        "description": "Response from the graph insights endpoint.",
+        "properties": {
+          "communities": {
+            "default": [],
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Communities",
+            "type": "array"
+          },
+          "hubs": {
+            "default": [],
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Hubs",
+            "type": "array"
+          },
+          "insights": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/GraphInsightOut"
+            },
+            "title": "Insights",
+            "type": "array"
+          },
+          "orphans": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Orphans",
+            "type": "array"
+          },
+          "sinks": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Sinks",
+            "type": "array"
+          },
+          "thread_id": {
+            "title": "Thread Id",
+            "type": "string"
+          },
+          "total_links": {
+            "title": "Total Links",
+            "type": "integer"
+          },
+          "total_pages": {
+            "title": "Total Pages",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "thread_id",
+          "total_pages",
+          "total_links"
+        ],
+        "title": "GraphInsightsResponse",
+        "type": "object"
+      },
+      "GraphNodeOut": {
+        "description": "A node in the wiki knowledge graph.",
+        "properties": {
+          "category": {
+            "default": "uncategorized",
+            "title": "Category",
+            "type": "string"
+          },
+          "community_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Community Id"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "tags": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Tags",
+            "type": "array"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "title"
+        ],
+        "title": "GraphNodeOut",
+        "type": "object"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "title": "Detail",
+            "type": "array"
+          }
+        },
+        "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "ReviewItemOut": {
+        "description": "A single curation signal from the post-ingest review.",
+        "properties": {
+          "description": {
+            "title": "Description",
+            "type": "string"
+          },
+          "item_type": {
+            "title": "Item Type",
+            "type": "string"
+          },
+          "search_query": {
+            "default": "",
+            "title": "Search Query",
+            "type": "string"
+          },
+          "suggested_action": {
+            "default": "",
+            "title": "Suggested Action",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "item_type",
+          "title",
+          "description"
+        ],
+        "title": "ReviewItemOut",
+        "type": "object"
+      },
+      "ReviewReportOut": {
+        "description": "Post-ingest review report with human-in-the-loop curation signals.",
+        "properties": {
+          "duplicate_suggestions": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ReviewItemOut"
+            },
+            "title": "Duplicate Suggestions",
+            "type": "array"
+          },
+          "gaps": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ReviewItemOut"
+            },
+            "title": "Gaps",
+            "type": "array"
+          },
+          "is_empty": {
+            "default": true,
+            "title": "Is Empty",
+            "type": "boolean"
+          },
+          "missing_pages": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ReviewItemOut"
+            },
+            "title": "Missing Pages",
+            "type": "array"
+          },
+          "research_questions": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ReviewItemOut"
+            },
+            "title": "Research Questions",
+            "type": "array"
+          },
+          "total_items": {
+            "default": 0,
+            "title": "Total Items",
+            "type": "integer"
+          }
+        },
+        "title": "ReviewReportOut",
+        "type": "object"
+      },
+      "SourceCitationOut": {
+        "description": "A single structured source citation parsed from an answer.",
+        "properties": {
+          "kind": {
+            "default": "raw",
+            "title": "Kind",
+            "type": "string"
+          },
+          "line_end": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Line End"
+          },
+          "line_start": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Line Start"
+          },
+          "locator": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Locator"
+          },
+          "page": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Page"
+          },
+          "raw_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Raw Path"
+          },
+          "url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Url"
+          }
+        },
+        "title": "SourceCitationOut",
+        "type": "object"
+      },
+      "ValidationError": {
+        "properties": {
+          "ctx": {
+            "title": "Context",
+            "type": "object"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "title": "Location",
+            "type": "array"
+          },
+          "msg": {
+            "title": "Message",
+            "type": "string"
+          },
+          "type": {
+            "title": "Error Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError",
+        "type": "object"
+      },
+      "WikiGitImportRequest": {
+        "description": "Request body for public Git repository import and wiki ingest.",
+        "properties": {
+          "note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Note"
+          },
+          "ref": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ref"
+          },
+          "topic": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Topic"
+          },
+          "url": {
+            "title": "Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "title": "WikiGitImportRequest",
+        "type": "object"
+      },
+      "WikiGitImportResponse": {
+        "description": "Response from queuing repository import and wiki ingest.",
+        "properties": {
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "ref": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ref"
+          },
+          "repository_url": {
+            "title": "Repository Url",
+            "type": "string"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "thread_id": {
+            "title": "Thread Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "thread_id",
+          "status",
+          "message",
+          "repository_url"
+        ],
+        "title": "WikiGitImportResponse",
+        "type": "object"
+      },
+      "WikiGraphResponse": {
+        "description": "Response from the wiki graph endpoint.",
+        "properties": {
+          "communities": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/CommunityOut"
+            },
+            "title": "Communities",
+            "type": "array"
+          },
+          "edges": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/GraphEdgeOut"
+            },
+            "title": "Edges",
+            "type": "array"
+          },
+          "nodes": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/GraphNodeOut"
+            },
+            "title": "Nodes",
+            "type": "array"
+          },
+          "thread_id": {
+            "title": "Thread Id",
+            "type": "string"
+          },
+          "total_links": {
+            "default": 0,
+            "title": "Total Links",
+            "type": "integer"
+          },
+          "total_pages": {
+            "default": 0,
+            "title": "Total Pages",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "thread_id"
+        ],
+        "title": "WikiGraphResponse",
+        "type": "object"
+      },
+      "WikiIngestRequest": {
+        "description": "Request body for triggering wiki ingest.",
+        "properties": {
+          "note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Note"
+          },
+          "topic": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Topic"
+          }
+        },
+        "title": "WikiIngestRequest",
+        "type": "object"
+      },
+      "WikiIngestResponse": {
+        "description": "Response from triggering wiki ingest.",
+        "properties": {
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "thread_id": {
+            "title": "Thread Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "thread_id",
+          "status",
+          "message"
+        ],
+        "title": "WikiIngestResponse",
+        "type": "object"
+      },
+      "WikiLintRequest": {
+        "description": "Request body for running wiki lint.",
+        "properties": {
+          "note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Note"
+          },
+          "topic": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Topic"
+          }
+        },
+        "title": "WikiLintRequest",
+        "type": "object"
+      },
+      "WikiLintResponse": {
+        "description": "Response from a wiki lint operation.",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          },
+          "topic": {
+            "title": "Topic",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result",
+          "topic"
+        ],
+        "title": "WikiLintResponse",
+        "type": "object"
+      },
+      "WikiQueryRequestModel": {
+        "description": "Request body for querying the wiki.",
+        "properties": {
+          "file_results": {
+            "default": true,
+            "title": "File Results",
+            "type": "boolean"
+          },
+          "question": {
+            "title": "Question",
+            "type": "string"
+          }
+        },
+        "required": [
+          "question"
+        ],
+        "title": "WikiQueryRequestModel",
+        "type": "object"
+      },
+      "WikiQueryResponse": {
+        "description": "Response from a wiki query.",
+        "properties": {
+          "answer": {
+            "title": "Answer",
+            "type": "string"
+          },
+          "filed_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Filed Path"
+          },
+          "sources_cited": {
+            "items": {
+              "$ref": "#/components/schemas/SourceCitationOut"
+            },
+            "title": "Sources Cited",
+            "type": "array"
+          }
+        },
+        "required": [
+          "answer"
+        ],
+        "title": "WikiQueryResponse",
+        "type": "object"
+      },
+      "WikiStatusResponse": {
+        "description": "Response for wiki ingest status.",
+        "properties": {
+          "code_analysis": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CodeAnalysisSummaryOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "completed_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Completed At"
+          },
+          "detail": {
+            "title": "Detail",
+            "type": "string"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "is_active": {
+            "title": "Is Active",
+            "type": "boolean"
+          },
+          "phase": {
+            "title": "Phase",
+            "type": "string"
+          },
+          "progress": {
+            "title": "Progress",
+            "type": "integer"
+          },
+          "review_report": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ReviewReportOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "source_count": {
+            "title": "Source Count",
+            "type": "integer"
+          },
+          "sources_processed": {
+            "title": "Sources Processed",
+            "type": "integer"
+          },
+          "started_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Started At"
+          },
+          "thread_id": {
+            "title": "Thread Id",
+            "type": "string"
+          },
+          "wiki_ready": {
+            "title": "Wiki Ready",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "thread_id",
+          "phase",
+          "progress",
+          "detail",
+          "source_count",
+          "sources_processed",
+          "error",
+          "started_at",
+          "completed_at",
+          "is_active",
+          "wiki_ready"
+        ],
+        "title": "WikiStatusResponse",
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "description": "Upload documents to the deep research agent docs folder",
+    "title": "Document Upload API",
+    "version": "1.8.119"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/auth/callback/{provider}": {
+      "get": {
+        "description": "Handle OAuth callback from Google or GitHub.",
+        "operationId": "oauth_callback_auth_callback__provider__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "provider",
+            "required": true,
+            "schema": {
+              "title": "Provider",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Oauth Callback"
+      }
+    },
+    "/auth/login/{provider}": {
+      "get": {
+        "description": "Initiate OAuth login with Google or GitHub.",
+        "operationId": "oauth_login_auth_login__provider__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "provider",
+            "required": true,
+            "schema": {
+              "title": "Provider",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "redirect_url",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Redirect Url"
+            }
+          },
+          {
+            "in": "query",
+            "name": "return_path",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Return Path"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Oauth Login"
+      }
+    },
+    "/auth/logout": {
+      "post": {
+        "description": "Logout user by invalidating their OAuth session token.",
+        "operationId": "logout_auth_logout_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Logout"
+      }
+    },
+    "/auth/passkeys": {
+      "get": {
+        "operationId": "passkey_list_auth_passkeys_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Passkey List"
+      }
+    },
+    "/auth/passkeys/authentication/options": {
+      "post": {
+        "operationId": "passkey_authentication_options_auth_passkeys_authentication_options_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Passkey Authentication Options"
+      }
+    },
+    "/auth/passkeys/authentication/verify": {
+      "post": {
+        "operationId": "passkey_authentication_verify_auth_passkeys_authentication_verify_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Passkey Authentication Verify"
+      }
+    },
+    "/auth/passkeys/registration/options": {
+      "post": {
+        "operationId": "passkey_registration_options_auth_passkeys_registration_options_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Passkey Registration Options"
+      }
+    },
+    "/auth/passkeys/registration/verify": {
+      "post": {
+        "operationId": "passkey_registration_verify_auth_passkeys_registration_verify_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Passkey Registration Verify"
+      }
+    },
+    "/auth/passkeys/{credential_id}": {
+      "delete": {
+        "operationId": "passkey_delete_auth_passkeys__credential_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "credential_id",
+            "required": true,
+            "schema": {
+              "title": "Credential Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Passkey Delete"
+      },
+      "patch": {
+        "operationId": "passkey_rename_auth_passkeys__credential_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "credential_id",
+            "required": true,
+            "schema": {
+              "title": "Credential Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Passkey Rename"
+      }
+    },
+    "/auth/session/refresh": {
+      "post": {
+        "description": "Refresh (extend) an OAuth session token by 24 hours.",
+        "operationId": "refresh_session_auth_session_refresh_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Refresh Session"
+      }
+    },
+    "/auth/session/validate": {
+      "get": {
+        "description": "Validate an OAuth session token.",
+        "operationId": "validate_session_auth_session_validate_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Validate Session"
+      }
+    },
+    "/chat_threads/{thread_id}/state": {
+      "get": {
+        "description": "Return thread state values.  No auth \u2014 thread ID is the access key.",
+        "operationId": "get_chat_thread_state_chat_threads__thread_id__state_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "thread_id",
+            "required": true,
+            "schema": {
+              "title": "Thread Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Chat Thread State"
+      },
+      "post": {
+        "description": "Update thread state values.  No auth \u2014 thread ID is the access key.\n\nExpects JSON body: ``{\"values\": {key: value, ...}}``.\nMerges with existing values so partial updates are safe.",
+        "operationId": "update_chat_thread_state_chat_threads__thread_id__state_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "thread_id",
+            "required": true,
+            "schema": {
+              "title": "Thread Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "title": "Body",
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Chat Thread State"
+      }
+    },
+    "/documents/download/{filename}": {
+      "get": {
+        "description": "Download a specific file from a folder.",
+        "operationId": "download_document_documents_download__filename__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "filename",
+            "required": true,
+            "schema": {
+              "title": "Filename",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "folder",
+            "required": false,
+            "schema": {
+              "default": "policy",
+              "title": "Folder",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Download Document"
+      }
+    },
+    "/documents/extract/{filename}": {
+      "get": {
+        "description": "Extract text/markdown content from a document for preview.",
+        "operationId": "extract_document_documents_extract__filename__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "filename",
+            "required": true,
+            "schema": {
+              "title": "Filename",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "folder",
+            "required": false,
+            "schema": {
+              "default": "policy",
+              "title": "Folder",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Extract Document Documents Extract  Filename  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Extract Document"
+      }
+    },
+    "/documents/folder/{folder}": {
+      "delete": {
+        "description": "Delete all files in a specified folder.",
+        "operationId": "delete_folder_contents_documents_folder__folder__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "folder",
+            "required": true,
+            "schema": {
+              "title": "Folder",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Delete Folder Contents Documents Folder  Folder  Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Folder Contents"
+      }
+    },
+    "/documents/list": {
+      "get": {
+        "description": "List all files in a specified folder within docs directory.",
+        "operationId": "list_documents_documents_list_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "folder",
+            "required": false,
+            "schema": {
+              "default": "policy",
+              "title": "Folder",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Documents Documents List Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Documents"
+      }
+    },
+    "/documents/upload": {
+      "post": {
+        "description": "Upload documents to a specified folder within docs directory.",
+        "operationId": "upload_documents_documents_upload_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_upload_documents_documents_upload_post"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Upload Documents Documents Upload Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Upload Documents"
+      }
+    },
+    "/documents/view/{filename}": {
+      "get": {
+        "description": "Serve a document for inline viewing (browser renders instead of downloading).",
+        "operationId": "view_document_documents_view__filename__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "filename",
+            "required": true,
+            "schema": {
+              "title": "Filename",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "folder",
+            "required": false,
+            "schema": {
+              "default": "policy",
+              "title": "Folder",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "View Document"
+      }
+    },
+    "/documents/{filename}": {
+      "delete": {
+        "description": "Delete a specific file from a folder.",
+        "operationId": "delete_document_documents__filename__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "filename",
+            "required": true,
+            "schema": {
+              "title": "Filename",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "folder",
+            "required": false,
+            "schema": {
+              "default": "policy",
+              "title": "Folder",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Delete Document Documents  Filename  Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Document"
+      }
+    },
+    "/health": {
+      "get": {
+        "description": "Health check endpoint.",
+        "operationId": "health_check_health_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Health Check"
+      }
+    },
+    "/markdown-threads/{markdown_id}/images": {
+      "delete": {
+        "operationId": "delete_markdown_images_markdown_threads__markdown_id__images_delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "markdown_id",
+            "required": true,
+            "schema": {
+              "title": "Markdown Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "anyOf": [
+                      {
+                        "type": "integer"
+                      },
+                      {
+                        "type": "string"
+                      }
+                    ]
+                  },
+                  "title": "Response Delete Markdown Images Markdown Threads  Markdown Id  Images Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Markdown Images"
+      },
+      "post": {
+        "operationId": "upload_markdown_images_markdown_threads__markdown_id__images_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "markdown_id",
+            "required": true,
+            "schema": {
+              "title": "Markdown Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Upload Markdown Images Markdown Threads  Markdown Id  Images Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Upload Markdown Images"
+      }
+    },
+    "/markdown-threads/{markdown_id}/images/{asset_id}": {
+      "get": {
+        "operationId": "view_markdown_image_markdown_threads__markdown_id__images__asset_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "markdown_id",
+            "required": true,
+            "schema": {
+              "title": "Markdown Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "asset_id",
+            "required": true,
+            "schema": {
+              "title": "Asset Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "View Markdown Image"
+      }
+    },
+    "/markdown-threads/{markdown_id}/images/{asset_id}/download": {
+      "get": {
+        "operationId": "download_markdown_image_markdown_threads__markdown_id__images__asset_id__download_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "markdown_id",
+            "required": true,
+            "schema": {
+              "title": "Markdown Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "asset_id",
+            "required": true,
+            "schema": {
+              "title": "Asset Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Download Markdown Image"
+      }
+    },
+    "/skills": {
+      "get": {
+        "description": "List all available skills from deep_research.",
+        "operationId": "list_skills_skills_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Skills"
+      }
+    },
+    "/skills/upload": {
+      "post": {
+        "description": "Upload and install a new agent skill archive (.zip), SKILL.md file, or full skill directory into ./doc/.deepagents/skills/.",
+        "operationId": "upload_skill_skills_upload_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_upload_skill_skills_upload_post"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Upload Skill"
+      }
+    },
+    "/skills/{skill_id}": {
+      "delete": {
+        "description": "Remove an uploaded skill from ./doc/.deepagents/skills/.",
+        "operationId": "delete_skill_skills__skill_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "skill_id",
+            "required": true,
+            "schema": {
+              "title": "Skill Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Skill"
+      }
+    },
+    "/storage/info": {
+      "get": {
+        "description": "Get server storage details and model factory diagnostics.",
+        "operationId": "storage_info_storage_info_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Storage Info"
+      }
+    },
+    "/threads/{thread_id}/wiki": {
+      "delete": {
+        "description": "Delete a thread's LLM wiki workspace and uploaded documents.",
+        "operationId": "delete_thread_wiki_threads__thread_id__wiki_delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "thread_id",
+            "required": true,
+            "schema": {
+              "title": "Thread Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Delete Thread Wiki Threads  Thread Id  Wiki Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Thread Wiki",
+        "tags": [
+          "Wiki"
+        ]
+      }
+    },
+    "/threads/{thread_id}/wiki/file": {
+      "get": {
+        "description": "Read and return the text content of a specific file in the thread's wiki workspace.",
+        "operationId": "get_thread_wiki_file_threads__thread_id__wiki_file_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "thread_id",
+            "required": true,
+            "schema": {
+              "title": "Thread Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Relative file path inside threads-wiki/<thread_id>",
+            "in": "query",
+            "name": "path",
+            "required": true,
+            "schema": {
+              "description": "Relative file path inside threads-wiki/<thread_id>",
+              "title": "Path",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Thread Wiki File Threads  Thread Id  Wiki File Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Thread Wiki File",
+        "tags": [
+          "Wiki"
+        ]
+      }
+    },
+    "/threads/{thread_id}/wiki/graph": {
+      "get": {
+        "description": "Get the wiki knowledge graph as nodes and edges for visualization.\n\nReturns page nodes with frontmatter metadata (title, category, tags),\nwikilink edges between pages, and Louvain community assignments.",
+        "operationId": "get_wiki_graph_threads__thread_id__wiki_graph_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "thread_id",
+            "required": true,
+            "schema": {
+              "title": "Thread Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WikiGraphResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Wiki Graph",
+        "tags": [
+          "Wiki"
+        ]
+      }
+    },
+    "/threads/{thread_id}/wiki/import/git": {
+      "post": {
+        "description": "Import a public repository, then run normal AST-aware wiki ingest.",
+        "operationId": "import_git_repository_to_wiki_threads__thread_id__wiki_import_git_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "thread_id",
+            "required": true,
+            "schema": {
+              "title": "Thread Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WikiGitImportRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WikiGitImportResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Import Git Repository To Wiki",
+        "tags": [
+          "Wiki"
+        ]
+      }
+    },
+    "/threads/{thread_id}/wiki/ingest": {
+      "post": {
+        "description": "Trigger wiki ingest for a thread's uploaded documents.\n\nIf an ingest is already running, it will be cancelled and replaced.\nThe ingest runs as a background task; poll `/wiki/status` or stream\n`/wiki/progress` for real-time updates.",
+        "operationId": "trigger_wiki_ingest_threads__thread_id__wiki_ingest_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "thread_id",
+            "required": true,
+            "schema": {
+              "title": "Thread Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WikiIngestRequest",
+                "default": {}
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WikiIngestResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Trigger Wiki Ingest",
+        "tags": [
+          "Wiki"
+        ]
+      }
+    },
+    "/threads/{thread_id}/wiki/ingest/cancel": {
+      "post": {
+        "description": "Cancel an in-progress wiki ingest for a thread.\n\nReturns immediately. The background task will stop at the next\nphase checkpoint.",
+        "operationId": "cancel_wiki_ingest_threads__thread_id__wiki_ingest_cancel_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "thread_id",
+            "required": true,
+            "schema": {
+              "title": "Thread Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Cancel Wiki Ingest Threads  Thread Id  Wiki Ingest Cancel Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Cancel Wiki Ingest",
+        "tags": [
+          "Wiki"
+        ]
+      }
+    },
+    "/threads/{thread_id}/wiki/insights": {
+      "get": {
+        "description": "Get knowledge graph insights for a thread's wiki.\n\nRuns community detection, relevance scoring, and graph analysis to\nsurface surprising connections, knowledge gaps, bridge nodes, and\nmissing cross-references.",
+        "operationId": "get_wiki_insights_threads__thread_id__wiki_insights_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "thread_id",
+            "required": true,
+            "schema": {
+              "title": "Thread Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GraphInsightsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Wiki Insights",
+        "tags": [
+          "Wiki"
+        ]
+      }
+    },
+    "/threads/{thread_id}/wiki/lint": {
+      "post": {
+        "description": "Run lint reconciliation on the thread's wiki.\n\nUse this after document deletions to reconcile stale references,\nremove orphan pages, and refresh cross-links.",
+        "operationId": "lint_wiki_threads__thread_id__wiki_lint_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "thread_id",
+            "required": true,
+            "schema": {
+              "title": "Thread Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WikiLintRequest",
+                "default": {}
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WikiLintResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Lint Wiki",
+        "tags": [
+          "Wiki"
+        ]
+      }
+    },
+    "/threads/{thread_id}/wiki/progress": {
+      "get": {
+        "description": "SSE stream for real-time ingest progress updates.\n\nThe frontend can connect to this endpoint and receive progress events\nas the ingest proceeds. The stream ends when the ingest reaches a\nterminal state (ready, error, or cancelled).",
+        "operationId": "stream_wiki_progress_threads__thread_id__wiki_progress_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "thread_id",
+            "required": true,
+            "schema": {
+              "title": "Thread Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Stream Wiki Progress",
+        "tags": [
+          "Wiki"
+        ]
+      }
+    },
+    "/threads/{thread_id}/wiki/query": {
+      "post": {
+        "description": "Query the thread's wiki knowledge base.\n\nReturns a grounded answer with citations from the ingested documents.\nIf the answer has durable value, it will be filed into the wiki for\nfuture reference.",
+        "operationId": "llm_wiki_query_threads__thread_id__wiki_query_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "thread_id",
+            "required": true,
+            "schema": {
+              "title": "Thread Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WikiQueryRequestModel"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WikiQueryResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Llm Wiki Query",
+        "tags": [
+          "Wiki"
+        ]
+      }
+    },
+    "/threads/{thread_id}/wiki/status": {
+      "get": {
+        "description": "Get current wiki ingest status and progress for a thread.",
+        "operationId": "get_wiki_status_threads__thread_id__wiki_status_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "thread_id",
+            "required": true,
+            "schema": {
+              "title": "Thread Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WikiStatusResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Wiki Status",
+        "tags": [
+          "Wiki"
+        ]
+      }
+    },
+    "/threads/{thread_id}/wiki/tree": {
+      "get": {
+        "description": "Get the full directory tree structure for a thread's wiki workspace.",
+        "operationId": "get_thread_wiki_tree_threads__thread_id__wiki_tree_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "thread_id",
+            "required": true,
+            "schema": {
+              "title": "Thread Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Thread Wiki Tree Threads  Thread Id  Wiki Tree Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Thread Wiki Tree",
+        "tags": [
+          "Wiki"
+        ]
+      }
+    }
+  }
+}
