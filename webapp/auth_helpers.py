@@ -6,12 +6,17 @@ to authorize access to route modules.
 
 from __future__ import annotations
 
+import asyncio
+
 from fastapi import Request
 
 import webapp.config as _cfg
 
 
-def is_authenticated(x_api_key: str | None, request: Request | None = None) -> bool:
+async def is_authenticated(
+    x_api_key: str | None,
+    request: Request | None = None,
+) -> bool:
     """Return True when the request carries a valid API key or OAuth session token.
 
     Check order:
@@ -32,7 +37,10 @@ def is_authenticated(x_api_key: str | None, request: Request | None = None) -> b
             auth_header = request.headers.get("authorization")
             if auth_header and auth_header.startswith("Bearer "):
                 token = auth_header[7:]
-        if token and _cfg.user_manager.validate_session(token):
+        if token and await asyncio.to_thread(
+            _cfg.user_manager.validate_session,
+            token,
+        ):
             return True
 
     return False

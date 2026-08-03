@@ -445,7 +445,8 @@ app.add_middleware(
 # Session middleware (for OAuth)
 app.add_middleware(
     SessionMiddleware,
-    secret_key=os.environ.get("OAUTH_SECRET_KEY", "oauth-session-secret-key-fallback-for-dev"),
+    secret_key=_config.OAUTH_SESSION_SECRET,
+    https_only=_config.PASSKEY_CONFIG.oauth_cookie_secure,
 )
 
 # Thread-wiki routes (registered as a router, not inline functions)

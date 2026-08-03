@@ -184,7 +184,7 @@ def register_markdown_image_routes(app) -> None:
             markdown_id: str,
             x_api_key: str | None = Header(None),
     ) -> dict[str, Any]:
-        if not is_authenticated(x_api_key, request):
+        if not await is_authenticated(x_api_key, request):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid or missing API key",
@@ -296,7 +296,7 @@ def register_markdown_image_routes(app) -> None:
             asset_id: str,
             x_api_key: str | None = Header(None),
     ):
-        if not is_authenticated(x_api_key, request):
+        if not await is_authenticated(x_api_key, request):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid or missing API key",
@@ -310,7 +310,7 @@ def register_markdown_image_routes(app) -> None:
             asset_id: str,
             x_api_key: str | None = Header(None),
     ):
-        if not is_authenticated(x_api_key, request):
+        if not await is_authenticated(x_api_key, request):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid or missing API key",
@@ -323,7 +323,7 @@ def register_markdown_image_routes(app) -> None:
             markdown_id: str,
             x_api_key: str | None = Header(None),
     ) -> dict[str, int | str]:
-        if not is_authenticated(x_api_key, request):
+        if not await is_authenticated(x_api_key, request):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid or missing API key",

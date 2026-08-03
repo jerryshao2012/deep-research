@@ -13,6 +13,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from webapp.passkeys import PasskeyConfig, PasskeyService
+
 logger = logging.getLogger(__name__)
 
 # ── Environment ──────────────────────────────────────────────────────────────
@@ -48,8 +50,14 @@ API_KEY: str = os.environ.get("UPLOAD_API_KEY") or os.environ.get(
 
 if not API_KEY:
     API_KEY = secrets.token_urlsafe(32)
-    print(f"⚠️  WARNING: UPLOAD_API_KEY not set. Using generated key: {API_KEY}")
-    print("   Set UPLOAD_API_KEY in your .env file for production use.")
+    logger.warning(
+        "UPLOAD_API_KEY not set; using a process-local generated key. "
+        "Set UPLOAD_API_KEY for production."
+    )
+
+OAUTH_SESSION_SECRET: str = os.environ.get("OAUTH_SECRET_KEY") or secrets.token_urlsafe(
+    32
+)
 
 # ── OAuth (optional dependency) ───────────────────────────────────────────────
 
@@ -72,7 +80,19 @@ except ImportError:
     handle_google_callback = None  # type: ignore[assignment]
     handle_logout = None  # type: ignore[assignment]
     user_manager = None  # type: ignore[assignment]
-    print("⚠️  OAuth dependencies not installed. OAuth login will be disabled.")
+    logger.warning("OAuth dependencies not installed; OAuth login is disabled")
+
+# ── Passkeys (disabled by default) ───────────────────────────────────────────
+
+PASSKEY_CONFIG = PasskeyConfig.from_environ()
+PASSKEY_ENABLED: bool = PASSKEY_CONFIG.enabled
+if PASSKEY_ENABLED and user_manager is None:
+    raise RuntimeError("Passkeys require installed OAuth dependencies")
+PASSKEY_SERVICE = (
+    PasskeyService(PASSKEY_CONFIG, user_manager.store)
+    if PASSKEY_ENABLED and user_manager is not None
+    else None
+)
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
 

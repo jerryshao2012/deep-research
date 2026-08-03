@@ -4,13 +4,14 @@ Registers clients for Google and GitHub authentication, manages active user sess
 and handles cookie lifetimes and state checks.
 """
 
+import asyncio
 import os
-from datetime import datetime, timedelta, timezone
-from typing import Optional
 
 from authlib.integrations.starlette_client import OAuth
 from starlette.config import Config
 from starlette.requests import Request
+
+from webapp.auth_store import SQLiteAuthStore, create_auth_store
 
 # OAuth configuration from environment variables
 config = Config(
@@ -85,90 +86,51 @@ github = oauth.register(
 
 
 class OAuthUserManager:
-    """Manages OAuth user sessions and token storage.
+    """Compatibility facade over the configured durable auth store."""
 
-    Sessions are stored in memory (a plain dict) and expire after 24 hours.
-    In production this should be backed by Redis or a database.
+    def __init__(self, store: SQLiteAuthStore | None = None):
+        """Use an explicit store or build one from environment configuration."""
+        self._store = store
 
-    Attributes:
-        sessions: Dictionary mapping session tokens to user data/metadata.
-    """
+    @property
+    def store(self):
+        """Build configured store lazily on first authentication operation."""
+        if self._store is None:
+            self._store = create_auth_store()
+        return self._store
 
-    def __init__(self):
-        """Initialize the session store (in-memory dict)."""
-        # In production, use Redis or database for session storage
-        self.sessions = {}
+    def create_session(
+            self,
+            user_data: dict,
+            provider: str,
+            auth_method: str = "oauth",
+    ) -> str:
+        """Create a new session and return its raw bearer token."""
+        return self.store.create_session(user_data, provider, auth_method=auth_method)
 
-    def create_session(self, user_data: dict, provider: str) -> str:
-        """Create a new session and return session token."""
-        import secrets
-
-        session_token = secrets.token_urlsafe(32)
-        self.sessions[session_token] = {
-            "user_data": user_data,
-            "provider": provider,
-            "created_at": datetime.now(timezone.utc),
-            "expires_at": datetime.now(timezone.utc) + timedelta(hours=24),
-        }
-        return session_token
-
-    def validate_session(self, session_token: str) -> Optional[dict]:
+    def validate_session(self, session_token: str) -> dict | None:
         """Validate session token and return user data if valid.
 
         Implements a sliding window: if the session has less than 1 hour
         remaining, automatically extend the expiry by 24 hours from now.
         """
-        session = self.sessions.get(session_token)
-        if not session:
-            return None
+        return self.store.validate_session(session_token)
 
-        now = datetime.now(timezone.utc)
-        if now > session["expires_at"]:
-            del self.sessions[session_token]
-            return None
-
-        # Sliding window: extend session if less than 1 hour remaining
-        remaining = session["expires_at"] - now
-        if remaining < timedelta(hours=1):
-            session["expires_at"] = now + timedelta(hours=24)
-
-        return session["user_data"]
-
-    def refresh_session(self, session_token: str) -> Optional[dict]:
+    def refresh_session(self, session_token: str) -> dict | None:
         """Explicitly extend a session's expiry by 24 hours.
 
         Returns the user data if the session was found and refreshed,
         None if the session doesn't exist or is already expired.
         """
-        session = self.sessions.get(session_token)
-        if not session:
-            return None
+        return self.store.refresh_session(session_token)
 
-        now = datetime.now(timezone.utc)
-        if now > session["expires_at"]:
-            del self.sessions[session_token]
-            return None
+    def cleanup_expired_sessions(self) -> int:
+        """Remove a bounded batch of expired sessions."""
+        return self.store.cleanup_expired_sessions()
 
-        session["expires_at"] = now + timedelta(hours=24)
-        return session["user_data"]
-
-    def cleanup_expired_sessions(self):
-        """Remove all sessions whose expiry time has passed."""
-        now = datetime.now(timezone.utc)
-        expired = [
-            token
-            for token, session in self.sessions.items()
-            if now > session["expires_at"]
-        ]
-        for token in expired:
-            del self.sessions[token]
-
-    def remove_session(self, session_token: str) -> Optional[str]:
+    def remove_session(self, session_token: str) -> str | None:
         """Remove a specific session and return the user identity if it existed."""
-        session = self.sessions.pop(session_token, None)
-        if session:
-            return session["user_data"].get("identity")
-        return None
+        return self.store.remove_session(session_token)
 
 
 # Global user manager instance
@@ -182,9 +144,23 @@ async def handle_google_callback(request: Request) -> dict:
         userinfo = token.get("userinfo")
         if not userinfo:
             raise Exception("No userinfo found in Google token")
+        subject = userinfo.get("sub")
+        if (
+                not isinstance(subject, str)
+                or not subject
+                or subject != subject.strip()
+                or len(subject) > 255
+                or not subject.isascii()
+                or subject.lower() in {"none", "null"}
+                or any(
+            ord(character) < 0x21 or ord(character) > 0x7E
+            for character in subject
+        )
+        ):
+            raise ValueError("invalid Google subject")
 
         user_data = {
-            "identity": f"google:{userinfo.get('sub')}",
+            "identity": f"google:{subject}",
             "email": userinfo.get("email"),
             "name": userinfo.get("name"),
             "picture": userinfo.get("picture"),
@@ -197,7 +173,11 @@ async def handle_google_callback(request: Request) -> dict:
         }
 
         # Create session
-        session_token = user_manager.create_session(user_data, "google")
+        session_token = await asyncio.to_thread(
+            user_manager.create_session,
+            user_data,
+            "google",
+        )
         user_data["session_token"] = session_token
 
         return user_data
@@ -217,6 +197,14 @@ async def handle_github_callback(request: Request) -> dict:
         # Get user info from GitHub API
         resp = await github_client.get("user", token=token)
         user_info = resp.json()
+        subject = user_info.get("id")
+        if (
+                isinstance(subject, bool)
+                or not isinstance(subject, int)
+                or subject <= 0
+                or len(str(subject)) > 255
+        ):
+            raise ValueError("invalid GitHub subject")
 
         # Get user emails
         email_resp = await github_client.get("user/emails", token=token)
@@ -229,7 +217,7 @@ async def handle_github_callback(request: Request) -> dict:
         )
 
         user_data = {
-            "identity": f"github:{user_info.get('id')}",
+            "identity": f"github:{subject}",
             "username": user_info.get("login"),
             "email": primary_email,
             "name": user_info.get("name") or user_info.get("login"),
@@ -247,7 +235,11 @@ async def handle_github_callback(request: Request) -> dict:
         }
 
         # Create session
-        session_token = user_manager.create_session(user_data, "github")
+        session_token = await asyncio.to_thread(
+            user_manager.create_session,
+            user_data,
+            "github",
+        )
         user_data["session_token"] = session_token
 
         return user_data
@@ -299,7 +291,7 @@ async def get_oauth_login_url(
         raise ValueError(f"Unsupported provider: {provider}")
 
 
-def handle_logout(session_token: str) -> Optional[str]:
+def handle_logout(session_token: str) -> str | None:
     """Handle user logout by removing session and returning user identity.
 
     Returns the user identity if the session was found and removed, None otherwise.

@@ -28,6 +28,7 @@ from research_agent.utils.skill_registry import get_skill_registry
 from webapp.auth_helpers import is_authenticated
 from webapp.markdown_images import register_markdown_image_routes
 from webapp.model_diagnostics import run_model_diagnostics
+from webapp.passkeys import register_passkey_routes, safe_oauth_return_path
 from webapp.utils import (
     detect_media_type,
     extract_thread_id_from_folder,
@@ -75,7 +76,7 @@ def register_storage_routes(app) -> None:
     @app.get("/storage/info")
     async def storage_info(request: Request, x_api_key: str | None = Header(None)):
         """Get server storage details and model factory diagnostics."""
-        if not is_authenticated(x_api_key, request):
+        if not await is_authenticated(x_api_key, request):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid or missing API key. Provide X-API-Key header or Authorization header.",
@@ -117,7 +118,7 @@ def register_document_routes(app) -> None:
             x_api_key: str | None = Header(None),
     ):
         """Serve a document for inline viewing (browser renders instead of downloading)."""
-        if not is_authenticated(x_api_key, request):
+        if not await is_authenticated(x_api_key, request):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid or missing API key. Provide X-API-Key header or Authorization header.",
@@ -155,7 +156,7 @@ def register_document_routes(app) -> None:
             x_api_key: str | None = Header(None),
     ) -> dict:
         """Extract text/markdown content from a document for preview."""
-        if not is_authenticated(x_api_key, request):
+        if not await is_authenticated(x_api_key, request):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid or missing API key. Provide X-API-Key header or Authorization header.",
@@ -211,7 +212,7 @@ def register_document_routes(app) -> None:
             x_api_key: str | None = Header(None),
     ) -> dict:
         """Upload documents to a specified folder within docs directory."""
-        if not is_authenticated(x_api_key, request):
+        if not await is_authenticated(x_api_key, request):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid or missing API key. Provide X-API-Key header or Authorization header.",
@@ -297,7 +298,7 @@ def register_document_routes(app) -> None:
             x_api_key: str | None = Header(None),
     ) -> dict:
         """List all files in a specified folder within docs directory."""
-        if not is_authenticated(x_api_key, request):
+        if not await is_authenticated(x_api_key, request):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid or missing API key. Provide X-API-Key header or Authorization header.",
@@ -347,7 +348,7 @@ def register_document_routes(app) -> None:
             x_api_key: str | None = Header(None),
     ):
         """Download a specific file from a folder."""
-        if not is_authenticated(x_api_key, request):
+        if not await is_authenticated(x_api_key, request):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid or missing API key. Provide X-API-Key header or Authorization header.",
@@ -384,7 +385,7 @@ def register_document_routes(app) -> None:
             x_api_key: str | None = Header(None),
     ) -> dict:
         """Delete a specific file from a folder."""
-        if not is_authenticated(x_api_key, request):
+        if not await is_authenticated(x_api_key, request):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid or missing API key. Provide X-API-Key header or Authorization header.",
@@ -430,7 +431,7 @@ def register_document_routes(app) -> None:
             x_api_key: str | None = Header(None),
     ) -> dict:
         """Delete all files in a specified folder."""
-        if not is_authenticated(x_api_key, request):
+        if not await is_authenticated(x_api_key, request):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid or missing API key. Provide X-API-Key header or Authorization header.",
@@ -485,7 +486,10 @@ def register_oauth_routes(app) -> None:
 
     @app.get("/auth/login/{provider}")
     async def oauth_login(
-            provider: str, request: Request, redirect_url: str | None = None
+            provider: str,
+            request: Request,
+            redirect_url: str | None = None,
+            return_path: str | None = None,
     ):
         """Initiate OAuth login with Google or GitHub."""
         if not _cfg.OAUTH_ENABLED:
@@ -528,6 +532,11 @@ def register_oauth_routes(app) -> None:
             )
 
         request.session["oauth_frontend_url"] = target_frontend
+        allowed_return_path = safe_oauth_return_path(return_path)
+        if allowed_return_path:
+            request.session["oauth_return_path"] = allowed_return_path
+        else:
+            request.session.pop("oauth_return_path", None)
 
         forwarded_host = request.headers.get(
             "x-forwarded-host", request.headers.get("host", "")
@@ -573,6 +582,9 @@ def register_oauth_routes(app) -> None:
                 user_data = await _cfg.handle_github_callback(request)
 
             frontend_url = request.session.pop("oauth_frontend_url", None)
+            return_path = safe_oauth_return_path(
+                request.session.pop("oauth_return_path", None)
+            )
             if not frontend_url:
                 frontend_url = (
                     _cfg.FRONTEND_ORIGINS[0]
@@ -582,8 +594,13 @@ def register_oauth_routes(app) -> None:
             frontend_url = frontend_url.rstrip("/")
 
             session_token = user_data["session_token"]
+            from urllib.parse import urlencode
+
+            query = {"token": session_token}
+            if return_path:
+                query["return_path"] = return_path
             return RedirectResponse(
-                url=f"{frontend_url}/login/success?token={session_token}"
+                url=f"{frontend_url}/login/success?{urlencode(query)}"
             )
         except Exception as e:
             raise HTTPException(
@@ -612,7 +629,10 @@ def register_oauth_routes(app) -> None:
                 detail="Missing session token.",
             )
 
-        user_data = _cfg.user_manager.validate_session(token)
+        user_data = await asyncio.to_thread(
+            _cfg.user_manager.validate_session,
+            token,
+        )
         if not user_data:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -627,6 +647,11 @@ def register_oauth_routes(app) -> None:
                 "name": user_data.get("name"),
                 "provider": user_data.get("provider"),
                 "avatar_url": user_data.get("picture") or user_data.get("avatar_url"),
+                **(
+                    {"auth_method": user_data["auth_method"]}
+                    if user_data.get("auth_method") == "passkey"
+                    else {}
+                ),
             },
             "metadata": {
                 k: v
@@ -641,6 +666,7 @@ def register_oauth_routes(app) -> None:
                        "avatar_url",
                        "raw_token",
                        "session_token",
+                       "auth_method",
                    }
             },
         }
@@ -666,7 +692,10 @@ def register_oauth_routes(app) -> None:
                 detail="Missing session token.",
             )
 
-        user_data = _cfg.user_manager.refresh_session(token)
+        user_data = await asyncio.to_thread(
+            _cfg.user_manager.refresh_session,
+            token,
+        )
         if not user_data:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -681,6 +710,11 @@ def register_oauth_routes(app) -> None:
                 "name": user_data.get("name"),
                 "provider": user_data.get("provider"),
                 "avatar_url": user_data.get("picture") or user_data.get("avatar_url"),
+                **(
+                    {"auth_method": user_data["auth_method"]}
+                    if user_data.get("auth_method") == "passkey"
+                    else {}
+                ),
             },
         }
 
@@ -705,7 +739,7 @@ def register_oauth_routes(app) -> None:
                 detail="Missing session token.",
             )
 
-        identity = _cfg.handle_logout(token)
+        identity = await asyncio.to_thread(_cfg.handle_logout, token)
         if not identity:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -735,7 +769,7 @@ def register_skills_routes(app) -> None:
     @app.get("/skills")
     async def list_skills(request: Request, x_api_key: str | None = Header(None)):
         """List all available skills from deep_research."""
-        if not is_authenticated(x_api_key, request):
+        if not await is_authenticated(x_api_key, request):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid or missing API key. Provide X-API-Key header or Authorization header.",
@@ -867,7 +901,7 @@ def register_skills_routes(app) -> None:
             x_api_key: str | None = Header(None),
     ):
         """Upload and install a new agent skill archive (.zip), SKILL.md file, or full skill directory into ./doc/.deepagents/skills/."""
-        if not is_authenticated(x_api_key, request):
+        if not await is_authenticated(x_api_key, request):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid or missing API key. Provide X-API-Key header or Authorization header.",
@@ -979,7 +1013,7 @@ def register_skills_routes(app) -> None:
             skill_id: str, request: Request, x_api_key: str | None = Header(None)
     ):
         """Remove an uploaded skill from ./doc/.deepagents/skills/."""
-        if not is_authenticated(x_api_key, request):
+        if not await is_authenticated(x_api_key, request):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid or missing API key.",
@@ -1140,5 +1174,11 @@ def register_all_routes(app) -> None:
     register_document_routes(app)
     register_markdown_image_routes(app)
     register_oauth_routes(app)
+    if _cfg.PASSKEY_ENABLED and _cfg.PASSKEY_SERVICE is not None:
+        register_passkey_routes(
+            app,
+            service=_cfg.PASSKEY_SERVICE,
+            config=_cfg.PASSKEY_CONFIG,
+        )
     register_skills_routes(app)
     register_chat_thread_routes(app)

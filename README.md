@@ -734,6 +734,98 @@ To expose the API publicly:
 
 ## 🔑 OAuth Authentication
 
+### Passkeys with SQLite on Azure Container Apps
+
+Passkey authentication is disabled by default. OAuth recovery remains
+mandatory: configure at least one Google or GitHub OAuth provider before setting
+`PASSKEY_ENABLED=true`. For a single-replica demo, SQLite is supported when its
+database is stored on a persistent Azure File mount:
+
+```env
+DB_TYPE=sqlite
+SQLITE_DB_PATH=/mnt/auth/auth.db
+AUTH_SQLITE_JOURNAL_MODE=DELETE
+PASSKEY_ENABLED=true
+PASSKEY_RP_IDS="bmo-deepagent-ui-0312.azurewebsites.net,bmo-deepagent-ui.vercel.app"
+PASSKEY_RP_NAME=BMO Deep Agent
+PASSKEY_ORIGINS="https://bmo-deepagent-ui-0312.azurewebsites.net,https://bmo-deepagent-ui.vercel.app"
+PASSKEY_PROXY_ID=web-bff
+PASSKEY_PROXY_SECRET=<at-least-32-random-bytes>
+OAUTH_SECRET_KEY=
+```
+
+Leave that field blank in checked-in files and inject `OAUTH_SECRET_KEY` at runtime
+from Azure Key Vault or another secret store. Generate it independently from
+`PASSKEY_PROXY_SECRET`.
+
+`deploy.sh` provisions `/mnt/auth` as an Azure File volume, selects SQLite
+`DELETE` journal mode for SMB compatibility, and limits the Container App to one
+replica. Do not scale this SQLite deployment beyond one replica; use PostgreSQL
+or Cosmos DB for multi-replica production deployments.
+
+`PASSKEY_ORIGINS` contains exact browser origins. `PASSKEY_RP_IDS` contains the
+allowed RP IDs and maps each origin to the most-specific compatible ID: its
+hostname or a parent domain. Values are normalized from IDNA DNS names to
+lowercase ASCII. Schemes, ports, paths, wildcards, malformed DNS labels, and
+public suffixes such as `vercel.app` or `azurewebsites.net` are rejected. Tenant
+hosts such as the two above are valid RP IDs.
+
+`PASSKEY_RP_ID` remains an absent-only fallback for a single RP. Do not define
+it when `PASSKEY_RP_IDS` is present. For local development, remove the plural
+variable and set `PASSKEY_RP_ID=localhost` with
+`PASSKEY_ORIGINS=http://localhost:3000`.
+
+Each unrelated RP domain requires separate passkey enrollment. Registration
+only excludes credentials already enrolled for the RP selected by the current
+origin, while passkey management lists all credentials for the signed-in
+account across configured RPs. OAuth remains the enrollment and recovery path.
+Recovery must use the same immutable provider identity that enrolled the
+passkey. Google and GitHub accounts are never linked automatically by matching
+email addresses.
+
+Existing SQLite persistence and single-replica Azure File requirements are
+unchanged.
+
+Configure the UI BFF with the same `PASSKEY_PROXY_ID` and
+`PASSKEY_PROXY_SECRET`. Keep both shared secrets in Azure Key Vault; never
+commit them or expose them to browser-side variables. Startup fails closed when
+enabled configuration or OAuth recovery is missing. For SQLite, startup checks
+that a non-memory database path is configured; it cannot prove that path is on
+durable storage. The persistent Azure File mount described above remains
+required for container deployments.
+
+#### Cosmos orphan-reservation recovery
+
+Cosmos passkey limits fail closed when a writer disappears after reserving
+capacity but before creating its credential or challenge document. This avoids
+hard-cap violations from merely paused writers, but a crashed writer can leave
+an orphan reservation that requires explicit maintenance.
+
+Stop **every application replica and auth writer** before repair. Cosmos cannot
+fence a paused writer across containers. Then inspect reservations older than a
+chosen Unix timestamp; dry-run is the default:
+
+```bash
+uv run python -m scripts.reclaim_cosmos_auth_reservations \
+  --identity google:123 \
+  --cutoff 1785700000 \
+  --confirm-quiesced
+```
+
+Review the count-only JSON output, then repeat with `--apply`. Use `--limit` to
+bound one invocation (maximum 100). The tool rechecks that each credential or
+challenge document is absent and uses the current account ETag before removing
+a reservation. It never prints tokens, keys, or credential IDs. Restart
+replicas only after the repair command exits.
+
+By default, committed markers (reservations whose lease is `null`) remain
+untouched. If a credential/challenge delete succeeded but its final account
+update failed, such a marker can remain after the document is gone. While all
+writers are still stopped, add `--include-committed-missing` to dry-run and then
+apply removal of those markers. This flag has no age signal, so it remains
+explicitly opt-in; the tool still point-reads each referenced document and
+retains every marker whose document exists.
+
 This section provides a complete guide to Google and GitHub OAuth authentication for the deep research agent. OAuth authentication enables rich user identity metadata and session management while maintaining full backward compatibility with existing API key authentication.
 
 ### 📋 Overview & Key Features
@@ -1091,8 +1183,8 @@ GOOGLE_CLIENT_SECRET="your_google_client_secret_here"
 GITHUB_CLIENT_IDS="your_github_client_id_here"
 GITHUB_CLIENT_SECRETS="your_github_client_secret_here"
 
-# OAuth Session Secret Key (for token verification and signing)
-OAUTH_SECRET_KEY="generate-a-random-secret-string-here"
+# OAuth Session Secret Key (leave blank in checked-in files; inject at runtime)
+OAUTH_SECRET_KEY=
 
 # Target Frontend URLs to redirect to after successful callback
 FRONTEND_URLS="http://localhost:3000"
@@ -1100,6 +1192,8 @@ FRONTEND_URLS="http://localhost:3000"
 > [!TIP]
 > You can generate a strong random secret key by running:
 > `python -c "import secrets; print(secrets.token_urlsafe(32))"`
+> Then inject `OAUTH_SECRET_KEY` at runtime through your environment or secret
+> store. Never commit its generated value.
 
 ---
 

@@ -4,6 +4,7 @@ Validates incoming credentials (supporting Google/GitHub OAuth session tokens an
 standard API keys) to authorize access to thread endpoints.
 """
 
+import asyncio
 import os
 from typing import Any, Set
 
@@ -168,6 +169,6 @@ async def authenticate(headers: dict) -> Auth.types.MinimalUserDict:
         )
 
     try:
-        return authenticate_credential(credential)
+        return await asyncio.to_thread(authenticate_credential, credential)
     except HTTPException as e:
         raise Auth.exceptions.HTTPException(status_code=e.status_code, detail=e.detail)

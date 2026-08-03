@@ -177,6 +177,8 @@ echo ""
 echo "📦 Setting up Azure Blob Storage container..."
 STORAGE_ACCOUNT_NAME="stdeepagents"
 BLOB_CONTAINER_NAME="deep-research-blobs"
+SQLITE_FILE_SHARE_NAME="deep-research-auth"
+SQLITE_ENV_STORAGE_NAME="authsqlite"
 
 EXISTING_STORAGE=$(az storage account list --resource-group $RESOURCE_GROUP --query "[?starts_with(name, 'stdeepagents')].name" -o tsv 2>/dev/null || echo "")
 if [ -n "$EXISTING_STORAGE" ]; then
@@ -197,6 +199,21 @@ else
   echo "📁 Creating Blob Container: $BLOB_CONTAINER_NAME"
   az storage container create --name $BLOB_CONTAINER_NAME --account-name $STORAGE_ACCOUNT_NAME --account-key $STORAGE_KEY
 fi
+
+echo "📁 Ensuring persistent Azure File share for SQLite auth state..."
+az storage share-rm create \
+  --resource-group "$RESOURCE_GROUP" \
+  --storage-account "$STORAGE_ACCOUNT_NAME" \
+  --name "$SQLITE_FILE_SHARE_NAME" \
+  --quota 1 > /dev/null
+az containerapp env storage set \
+  --name "$ENV_NAME" \
+  --resource-group "$RESOURCE_GROUP" \
+  --storage-name "$SQLITE_ENV_STORAGE_NAME" \
+  --azure-file-account-name "$STORAGE_ACCOUNT_NAME" \
+  --azure-file-account-key "$STORAGE_KEY" \
+  --azure-file-share-name "$SQLITE_FILE_SHARE_NAME" \
+  --access-mode ReadWrite > /dev/null
 
 echo "🔐 Storing storage credentials in Key Vault..."
 az keyvault secret set --vault-name $KV_NAME --name STORAGE-ACCOUNT-NAME --value $STORAGE_ACCOUNT_NAME > /dev/null
@@ -377,7 +394,9 @@ properties:
           - name: INPUT_FOLDER
             value: /deps/deep_research/input
           - name: SQLITE_DB_PATH
-            value: /deps/deep_research/deep_research.db
+            value: /mnt/auth/auth.db
+          - name: AUTH_SQLITE_JOURNAL_MODE
+            value: DELETE
           - name: TAVILY_API_KEY
             secretRef: tavily-api-key
           - name: LANGCHAIN_API_KEY
@@ -392,6 +411,13 @@ properties:
             secretRef: azure-storage-container-name
           - name: GOOGLE_API_KEY
             secretRef: google-api-key
+        volumeMounts:
+          - volumeName: auth-sqlite
+            mountPath: /mnt/auth
+    volumes:
+      - name: auth-sqlite
+        storageType: AzureFile
+        storageName: ${SQLITE_ENV_STORAGE_NAME}
     scale:
       minReplicas: 0
       maxReplicas: 1

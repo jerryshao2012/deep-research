@@ -19,7 +19,10 @@ def test_azure_build_stages_context_without_git_metadata() -> None:
     assert "tar --null -T - -cf -" in source
     assert 'tar -xf - -C "$BUILD_CONTEXT_DIR"' in source
     assert 'cp .env.docker "$BUILD_CONTEXT_DIR/.env.docker"' in source
-    assert 'container build --platform linux/amd64 -t $FULL_IMAGE_NAME "$BUILD_CONTEXT_DIR"' in source
+    assert (
+            'container build --platform linux/amd64 -t $FULL_IMAGE_NAME "$BUILD_CONTEXT_DIR"'
+            in source
+    )
     assert "trap cleanup_build_context EXIT" in source
 
 
@@ -34,13 +37,88 @@ def test_azure_deploy_uses_sqlite_without_cosmos() -> None:
         assert forbidden not in source
 
 
+def test_passkey_sqlite_deployment_is_single_replica_on_persistent_azure_file():
+    source = (PROJECT_ROOT / "deploy.sh").read_text(encoding="utf-8")
+
+    assert "az storage share-rm create" in source
+    assert "az containerapp env storage set" in source
+    assert "mountPath: /mnt/auth" in source
+    assert "storageType: AzureFile" in source
+    assert re.search(
+        r"name:\s+SQLITE_DB_PATH\s*\n\s+value:\s+/mnt/auth/auth.db",
+        source,
+    )
+    assert re.search(
+        r"name:\s+AUTH_SQLITE_JOURNAL_MODE\s*\n\s+value:\s+DELETE",
+        source,
+    )
+    assert "maxReplicas: 1" in source
+
+
+def test_passkey_demo_configuration_documents_safe_azure_sqlite_contract():
+    env_example = (PROJECT_ROOT / ".env.example").read_text(encoding="utf-8")
+    readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+
+    assert re.search(r"(?m)^PASSKEY_ENABLED=false$", env_example)
+    for setting in (
+            "PASSKEY_RP_ID",
+            "PASSKEY_RP_NAME",
+            "PASSKEY_ORIGINS",
+            "PASSKEY_PROXY_ID",
+            "PASSKEY_PROXY_SECRET",
+            "OAUTH_SECRET_KEY",
+            "SQLITE_DB_PATH",
+            "AUTH_SQLITE_JOURNAL_MODE",
+    ):
+        assert setting in env_example
+        assert setting in readme
+
+    assert "Azure File" in readme
+    assert "one replica" in readme.lower()
+    assert "DELETE" in readme
+    assert "OAuth recovery" in readme
+    assert "PASSKEY_PROXY_SECRET" in readme and "Key Vault" in readme
+
+
+def test_passkey_demo_documents_requested_multi_domain_rp_configuration():
+    env_example = (PROJECT_ROOT / ".env.example").read_text(encoding="utf-8")
+    readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+    expected = (
+        'PASSKEY_RP_IDS="bmo-deepagent-ui-0312.azurewebsites.net,'
+        'bmo-deepagent-ui.vercel.app"'
+    )
+    expected_origins = (
+        'PASSKEY_ORIGINS="https://bmo-deepagent-ui-0312.azurewebsites.net,'
+        'https://bmo-deepagent-ui.vercel.app"'
+    )
+
+    assert expected in env_example
+    assert expected_origins in env_example
+    assert expected in readme
+    assert expected_origins in readme
+
+
+def test_passkey_documentation_never_presents_an_accepted_oauth_secret_placeholder():
+    readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+    assignments = re.findall(r"(?m)^OAUTH_SECRET_KEY=(.*)$", readme)
+
+    assert assignments
+    assert all(value.strip() in {"", '""', "''"} for value in assignments)
+    assert "inject `OAUTH_SECRET_KEY` at runtime" in readme
+
+
 def test_generic_azure_sync_includes_langgraph_state(monkeypatch) -> None:
     monkeypatch.setenv("REPORTS_OUTPUT_FOLDER", "/tmp/reports")
     monkeypatch.setenv("INPUT_FOLDER", "/tmp/input")
 
     tracked = azure_storage._resolve_tracked_folders()
 
-    assert [prefix for prefix, _path in tracked] == ["docs", "output", "input", ".langgraph_api"]
+    assert [prefix for prefix, _path in tracked] == [
+        "docs",
+        "output",
+        "input",
+        ".langgraph_api",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -89,7 +167,9 @@ class _MockContainerClient:
         self.downloads: list[tuple[str, str]] = []
 
     def list_blobs(self, name_starts_with: str = ""):
-        return [_MockBlob(name) for name in self._blobs if name.startswith(name_starts_with)]
+        return [
+            _MockBlob(name) for name in self._blobs if name.startswith(name_starts_with)
+        ]
 
     def get_blob_client(self, blob_name: str):
         class _MockBlobClient:
