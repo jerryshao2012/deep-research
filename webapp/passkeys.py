@@ -35,7 +35,7 @@ from webauthn.helpers.structs import (
     UserVerificationRequirement,
 )
 
-from webapp.auth_store import AuthStore, ChallengeRecord, CredentialRecord
+from webapp.features.auth import AuthStore, ChallengeRecord, CredentialRecord
 from webapp.webauthn_scope import (
     ends_in_numeric_label,
     normalize_dns_name,

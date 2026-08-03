@@ -13,10 +13,20 @@ import secrets
 import sqlite3
 import threading
 import time
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Protocol, Sequence
+from typing import Any, Mapping, Sequence
 
+from webapp.features.auth import (
+    AccountRecord,
+    AuthStore,
+    AuthStoreError,
+    ChallengeLimitError,
+    ChallengeRecord,
+    CredentialLimitError,
+    CredentialRecord,
+    DuplicateCredentialError,
+    SessionDetail,
+)
 from webapp.webauthn_scope import normalize_rp_id
 
 SESSION_LIFETIME_SECONDS = 24 * 60 * 60
@@ -46,128 +56,6 @@ _PROFILE_STRING_LIMITS = {
 }
 _PROFILE_BOOL_FIELDS = {"email_verified"}
 _PROFILE_INTEGER_FIELDS = {"followers", "following", "public_repos"}
-
-
-class AuthStoreError(RuntimeError):
-    """Base error for durable authentication persistence failures."""
-
-
-class DuplicateCredentialError(AuthStoreError):
-    """Raised when a globally unique credential ID already exists."""
-
-
-class CredentialLimitError(AuthStoreError):
-    """Raised when an account already owns the maximum credential count."""
-
-
-class ChallengeLimitError(AuthStoreError):
-    """Raised when an account has too many registration challenges."""
-
-
-@dataclass(frozen=True)
-class AccountRecord:
-    """Sanitized durable account data required by authentication ceremonies."""
-
-    identity: str
-    provider: str
-    email: str | None
-    name: str | None
-    avatar_url: str | None
-    profile: Mapping[str, Any]
-    webauthn_user_handle: str
-
-
-@dataclass(frozen=True)
-class CredentialRecord:
-    """Backend-neutral persisted passkey credential."""
-
-    credential_id: str
-    identity: str
-    public_key: bytes
-    sign_count: int
-    transports: tuple[str, ...]
-    device_type: str
-    backed_up: bool
-    label: str | None
-    created_at: float
-    last_used_at: float | None
-    rp_id: str | None = None
-
-
-@dataclass(frozen=True)
-class ChallengeRecord:
-    """Backend-neutral one-time WebAuthn ceremony challenge."""
-
-    ceremony_id: str
-    challenge: bytes
-    kind: str
-    identity: str | None
-    origin: str
-    rp_id: str
-    proxy_id: str
-    created_at: float
-    expires_at: float
-    consumed_at: float | None
-
-
-@dataclass(frozen=True)
-class SessionDetail:
-    """Session metadata used for recent-auth and authorization checks."""
-
-    identity: str
-    provider: str
-    auth_method: str
-    authenticated_at: float
-    expires_at: float
-
-
-class AuthStore(Protocol):
-    """Backend-neutral contract implemented by all auth persistence adapters."""
-
-    def create_session(
-            self,
-            user_data: Mapping[str, Any],
-            provider: str,
-            auth_method: str = "oauth",
-    ) -> str: ...
-
-    def validate_session(self, session_token: str) -> dict[str, Any] | None: ...
-
-    def refresh_session(self, session_token: str) -> dict[str, Any] | None: ...
-
-    def remove_session(self, session_token: str) -> str | None: ...
-
-    def get_session_detail(self, session_token: str) -> SessionDetail | None: ...
-
-    def get_account(self, identity: str) -> AccountRecord | None: ...
-
-    def list_credentials(
-            self, identity: str, rp_id: str | None = None
-    ) -> list[CredentialRecord]: ...
-
-    def get_credential(self, credential_id: str) -> CredentialRecord | None: ...
-
-    def create_credential(self, **kwargs: Any) -> CredentialRecord: ...
-
-    def bind_credential_rp_id(self, credential_id: str, rp_id: str) -> bool: ...
-
-    def update_credential_state(self, credential_id: str, **kwargs: Any) -> bool: ...
-
-    def rename_credential(
-            self, identity: str, credential_id: str, label: str
-    ) -> bool: ...
-
-    def delete_credential(self, identity: str, credential_id: str) -> bool: ...
-
-    def create_challenge(self, **kwargs: Any) -> ChallengeRecord: ...
-
-    def claim_challenge(self, ceremony_id: str) -> ChallengeRecord | None: ...
-
-    def consume_rate_limit(
-            self, scope: str, key: str, window_start: int, limit: int
-    ) -> bool: ...
-
-    def close(self) -> None: ...
 
 
 def _validate_base64url(value: object, field: str, max_length: int = 2_048) -> str:
