@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -43,6 +45,51 @@ def test_openapi_snapshot_script_loads_app_from_repository_root() -> None:
         text=True,
     )
     assert result.returncode == 0, result.stderr or result.stdout
+
+
+def test_openapi_snapshot_ignores_ambient_passkey_configuration(
+    tmp_path: Path,
+) -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("PASSKEY_")
+    }
+    env.update(
+        {
+            "PYTHON_DOTENV_DISABLED": "1",
+            "PASSKEY_ENABLED": "true",
+            "PASSKEY_RP_ID": "app.example.com",
+            "PASSKEY_RP_NAME": "BMO Deep Agent",
+            "PASSKEY_ORIGINS": "https://app.example.com",
+            "PASSKEY_PROXY_ID": "web-bff",
+            "PASSKEY_PROXY_SECRET": "proxy-secret-with-32-bytes-minimum",
+            "GOOGLE_CLIENT_ID": "google-client",
+            "GOOGLE_CLIENT_SECRET": "google-secret",
+            "OAUTH_SECRET_KEY": "oauth-session-secret-with-32-bytes-minimum",
+            "AUTH_STORE_TYPE": "sqlite",
+            "SQLITE_DB_PATH": str(tmp_path / "auth.db"),
+        }
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from scripts.snapshot_openapi import rendered_schema; "
+                "print(rendered_schema(), end='')"
+            ),
+        ],
+        cwd=repo_root,
+        env=env,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    schema = json.loads(result.stdout)
+    assert not any(path.startswith("/auth/passkeys") for path in schema["paths"])
 
 
 def _write(root: Path, relative_path: str, content: str) -> None:

@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -17,7 +19,11 @@ SNAPSHOT_PATH = REPO_ROOT / "contracts" / "custom-api.openapi.json"
 
 def rendered_schema() -> str:
     """Return deterministic OpenAPI JSON for the custom application routes."""
-    from webapp import app
+    with patch.dict(
+        os.environ,
+        {"PASSKEY_ENABLED": "false", "PYTHON_DOTENV_DISABLED": "1"},
+    ):
+        from webapp import app
 
     return json.dumps(app.openapi(), indent=2, sort_keys=True) + "\n"
 
