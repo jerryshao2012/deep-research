@@ -59,7 +59,7 @@ if [[ -f "$INPUT" && "$INPUT" == *.html ]]; then
             # Resolve the reference relative to the HTML file's directory
             SOURCE_FILE="$PARENT_DIR/$ref"
             if [[ -e "$SOURCE_FILE" ]]; then
-                # Preserve directory structure for nested paths (e.g., assets/LLM_Wiki_Query 2026-07-27 at 12 18 11 PM.png)
+                # Preserve directory structure for nested paths (e.g., assets/screenshots/example.png)
                 TARGET_DIR="$DEPLOY_DIR/$(dirname "$ref")"
                 mkdir -p "$TARGET_DIR"
                 cp -r "$SOURCE_FILE" "$TARGET_DIR/"

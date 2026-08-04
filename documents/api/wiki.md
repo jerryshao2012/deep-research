@@ -104,15 +104,15 @@ Typical sequence:
 
 The companion UI exposes generated wiki navigation alongside the research conversation. The index view lets users browse entities, concepts, source summaries, and supporting wiki files.
 
-![Thread Wiki index and generated navigation](../../resources/LLM_Wiki_Index-20260723-qcgl.png)
+![Thread Wiki index and generated navigation](../assets/screenshots/LLM_Wiki_Index-20260723-qcgl.png)
 
 Grounded answers link directly to original document pages so users can inspect the cited evidence beside the response.
 
-![Grounded Thread Wiki answer with cited PDF page](../../resources/LLM_Wiki_Query%202026-07-04%20at%209%2031%2011%20AM.png)
+![Grounded Thread Wiki answer with cited PDF page](../assets/screenshots/LLM_Wiki_Query%202026-07-04%20at%209%2031%2011%20AM.png)
 
 Answers can combine generated wiki context with validated citations to original source pages; wiki pages support retrieval and navigation but do not replace raw evidence.
 
-![Thread Wiki answer combining wiki context and raw-document citations](../../resources/LLM_Wiki_Query%202026-07-27%20at%2012%2018%2011%20PM.png)
+![Thread Wiki answer combining wiki context and raw-document citations](../assets/screenshots/LLM_Wiki_Query%202026-07-27%20at%2012%2018%2011%20PM.png)
 
 ## Troubleshooting
 
