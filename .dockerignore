@@ -19,7 +19,7 @@ sync-aws/
 .deepeval/
 tests/
 *.ipynb
-docs/
+documents/
 output/
 input/
 deep_research_example.egg-info/
