@@ -82,6 +82,8 @@ List current skill IDs:
 uv run python research_agent_cli.py --skill list
 ```
 
+For browser-based skill selection and execution, see [Use skills in the UI](documents/guides/skills.md).
+
 Start the configured `research` graph and LangGraph Studio:
 
 ```bash

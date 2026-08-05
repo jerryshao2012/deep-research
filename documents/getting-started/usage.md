@@ -60,6 +60,8 @@ Generate code from a subject file:
 uv run python research_agent_cli.py --subject-file /path/to/coding-task.txt --skill code-generator
 ```
 
+For browser-based skill selection, see [Use skills in the UI](../guides/skills.md).
+
 ### Control context and state
 
 Use only local documents, with no web search:
@@ -112,6 +114,7 @@ After staging documents, point `--doc-folder` at their folder for a CLI task, or
 
 - [Installation](installation.md)
 - [Local development](local-development.md)
+- [Use skills in the UI](../guides/skills.md)
 - [Document Upload API](../api/upload.md)
 - [Thread Wiki API](../api/wiki.md)
 - [Handbook index](../README.md)

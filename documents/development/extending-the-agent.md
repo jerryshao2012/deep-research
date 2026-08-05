@@ -132,6 +132,7 @@ Context controls include `MAX_GLOB_DEPTH`, `MAX_FILES_TO_READ`, `MAX_TOTAL_SIZE_
 - [Test and check changes](testing.md)
 - [Validate prompt changes](prompt-validation.md)
 - [Configuration](../guides/configuration.md)
+- [Use skills in the UI](../guides/skills.md)
 - [Use the research interfaces](../getting-started/usage.md)
 - [Evaluate research quality and regressions](../guides/evaluation.md)
 - [Code ingestion](../architecture/code-ingestion.md)

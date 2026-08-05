@@ -14,6 +14,7 @@ This index is the canonical handbook navigation for installing, using, extending
 - [Authentication](guides/authentication.md) explains API keys, OAuth, passkeys, and production hardening.
 - [Reliability](guides/reliability.md) covers rate shaping, retries, and common operational failures.
 - [Evaluation](guides/evaluation.md) describes regression tracking, verification, and evaluation metrics.
+- [Use skills in the UI](guides/skills.md) covers skill discovery, configuration, application, and results.
 
 ## API reference
 
