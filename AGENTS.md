@@ -1,6 +1,6 @@
 # Deep Research Agent
 
-A multi-agent research orchestration system that breaks down complex research queries into concurrent sub-agent tasks, synthesizes findings, and outputs structured research reports. Supports multiple output skills (golden dataset, interview prep, study slides, etc.) and works with local models (Ollama) or cloud APIs (Anthropic Claude, OpenAI, Google Gemini).
+A multi-agent deep research orchestration system built on LangGraph and the `deepagents` library. It breaks complex research queries into concurrent sub-agent tasks, synthesizes findings, and outputs structured reports through pluggable output skills (golden dataset, interview prep, study slides, etc.). It supports local models (Ollama), cloud APIs (Anthropic Claude, OpenAI, Google Gemini), and a FastAPI server implementing the LangGraph Agent Protocol for asynchronous subagent execution.
 
 ---
 
@@ -28,9 +28,14 @@ uv run python research_agent_cli.py "Topic" --skill golden-dataset --eval-golden
 
 ### Interactive Development
 ```bash
-langgraph dev                              # Run workflow visualizer at localhost:8123
+langgraph dev                              # LangGraph Platform development server
+uv run python -m webapp                    # Document upload API on port 8000
 uv run pytest tests/ -v                    # Run full test suite
+uv run ruff check .                        # Lint
+uv run mypy research_agent/                # Type check
 ```
+
+Deployment guides: [Azure](documents/deployment/azure/README.md), [AWS](documents/deployment/aws.md), and [Vercel](documents/deployment/vercel.md).
 
 ---
 
@@ -38,14 +43,77 @@ uv run pytest tests/ -v                    # Run full test suite
 
 | Component | Purpose | Key File |
 |-----------|---------|----------|
-| **Orchestration** | Manages research workflow, delegates to sub-agents | [agent.py](agent.py) |
-| **CLI Interface** | Standalone research execution with evaluation tracking | [research_agent_cli.py](research_agent_cli.py) |
-| **Web API** | FastAPI server for document uploads; OAuth/SSO support | [webapp.py](webapp.py) |
+| **Orchestration** | Core graph, research state, middleware, and sub-agent delegation | [agent.py](agent.py) |
+| **CLI Interface** | Standalone research execution, skills, evaluation tracking, and SSL options | [research_agent_cli.py](research_agent_cli.py) |
+| **Web API** | FastAPI app factory for document uploads, OAuth/SSO, wiki routes, and LangGraph custom routes | [webapp/__init__.py](webapp/__init__.py) |
 | **Tools** | Web search (Tavily), file I/O, thinking/reflection | [research_agent/tools.py](research_agent/tools.py) |
 | **Prompts** | System instructions for researcher agent | [research_agent/prompts.py](research_agent/prompts.py) |
-| **Skills** | Pluggable output formatters (golden-dataset, interview-prep, etc.) | [research_agent/skills/](research_agent/skills/) |
+| **Skills** | Pluggable output formatters and capabilities | [.deepagents/skills/](.deepagents/skills/) |
 | **Model Config** | Multi-provider model abstraction | [model_factory.py](model_factory.py) |
 | **Tests** | 20+ test files (unit, integration, E2E) | [tests/](tests/) |
+
+### Entry Points
+
+| File | Role |
+|------|------|
+| [agent.py](agent.py) | Core agent graph. Defines `ResearchState`, `ResearchStateMiddleware`, and the `agent` graph. Middleware injects document folder, skill, wiki context, and cited responses before each turn. Referenced by `langgraph.json`. |
+| [research_agent_cli.py](research_agent_cli.py) | Standalone CLI for research without the server. Supports `--doc-folder`, `--skill`, evaluation tracking, and SSL customization. |
+| [webapp/__init__.py](webapp/__init__.py) | FastAPI app factory for the Document Upload API. Configures CORS, OAuth sessions, wiki routes, and document endpoints. |
+| [server.py](server.py) | **Deprecated.** Custom LangGraph Platform server, replaced by `langgraph dev`; retained for reference. |
+| [run.py](run.py) | **Deprecated.** Thin `server:app` launcher, replaced by `langgraph dev`; retained for reference. |
+
+### Core Packages
+
+- **`research_agent/`** - Agent logic:
+  - `prompts.py` - `RESEARCH_WORKFLOW_INSTRUCTIONS`, `RESEARCHER_INSTRUCTIONS`, and `SUBAGENT_DELEGATION_INSTRUCTIONS`
+  - `tools.py` - `tavily_search`, `fetch_webpage_content`, `think_tool`, file I/O (`ls`, `glob`, `read_file`, `write_file`), and skill output rendering
+  - `utils/` - CLI helpers, web search, citation validation, knowledge filesystem, JSON utilities, FAISS retrieval, evaluation tracking, and dynamic skill discovery
+- **`.deepagents/skills/`** - Built-in skills. Each skill has a `SKILL.md` with YAML frontmatter and instruction body, and may bundle scripts or assets.
+- **`thread_wiki/`** - Thread-level document RAG without a vector database:
+  - `service.py` - Wiki initialization, ingest, query, and lint operations
+  - `models.py` - Pydantic models for wiki paths, progress, and query results
+  - `progress.py` - Ingest phase progress from preparation through completion
+  - `routes.py` - FastAPI routes for wiki operations
+- **`webapp/`** - FastAPI application:
+  - `config.py` - API key, version, CORS, document root, and OAuth settings
+  - `routes.py` - Document upload/list/delete and research trigger routes
+  - `oauth_handler.py` - OAuth/SSO session management
+  - `wiki_hooks.py` - Upload lifecycle hooks that trigger wiki ingest
+  - `auth_helpers.py` - Shared authentication utilities
+
+### Infrastructure
+
+- [model_factory.py](model_factory.py) creates provider-specific LangChain chat and embedding models from environment variables. It supports Azure OpenAI with managed identity, Anthropic, Google Gemini, and Ollama.
+- [db.py](db.py) abstracts SQLite for development, PostgreSQL for production, and Cosmos DB for Azure production. It stores thread and run state.
+- [auth.py](auth.py) authenticates Agent Protocol requests with `LANGCHAIN_API_KEY` or OAuth session tokens. `langgraph.json` registers it as the auth module.
+- [retry_utils.py](retry_utils.py) tracks TPM/RPM quotas and applies exponential backoff to rate limits.
+- [s3_storage.py](s3_storage.py) provides S3-compatible document persistence.
+
+### Data Flow
+
+1. Query enters through `research_agent_cli.py` or LangGraph Platform API served by `langgraph dev` from `langgraph.json`.
+2. `ResearchStateMiddleware` injects document folder, selected skill, wiki context, and prior cited responses.
+3. Researcher graph delegates with `create_deep_agent` and `SubAgent`, calls web/file/reflection tools, and synthesizes findings.
+4. If a skill is selected, `render_skill_output` passes synthesized result to skill pipeline.
+5. Output is written to `output/<thread_id>/`.
+
+### Skills Runtime
+
+Skills are auto-discovered from `.deepagents/skills/<skill-name>/SKILL.md` and supported custom roots such as `docs/.deepagents/skills/` by `research_agent/utils/skill_registry.py`. Each `SKILL.md` contains YAML frontmatter (including `name` and `description`) plus instruction body; selected instructions are injected into researcher system prompt. Skills may bundle processing scripts or other assets. Existing skills include golden-dataset, interview, frontend-slides, study-slides, autoresearch-universal, code-generator, humanizer, and find-skills.
+
+### Testing Notes
+
+- `tests/conftest.py` provides shared fixtures such as `mock_tavily_search` and `temp_docs_dir`.
+- Mock external APIs (Tavily and model providers), not internal tools.
+- `test_prompts_validation.py` validates prompt quality and structure.
+- `test_research_agent_cli_e2e.py` exercises complete workflow and is slowest, most realistic suite.
+- `test_research_agent_cli_helpers.py` covers CLI helpers without API calls.
+
+### Key LangGraph Deviations
+
+- `webapp/__init__.py` uses `importlib.util` to load submodules by file path because LangGraph `load_custom_app` loads module without parent package context.
+- `agent.py` sends wiki queries through thread-pool executors inside running event loops and uses `asyncio.run()` otherwise.
+- `ResearchStateMiddleware` seeds filesystem state with research request and wiki context before agent decision step.
 
 ---
 
@@ -78,10 +146,10 @@ uv run pytest tests/ -v                    # Run full test suite
    ```
 
 ### Adding New Skills
-1. Create directory: `research_agent/skills/{skill-name}/`
-2. Add YAML definition: `skill.yaml` (see [research_agent/skills/golden_dataset/skill.yaml](research_agent/skills/golden_dataset/skill.yaml) for template)
-3. Implement processor: `processor.py` with `process_research_output()` function
-4. Register in agent: [research_agent/__init__.py](research_agent/__init__.py) exports it
+1. Create directory: `.deepagents/skills/{skill-name}/` (built-in) or `docs/.deepagents/skills/{skill-name}/` (custom/uploaded).
+2. Add `SKILL.md` with YAML frontmatter (`name`, `description`, and optional metadata) followed by instructions.
+3. Add processing scripts or assets only when skill needs them.
+4. Let [research_agent/utils/skill_registry.py](research_agent/utils/skill_registry.py) discover the skill dynamically.
 5. Test via: `uv run python research_agent_cli.py "Topic" --skill {skill-name}`
 
 ### Integrating New Tools
@@ -168,6 +236,12 @@ export GOOGLE_API_KEY=...                      # Gemini
 export MODEL_TPM=120000                        # Tokens per minute quota
 export MODEL_RPM=500                           # Requests per minute quota
 export GRAPH_RECURSION_LIMIT=200               # Multi-agent recursion depth
+export MAX_CONCURRENT_RESEARCH_UNITS=3         # Max parallel sub-agents
+export MAX_RESEARCHER_ITERATIONS=3             # Max iterations per researcher
+
+# Persistence and server
+export DB_TYPE=sqlite                           # sqlite, postgres, or cosmosdb
+export UPLOAD_PORT=8000                         # Document upload API port
 
 # Verification Loop (iterative report refinement)
 export ENABLE_VERIFICATION=true                # Enable post-generation verification (default: true)
@@ -226,7 +300,7 @@ uv run python research_agent_cli.py "Topic" --ssl-ca-files /path/to/ca-bundle.pe
 
 ### Run the FastAPI Upload Server
 ```bash
-uv run python webapp.py
+uv run python -m webapp
 # Server at http://localhost:8000
 # Upload docs: POST /api/upload
 # Trigger research: POST /api/research with {topic, doc_folder, skill}
@@ -279,13 +353,6 @@ research_agent/
 ├── __init__.py                    # Public API (tools, skills exports)
 ├── prompts.py                     # System prompts & instructions
 ├── tools.py                       # Tool implementations (search, thinking, file I/O)
-├── skills/                        # Output formatters
-│   ├── golden_dataset/
-│   │   ├── skill.yaml
-│   │   └── processor.py
-│   └── interview_prep/
-│       ├── skill.yaml
-│       └── processor.py
 └── utils/                         # Utilities
     ├── cli.py                     # CLI helpers
     ├── citation_validator.py      # URL reachability + claim grounding
@@ -298,6 +365,13 @@ research_agent/
     ├── text_search.py             # Hybrid BM25+FAISS search index
     ├── verification.py            # Post-generation adversarial verification
     └── web_search.py              # Tavily search + webpage fetching
+
+.deepagents/skills/                # Built-in output formatters and capabilities
+├── golden-dataset/
+│   ├── SKILL.md
+│   └── scripts/                   # Optional processing and scoring helpers
+└── interview/
+    └── SKILL.md
 ```
 
 **Tests**
@@ -420,26 +494,73 @@ cross-session memory.
 
 ### Searching the codebase
 
-**Use `context_search` instead of reading files directly** when exploring
-the codebase, answering questions about code, or understanding how things
-work. `context_search` returns the most relevant code chunks with
-confidence scores instead of whole files.
+**You MUST use `context_search` instead of reading files directly** when
+exploring the codebase, answering questions about code, or understanding how
+things work. This is a hard requirement, not a suggestion. `context_search`
+returns the most relevant code chunks with confidence scores instead of whole
+files and tracks token savings automatically.
 
 When to use `context_search`:
 - Answering questions about the codebase ("how does X work?", "where is Y?")
 - Exploring structure or architecture
 - Finding related code, functions, or patterns
+- Any time you would otherwise read a file just to understand it
 
-Other tools:
-- `expand_chunk` for full source of a compressed result
-- `related_context` for what calls/imports a function
-- `session_recall` to recall past decisions
+When to use `Read` instead:
+- You need to edit a specific file (read before editing)
+- You need the exact, complete content of a known file path
 
-### Cross-session memory
+Other search tools:
+- `expand_chunk` - get full source for a compressed result
+- `related_context` - find what calls or imports a function
 
-Call `session_recall("topic phrase")` before answering non-trivial questions.
-Call `record_decision(decision="...", reason="...")` after making choices.
-Call `record_code_area(file_path="...", description="...")` after meaningful work.
+### Cross-session memory - use it actively
+
+This project has persistent memory across sessions. **Use it both ways: recall
+before answering, record after deciding.** Memory not recorded is lost; memory
+not recalled does nothing.
+
+**Before answering a non-trivial question, call `session_recall`.** Especially
+when:
+- Question concerns architecture, design, or naming choices
+- User asks "what / why / how did we ..."
+- You are about to recommend an approach team may already have chosen or rejected
+
+Pass a topic phrase, not a single word - for example,
+`session_recall("auth flow")`, not `session_recall("auth")`. Recall uses vector
+similarity, so paraphrases match. If relevant entries exist, lead with them
+instead of re-deriving answer.
+
+**After making a non-obvious decision, call `record_decision`.** Especially:
+- Choosing one library, pattern, or approach over another
+- Resolving ambiguity in specification or requirements
+- Establishing convention project should follow
+- Anything you would not want to re-litigate next session
+
+Format: `record_decision(decision="...", reason="...")`. Keep both fields short
+and specific; they surface verbatim in future sessions.
+
+**After meaningful work in a file, call `record_code_area`.** Especially when:
+- You added or substantially modified a function or class
+- You traced non-obvious flow and want future sessions to find it quickly
+
+Format: `record_code_area(file_path="...", description="...")`.
+
+Skip recording for trivial reads, formatting changes, or one-off lookups. Goal
+is durable signal, not event log.
+
+### Drilling deeper from a recall hit
+
+`session_recall` results include source session ID, for example
+`[turn sid:abc123|n:5]`. To drill in:
+
+- `session_timeline(session_id="abc123")` - walk per-turn summaries in order;
+  use when user asks what reasoning led to a decision.
+- `session_event(event_id=N)` - fetch one tool event's raw input and output;
+  use when turn summary references result you need to inspect.
+
+Both are read-only and cheap. Prefer them over re-running calls or asking user
+to re-paste context.
 
 ### Output style
 
