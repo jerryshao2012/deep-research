@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 
 from langchain_core.messages import HumanMessage
 
-from model_factory import get_configured_model
+from research_agent.model_factory import get_configured_model
 from research_agent.research_subagent.utils.citation_validator import (
     ValidationResult,
     validate_web_citations,

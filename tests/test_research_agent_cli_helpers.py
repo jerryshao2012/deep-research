@@ -3,7 +3,7 @@
 import os
 from pathlib import Path
 
-from research_agent_cli import (
+from research_agent.cli import (
     configure_output_folder,
     derive_output_folder,
 )

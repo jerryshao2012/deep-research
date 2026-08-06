@@ -472,7 +472,7 @@ class TestTurnAwareReportNaming:
     def test_after_model_wiki_query_complete_fallback(self) -> None:
         from langchain_core.messages import AIMessage
 
-        from agent import ResearchStateMiddleware
+        from research_agent.agent import ResearchStateMiddleware
         from research_agent.research_subagent.utils.knowledge_filesystem import (
             _thread_wiki_query_complete,
         )
@@ -507,7 +507,7 @@ class TestTurnAwareReportNaming:
         """Wiki retrieval is an explicit agent tool, not middleware work."""
         from langchain_core.messages import HumanMessage
 
-        from agent import ResearchStateMiddleware
+        from research_agent.agent import ResearchStateMiddleware
 
         middleware = ResearchStateMiddleware()
         state = {
@@ -528,7 +528,7 @@ class TestTurnAwareReportNaming:
         from deepagents.backends.utils import create_file_data
         from langchain_core.messages import AIMessage
 
-        from agent import ResearchStateMiddleware
+        from research_agent.agent import ResearchStateMiddleware
 
         middleware = ResearchStateMiddleware()
 
@@ -557,7 +557,7 @@ class TestTurnAwareReportNaming:
         """after_model must declare can_jump_to=['end'] so the framework
         registers a conditional edge that honors jump_to (otherwise a static
         edge is created and jump_to is silently ignored)."""
-        from agent import ResearchStateMiddleware
+        from research_agent.agent import ResearchStateMiddleware
 
         can_jump = getattr(ResearchStateMiddleware.after_model, "__can_jump_to__", None)
         assert can_jump == ["end"]
@@ -567,7 +567,7 @@ class TestTurnAwareReportNaming:
         from deepagents.backends.utils import create_file_data
         from langchain_core.messages import HumanMessage
 
-        from agent import ResearchStateMiddleware
+        from research_agent.agent import ResearchStateMiddleware
 
         middleware = ResearchStateMiddleware()
         wiki_answer = "The definitive wiki answer."
@@ -588,7 +588,7 @@ class TestTurnAwareReportNaming:
     def test_before_model_has_can_jump_to_end(self) -> None:
         """before_model must declare can_jump_to=['end'] so the framework
         registers a conditional edge that honors jump_to."""
-        from agent import ResearchStateMiddleware
+        from research_agent.agent import ResearchStateMiddleware
 
         can_jump = getattr(ResearchStateMiddleware.before_model, "__can_jump_to__", None)
         assert can_jump == ["end"]
@@ -598,7 +598,7 @@ class TestTurnAwareReportNaming:
         before (initialize chat_start_time) and NOT jump to end."""
         from langchain_core.messages import HumanMessage
 
-        from agent import ResearchStateMiddleware
+        from research_agent.agent import ResearchStateMiddleware
 
         middleware = ResearchStateMiddleware()
         state = {
@@ -617,7 +617,7 @@ class TestTurnAwareReportNaming:
         """Legacy wiki state cannot bypass planning and report synthesis."""
         from deepagents.backends.utils import create_file_data
 
-        from agent import ResearchStateMiddleware
+        from research_agent.agent import ResearchStateMiddleware
 
         state = {
             "files": {"/cited_response.md": create_file_data("wiki answer")},

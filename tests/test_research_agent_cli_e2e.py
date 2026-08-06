@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 from langchain_core.messages import AIMessage, ToolMessage
 
-import research_agent_cli
+from research_agent import cli as research_agent_cli
 
 
 class FakeAgent:
@@ -36,7 +36,7 @@ def _run_cli(monkeypatch, tmp_path: Path, argv: list[str], fake_agent: FakeAgent
     monkeypatch.setattr(research_agent_cli, "show_prompt", lambda *args, **kwargs: None)
     monkeypatch.setattr(research_agent_cli, "format_messages", lambda *args, **kwargs: None)
     monkeypatch.setattr(research_agent_cli, "file_data_to_string", lambda data: data)
-    monkeypatch.setattr(sys, "argv", ["research_agent_cli.py", *argv])
+    monkeypatch.setattr(sys, "argv", ["research_agent/cli.py", *argv])
 
     research_agent_cli.main()
 

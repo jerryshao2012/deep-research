@@ -3,17 +3,12 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 
 import httpx
-import sys
 from pydantic import SecretStr
 
-# Add parent directories to path to import retry_utils
-sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent.parent))
-from retry_utils import wrap_model_with_rate_limiting
-
-from utils import get_ssl_verify_config
+from research_agent.cli_utils import get_ssl_verify_config
+from research_agent.retry_utils import wrap_model_with_rate_limiting
 
 
 def get_configured_model():

@@ -19,7 +19,7 @@ from langgraph._internal._constants import CONFIG_KEY_SEND
 from langgraph.config import get_config
 from langgraph.prebuilt import InjectedState
 
-from logger_utils import setup_logger
+from research_agent.logger_utils import setup_logger
 from research_agent.research_subagent.utils.content_extractors import extract_supported_document
 from research_agent.research_subagent.utils.text_search import load_or_build_search_index
 

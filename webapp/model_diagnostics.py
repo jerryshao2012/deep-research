@@ -184,7 +184,7 @@ def _detect_model_provider() -> tuple[str, dict]:
 
 def _create_model_safe():
     """Import and call ``model_factory.get_configured_model()`` safely."""
-    from model_factory import get_configured_model
+    from research_agent.model_factory import get_configured_model
 
     return get_configured_model()
 

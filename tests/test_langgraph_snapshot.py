@@ -18,8 +18,8 @@ from uuid import UUID
 
 import pytest
 
-import langgraph_snapshot as snapshot_module
-from langgraph_snapshot import (
+from research_agent import langgraph_snapshot as snapshot_module
+from research_agent.langgraph_snapshot import (
     AWS_IMAGE_RUNTIME_VERSIONS,
     GENERATION_PREFIX,
     ROOT_MANIFEST_KEY,

@@ -20,8 +20,7 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 # Ensure deep_research is in sys.path
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-import db
-import server
+from research_agent import db, server
 
 
 @pytest.fixture(autouse=True)

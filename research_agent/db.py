@@ -8,7 +8,7 @@ import threading
 from datetime import UTC, datetime
 from typing import Any
 
-import db_sql
+from research_agent import db_sql
 
 _sqlite_lock = threading.Lock()
 _sqlite_conn = None

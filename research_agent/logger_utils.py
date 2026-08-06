@@ -31,7 +31,7 @@ def setup_logger(
         Configured logger instance
     
     Example:
-        from logger_utils import setup_logger
+        from research_agent.logger_utils import setup_logger
         logger = setup_logger(__name__)
         logger.info("Application started")
     """

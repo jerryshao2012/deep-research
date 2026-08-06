@@ -20,7 +20,6 @@ import math
 import os
 import re
 import shutil
-import sys
 import threading
 from collections import defaultdict
 from datetime import UTC, datetime
@@ -34,7 +33,7 @@ from deepagents.middleware.filesystem import FilesystemPermission
 from langchain_core.runnables import RunnableConfig
 from networkx.algorithms.community import louvain_communities
 
-from model_factory import get_configured_model
+from research_agent.model_factory import get_configured_model
 from research_agent.research_subagent.utils.text_search import (
     load_or_build_search_index,
 )
@@ -864,12 +863,7 @@ def _append_log_entry(
 
 def _resolve_model():
     """Return the configured chat model from model_factory."""
-    # Import here to avoid circular imports at module load time.
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    try:
-        return get_configured_model()
-    finally:
-        sys.path.pop(0)
+    return get_configured_model()
 
 
 def _run_agent(

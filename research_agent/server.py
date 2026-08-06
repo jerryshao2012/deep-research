@@ -45,13 +45,13 @@ from langgraph_sdk import Auth
 from pydantic import BaseModel, Field
 
 # Import DB wrapper
-import db
+from research_agent import db
 
 # Import the actual deep_research agent
-from agent import RECURSION_LIMIT, agent
+from research_agent.agent import RECURSION_LIMIT, agent
 
 # Import shared authentication logic
-from auth import authenticate_credential
+from research_agent.auth import authenticate_credential
 from research_agent.research_subagent.prompts import RESEARCHER_DESCRIPTION
 from research_agent.research_subagent.resume import (
     build_round_limit_message,
@@ -2487,6 +2487,6 @@ async def cancel_run(
 if __name__ == "__main__":
     # For development with uvicorn: python run.py
     # For production: uvicorn server:app --port 2024
-    from run import main
+    from research_agent.run import main
 
     main()

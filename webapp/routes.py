@@ -748,7 +748,7 @@ def register_oauth_routes(app) -> None:
             )
 
         # Clean up the logged users tracking in auth module
-        from auth import _logged_oauth_users
+        from research_agent.auth import _logged_oauth_users
 
         if identity in _logged_oauth_users:
             _logged_oauth_users.discard(identity)

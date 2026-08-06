@@ -744,7 +744,7 @@ def test_github_callback_persists_session_off_event_loop(monkeypatch):
 
 
 def test_langgraph_authentication_checks_session_off_event_loop(monkeypatch):
-    import auth
+    from research_agent import auth
 
     def authenticate_credential(credential):
         with pytest.raises(RuntimeError, match="no running event loop"):

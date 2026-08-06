@@ -22,7 +22,7 @@ def test_langgraph_mutations_return_503_in_read_only_mode(
         handler_name: str,
         monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import auth
+    from research_agent import auth
 
     monkeypatch.setenv("S3_BUCKET_NAME", "demo-bucket")
     monkeypatch.setenv("AWS_REGION", "us-east-1")
@@ -49,7 +49,7 @@ def test_langgraph_mutations_remain_allowed_outside_read_only_mode(
         handler_name: str,
         monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import auth
+    from research_agent import auth
 
     monkeypatch.delenv("LANGGRAPH_S3_READ_ONLY", raising=False)
     handler = getattr(auth, handler_name)
@@ -60,7 +60,7 @@ def test_langgraph_mutations_remain_allowed_outside_read_only_mode(
 def test_read_only_flag_does_not_change_non_aws_auth(
         monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import auth
+    from research_agent import auth
 
     monkeypatch.delenv("S3_BUCKET_NAME", raising=False)
     monkeypatch.delenv("AWS_REGION", raising=False)
@@ -169,8 +169,7 @@ def test_custom_app_allows_mutations_when_read_only_is_disabled(
 def test_aws_read_write_lifespan_claims_writer_before_serving(
         monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import langgraph_snapshot
-    import s3_storage
+    from research_agent import langgraph_snapshot, s3_storage
     import webapp
 
     monkeypatch.setenv("S3_BUCKET_NAME", "demo-bucket")
@@ -219,7 +218,7 @@ def test_aws_read_write_lifespan_claims_writer_before_serving(
 def test_writer_claim_failure_prevents_lifespan_from_serving(
         monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import langgraph_snapshot
+    from research_agent import langgraph_snapshot
     import webapp
 
     monkeypatch.setenv("S3_BUCKET_NAME", "demo-bucket")
@@ -252,8 +251,7 @@ def test_writer_claim_failure_prevents_lifespan_from_serving(
 def test_lifespan_does_not_run_late_snapshot_restore(
         monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import langgraph_snapshot
-    import s3_storage
+    from research_agent import langgraph_snapshot, s3_storage
     import webapp
 
     monkeypatch.setenv("S3_BUCKET_NAME", "demo-bucket")
@@ -280,8 +278,7 @@ def test_lifespan_does_not_run_late_snapshot_restore(
 def test_read_only_runtime_starts_when_s3_denies_every_write(
         monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import langgraph_snapshot
-    import s3_storage
+    from research_agent import langgraph_snapshot, s3_storage
     import webapp
 
     monkeypatch.setenv("S3_BUCKET_NAME", "demo-bucket")
@@ -310,7 +307,7 @@ def test_read_only_runtime_starts_when_s3_denies_every_write(
 def test_non_aws_lifespan_does_not_start_s3_controllers(
         monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import langgraph_snapshot
+    from research_agent import langgraph_snapshot
     import webapp
 
     monkeypatch.delenv("S3_BUCKET_NAME", raising=False)
@@ -338,7 +335,7 @@ def test_generic_s3_upload_loop_mirrors_only_tracked_folders(
         monkeypatch: pytest.MonkeyPatch,
         tmp_path,
 ) -> None:
-    import s3_storage
+    from research_agent import s3_storage
     import webapp
 
     tracked = [
@@ -374,7 +371,7 @@ def test_generic_s3_upload_loop_retries_after_cycle_exception(
         monkeypatch: pytest.MonkeyPatch,
         tmp_path,
 ) -> None:
-    import s3_storage
+    from research_agent import s3_storage
     import webapp
 
     resolve_calls = 0
@@ -414,7 +411,7 @@ def test_sleeping_persistence_workers_stop_promptly(
         monkeypatch: pytest.MonkeyPatch,
         tmp_path,
 ) -> None:
-    import langgraph_snapshot
+    from research_agent import langgraph_snapshot
     import webapp
 
     lease = langgraph_snapshot.RuntimeLease(
@@ -477,7 +474,7 @@ def test_sleeping_generic_worker_stops_promptly() -> None:
 
 
 def test_blocked_runtime_worker_shutdown_is_bounded_and_explicit() -> None:
-    import langgraph_snapshot
+    from research_agent import langgraph_snapshot
     import webapp
 
     release = threading.Event()
@@ -548,7 +545,7 @@ def test_blocked_generic_worker_shutdown_is_bounded_and_explicit() -> None:
 def test_invalid_generic_sync_interval_prevents_writer_claim(
         monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import langgraph_snapshot
+    from research_agent import langgraph_snapshot
     import webapp
 
     monkeypatch.setenv("S3_BUCKET_NAME", "demo-bucket")

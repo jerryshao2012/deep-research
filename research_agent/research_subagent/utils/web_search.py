@@ -18,7 +18,7 @@ from langgraph.prebuilt import InjectedState
 from markdownify import markdownify
 from tavily import TavilyClient
 
-from utils import get_ssl_verify_config
+from research_agent.cli_utils import get_ssl_verify_config
 
 verify_ssl = get_ssl_verify_config()
 tavily_session = requests.Session()

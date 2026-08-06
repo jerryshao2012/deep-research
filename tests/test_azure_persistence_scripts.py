@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-import azure_storage
+from research_agent import azure_storage
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 

@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 import pytest
 
-from retry_utils import (
+from research_agent.retry_utils import (
     RetryConfig,
     calculate_backoff,
     is_rate_limit_error,
@@ -135,7 +135,7 @@ class TestRetryConfig:
 
     def test_default_config(self):
         """Should use default values."""
-        import retry_utils
+        from research_agent import retry_utils
         config = RetryConfig()
         assert config.max_retries == retry_utils.MAX_RETRIES
         assert config.initial_backoff == retry_utils.INITIAL_BACKOFF

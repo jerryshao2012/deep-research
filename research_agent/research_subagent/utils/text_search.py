@@ -575,18 +575,11 @@ def _resolve_embedding_model():
         return None
 
     try:
-        import sys as _sys
-        from pathlib import Path as _Path
+        from research_agent.model_factory import create_embedding_model
 
-        _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent.parent.parent))
-        try:
-            from model_factory import create_embedding_model
-
-            model = create_embedding_model()
-            _embedding_model_cache = model
-            return model
-        finally:
-            _sys.path.pop(0)
+        model = create_embedding_model()
+        _embedding_model_cache = model
+        return model
     except Exception:
         _embedding_failed = True
         logger.debug(

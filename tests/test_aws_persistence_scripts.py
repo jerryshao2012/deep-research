@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-import s3_storage
+from research_agent import s3_storage
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -113,7 +113,7 @@ def client(service, region_name=None):
     )
 
     result = subprocess.run(
-        [sys.executable, "-m", "s3_storage", "startup"],
+        [sys.executable, "-m", "research_agent.s3_storage", "startup"],
         cwd=tmp_path,
         env=environment,
         capture_output=True,
@@ -145,7 +145,7 @@ def test_s3_storage_startup_cli_requires_complete_aws_configuration(
     environment["PYTHONPATH"] = str(PROJECT_ROOT)
 
     result = subprocess.run(
-        [sys.executable, "-m", "s3_storage", "startup"],
+        [sys.executable, "-m", "research_agent.s3_storage", "startup"],
         cwd=tmp_path,
         env=environment,
         capture_output=True,

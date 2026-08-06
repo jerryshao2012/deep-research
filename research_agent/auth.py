@@ -11,7 +11,7 @@ from typing import Any, Set
 from fastapi import HTTPException
 from langgraph_sdk import Auth
 
-from logger_utils import setup_logger
+from research_agent.logger_utils import setup_logger
 from webapp.oauth_handler import user_manager
 
 logger = setup_logger(__name__)

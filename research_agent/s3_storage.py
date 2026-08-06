@@ -10,7 +10,7 @@ mount).  This module adds:
 - **Fire-and-forget**: uploads never block the request path.
 
 Usage in webapp.py / the LangGraph Platform app:
-    from s3_storage import startup_sync, fire_and_forget_upload, upload_directory_sync
+    from research_agent.s3_storage import fire_and_forget_upload, startup_sync, upload_directory_sync
 
     # On startup (inside lifespan)
     startup_sync()
@@ -30,7 +30,7 @@ import sys
 import threading
 from pathlib import Path
 
-from logger_utils import setup_logger
+from research_agent.logger_utils import setup_logger
 
 logger = setup_logger(__name__)
 
@@ -228,9 +228,10 @@ def fire_and_forget_directory_upload(local_dir: str | Path, s3_prefix: str) -> N
 def _resolve_tracked_folders() -> list[tuple[str, Path]]:
     """Return list of (s3_prefix, local_path) pairs to sync on startup."""
     pairs: list[tuple[str, Path]] = []
+    project_root = Path(__file__).resolve().parent.parent
 
     # docs/ → DOCS_ROOT from webapp.py
-    docs_root = Path(__file__).resolve().parent / "docs"
+    docs_root = project_root / "docs"
     pairs.append(("docs", docs_root))
 
     # output/ → REPORTS_OUTPUT_FOLDER
@@ -288,7 +289,7 @@ def local_path_to_s3_key(local_path: str | Path, base_s3_prefix: str, base_local
 
 def _cli_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="python -m s3_storage",
+        prog="python -m research_agent.s3_storage",
         description="Synchronize generic application folders with S3.",
     )
     parser.add_subparsers(dest="command", required=True).add_parser("startup")

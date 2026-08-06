@@ -18,7 +18,7 @@ from typing import Any
 
 import yaml
 
-from logger_utils import setup_logger
+from research_agent.logger_utils import setup_logger
 from research_agent.research_subagent.utils.json_utils import robust_json_loads
 
 logger = setup_logger(__name__)

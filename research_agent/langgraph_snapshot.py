@@ -2068,7 +2068,7 @@ def _build_s3_client() -> object:
 
 def _cli_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="python -m langgraph_snapshot",
+        prog="python -m research_agent.langgraph_snapshot",
         description="Restore or publish guarded LangGraph S3 snapshots.",
     )
     commands = parser.add_subparsers(dest="command", required=True)

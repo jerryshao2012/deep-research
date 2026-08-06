@@ -6,6 +6,25 @@ import tempfile
 from pathlib import Path
 
 
+def test_resolve_model_does_not_mutate_sys_path(monkeypatch):
+    import sys
+
+    from thread_wiki import service
+
+    class MutationRejectingPath(list):
+        def insert(self, index, value):
+            raise AssertionError("_resolve_model must not mutate sys.path")
+
+        def pop(self, index=-1):
+            raise AssertionError("_resolve_model must not mutate sys.path")
+
+    configured_model = object()
+    monkeypatch.setattr(service, "get_configured_model", lambda: configured_model)
+    monkeypatch.setattr(sys, "path", MutationRejectingPath(sys.path))
+
+    assert service._resolve_model() is configured_model
+
+
 # ── Phase 1.1: Purpose.md ────────────────────────────────────────────────────
 
 

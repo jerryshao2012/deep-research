@@ -232,7 +232,7 @@ async def _wiki_get_current_user(request: Request) -> MinimalUserDict:
     Delegates to the auth module at request time (not import time)
     to avoid circular imports.
     """
-    import server as _server
+    from research_agent import server as _server
 
     return await _server.get_current_user(request)
 

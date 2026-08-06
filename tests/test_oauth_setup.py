@@ -76,7 +76,7 @@ def test_auth_module():
     print("\nTesting auth module...")
 
     try:
-        from auth import authenticate, auth
+        from research_agent.auth import authenticate, auth
         print("✓ Auth module imported successfully")
         print(f"✓ Auth instance created: {auth}")
         return True
@@ -168,7 +168,7 @@ def test_logout_and_cleanup():
 
     try:
         from webapp.oauth_handler import user_manager, handle_logout
-        from auth import _logged_oauth_users
+        from research_agent.auth import _logged_oauth_users
 
         # Create a test session
         test_user = {

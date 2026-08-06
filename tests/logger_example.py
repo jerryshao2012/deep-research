@@ -1,6 +1,6 @@
 """Example usage of centralized logger configuration."""
 
-from logger_utils import setup_logger, get_log_level_from_env
+from research_agent.logger_utils import get_log_level_from_env, setup_logger
 
 # Example 1: Basic logger setup (recommended for most modules)
 logger = setup_logger(__name__)
@@ -19,5 +19,5 @@ logger.warning("This is a warning message")
 logger.error("This is an error message")
 
 # In your actual modules, simply use:
-# from logger_utils import setup_logger
+# from research_agent.logger_utils import setup_logger
 # logger = setup_logger(__name__)

@@ -19,8 +19,7 @@ from langchain_core.messages import (
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-import db
-import server
+from research_agent import db, server
 
 
 @pytest.fixture(autouse=True)

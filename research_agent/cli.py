@@ -18,11 +18,11 @@ from deepagents.backends.utils import file_data_to_string
 from dotenv import load_dotenv
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, ToolMessage
 
-from agent import agent, model
+from research_agent.agent import agent, model
 from research_agent.research_subagent.resume import inspect_todos
 from research_agent.research_subagent.utils.cli import build_parser, list_skills
 from research_agent.research_subagent.utils.knowledge_filesystem import normalize_path_for_filesystem_tools
-from utils import str2bool, show_prompt, format_messages
+from research_agent.cli_utils import format_messages, show_prompt, str2bool
 
 # Load environment variables
 load_dotenv()

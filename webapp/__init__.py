@@ -139,7 +139,7 @@ def _generic_s3_upload_loop(
         interval_seconds: float,
 ) -> None:
     """Periodically mirror generic runtime folders without LangGraph state."""
-    from s3_storage import _resolve_tracked_folders, upload_directory_sync
+    from research_agent.s3_storage import _resolve_tracked_folders, upload_directory_sync
 
     while not stop_event.wait(interval_seconds):
         try:
@@ -188,7 +188,7 @@ def _generic_azure_upload_loop(
         interval_seconds: float,
 ) -> None:
     """Periodically mirror generic runtime folders to Azure Blob Storage."""
-    from azure_storage import _resolve_tracked_folders, upload_directory_sync
+    from research_agent.azure_storage import _resolve_tracked_folders, upload_directory_sync
 
     while not stop_event.wait(interval_seconds):
         try:
@@ -302,7 +302,7 @@ async def _lifespan(app: FastAPI):
     _generic_s3_daemon = None
     _generic_azure_daemon = None
     try:
-        import db
+        from research_agent import db
         db.init_db()
         print("✅ Database initialized via lifespan")
     except Exception as exc:
@@ -330,7 +330,7 @@ async def _lifespan(app: FastAPI):
             _saver = AsyncSqliteSaver(_checkpointer_conn)
             await _saver.setup()
 
-            from agent import agent as _agent
+            from research_agent.agent import agent as _agent
             _agent.checkpointer = _saver
             print(f"✅ Checkpointer initialized: AsyncSqliteSaver → {_sqlite_path}")
 
@@ -343,21 +343,21 @@ async def _lifespan(app: FastAPI):
             if hasattr(_saver, "__aenter__"):
                 async with _saver as _s:
                     await _s.setup()
-                    from agent import agent as _agent
+                    from research_agent.agent import agent as _agent
                     _agent.checkpointer = _s
             else:
                 await _saver.setup()
-                from agent import agent as _agent
+                from research_agent.agent import agent as _agent
                 _agent.checkpointer = _saver
             print("✅ Checkpointer initialized: AsyncPostgresSaver")
     except Exception as _exc:
         print(f"⚠️  Persistent checkpointer setup skipped (using InMemorySaver): {_exc}")
 
     try:
-        from s3_storage import is_s3_enabled
+        from research_agent.s3_storage import is_s3_enabled
 
         if is_s3_enabled():
-            from langgraph_snapshot import start_runtime_controller
+            from research_agent.langgraph_snapshot import start_runtime_controller
 
             sync_interval_seconds = (
                 None
@@ -370,7 +370,7 @@ async def _lifespan(app: FastAPI):
                     sync_interval_seconds
                 )
 
-        from azure_storage import is_azure_storage_enabled
+        from research_agent.azure_storage import is_azure_storage_enabled
 
         if is_azure_storage_enabled():
             sync_interval_seconds = _generic_azure_sync_interval_seconds()

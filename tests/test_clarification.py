@@ -477,7 +477,7 @@ def test_interrupt_pauses_and_resumes_same_checkpoint() -> None:
 
 
 def test_agent_registers_clarification_tool_and_middleware() -> None:
-    source = Path("agent.py").read_text(encoding="utf-8")
+    source = Path("research_agent/agent.py").read_text(encoding="utf-8")
 
     assert "clarify_requirements," in source
     middleware_block = re.search(

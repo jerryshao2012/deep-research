@@ -15,8 +15,8 @@ from typing import Any, Callable, TypeVar, List, Tuple
 import tiktoken
 from dotenv import load_dotenv
 
-from logger_utils import setup_logger
-from utils import str2bool
+from research_agent.cli_utils import str2bool
+from research_agent.logger_utils import setup_logger
 
 # Load environment variables
 load_dotenv()

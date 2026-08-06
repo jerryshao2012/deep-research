@@ -17,7 +17,7 @@ from dotenv import load_dotenv
 from langchain_core.tools import InjectedToolArg, tool
 from langgraph.prebuilt import InjectedState
 
-from logger_utils import setup_logger
+from research_agent.logger_utils import setup_logger
 from research_agent.research_subagent.utils.knowledge_filesystem import (
     glob_impl,
     ls_impl,

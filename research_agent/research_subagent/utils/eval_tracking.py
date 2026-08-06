@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from logger_utils import setup_logger
+from research_agent.logger_utils import setup_logger
 
 logger = setup_logger(__name__)
 

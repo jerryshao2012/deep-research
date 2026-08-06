@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from logger_utils import setup_logger
+from research_agent.logger_utils import setup_logger
 
 logger = setup_logger(__name__)
 

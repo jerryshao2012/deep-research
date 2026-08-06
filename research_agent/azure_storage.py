@@ -20,7 +20,7 @@ from pathlib import Path
 from azure.core.exceptions import ResourceNotFoundError
 from azure.storage.blob import BlobServiceClient
 
-from logger_utils import setup_logger
+from research_agent.logger_utils import setup_logger
 
 logger = setup_logger(__name__)
 
@@ -228,9 +228,10 @@ def fire_and_forget_directory_upload(local_dir: str | Path, blob_prefix: str) ->
 def _resolve_tracked_folders() -> list[tuple[str, Path]]:
     """Return list of (blob_prefix, local_path) pairs to sync on startup."""
     pairs: list[tuple[str, Path]] = []
+    project_root = Path(__file__).resolve().parent.parent
 
     # docs/ → DOCS_ROOT from webapp.py
-    docs_root = Path(__file__).resolve().parent / "docs"
+    docs_root = project_root / "docs"
     pairs.append(("docs", docs_root))
 
     # output/ → REPORTS_OUTPUT_FOLDER
@@ -242,7 +243,7 @@ def _resolve_tracked_folders() -> list[tuple[str, Path]]:
     pairs.append(("input", Path(input_folder)))
 
     # .langgraph_api/ → .langgraph_api (for checkpoints)
-    langgraph_api_dir = Path(__file__).resolve().parent / ".langgraph_api"
+    langgraph_api_dir = project_root / ".langgraph_api"
     pairs.append((".langgraph_api", langgraph_api_dir))
 
     return pairs
@@ -272,7 +273,7 @@ def startup_sync() -> int:
 
 def _cli_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="python -m azure_storage",
+        prog="python -m research_agent.azure_storage",
         description="Synchronize generic application folders with Azure Blob Storage.",
     )
     parser.add_subparsers(dest="command", required=True).add_parser("startup")
