@@ -33,7 +33,7 @@ ENV PATH="/deps/deep_research/.venv/bin:$PATH"
 # Fail the image build if the exact runtime environment cannot load the S3
 # snapshot stack or expose the LangGraph CLI. No AWS credentials are required.
 RUN /deps/deep_research/.venv/bin/python -c \
-      "import boto3; import langgraph_api; import langgraph_runtime_inmem; import langgraph_snapshot" \
+      "import boto3; import langgraph_api; import langgraph_runtime_inmem; import research_agent.langgraph_snapshot" \
     && test "$(command -v langgraph)" = "/deps/deep_research/.venv/bin/langgraph" \
     && /deps/deep_research/.venv/bin/langgraph dev --help > /dev/null \
     && rm -rf /deps/deep_research/.langgraph_api \

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import json
 from pathlib import Path
 
 
@@ -142,3 +143,31 @@ def test_nested_resource_roots_still_point_to_repository() -> None:
         ROOT / ".deepagents" / "skills",
         ROOT / "docs" / ".deepagents" / "skills",
     ]
+
+
+def test_langgraph_loads_packaged_application_entrypoints() -> None:
+    config = json.loads((ROOT / "langgraph.json").read_text(encoding="utf-8"))
+
+    assert config["graphs"]["research"] == "./research_agent/agent.py:agent"
+    assert config["auth"]["path"] == "./research_agent/auth.py:auth"
+    assert config["http"]["app"] == "./webapp/__init__.py:app"
+
+
+def test_eval_workflow_watches_and_imports_packaged_modules() -> None:
+    workflow = (
+        ROOT / ".github" / "workflows" / "eval-regression.yml"
+    ).read_text(encoding="utf-8")
+
+    assert '      - "research_agent/agent.py"' in workflow
+    assert '      - "research_agent/model_factory.py"' in workflow
+    assert '      - "agent.py"' not in workflow
+    assert '      - "model_factory.py"' not in workflow
+    assert (
+        "from research_agent.research_subagent.utils.eval_tracking import"
+        in workflow
+    )
+    assert (
+        "from research_agent.research_subagent.utils.learning import"
+        in workflow
+    )
+    assert "from research_agent.utils" not in workflow

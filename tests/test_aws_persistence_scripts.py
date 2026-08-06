@@ -226,13 +226,13 @@ def test_download_prefix_rejects_destination_resolved_outside_root(
 def test_aws_entrypoint_restores_guarded_snapshot_before_exec() -> None:
     source = (PROJECT_ROOT / "entrypoint.sh").read_text(encoding="utf-8")
 
-    generic_startup = source.index("-m s3_storage startup")
-    guarded_restore = source.index("-m langgraph_snapshot restore")
+    generic_startup = source.index("-m research_agent.s3_storage startup")
+    guarded_restore = source.index("-m research_agent.langgraph_snapshot restore")
     application_exec = source.index('exec "$@"')
 
     assert generic_startup < guarded_restore < application_exec
-    assert "langgraph_snapshot restore ||" not in source
-    assert "-m langgraph_snapshot restore --write-receipt" in source
+    assert "research_agent.langgraph_snapshot restore ||" not in source
+    assert "-m research_agent.langgraph_snapshot restore --write-receipt" in source
 
 
 def test_aws_entrypoint_restore_failure_stops_application(tmp_path) -> None:
@@ -283,8 +283,8 @@ printf 'application-started\\n' >> "$CALL_LOG"
     calls = call_log.read_text(encoding="utf-8").splitlines()
     assert result.returncode == 23
     assert calls == [
-        "-m s3_storage startup",
-        "-m langgraph_snapshot restore --write-receipt",
+        "-m research_agent.s3_storage startup",
+        "-m research_agent.langgraph_snapshot restore --write-receipt",
     ]
 
 
@@ -390,8 +390,8 @@ printf 'application-started\\n' >> "$CALL_LOG"
 def test_manual_aws_sync_delegates_langgraph_state_to_guarded_cli() -> None:
     source = (PROJECT_ROOT / "sync-files-aws.sh").read_text(encoding="utf-8")
 
-    assert "-m langgraph_snapshot restore" in source
-    assert "-m langgraph_snapshot publish" in source
+    assert "-m research_agent.langgraph_snapshot restore" in source
+    assert "-m research_agent.langgraph_snapshot publish" in source
     assert "--source \"$PROJECT_ROOT/.langgraph_api\"" in source
     assert "--target \"$PROJECT_ROOT/.langgraph_api\"" in source
     for line in source.splitlines():
@@ -465,7 +465,7 @@ exit 0
     calls = call_log.read_text(encoding="utf-8")
     assert f"aws s3 sync {PROJECT_ROOT / 'docs'}" in calls
     assert (
-               "python -m langgraph_snapshot publish "
+               "python -m research_agent.langgraph_snapshot publish "
                f"--source {PROJECT_ROOT / '.langgraph_api'}"
            ) in calls
     assert "aws s3 sync" in calls
@@ -529,8 +529,8 @@ exit 0
 
     assert result.returncode == 0, result.stderr
     calls = call_log.read_text(encoding="utf-8")
-    assert "python -m langgraph_snapshot restore" in calls
-    assert "langgraph_snapshot publish" not in calls
+    assert "python -m research_agent.langgraph_snapshot restore" in calls
+    assert "research_agent.langgraph_snapshot publish" not in calls
     generic_calls = [
         line
         for line in calls.splitlines()
@@ -567,7 +567,7 @@ def test_aws_container_uses_frozen_uv_runtime() -> None:
             "boto3",
             "langgraph_api",
             "langgraph_runtime_inmem",
-            "langgraph_snapshot",
+            "research_agent.langgraph_snapshot",
     ):
         assert f"import {module}" in source
 

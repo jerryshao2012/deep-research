@@ -5,8 +5,8 @@ on:
     branches: [main]
     paths:
       - "research_agent/**"
-      - "agent.py"
-      - "model_factory.py"
+      - "research_agent/agent.py"
+      - "research_agent/model_factory.py"
       - "pyproject.toml"
   workflow_dispatch:  # Allow manual trigger.
 

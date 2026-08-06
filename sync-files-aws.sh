@@ -105,13 +105,13 @@ cd "$PROJECT_ROOT"
 
 if [[ "$MODE" != "upload" ]]; then
   download_generic_folders
-  "$PYTHON_BIN" -m langgraph_snapshot restore \
+  "$PYTHON_BIN" -m research_agent.langgraph_snapshot restore \
     --target "$PROJECT_ROOT/.langgraph_api"
 fi
 
 if [[ "$MODE" != "download" ]]; then
   upload_generic_folders
-  "$PYTHON_BIN" -m langgraph_snapshot publish \
+  "$PYTHON_BIN" -m research_agent.langgraph_snapshot publish \
     --source "$PROJECT_ROOT/.langgraph_api"
 fi
 

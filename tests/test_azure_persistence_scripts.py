@@ -121,6 +121,13 @@ def test_generic_azure_sync_includes_langgraph_state(monkeypatch) -> None:
     ]
 
 
+def test_azure_entrypoint_uses_packaged_storage_cli() -> None:
+    source = (PROJECT_ROOT / "entrypoint.sh").read_text(encoding="utf-8")
+
+    assert "python3 -m research_agent.azure_storage startup" in source
+    assert "python3 -m azure_storage startup" not in source
+
+
 @pytest.mark.parametrize(
     "environment_update",
     [

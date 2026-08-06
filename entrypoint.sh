@@ -104,12 +104,12 @@ echo "════════════════════════�
 cd "$PROJECT_ROOT"
 if $AWS_MODE; then
     echo "📥 Downloading generic application files..."
-    python3 -m s3_storage startup
+    python3 -m research_agent.s3_storage startup
     echo "📥 Restoring guarded LangGraph snapshot..."
-    python3 -m langgraph_snapshot restore --write-receipt
+    python3 -m research_agent.langgraph_snapshot restore --write-receipt
 elif $AZURE_BLOB_MODE; then
     echo "📥 Downloading generic application files from Azure Blob Storage..."
-    python3 -m azure_storage startup
+    python3 -m research_agent.azure_storage startup
 fi
 
 # Execute the passed command (e.g., langgraph dev)

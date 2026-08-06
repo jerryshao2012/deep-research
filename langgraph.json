@@ -3,13 +3,13 @@
     "."
   ],
   "graphs": {
-    "research": "./agent.py:agent"
+    "research": "./research_agent/agent.py:agent"
   },
   "env": ".env",
   "http": {
     "app": "./webapp/__init__.py:app"
   },
   "auth": {
-    "path": "./auth.py:auth"
+    "path": "./research_agent/auth.py:auth"
   }
 }
