@@ -7,6 +7,7 @@ import importlib.util
 import json
 from pathlib import Path
 
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 APPLICATION_FILES = {
@@ -37,6 +38,128 @@ RESEARCHER_ENTRIES = (
     "resume",
     "utils",
 )
+ACTIVE_PYTHON_PATHS = (
+    ROOT / "research_agent",
+    ROOT / "webapp",
+    ROOT / "thread_wiki",
+    ROOT / "tests",
+    ROOT / ".deepagents" / "skills",
+    ROOT / "scripts",
+    ROOT / "increment_version.py",
+    ROOT / "migrate_sqlite_to_cosmos.py",
+)
+LEGACY_ROOT_MODULES = {
+    "agent",
+    "auth",
+    "azure_storage",
+    "db",
+    "db_sql",
+    "langgraph_snapshot",
+    "logger_utils",
+    "model_factory",
+    "research_agent_cli",
+    "retry_utils",
+    "s3_storage",
+    "server",
+    "utils",
+}
+LEGACY_RESEARCHER_PREFIXES = {
+    "research_agent.prompts",
+    "research_agent.tools",
+    "research_agent.clarification",
+    "research_agent.resume",
+    "research_agent.utils",
+}
+
+
+def _is_legacy_import(module: str) -> bool:
+    root_module = module.partition(".")[0]
+    return root_module in LEGACY_ROOT_MODULES or any(
+        module == prefix or module.startswith(f"{prefix}.")
+        for prefix in LEGACY_RESEARCHER_PREFIXES
+    )
+
+
+def _python_sources() -> list[Path]:
+    sources: list[Path] = []
+    for path in ACTIVE_PYTHON_PATHS:
+        if path.is_file():
+            sources.append(path)
+        else:
+            sources.extend(path.rglob("*.py"))
+    return sorted(sources)
+
+
+def _legacy_imports_in_source(source: str, display_path: Path) -> list[str]:
+    tree = ast.parse(source, filename=str(display_path))
+    findings: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            modules = (alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            modules = (
+                (node.module,)
+                if _is_legacy_import(node.module)
+                else tuple(f"{node.module}.{alias.name}" for alias in node.names)
+            )
+        else:
+            continue
+
+        findings.extend(
+            f"{display_path}:{node.lineno}: {module}"
+            for module in modules
+            if _is_legacy_import(module)
+        )
+    return findings
+
+
+def _legacy_imports_in(path: Path) -> list[str]:
+    return _legacy_imports_in_source(
+        path.read_text(encoding="utf-8"), path.relative_to(ROOT)
+    )
+
+
+def test_active_python_sources_include_maintained_executables() -> None:
+    expected = {
+        ROOT / "increment_version.py",
+        ROOT / "migrate_sqlite_to_cosmos.py",
+        *(ROOT / "scripts").rglob("*.py"),
+    }
+
+    assert expected <= set(_python_sources())
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        (
+            "from research_agent import prompts as p\n",
+            ["fixture.py:1: research_agent.prompts"],
+        ),
+        (
+            "from research_agent import db, prompts as p, tools\n",
+            [
+                "fixture.py:1: research_agent.prompts",
+                "fixture.py:1: research_agent.tools",
+            ],
+        ),
+        ("from research_agent import cli_utils as utils\n", []),
+        ("from model_factory import get_model\n", ["fixture.py:1: model_factory"]),
+        ("import json, server\n", ["fixture.py:1: server"]),
+    ],
+)
+def test_legacy_import_extraction(source: str, expected: list[str]) -> None:
+    assert _legacy_imports_in_source(source, Path("fixture.py")) == expected
+
+
+def test_python_sources_do_not_use_legacy_imports() -> None:
+    findings = [
+        finding
+        for path in _python_sources()
+        for finding in _legacy_imports_in(path)
+    ]
+
+    assert findings == []
 
 
 def test_application_modules_live_in_package() -> None:
