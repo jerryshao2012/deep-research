@@ -226,6 +226,9 @@ base_dir = Path(__file__).resolve().parent.parent.parent.parent
 
 # research_agent/research_subagent/utils/knowledge_filesystem.py
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+
+# research_agent/research_subagent/utils/text_search.py (temporary until Task 2)
+_sys.path.insert(0, str(_Path(__file__).resolve().parent.parent.parent.parent))
 ```
 
 For `text_search.py`, remove temporary `sys.path` mutation and import canonical
@@ -235,8 +238,8 @@ factory directly once Task 2 creates it:
 from research_agent.model_factory import create_embedding_model
 ```
 
-Until Task 2, keep existing model import block working; complete its canonical
-rewrite in Task 2.
+Until Task 2, keep existing model import block working with corrected temporary
+root depth; complete its canonical rewrite in Task 2.
 
 - [ ] **Step 7: Run focused nested-package tests**
 
