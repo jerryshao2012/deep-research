@@ -28,7 +28,7 @@ The suite does not use pytest markers to separate layers; select files directly.
 | Integration and mixed tests | Boundaries between components, file formats, persistence, or external adapters | `tests/test_code_ingestion_integration.py`, `tests/test_document_upload_api.py`, `tests/test_tools.py` |
 | End-to-end tests | Complete CLI or agent workflows and their output contracts | `tests/test_research_agent_cli_e2e.py` |
 
-`tests/test_tools.py` is not an offline-fast suite. It imports `agent.py`, so collection initializes the configured model, and it contains unskipped tests that make real HTTP requests to valid and invalid public URLs; configure a supported model provider and allow outbound DNS/HTTPS before running the whole file.
+`tests/test_tools.py` is not an offline-fast suite. It imports `research_agent.agent`, so collection initializes the configured model, and it contains unskipped tests that make real HTTP requests to valid and invalid public URLs; configure a supported model provider and allow outbound DNS/HTTPS before running the whole file.
 
 Start with one test or file, then run the related layer. This offline-safe focused example requires neither model credentials nor network access:
 
@@ -89,7 +89,7 @@ uv run mypy research_agent
 
 ## Compare golden-dataset runs
 
-Golden-dataset regression tracking belongs to the scoring script, not `research_agent_cli.py`. Inspect its current interface first:
+Golden-dataset regression tracking belongs to the scoring script, not the `research_agent.cli` module. Inspect its current interface first:
 
 ```bash
 uv run python .deepagents/skills/golden-dataset/scripts/score_dataset.py --help

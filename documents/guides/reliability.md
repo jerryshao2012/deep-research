@@ -8,7 +8,7 @@ Configure a working model provider first, then obtain that deployment's current 
 
 ## Shape traffic proactively
 
-Every model created by `model_factory.py` is wrapped by the reliability layer. For asynchronous `ainvoke` calls, proactive shaping runs only when both `MODEL_TPM` and `MODEL_RPM` are positive.
+Every model created by `research_agent/model_factory.py` is wrapped by the reliability layer. For asynchronous `ainvoke` calls, proactive shaping runs only when both `MODEL_TPM` and `MODEL_RPM` are positive.
 
 ```dotenv
 MODEL_TPM=120000
@@ -53,7 +53,7 @@ With defaults, nominal waits are 1, 2, 4, 8, and 16 seconds; jitter can shorten 
 
 Non-matching exceptions are raised immediately. Azure content-filter errors are explicitly excluded because repeating the same request is not expected to make it acceptable; other provider errors are only retried when their message matches a configured indicator.
 
-Configuration is read when `retry_utils.py` is imported. Restart the CLI or server after changing environment values.
+Configuration is read when `research_agent/retry_utils.py` is imported. Restart the CLI or server after changing environment values.
 
 ## Choose a tuning profile
 

@@ -1,6 +1,6 @@
 # Validate prompt changes
 
-Use this guide to understand and run the executable contracts in `tests/test_prompts_validation.py`. It is for contributors changing orchestration, researcher, delegation, or report-writing instructions in `research_agent/prompts.py`.
+Use this guide to understand and run the executable contracts in `tests/test_prompts_validation.py`. It is for contributors changing orchestration, researcher, delegation, or report-writing instructions in `research_agent/research_subagent/prompts.py`.
 
 ## Run the prompt contract
 

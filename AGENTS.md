@@ -17,13 +17,13 @@ export MODEL_NAME=glm-4.7-flash:latest    # or: claude-3-5-sonnet, gpt-4, etc.
 ### Run Research
 ```bash
 # Basic research query
-uv run python research_agent_cli.py "What is quantum computing?"
+uv run python -m research_agent.cli "What is quantum computing?"
 
 # With documents context and specific skill
-uv run python research_agent_cli.py "Topic" --doc-folder ./docs --skill golden-dataset
+uv run python -m research_agent.cli "Topic" --doc-folder ./docs --skill golden-dataset
 
-# Track evaluation baseline for regression testing
-uv run python research_agent_cli.py "Topic" --skill golden-dataset --eval-golden-dataset --eval-mode baseline
+# Generate a golden dataset for later regression scoring
+uv run python -m research_agent.cli "Topic" --skill golden-dataset
 ```
 
 ### Interactive Development
@@ -43,31 +43,37 @@ Deployment guides: [Azure](documents/deployment/azure/README.md), [AWS](document
 
 | Component | Purpose | Key File |
 |-----------|---------|----------|
-| **Orchestration** | Core graph, research state, middleware, and sub-agent delegation | [agent.py](agent.py) |
-| **CLI Interface** | Standalone research execution, skills, evaluation tracking, and SSL options | [research_agent_cli.py](research_agent_cli.py) |
+| **Orchestration** | Core graph, research state, middleware, and sub-agent delegation | [research_agent/agent.py](research_agent/agent.py) |
+| **CLI Interface** | Standalone research execution, skills, evaluation tracking, and SSL options | [research_agent/cli.py](research_agent/cli.py) |
 | **Web API** | FastAPI app factory for document uploads, OAuth/SSO, wiki routes, and LangGraph custom routes | [webapp/__init__.py](webapp/__init__.py) |
-| **Tools** | Web search (Tavily), file I/O, thinking/reflection | [research_agent/tools.py](research_agent/tools.py) |
-| **Prompts** | System instructions for researcher agent | [research_agent/prompts.py](research_agent/prompts.py) |
+| **Tools** | Source definitions for web, reflection, file, and wiki tools; runtime assignment is owned by application graph | [research_agent/research_subagent/tools.py](research_agent/research_subagent/tools.py) |
+| **Prompts** | System instructions for orchestration and delegated research | [research_agent/research_subagent/prompts.py](research_agent/research_subagent/prompts.py) |
 | **Skills** | Pluggable output formatters and capabilities | [.deepagents/skills/](.deepagents/skills/) |
-| **Model Config** | Multi-provider model abstraction | [model_factory.py](model_factory.py) |
+| **Model Config** | Multi-provider model abstraction | [research_agent/model_factory.py](research_agent/model_factory.py) |
 | **Tests** | 20+ test files (unit, integration, E2E) | [tests/](tests/) |
 
 ### Entry Points
 
 | File | Role |
 |------|------|
-| [agent.py](agent.py) | Core agent graph. Defines `ResearchState`, `ResearchStateMiddleware`, and the `agent` graph. Middleware injects document folder, skill, wiki context, and cited responses before each turn. Referenced by `langgraph.json`. |
-| [research_agent_cli.py](research_agent_cli.py) | Standalone CLI for research without the server. Supports `--doc-folder`, `--skill`, evaluation tracking, and SSL customization. |
+| [research_agent/agent.py](research_agent/agent.py) | Core application graph. Defines `ResearchState`, `ResearchStateMiddleware`, and the `agent` graph. Middleware injects document folder, skill, wiki context, and cited responses before each turn. Referenced by `langgraph.json`. |
+| [research_agent/cli.py](research_agent/cli.py) | Packaged standalone CLI for research without the server. Supports `--doc-folder`, `--skill`, evaluation tracking, and SSL customization. Run with `python -m research_agent.cli`. |
 | [webapp/__init__.py](webapp/__init__.py) | FastAPI app factory for the Document Upload API. Configures CORS, OAuth sessions, wiki routes, and document endpoints. |
-| [server.py](server.py) | **Deprecated.** Custom LangGraph Platform server, replaced by `langgraph dev`; retained for reference. |
-| [run.py](run.py) | **Deprecated.** Thin `server:app` launcher, replaced by `langgraph dev`; retained for reference. |
+| [research_agent/server.py](research_agent/server.py) | **Deprecated.** Packaged custom LangGraph Platform server, replaced by `langgraph dev`; retained for compatibility. |
+| [research_agent/run.py](research_agent/run.py) | **Deprecated.** Packaged thin server launcher, replaced by `langgraph dev`; retained for compatibility. |
 
 ### Core Packages
 
-- **`research_agent/`** - Agent logic:
-  - `prompts.py` - `RESEARCH_WORKFLOW_INSTRUCTIONS`, `RESEARCHER_INSTRUCTIONS`, and `SUBAGENT_DELEGATION_INSTRUCTIONS`
-  - `tools.py` - `tavily_search`, `fetch_webpage_content`, `think_tool`, file I/O (`ls`, `glob`, `read_file`, `write_file`), and skill output rendering
-  - `utils/` - CLI helpers, web search, citation validation, knowledge filesystem, JSON utilities, FAISS retrieval, evaluation tracking, and dynamic skill discovery
+- **`research_agent/`** - Application package:
+  - `agent.py` - LangGraph composition, research state, middleware, delegation, and skill integration
+  - `cli.py` and `cli_utils.py` - packaged CLI and application-level CLI/SSL helpers
+  - `research_agent/model_factory.py`, `research_agent/auth.py`, `research_agent/db.py`, `research_agent/retry_utils.py`, and `research_agent/s3_storage.py` - model, identity, persistence, reliability, and storage adapters
+  - `research_subagent/` - researcher source package; source location is not runtime ownership:
+    - `prompts.py` - `RESEARCH_WORKFLOW_INSTRUCTIONS`, `RESEARCHER_INSTRUCTIONS`, and `SUBAGENT_DELEGATION_INSTRUCTIONS`
+    - `tools.py` - source definitions for `tavily_search`, `fetch_webpage_content`, `think_tool`, file I/O (`ls`, `glob`, `read_file`, `write_file`), and wiki access
+    - `utils/` - supporting web search, citation, filesystem, retrieval, skill, evaluation, and verification implementations consumed by application orchestration
+    - delegated `research-agent` runtime receives only `tavily_search`, `fetch_webpage_content`, and `think_tool`; application graph owns file/wiki tools plus evaluation and verification flow
+  - outer `__init__.py` remains lightweight; `research_subagent/__init__.py` owns the delegated researcher's public prompt and tool exports
 - **`.deepagents/skills/`** - Built-in skills. Each skill has a `SKILL.md` with YAML frontmatter and instruction body, and may bundle scripts or assets.
 - **`thread_wiki/`** - Thread-level document RAG without a vector database:
   - `service.py` - Wiki initialization, ingest, query, and lint operations
@@ -83,23 +89,23 @@ Deployment guides: [Azure](documents/deployment/azure/README.md), [AWS](document
 
 ### Infrastructure
 
-- [model_factory.py](model_factory.py) creates provider-specific LangChain chat and embedding models from environment variables. It supports Azure OpenAI with managed identity, Anthropic, Google Gemini, and Ollama.
-- [db.py](db.py) abstracts SQLite for development, PostgreSQL for production, and Cosmos DB for Azure production. It stores thread and run state.
-- [auth.py](auth.py) authenticates Agent Protocol requests with `LANGCHAIN_API_KEY` or OAuth session tokens. `langgraph.json` registers it as the auth module.
-- [retry_utils.py](retry_utils.py) tracks TPM/RPM quotas and applies exponential backoff to rate limits.
-- [s3_storage.py](s3_storage.py) provides S3-compatible document persistence.
+- [research_agent/model_factory.py](research_agent/model_factory.py) creates provider-specific LangChain chat and embedding models from environment variables. It supports Azure OpenAI with managed identity, Anthropic, Google Gemini, and Ollama.
+- [research_agent/db.py](research_agent/db.py) abstracts SQLite for development, PostgreSQL for production, and Cosmos DB for Azure production. It stores thread and run state.
+- [research_agent/auth.py](research_agent/auth.py) authenticates Agent Protocol requests with `LANGCHAIN_API_KEY` or OAuth session tokens. `langgraph.json` registers it as the auth module.
+- [research_agent/retry_utils.py](research_agent/retry_utils.py) tracks TPM/RPM quotas and applies exponential backoff to rate limits.
+- [research_agent/s3_storage.py](research_agent/s3_storage.py) provides S3-compatible document persistence.
 
 ### Data Flow
 
-1. Query enters through `research_agent_cli.py` or LangGraph Platform API served by `langgraph dev` from `langgraph.json`.
-2. `ResearchStateMiddleware` injects document folder, selected skill, wiki context, and prior cited responses.
-3. Researcher graph delegates with `create_deep_agent` and `SubAgent`, calls web/file/reflection tools, and synthesizes findings.
+1. Query enters through the `research_agent.cli` module or LangGraph Platform API served by `langgraph dev` from `langgraph.json`.
+2. `ResearchStateMiddleware` in the application package injects document folder, selected skill, wiki context, and prior cited responses.
+3. The application graph, built with `create_deep_agent`, delegates bounded web research to a `SubAgent` configured from `research_agent.research_subagent`; that sub-agent receives only Tavily search, page fetch, and reflection tools, while application graph retains file and wiki tools.
 4. If a skill is selected, `render_skill_output` passes synthesized result to skill pipeline.
 5. Output is written to `output/<thread_id>/`.
 
 ### Skills Runtime
 
-Skills are auto-discovered from `.deepagents/skills/<skill-name>/SKILL.md` and supported custom roots such as `docs/.deepagents/skills/` by `research_agent/utils/skill_registry.py`. Each `SKILL.md` contains YAML frontmatter (including `name` and `description`) plus instruction body; selected instructions are injected into researcher system prompt. Skills may bundle processing scripts or other assets. Existing skills include golden-dataset, interview, frontend-slides, study-slides, autoresearch-universal, code-generator, humanizer, and find-skills.
+Skills are auto-discovered from `.deepagents/skills/<skill-name>/SKILL.md` and supported custom roots such as `docs/.deepagents/skills/` by `research_agent/research_subagent/utils/skill_registry.py`. Each `SKILL.md` contains YAML frontmatter (including `name` and `description`) plus instruction body; selected instructions are injected into researcher system prompt. Skills may bundle processing scripts or other assets. Existing skills include golden-dataset, interview, frontend-slides, study-slides, autoresearch-universal, code-generator, humanizer, and find-skills.
 
 ### Testing Notes
 
@@ -112,7 +118,7 @@ Skills are auto-discovered from `.deepagents/skills/<skill-name>/SKILL.md` and s
 ### Key LangGraph Deviations
 
 - `webapp/__init__.py` uses `importlib.util` to load submodules by file path because LangGraph `load_custom_app` loads module without parent package context.
-- `agent.py` sends wiki queries through thread-pool executors inside running event loops and uses `asyncio.run()` otherwise.
+- `research_agent/agent.py` sends wiki queries through thread-pool executors inside running event loops and uses `asyncio.run()` otherwise.
 - `ResearchStateMiddleware` seeds filesystem state with research request and wiki context before agent decision step.
 
 ---
@@ -120,17 +126,17 @@ Skills are auto-discovered from `.deepagents/skills/<skill-name>/SKILL.md` and s
 ## Enhancing the Agent
 
 ### Modifying Research Behavior
-1. **System Prompts**: Edit [research_agent/prompts.py](research_agent/prompts.py)
+1. **System Prompts**: Edit [research_agent/research_subagent/prompts.py](research_agent/research_subagent/prompts.py)
    - `RESEARCH_WORKFLOW_INSTRUCTIONS` — high-level workflow guidance
    - `RESEARCHER_INSTRUCTIONS` — tool usage, delegation, hard limits
    - `SUBAGENT_DELEGATION_INSTRUCTIONS` — parallel research strategy
 
-2. **Tool Behavior**: Modify [research_agent/tools.py](research_agent/tools.py)
+2. **Tool Behavior**: Modify [research_agent/research_subagent/tools.py](research_agent/research_subagent/tools.py)
    - `tavily_search()` — web search behavior
    - `think_tool()` — reflection/strategic pausing
    - `fetch_webpage_content()` — page retrieval logic
 
-3. **Verification Loop**: The post-generation verification system ([research_agent/utils/verification.py](research_agent/utils/verification.py)) enables iterative report refinement:
+3. **Verification Loop**: Application middleware in `research_agent/agent.py` owns post-generation evaluation and revision, using implementations from [research_agent/research_subagent/utils/verification.py](research_agent/research_subagent/utils/verification.py):
    - **Citation grounding** — reuses `citation_validator.py` to check URL reachability and claim accuracy
    - **LLM-as-judge sufficiency** — evaluates whether the report fully answers the question
    - **Adversarial gap analysis** — devil's-advocate review to find missing perspectives
@@ -149,13 +155,13 @@ Skills are auto-discovered from `.deepagents/skills/<skill-name>/SKILL.md` and s
 1. Create directory: `.deepagents/skills/{skill-name}/` (built-in) or `docs/.deepagents/skills/{skill-name}/` (custom/uploaded).
 2. Add `SKILL.md` with YAML frontmatter (`name`, `description`, and optional metadata) followed by instructions.
 3. Add processing scripts or assets only when skill needs them.
-4. Let [research_agent/utils/skill_registry.py](research_agent/utils/skill_registry.py) discover the skill dynamically.
-5. Test via: `uv run python research_agent_cli.py "Topic" --skill {skill-name}`
+4. Let [research_agent/research_subagent/utils/skill_registry.py](research_agent/research_subagent/utils/skill_registry.py) discover the skill dynamically.
+5. Test via: `uv run python -m research_agent.cli "Topic" --skill {skill-name}`
 
 ### Integrating New Tools
-1. Add tool function to [research_agent/tools.py](research_agent/tools.py)
-2. Export from [research_agent/__init__.py](research_agent/__init__.py)
-3. Document in [research_agent/prompts.py](research_agent/prompts.py) `RESEARCHER_INSTRUCTIONS`
+1. Add tool function to [research_agent/research_subagent/tools.py](research_agent/research_subagent/tools.py)
+2. Export delegated-research public APIs from [research_agent/research_subagent/__init__.py](research_agent/research_subagent/__init__.py); keep outer [research_agent/__init__.py](research_agent/__init__.py) lightweight
+3. Document in [research_agent/research_subagent/prompts.py](research_agent/research_subagent/prompts.py) `RESEARCHER_INSTRUCTIONS`
 4. Add unit tests to [tests/](tests/) (follow [tests/conftest.py](tests/conftest.py) patterns)
 
 ---
@@ -199,18 +205,20 @@ uv run pytest tests/ --cov=research_agent --cov-report=html
 - **For bugs**: Write failing test first, then fix (Prove-It pattern)
 
 ### Golden Dataset Regression
-Track prompt improvements with automated regression testing:
+Generate a golden dataset with the packaged CLI, then use the scoring script's supported baseline/candidate workflow:
 ```bash
-# Baseline run (first time)
-uv run python research_agent_cli.py "AI Safety" --skill golden-dataset \
-  --eval-golden-dataset --eval-mode baseline
+# Generate the dataset
+uv run python -m research_agent.cli "AI Safety" --skill golden-dataset
 
-# Regression check (after changes)
-uv run python research_agent_cli.py "AI Safety" --skill golden-dataset \
-  --eval-golden-dataset --eval-mode baseline
+# Record a baseline
+uv run python .deepagents/skills/golden-dataset/scripts/score_dataset.py \
+  /path/to/golden-dataset.csv --output-dir ./output/golden-eval \
+  --eval-mode baseline
 
-# View evaluation history
-cat output/eval_history/server_runs.jsonl | tail -5
+# Compare a candidate
+uv run python .deepagents/skills/golden-dataset/scripts/score_dataset.py \
+  /path/to/golden-dataset.csv --output-dir ./output/golden-eval \
+  --eval-mode candidate
 ```
 
 ---
@@ -274,28 +282,29 @@ source ./secrets.sh                            # Load sensitive keys (not in git
 ### Debug a Research Query
 ```bash
 # Run with verbose output
-uv run python research_agent_cli.py "Your query" -v
+uv run python -m research_agent.cli "Your query" -v
 
 # Use LangSmith tracing
 export LANGCHAIN_API_KEY=<key>
 export LANGCHAIN_TRACING_V2=true
-uv run python research_agent_cli.py "Your query"
+uv run python -m research_agent.cli "Your query"
 # Then view at https://smith.langchain.com
 ```
 
-### Check Model Availability
+### Check Model Configuration and Connectivity
 ```bash
-uv run python model_factory.py
-# Lists: Ollama models, API key status, available providers
+uv run python -c "import asyncio, json; from webapp.model_diagnostics import run_model_diagnostics; print(json.dumps(asyncio.run(run_model_diagnostics()), indent=2))"
 ```
+
+This reports detected provider and masked configuration, attempts model construction, and sends a minimal connectivity prompt. It returns structured error details instead of claiming success when configuration or connectivity fails.
 
 ### Fix SSL Certificate Errors
 ```bash
 # For corporate environments
-uv run python research_agent_cli.py "Topic" --verify_ssl False
+uv run python -m research_agent.cli "Topic" --verify_ssl False
 
 # Or with custom CA bundle
-uv run python research_agent_cli.py "Topic" --ssl-ca-files /path/to/ca-bundle.pem
+uv run python -m research_agent.cli "Topic" --ssl-ca-files /path/to/ca-bundle.pem
 ```
 
 ### Run the FastAPI Upload Server
@@ -309,10 +318,7 @@ uv run python -m webapp
 ### Profile Agent Performance
 ```bash
 # Time individual components
-uv run python -m cProfile -s cumulative research_agent_cli.py "Quick Topic" | head -20
-
-# Check memory usage
-uv run python -m memory_profiler research_agent_cli.py "Topic"
+uv run python -m cProfile -s cumulative -m research_agent.cli "Quick Topic" | head -20
 ```
 
 ---
@@ -350,21 +356,22 @@ bash deploy-aws.sh  # Deploy to AWS App Runner
 **Python Modules**
 ```
 research_agent/
-├── __init__.py                    # Public API (tools, skills exports)
-├── prompts.py                     # System prompts & instructions
-├── tools.py                       # Tool implementations (search, thinking, file I/O)
-└── utils/                         # Utilities
-    ├── cli.py                     # CLI helpers
-    ├── citation_validator.py      # URL reachability + claim grounding
-    ├── content_extractors.py      # PDF/DOCX/PPTX/XLSX text extraction
-    ├── eval_tracking.py           # Metrics collection, baseline comparison
-    ├── json_utils.py              # Robust JSON parsing with repair
-    ├── knowledge_filesystem.py    # File I/O with safety limits
-    ├── learning.py                # Trend analysis from eval history
-    ├── skill_registry.py          # Dynamic skill discovery
-    ├── text_search.py             # Hybrid BM25+FAISS search index
-    ├── verification.py            # Post-generation adversarial verification
-    └── web_search.py              # Tavily search + webpage fetching
+├── __init__.py                    # Lightweight application-package marker
+├── agent.py                       # LangGraph composition and middleware
+├── cli.py                         # Packaged CLI entrypoint
+├── model_factory.py               # Chat and embedding model selection
+├── auth.py, db.py                 # Auth and persistence composition
+├── retry_utils.py, s3_storage.py  # Reliability and storage adapters
+└── research_subagent/             # Researcher source implementation
+    ├── __init__.py                # Researcher prompt/tool public API
+    ├── prompts.py                 # System prompts and instructions
+    ├── tools.py                   # Search, thinking, and file tools
+    ├── clarification/             # Requirement clarification behavior
+    ├── resume/                    # Incomplete-task resume behavior
+    └── utils/                     # Support code; application owns runtime lifecycle
+
+webapp/                            # Independent custom FastAPI package
+thread_wiki/                       # Independent per-thread knowledge package
 
 .deepagents/skills/                # Built-in output formatters and capabilities
 ├── golden-dataset/
@@ -420,10 +427,10 @@ Follow root [copilot-instructions.md](../.github/copilot-instructions.md):
 |-------|----------|
 | `ModuleNotFoundError: deepagents` | Run `uv sync` to install dependencies; activate `.venv/` |
 | `TAVILY_API_KEY not set` | Export before running: `export TAVILY_API_KEY=...` |
-| `Model not available` | Check `uv run python model_factory.py`; ensure Ollama running or API key valid |
+| `Model not available` | Run [model configuration and connectivity diagnostics](#check-model-configuration-and-connectivity); inspect provider detection, model construction, and test-request errors |
 | `Rate limit exceeded` | Increase `MODEL_TPM` / `MODEL_RPM` or wait before retrying |
-| `File path errors in tools` | Use `normalize_path_for_filesystem_tools()` helper (in [research_agent/utils/](research_agent/utils/)) |
-| `Golden dataset not recorded` | Ensure `--eval-golden-dataset --eval-mode baseline` flags; check `output/eval_history/` |
+| `File path errors in tools` | Use `normalize_path_for_filesystem_tools()` in [research_agent/research_subagent/utils/knowledge_filesystem.py](research_agent/research_subagent/utils/knowledge_filesystem.py) |
+| `Golden dataset baseline not recorded` | Run the golden-dataset scoring script with `--eval-mode baseline`; check its configured output directory |
 | `Verification loop not triggering` | Check `ENABLE_VERIFICATION=true` and `/final_report.md` exists in state files |
 | `Verification adds too much latency` | Reduce `MAX_VERIFICATION_ROUNDS` to 1; set `ENABLE_VERIFICATION=false` to disable |
 | `Docker build fails on Windows` | Use WSL2; upgrade `uv` to ≥0.5.0 in Dockerfile |
@@ -462,8 +469,8 @@ When enhancing this agent:
 2. **Read [prompt validation](documents/development/prompt-validation.md)** for prompt validation guidelines
 3. **Read [extending the agent](documents/development/extending-the-agent.md#change-orchestration-prompts)** for prompt enhancement guidelines
 4. **Read [Document Upload API](documents/api/upload.md)** for upload API documentation
-5. **Check [agent.py](agent.py)** to understand orchestration logic
-6. **Review [research_agent/prompts.py](research_agent/prompts.py)** for current instructions
+5. **Check [research_agent/agent.py](research_agent/agent.py)** to understand application orchestration
+6. **Review [research_agent/research_subagent/prompts.py](research_agent/research_subagent/prompts.py)** for current orchestrator and delegated-research instructions
 7. **Write tests first** (see [tests/conftest.py](tests/conftest.py) for fixtures)
 8. **Run validation**: `uv run pytest tests/test_prompts_validation.py -v`
 9. **Test end-to-end**: `uv run pytest tests/test_research_agent_cli_e2e.py -v`

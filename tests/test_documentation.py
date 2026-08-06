@@ -14,6 +14,33 @@ HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*#*\s*$", re.MULTILINE)
 FENCE_RE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})(.*)$")
 PLAIN_TEXT_NAMES = {".dockerignore", ".env.example", ".gitignore", "AGENTS.md", "CLAUDE.md"}
 LEGACY_PATHS = ("document" + "/", "docs" + "/superpowers/")
+MAINTAINED_SOURCE_DOCS = (
+    ROOT / "README.md",
+    ROOT / "AGENTS.md",
+    *(
+        path
+        for section in (
+            "api",
+            "architecture",
+            "deployment",
+            "development",
+            "getting-started",
+            "guides",
+        )
+        for path in sorted((DOCUMENTS / section).rglob("*.md"))
+    ),
+)
+LEGACY_SOURCE_DOC_PATTERNS = (
+    r"research_agent_cli\.py",
+    r"uv run python -m research_agent\.model_factory",
+    r"uv run python (?:\./)?model_factory\.py",
+    r"`(?:\./)?model_factory\.py`",
+    r"research_agent/(?:tools|prompts|utils)(?:/|\.py)",
+    r"research_agent\.(?:tools|prompts|utils)(?:\.|\b)",
+    r"\[(?:agent|auth|model_factory|server|run)\.py\]"
+    r"\((?:agent|auth|model_factory|server|run)\.py\)",
+    r"\bmemory_profiler\b",
+)
 
 
 def _markdown_files() -> list[Path]:
@@ -213,3 +240,20 @@ def test_legacy_documentation_paths_are_absent() -> None:
 
 def test_documents_have_no_duplicate_copy_names() -> None:
     assert not list(DOCUMENTS.rglob("* 2.md"))
+
+
+def test_maintained_source_docs_use_packaged_architecture() -> None:
+    failures: list[str] = []
+    for path in MAINTAINED_SOURCE_DOCS:
+        text = path.read_text(encoding="utf-8")
+        for pattern in LEGACY_SOURCE_DOC_PATTERNS:
+            match = re.search(pattern, text)
+            if match:
+                failures.append(f"{path.relative_to(ROOT)}: {match.group(0)}")
+    assert not failures, "\n".join(failures)
+
+
+def test_maintained_source_docs_cover_current_deployment_guides() -> None:
+    deployment_guides = set((DOCUMENTS / "deployment").rglob("*.md"))
+    assert deployment_guides <= set(MAINTAINED_SOURCE_DOCS)
+    assert not any(HISTORY in path.parents for path in MAINTAINED_SOURCE_DOCS)

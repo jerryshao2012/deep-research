@@ -88,7 +88,7 @@ curl -X DELETE -H "X-API-Key: ${DEEP_RESEARCH_API_KEY}" \
 For CLI research, upload sources to a project folder and pass that folder to the agent:
 
 ```bash
-uv run python research_agent_cli.py 'Summarize policy changes' --doc-folder ./docs/policy
+uv run python -m research_agent.cli 'Summarize policy changes' --doc-folder ./docs/policy
 ```
 
 For Thread Wiki, upload to `threads/<thread-id>`:

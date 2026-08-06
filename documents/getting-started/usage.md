@@ -7,7 +7,7 @@ Run research through the command-line interface or the LangGraph server. Use the
 Pass a subject directly:
 
 ```bash
-uv run python research_agent_cli.py "Research AI agents"
+uv run python -m research_agent.cli "Research AI agents"
 ```
 
 The CLI prints the run's thread ID and saves its report beneath `output/`.
@@ -33,31 +33,31 @@ The CLI prints the run's thread ID and saves its report beneath `output/`.
 Generate study slides from a document folder:
 
 ```bash
-uv run python research_agent_cli.py "Research AI agents" --doc-folder /path/to/documents --skill study-slides
+uv run python -m research_agent.cli "Research AI agents" --doc-folder /path/to/documents --skill study-slides
 ```
 
 Generate an interview question kit:
 
 ```bash
-uv run python research_agent_cli.py "Research AI agents" --doc-folder /path/to/documents --skill interview
+uv run python -m research_agent.cli "Research AI agents" --doc-folder /path/to/documents --skill interview
 ```
 
 Prepare a longer interview with questions and answers:
 
 ```bash
-uv run python research_agent_cli.py "Prepare a 60-minute interview with questions and answers" --doc-folder /path/to/interview_material --skill interview-coach-pro
+uv run python -m research_agent.cli "Prepare a 60-minute interview with questions and answers" --doc-folder /path/to/interview_material --skill interview-coach-pro
 ```
 
 Generate a golden dataset grounded in supplied documents:
 
 ```bash
-uv run python research_agent_cli.py "Generate 20 question-answer pairs from the provided documents" --doc-folder /path/to/policy_documents --skill golden-dataset
+uv run python -m research_agent.cli "Generate 20 question-answer pairs from the provided documents" --doc-folder /path/to/policy_documents --skill golden-dataset
 ```
 
 Generate code from a subject file:
 
 ```bash
-uv run python research_agent_cli.py --subject-file /path/to/coding-task.txt --skill code-generator
+uv run python -m research_agent.cli --subject-file /path/to/coding-task.txt --skill code-generator
 ```
 
 For browser-based skill selection, see [Use skills in the UI](../guides/skills.md).
@@ -67,19 +67,19 @@ For browser-based skill selection, see [Use skills in the UI](../guides/skills.m
 Use only local documents, with no web search:
 
 ```bash
-uv run python research_agent_cli.py "Research AI agents" --doc-folder /path/to/documents --no-web
+uv run python -m research_agent.cli "Research AI agents" --doc-folder /path/to/documents --no-web
 ```
 
 Read the subject from a file and reuse a known thread:
 
 ```bash
-uv run python research_agent_cli.py --subject-file /path/to/research-subject.txt --doc-folder /path/to/documents --thread-id my-research-thread
+uv run python -m research_agent.cli --subject-file /path/to/research-subject.txt --doc-folder /path/to/documents --thread-id my-research-thread
 ```
 
 List the currently installed structured output skills:
 
 ```bash
-uv run python research_agent_cli.py --skill list
+uv run python -m research_agent.cli --skill list
 ```
 
 For notebook-based exploration, run:

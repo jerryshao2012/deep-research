@@ -45,13 +45,13 @@ export TAVILY_API_KEY=your_tavily_api_key_here
 Keep real credentials in an ignored `.env` file or a secret manager. Run a first query:
 
 ```bash
-uv run python research_agent_cli.py "What is quantum computing?"
+uv run python -m research_agent.cli "What is quantum computing?"
 ```
 
 For a local-model run without Tavily:
 
 ```bash
-uv run python research_agent_cli.py \
+uv run python -m research_agent.cli \
   "Summarize the purpose of deep research" --no-web
 ```
 
@@ -62,7 +62,7 @@ Generated reports are written beneath `output/`. See [installation](documents/ge
 Run a document-backed CLI task:
 
 ```bash
-uv run python research_agent_cli.py \
+uv run python -m research_agent.cli \
   "Summarize the supplied material" \
   --doc-folder /path/to/documents
 ```
@@ -70,7 +70,7 @@ uv run python research_agent_cli.py \
 Apply an installed output skill:
 
 ```bash
-uv run python research_agent_cli.py \
+uv run python -m research_agent.cli \
   "Generate grounded question-answer pairs" \
   --doc-folder /path/to/documents \
   --skill golden-dataset
@@ -79,7 +79,7 @@ uv run python research_agent_cli.py \
 List current skill IDs:
 
 ```bash
-uv run python research_agent_cli.py --skill list
+uv run python -m research_agent.cli --skill list
 ```
 
 For browser-based skill selection and execution, see [Use skills in the UI](documents/guides/skills.md).
@@ -110,16 +110,15 @@ Choose the interface that matches the workflow:
 
 ## Architecture
 
-`agent.py` defines the research graph and state middleware. The graph plans work, delegates research units, gathers web or file context, synthesizes a report, and optionally evaluates and revises it.
+`research_agent/agent.py` defines the research graph and state middleware. The application graph plans work, assigns filesystem and wiki tools, delegates bounded web research to a web-only sub-agent, synthesizes a report, and owns evaluation and revision.
 
 | Area | Ownership |
 | --- | --- |
-| `research_agent/` | Prompts, tools, skills, retrieval, evaluation, and verification |
+| `research_agent/` | Application package: graph composition, runtime tool assignment, evaluation/verification flow, CLI, models, authentication, persistence, and reliability |
+| `research_agent/research_subagent/` | Source package for research prompts, tool definitions, and supporting utilities; delegated runtime receives only Tavily search, page fetch, and reflection |
 | `thread_wiki/` | Thread-scoped ingestion, knowledge generation, progress, and queries |
 | `webapp/` | Document Upload API, wiki routes, OAuth, sessions, and CORS |
-| `model_factory.py` | Chat and embedding model selection across providers |
-| `auth.py` | LangGraph authentication and request identity |
-| `db.py` | SQLite, PostgreSQL, and Cosmos DB persistence adapters |
+| `.deepagents/skills/` | Built-in output-skill definitions and supporting assets |
 
 Start with the [architecture overview](documents/architecture/overview.md). Boundary rules live in [Clean Architecture](documents/architecture/clean-architecture.md), and AST-aware repository processing is covered by [code ingestion](documents/architecture/code-ingestion.md).
 

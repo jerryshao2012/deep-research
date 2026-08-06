@@ -10,7 +10,7 @@ At minimum, configure one supported chat-model provider. Web-enabled research al
 
 ## Configure a model provider
 
-`model_factory.py` selects the first complete configuration in this order: AWS Bedrock-compatible endpoint, Azure OpenAI with an explicit API version, Azure OpenAI without an API version, Google, Anthropic, then Ollama. `MODEL_NAME` has no implicit runtime default and is required for AWS, Google, Anthropic, and Ollama.
+`research_agent/model_factory.py` selects the first complete configuration in this order: AWS Bedrock-compatible endpoint, Azure OpenAI with an explicit API version, Azure OpenAI without an API version, Google, Anthropic, then Ollama. `MODEL_NAME` has no implicit runtime default and is required for AWS, Google, Anthropic, and Ollama.
 
 | Provider | Required variables | Notes |
 | --- | --- | --- |

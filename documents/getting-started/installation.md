@@ -108,13 +108,13 @@ The CLI, agent, and Document Upload server load the root `.env` file automatical
 Run a small web-enabled query:
 
 ```bash
-uv run python research_agent_cli.py "What is quantum computing?"
+uv run python -m research_agent.cli "What is quantum computing?"
 ```
 
 Or verify a local-model setup without Tavily:
 
 ```bash
-uv run python research_agent_cli.py "Summarize the purpose of deep research" --no-web
+uv run python -m research_agent.cli "Summarize the purpose of deep research" --no-web
 ```
 
 A successful run prints its thread ID and writes the generated report beneath `output/`. Continue with the [usage guide](usage.md) for document-backed tasks, output skills, and server modes.

@@ -10,7 +10,7 @@ From the repository root, run:
 uv run langgraph dev
 ```
 
-`langgraph.json` loads `.env`, exposes the `research` assistant from `agent.py`, and mounts the custom FastAPI application from `webapp`. LangGraph opens Studio in a browser; use the deployment URL printed in the terminal and assistant ID `research` when connecting another client.
+`langgraph.json` loads `.env`, exposes the `research` assistant from `research_agent/agent.py`, and mounts the custom FastAPI application from top-level `webapp`. LangGraph opens Studio in a browser; use the deployment URL printed in the terminal and assistant ID `research` when connecting another client.
 
 See [usage](usage.md#run-the-langgraph-server) for the request workflow.
 
@@ -83,7 +83,7 @@ For research requests, prefer the corporate PEM CA bundle:
 
 ```bash
 export SSL_CERT_FILE=/path/to/ca-bundle.pem
-uv run python research_agent_cli.py "Research topic"
+uv run python -m research_agent.cli "Research topic"
 ```
 
 In PowerShell, set `$env:SSL_CERT_FILE = "C:\path\to\ca-bundle.pem"` before running the same CLI command.
@@ -91,7 +91,7 @@ In PowerShell, set `$env:SSL_CERT_FILE = "C:\path\to\ca-bundle.pem"` before runn
 For temporary local diagnosis only, SSL verification can be disabled:
 
 ```bash
-uv run python research_agent_cli.py "Research topic" --verify_ssl False
+uv run python -m research_agent.cli "Research topic" --verify_ssl False
 ```
 
 Use `pip install uv` if the standalone `uv` installer is blocked. See [installation](installation.md#check-prerequisites) for that setup path.

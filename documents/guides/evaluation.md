@@ -17,7 +17,7 @@ Hold non-experimental factors such as input, model, and relevant configuration s
 | Operational tracking | Agent middleware plus `ENABLE_EVAL_TRACKING` | Append facts from diverse server runs without baseline comparison. |
 | Report verification | Agent middleware plus `ENABLE_VERIFICATION` | Ground citations, judge sufficiency, find gaps, and request revision. |
 
-The main `research_agent_cli.py` no longer accepts `--eval-golden-dataset`, `--eval-mode`, or `--eval-history-file`. Generate a golden dataset with that CLI if needed, then use the scoring script for its supported baseline/candidate workflow.
+The `research_agent.cli` module does not accept `--eval-golden-dataset`, `--eval-mode`, or `--eval-history-file`. Generate a golden dataset with that CLI if needed, then use the scoring script for its supported baseline/candidate workflow.
 
 ## Compare a golden-dataset baseline and candidate
 

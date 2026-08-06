@@ -30,7 +30,7 @@ Architecture policy keeps domain and application layers independent from FastAPI
 | `documents` | Upload, extraction, source lifecycle |
 | `skills` | Discovery, validation, installation, removal |
 
-Deployable composition remains split: `webapp` composes custom FastAPI, `../../agent.py` composes LangGraph, and `../../model_factory.py` selects model and checkpoint adapters. Deprecated `../../server.py` is not the production server entrypoint, but it is not consumer-free: active wiki authentication dynamically imports `server.get_current_user`, and compatibility tests still exercise the module. Removing that dependency is an intended migration follow-up.
+Deployable composition remains split. Top-level [`webapp`](../../webapp/) composes custom FastAPI, the application package's [`research_agent/agent.py`](../../research_agent/agent.py) composes LangGraph, and [`research_agent/model_factory.py`](../../research_agent/model_factory.py) selects model and checkpoint adapters. Top-level [`thread_wiki`](../../thread_wiki/) remains an independent package consumed by those entry surfaces. Deprecated [`research_agent/server.py`](../../research_agent/server.py) is not the production server entrypoint, but it is not consumer-free: active wiki authentication dynamically imports `research_agent.server.get_current_user`, and compatibility tests still exercise the module. Removing that dependency is an intended migration follow-up.
 
 ## Read the migration boundary map
 
@@ -50,9 +50,9 @@ This map describes implemented ports and intended seams, not a claim that all ru
 
 ## Preserve compatibility
 
-HTTP paths, request and response bodies, cookies, SSE event shapes, authentication headers, and persisted formats remain stable during extraction. Typed application errors map back to current wire responses at interface adapters. `../../contracts/custom-api.openapi.json` snapshots active route shapes, but runtime route code and tests remain authoritative for authentication and error responses omitted from that snapshot.
+HTTP paths, request and response bodies, cookies, SSE event shapes, authentication headers, and persisted formats remain stable during extraction. Typed application errors map back to current wire responses at interface adapters. [`contracts/custom-api.openapi.json`](../../contracts/custom-api.openapi.json) snapshots active route shapes, but runtime route code and tests remain authoritative for authentication and error responses omitted from that snapshot.
 
-Current compatibility gaps include direct concrete wiki service calls and the wiki authentication dependency on dynamically imported `server.get_current_user`. Treat those as explicit migration work; do not describe the target boundary as current runtime behavior.
+Current compatibility gaps include direct concrete wiki service calls and the wiki authentication dependency on dynamically imported `research_agent.server.get_current_user`. Treat those as explicit migration work; do not describe the target boundary as current runtime behavior.
 
 ## Enforce boundaries
 
