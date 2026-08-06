@@ -40,6 +40,7 @@ research_agent/
 ├── auth.py
 ├── azure_storage.py
 ├── cli.py
+├── cli_utils.py
 ├── db.py
 ├── db_sql.py
 ├── langgraph_snapshot.py
@@ -49,7 +50,6 @@ research_agent/
 ├── run.py
 ├── s3_storage.py
 ├── server.py
-├── utils.py
 └── research_subagent/
     ├── __init__.py
     ├── prompts.py
@@ -84,7 +84,7 @@ graph, models, database clients, or other environment-dependent objects.
 | `run.py` | `research_agent/run.py` |
 | `s3_storage.py` | `research_agent/s3_storage.py` |
 | `server.py` | `research_agent/server.py` |
-| `utils.py` | `research_agent/utils.py` |
+| `utils.py` | `research_agent/cli_utils.py` |
 | `research_agent/**` | `research_agent/research_subagent/**` |
 
 Moves should retain Git rename history. Content changes during relocation are
@@ -105,6 +105,12 @@ paths required by new layout.
   deprecation wrappers preserve old paths.
 - Imports such as `research_agent.tools` and root imports such as
   `from model_factory import ...` are invalid after migration.
+- Root `utils.py` becomes `research_agent.cli_utils`, rather than
+  `research_agent.utils`, so old researcher path `research_agent.utils` cannot
+  silently resolve to unrelated application helpers.
+
+Preserving public symbols means preserving their behavior under canonical new
+module paths. It does not retain exports from old `research_agent` namespace.
 
 ## Entry Points and Execution Flow
 
