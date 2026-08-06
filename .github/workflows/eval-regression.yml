@@ -43,8 +43,8 @@ jobs:
           uv run python -c "
           import json, sys
           from pathlib import Path
-          from research_agent.utils.eval_tracking import load_jsonl, compare_records
-          from research_agent.utils.learning import compute_baseline_from_history
+          from research_agent.research_subagent.utils.eval_tracking import load_jsonl, compare_records
+          from research_agent.research_subagent.utils.learning import compute_baseline_from_history
 
           history_dir = Path('./output/eval_history/')
           records = load_jsonl(history_dir / 'golden_dataset_runs.jsonl')

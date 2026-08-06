@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from research_agent.utils.learning import (
+from research_agent.research_subagent.utils.learning import (
     _topic_bucket,
     analyze_eval_trends,
     compute_baseline_from_history,

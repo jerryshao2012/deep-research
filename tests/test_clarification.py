@@ -14,23 +14,23 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command
 from pydantic import ValidationError
 
-from research_agent.clarification.contracts import (
+from research_agent.research_subagent.clarification.contracts import (
     ClarificationAnswer,
     ClarificationBatch,
     ClarificationOption,
     ClarificationQuestion,
     ClarificationResponse,
 )
-from research_agent.clarification.middleware import (
+from research_agent.research_subagent.clarification.middleware import (
     configure_clarification_tools,
 )
-from research_agent.clarification.policy import (
+from research_agent.research_subagent.clarification.policy import (
     ClarificationMode,
     evaluate_clarification_policy,
 )
-from research_agent.clarification.tool import run_clarification
-from research_agent.clarification.use_case import complete_clarification
-from research_agent.prompts import RESEARCH_WORKFLOW_INSTRUCTIONS
+from research_agent.research_subagent.clarification.tool import run_clarification
+from research_agent.research_subagent.clarification.use_case import complete_clarification
+from research_agent.research_subagent.prompts import RESEARCH_WORKFLOW_INSTRUCTIONS
 
 
 def _question(

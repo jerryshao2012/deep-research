@@ -4,7 +4,7 @@ Domain contracts and policy stay independent from LangGraph. Framework
 adapters live in ``tool.py`` and ``middleware.py``.
 """
 
-from research_agent.clarification.contracts import (
+from research_agent.research_subagent.clarification.contracts import (
     ClarificationAnswer,
     ClarificationBatch,
     ClarificationOption,
@@ -13,12 +13,12 @@ from research_agent.clarification.contracts import (
     ClarificationResult,
     NormalizedRequirement,
 )
-from research_agent.clarification.policy import (
+from research_agent.research_subagent.clarification.policy import (
     ClarificationMode,
     ClarificationPolicyDecision,
     evaluate_clarification_policy,
 )
-from research_agent.clarification.use_case import complete_clarification
+from research_agent.research_subagent.clarification.use_case import complete_clarification
 
 __all__ = [
     "ClarificationAnswer",

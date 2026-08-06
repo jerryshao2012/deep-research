@@ -18,7 +18,7 @@ from langchain_core.tools import InjectedToolArg, tool
 from langgraph.prebuilt import InjectedState
 
 from logger_utils import setup_logger
-from research_agent.utils.knowledge_filesystem import (
+from research_agent.research_subagent.utils.knowledge_filesystem import (
     glob_impl,
     ls_impl,
     read_docs_folder_impl,
@@ -26,8 +26,8 @@ from research_agent.utils.knowledge_filesystem import (
     send_files_to_state,
     write_file_impl,
 )
-from research_agent.utils.skill_registry import get_skill_registry
-from research_agent.utils.web_search import (
+from research_agent.research_subagent.utils.skill_registry import get_skill_registry
+from research_agent.research_subagent.utils.web_search import (
     fetch_webpage_content_impl,
     tavily_search_impl,
 )
@@ -513,8 +513,8 @@ def llm_wiki_query(
             "No documents folder is configured for this session."
         )
 
-    # tools.py lives in research_agent/ — go up one level to project root.
-    base_dir = _resolve_wiki_base_dir(Path(__file__).resolve().parent.parent)
+    # tools.py lives in research_agent/research_subagent/ — go up to project root.
+    base_dir = _resolve_wiki_base_dir(Path(__file__).resolve().parent.parent.parent)
     paths = ThreadWikiPaths.resolve(thread_id, base_dir)
 
     if not paths.wiki_content.exists():

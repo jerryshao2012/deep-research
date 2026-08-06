@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from research_agent.clarification.contracts import (
+from research_agent.research_subagent.clarification.contracts import (
     ClarificationBatch,
     ClarificationResponse,
     ClarificationResult,

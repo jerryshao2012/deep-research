@@ -12,7 +12,7 @@ from pathlib import Path
 
 import yaml
 
-from research_agent.utils.skill_registry import SkillRegistry, get_skill_registry
+from research_agent.research_subagent.utils.skill_registry import SkillRegistry, get_skill_registry
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -92,7 +92,7 @@ def list_skills() -> None:
     """Print available research skills to console."""
     registry = get_skill_registry()
     print("\nAvailable research skills:")
-    base_dir = Path(__file__).resolve().parent.parent.parent
+    base_dir = Path(__file__).resolve().parent.parent.parent.parent
     for sid in sorted(registry.SKILL_IDS):
         skill_file = base_dir / ".deepagents" / "skills" / sid / "SKILL.md"
         if not skill_file.is_file():

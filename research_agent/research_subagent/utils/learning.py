@@ -17,7 +17,7 @@ from typing import Any
 
 from pathlib import Path
 
-from research_agent.utils.eval_tracking import load_jsonl
+from research_agent.research_subagent.utils.eval_tracking import load_jsonl
 
 logger = logging.getLogger(__name__)
 

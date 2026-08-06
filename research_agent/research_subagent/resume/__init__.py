@@ -1,10 +1,10 @@
 """Public resume policy API."""
 
-from research_agent.resume.middleware import (
+from research_agent.research_subagent.resume.middleware import (
     RESUME_INSTRUCTION,
     ResumeMiddleware,
 )
-from research_agent.resume.policy import (
+from research_agent.research_subagent.resume.policy import (
     ACCEPTED_RESUME_PHRASES,
     BASE_RESUME_PHRASES,
     DEFAULT_MAX_RESUME_ROUNDS,

@@ -11,13 +11,13 @@ from langchain_core.messages import ToolMessage
 from langchain_core.tools import tool
 from langgraph.types import Command, interrupt
 
-from research_agent.clarification.contracts import (
+from research_agent.research_subagent.clarification.contracts import (
     ClarificationBatch,
     ClarificationInterrupt,
     ClarificationQuestion,
     ClarificationResponse,
 )
-from research_agent.clarification.use_case import complete_clarification
+from research_agent.research_subagent.clarification.use_case import complete_clarification
 
 InterruptFunction = Callable[[dict[str, Any]], Any]
 

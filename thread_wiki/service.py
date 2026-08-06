@@ -35,7 +35,7 @@ from langchain_core.runnables import RunnableConfig
 from networkx.algorithms.community import louvain_communities
 
 from model_factory import get_configured_model
-from research_agent.utils.text_search import (
+from research_agent.research_subagent.utils.text_search import (
     load_or_build_search_index,
 )
 from .code_ingestion import (
@@ -384,7 +384,7 @@ def _extract_binary_source(file_path: Path) -> str:
     error message if extraction fails rather than raising.
     """
     try:
-        from research_agent.utils.content_extractors import extract_supported_document
+        from research_agent.research_subagent.utils.content_extractors import extract_supported_document
 
         return extract_supported_document(file_path)
     except ImportError:
@@ -555,7 +555,7 @@ def _chunk_large_source(raw_dir: Path, filename: str) -> list[dict] | None:
         return None  # Small enough — no chunking needed
 
     try:
-        from research_agent.utils.text_search import chunk_markdown_by_boundaries
+        from research_agent.research_subagent.utils.text_search import chunk_markdown_by_boundaries
     except ImportError:
         logger.warning("text_search module unavailable; cannot chunk %s", filename)
         return None

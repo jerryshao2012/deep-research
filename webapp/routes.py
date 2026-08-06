@@ -23,8 +23,8 @@ from fastapi import File, Form, Header, HTTPException, Request, UploadFile, stat
 from fastapi.responses import FileResponse, RedirectResponse
 
 import webapp.config as _cfg
-from research_agent.utils.content_extractors import extract_supported_document
-from research_agent.utils.skill_registry import get_skill_registry
+from research_agent.research_subagent.utils.content_extractors import extract_supported_document
+from research_agent.research_subagent.utils.skill_registry import get_skill_registry
 from webapp.auth_helpers import is_authenticated
 from webapp.features.threads.infrastructure import InMemoryThreadRepository
 from webapp.markdown_images import register_markdown_image_routes

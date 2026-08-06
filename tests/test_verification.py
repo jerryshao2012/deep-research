@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from research_agent.utils.verification import (
+from research_agent.research_subagent.utils.verification import (
     VerificationVerdict,
     _adversarial_gap_analysis,
     _check_report_sufficiency,
@@ -64,7 +64,7 @@ class TestFormatFeedback:
         assert "Missing counter-argument about X." in text
 
     def test_produces_xml_block_with_grounding_issues(self):
-        from research_agent.utils.citation_validator import ValidationResult
+        from research_agent.research_subagent.utils.citation_validator import ValidationResult
 
         verdict = VerificationVerdict(
             status="needs_revision",

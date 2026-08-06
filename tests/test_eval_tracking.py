@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from research_agent.utils.eval_tracking import (
+from research_agent.research_subagent.utils.eval_tracking import (
     append_jsonl,
     build_manifest,
     collect_run_metrics,

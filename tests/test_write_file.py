@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from research_agent.utils.knowledge_filesystem import write_file_impl
+from research_agent.research_subagent.utils.knowledge_filesystem import write_file_impl
 
 
 def test_write_file_basic():

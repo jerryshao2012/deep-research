@@ -38,17 +38,17 @@ from langgraph.config import get_config
 
 from logger_utils import setup_logger
 from model_factory import create_memory_saver, get_configured_model
-from research_agent import (
+from research_agent.research_subagent import (
     RESEARCH_WORKFLOW_INSTRUCTIONS,
     RESEARCHER_INSTRUCTIONS,
     SUBAGENT_DELEGATION_INSTRUCTIONS,
 )
-from research_agent.clarification.middleware import ClarificationMiddleware
-from research_agent.clarification.tool import clarify_requirements
-from research_agent.prompts import RESEARCHER_DESCRIPTION
-from research_agent.resume.middleware import ResumeMiddleware
-from research_agent.resume.policy import inspect_todos
-from research_agent.tools import (
+from research_agent.research_subagent.clarification.middleware import ClarificationMiddleware
+from research_agent.research_subagent.clarification.tool import clarify_requirements
+from research_agent.research_subagent.prompts import RESEARCHER_DESCRIPTION
+from research_agent.research_subagent.resume.middleware import ResumeMiddleware
+from research_agent.research_subagent.resume.policy import inspect_todos
+from research_agent.research_subagent.tools import (
     fetch_webpage_content,
     glob,
     llm_wiki_query,
@@ -59,15 +59,15 @@ from research_agent.tools import (
     think_tool,
     write_file,
 )
-from research_agent.utils.cli import (
+from research_agent.research_subagent.utils.cli import (
     build_instruction,
 )
-from research_agent.utils.eval_tracking import log_server_metrics
-from research_agent.utils.knowledge_filesystem import (
+from research_agent.research_subagent.utils.eval_tracking import log_server_metrics
+from research_agent.research_subagent.utils.knowledge_filesystem import (
     normalize_path_for_filesystem_tools,
 )
-from research_agent.utils.skill_registry import get_skill_registry
-from research_agent.utils.verification import (
+from research_agent.research_subagent.utils.skill_registry import get_skill_registry
+from research_agent.research_subagent.utils.verification import (
     ENABLE_VERIFICATION,
     MAX_VERIFICATION_ROUNDS,
     VerificationVerdict,
@@ -99,7 +99,7 @@ EVAL_LOG_QUESTIONS = str2bool(os.environ.get("EVAL_LOG_QUESTIONS"), False)
 
 # Verification loop — post-generation quality review with iterative revision.
 # MAX_VERIFICATION_ROUNDS / ENABLE_VERIFICATION are defined in
-# research_agent.utils.verification — re-exported here for convenience.
+# research_agent.research_subagent.utils.verification — re-exported here for convenience.
 
 # Get current date
 current_date = datetime.now().strftime("%Y-%m-%d")

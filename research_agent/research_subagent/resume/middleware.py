@@ -14,7 +14,7 @@ from langchain.agents.middleware.todo import PlanningState
 from langchain_core.messages import AIMessage, SystemMessage
 from langgraph.config import get_config
 
-from research_agent.resume.policy import inspect_todos
+from research_agent.research_subagent.resume.policy import inspect_todos
 
 RESUME_INSTRUCTION = """<ResumeIncompleteTodos>
 Resume round {round_number} of {max_rounds}. Preserve the original research goal, selected skill, files, and valid existing todo plan. Execute every pending or in-progress item. Do not replace the plan merely because this run resumed. Mark an item completed only after its work is done. Synthesize the requested final output after all items are complete.

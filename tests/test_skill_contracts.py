@@ -1,7 +1,7 @@
 """Contract tests for skill definitions and parsing."""
 
-from research_agent.utils.cli import build_parser
-from research_agent.utils.skill_registry import get_skill_registry
+from research_agent.research_subagent.utils.cli import build_parser
+from research_agent.research_subagent.utils.skill_registry import get_skill_registry
 
 # After full migration, zero legacy skills remain in the SkillRegistry.
 # All skills are loaded by SkillsMiddleware from .deepagents/skills/.

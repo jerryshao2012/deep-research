@@ -7,8 +7,8 @@ from deepagents.backends.utils import create_file_data
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from agent import ResearchStateMiddleware
-from research_agent import tools
-from research_agent.tools import (
+from research_agent.research_subagent import tools
+from research_agent.research_subagent.tools import (
     fetch_webpage_content,
     read_docs_folder,
 )

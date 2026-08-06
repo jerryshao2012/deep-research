@@ -15,7 +15,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import requests
 
-from research_agent.utils.web_search import _run_tavily_search, tavily_search_impl
+from research_agent.research_subagent.utils.web_search import _run_tavily_search, tavily_search_impl
 
 
 class TestRunTavilySearch:
@@ -36,7 +36,7 @@ class TestRunTavilySearch:
         mock_response.raise_for_status = MagicMock()
 
         with patch.dict(os.environ, {"TAVILY_API_KEY": "test-api-key"}):
-            with patch("research_agent.utils.web_search.tavily_client") as mock_client:
+            with patch("research_agent.research_subagent.utils.web_search.tavily_client") as mock_client:
                 mock_client.session.post.return_value = mock_response
                 mock_client.base_url = "https://api.tavily.com"
 
@@ -68,7 +68,7 @@ class TestRunTavilySearch:
         mock_response.raise_for_status = MagicMock()
 
         with patch.dict(os.environ, {"TAVILY_API_KEY": "test-api-key"}):
-            with patch("research_agent.utils.web_search.tavily_client") as mock_client:
+            with patch("research_agent.research_subagent.utils.web_search.tavily_client") as mock_client:
                 mock_client.session.post.return_value = mock_response
                 mock_client.base_url = "https://api.tavily.com"
 
@@ -87,7 +87,7 @@ class TestRunTavilySearch:
         mock_response.raise_for_status = MagicMock()
 
         with patch.dict(os.environ, {"TAVILY_API_KEY": "test-api-key"}):
-            with patch("research_agent.utils.web_search.tavily_client") as mock_client:
+            with patch("research_agent.research_subagent.utils.web_search.tavily_client") as mock_client:
                 mock_client.session.post.return_value = mock_response
                 mock_client.base_url = "https://api.tavily.com"
 
@@ -106,7 +106,7 @@ class TestRunTavilySearch:
         mock_response.raise_for_status = MagicMock()
 
         with patch.dict(os.environ, {"TAVILY_API_KEY": "test-api-key"}):
-            with patch("research_agent.utils.web_search.tavily_client") as mock_client:
+            with patch("research_agent.research_subagent.utils.web_search.tavily_client") as mock_client:
                 mock_client.session.post.return_value = mock_response
                 mock_client.base_url = "https://api.tavily.com"
 
@@ -140,8 +140,8 @@ class TestTavilySearchImpl:
             ]
         }
 
-        with patch("research_agent.utils.web_search._run_tavily_search") as mock_search:
-            with patch("research_agent.utils.web_search.fetch_webpage_content_impl") as mock_fetch:
+        with patch("research_agent.research_subagent.utils.web_search._run_tavily_search") as mock_search:
+            with patch("research_agent.research_subagent.utils.web_search.fetch_webpage_content_impl") as mock_fetch:
                 mock_search.return_value = mock_search_results
                 mock_fetch.return_value = "# Example Content\n\nThis is test content."
 
@@ -192,7 +192,7 @@ class TestTavilySearchImpl:
         """Test handling of 401 authentication error."""
         http_error = requests.exceptions.HTTPError(response=MagicMock(status_code=401))
 
-        with patch("research_agent.utils.web_search._run_tavily_search") as mock_search:
+        with patch("research_agent.research_subagent.utils.web_search._run_tavily_search") as mock_search:
             mock_search.side_effect = http_error
 
             result = tavily_search_impl(
@@ -210,7 +210,7 @@ class TestTavilySearchImpl:
         mock_response = MagicMock(status_code=500)
         http_error = requests.exceptions.HTTPError(response=mock_response)
 
-        with patch("research_agent.utils.web_search._run_tavily_search") as mock_search:
+        with patch("research_agent.research_subagent.utils.web_search._run_tavily_search") as mock_search:
             mock_search.side_effect = http_error
 
             result = tavily_search_impl(
@@ -224,7 +224,7 @@ class TestTavilySearchImpl:
 
     def test_tavily_search_impl_value_error(self):
         """Test handling of ValueError (e.g., missing API key)."""
-        with patch("research_agent.utils.web_search._run_tavily_search") as mock_search:
+        with patch("research_agent.research_subagent.utils.web_search._run_tavily_search") as mock_search:
             mock_search.side_effect = ValueError("TAVILY_API_KEY is not set")
 
             result = tavily_search_impl(
@@ -238,7 +238,7 @@ class TestTavilySearchImpl:
 
     def test_tavily_search_impl_generic_exception(self):
         """Test handling of generic exceptions."""
-        with patch("research_agent.utils.web_search._run_tavily_search") as mock_search:
+        with patch("research_agent.research_subagent.utils.web_search._run_tavily_search") as mock_search:
             mock_search.side_effect = Exception("Network error")
 
             result = tavily_search_impl(
@@ -266,8 +266,8 @@ class TestTavilySearchImpl:
             ]
         }
 
-        with patch("research_agent.utils.web_search._run_tavily_search") as mock_search:
-            with patch("research_agent.utils.web_search.fetch_webpage_content_impl") as mock_fetch:
+        with patch("research_agent.research_subagent.utils.web_search._run_tavily_search") as mock_search:
+            with patch("research_agent.research_subagent.utils.web_search.fetch_webpage_content_impl") as mock_fetch:
                 mock_search.return_value = mock_search_results
                 mock_fetch.return_value = "# Content"
 
@@ -287,7 +287,7 @@ class TestTavilySearchImpl:
         """Test tavily_search_impl with default parameter values."""
         mock_search_results = {"results": []}
 
-        with patch("research_agent.utils.web_search._run_tavily_search") as mock_search:
+        with patch("research_agent.research_subagent.utils.web_search._run_tavily_search") as mock_search:
             mock_search.return_value = mock_search_results
 
             result = tavily_search_impl(
@@ -305,7 +305,7 @@ class TestTavilySearchImpl:
         """Test tavily_search_impl when state is None."""
         mock_search_results = {"results": []}
 
-        with patch("research_agent.utils.web_search._run_tavily_search") as mock_search:
+        with patch("research_agent.research_subagent.utils.web_search._run_tavily_search") as mock_search:
             mock_search.return_value = mock_search_results
 
             result = tavily_search_impl(
@@ -328,8 +328,8 @@ class TestTavilySearchImpl:
             ]
         }
 
-        with patch("research_agent.utils.web_search._run_tavily_search") as mock_search:
-            with patch("research_agent.utils.web_search.fetch_webpage_content_impl") as mock_fetch:
+        with patch("research_agent.research_subagent.utils.web_search._run_tavily_search") as mock_search:
+            with patch("research_agent.research_subagent.utils.web_search.fetch_webpage_content_impl") as mock_fetch:
                 mock_search.return_value = mock_search_results
                 mock_fetch.return_value = "# Heading\n\nSome content here."
 

@@ -11,7 +11,7 @@ from dataclasses import dataclass
 
 import httpx
 
-from research_agent.utils.web_search import get_cached_webpage
+from research_agent.research_subagent.utils.web_search import get_cached_webpage
 from thread_wiki.models import SourceCitation
 from utils import get_ssl_verify_config
 

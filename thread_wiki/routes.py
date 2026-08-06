@@ -22,7 +22,7 @@ from fastapi.responses import StreamingResponse
 from langgraph_sdk.auth.types import MinimalUserDict
 from pydantic import BaseModel, Field
 
-from research_agent.utils.knowledge_filesystem import clear_thread_cache
+from research_agent.research_subagent.utils.knowledge_filesystem import clear_thread_cache
 from . import progress as progress_tracker
 from .code_ingestion import load_code_analysis_summary
 from .git_import import (

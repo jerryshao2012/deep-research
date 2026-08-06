@@ -18,11 +18,11 @@ from dataclasses import dataclass, field
 from langchain_core.messages import HumanMessage
 
 from model_factory import get_configured_model
-from research_agent.utils.citation_validator import (
+from research_agent.research_subagent.utils.citation_validator import (
     ValidationResult,
     validate_web_citations,
 )
-from research_agent.utils.json_utils import robust_json_loads
+from research_agent.research_subagent.utils.json_utils import robust_json_loads
 from thread_wiki.models import SourceCitation
 
 logger = logging.getLogger(__name__)

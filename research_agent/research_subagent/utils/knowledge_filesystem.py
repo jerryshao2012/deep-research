@@ -20,8 +20,8 @@ from langgraph.config import get_config
 from langgraph.prebuilt import InjectedState
 
 from logger_utils import setup_logger
-from research_agent.utils.content_extractors import extract_supported_document
-from research_agent.utils.text_search import load_or_build_search_index
+from research_agent.research_subagent.utils.content_extractors import extract_supported_document
+from research_agent.research_subagent.utils.text_search import load_or_build_search_index
 
 # Load environment variables
 load_dotenv()
@@ -39,7 +39,7 @@ SUPPORTED_DOC_SUFFIXES = {".pdf", ".txt", ".md", ".docx", ".pptx", ".xlsx"}
 # Project root for resolving SkillsMiddleware backend paths to filesystem paths.
 # SkillsMiddleware uses the agent's internal FilesystemBackend, which produces
 # paths like /skills/.deepagents/skills/<name>/SKILL.md relative to cwd.
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 
 logger = setup_logger(__name__)
 

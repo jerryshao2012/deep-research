@@ -7,7 +7,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from research_agent.utils.content_extractors import _render_page_chunk
+from research_agent.research_subagent.utils.content_extractors import _render_page_chunk
 from thread_wiki.models import SourceCitation, WikiQueryResult
 from thread_wiki.service import _extract_citations
 
@@ -53,7 +53,7 @@ def mock_extractors_modules(monkeypatch):
     # _extract_pdf_text picks up our mock.
     import importlib
 
-    import research_agent.utils.content_extractors as mod
+    import research_agent.research_subagent.utils.content_extractors as mod
     importlib.reload(mod)
 
     yield mock_pymupdf, mock_pypdf, mod
@@ -360,7 +360,7 @@ class TestTurnAwareReportNaming:
     """Tests for turn-aware report naming and dynamic path resolution."""
 
     def test_normalize_citations_for_comparison(self) -> None:
-        from research_agent.utils.knowledge_filesystem import (
+        from research_agent.research_subagent.utils.knowledge_filesystem import (
             normalize_citations_for_comparison,
         )
 
@@ -373,7 +373,7 @@ class TestTurnAwareReportNaming:
         assert normalize_citations_for_comparison(t3) == normalize_citations_for_comparison(t4)
 
     def test_get_target_report_path_empty_state(self) -> None:
-        from research_agent.utils.knowledge_filesystem import (
+        from research_agent.research_subagent.utils.knowledge_filesystem import (
             get_target_cited_response_path,
         )
 
@@ -384,7 +384,7 @@ class TestTurnAwareReportNaming:
     def test_get_target_report_path_inplace_update(self) -> None:
         from deepagents.backends.utils import create_file_data
 
-        from research_agent.utils.knowledge_filesystem import (
+        from research_agent.research_subagent.utils.knowledge_filesystem import (
             get_target_cited_response_path,
         )
 
@@ -402,7 +402,7 @@ class TestTurnAwareReportNaming:
     def test_get_target_report_path_new_report(self) -> None:
         from deepagents.backends.utils import create_file_data
 
-        from research_agent.utils.knowledge_filesystem import (
+        from research_agent.research_subagent.utils.knowledge_filesystem import (
             get_target_cited_response_path,
         )
 
@@ -430,7 +430,7 @@ class TestTurnAwareReportNaming:
     def test_get_target_report_path_reuse_turn_path(self) -> None:
         from deepagents.backends.utils import create_file_data
 
-        from research_agent.utils.knowledge_filesystem import (
+        from research_agent.research_subagent.utils.knowledge_filesystem import (
             get_target_cited_response_path,
         )
 
@@ -451,7 +451,7 @@ class TestTurnAwareReportNaming:
     def test_get_active_report_path(self) -> None:
         from deepagents.backends.utils import create_file_data
 
-        from research_agent.utils.knowledge_filesystem import (
+        from research_agent.research_subagent.utils.knowledge_filesystem import (
             get_active_cited_response_path,
         )
 
@@ -473,7 +473,7 @@ class TestTurnAwareReportNaming:
         from langchain_core.messages import AIMessage
 
         from agent import ResearchStateMiddleware
-        from research_agent.utils.knowledge_filesystem import (
+        from research_agent.research_subagent.utils.knowledge_filesystem import (
             _thread_wiki_query_complete,
         )
 

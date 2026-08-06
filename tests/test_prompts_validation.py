@@ -8,7 +8,7 @@ This module validates that the enhanced prompt instructions contain:
 
 import pytest
 
-from research_agent.prompts import (
+from research_agent.research_subagent.prompts import (
     RESEARCH_WORKFLOW_INSTRUCTIONS,
     RESEARCHER_INSTRUCTIONS,
     SUBAGENT_DELEGATION_INSTRUCTIONS,

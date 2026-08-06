@@ -13,7 +13,7 @@ Hold non-experimental factors such as input, model, and relevant configuration s
 | Layer | Current entry point | Purpose |
 | --- | --- | --- |
 | Golden-dataset scoring | `.deepagents/skills/golden-dataset/scripts/score_dataset.py` | Score an existing CSV, render artifacts, and record a simple baseline or candidate. |
-| Agent-run regression utilities | `research_agent.utils.eval_tracking` | Collect orchestration metrics and compare records with thresholds. |
+| Agent-run regression utilities | `research_agent.research_subagent.utils.eval_tracking` | Collect orchestration metrics and compare records with thresholds. |
 | Operational tracking | Agent middleware plus `ENABLE_EVAL_TRACKING` | Append facts from diverse server runs without baseline comparison. |
 | Report verification | Agent middleware plus `ENABLE_VERIFICATION` | Ground citations, judge sufficiency, find gaps, and request revision. |
 
@@ -66,7 +66,7 @@ This script's run metrics are deliberately small: runtime, metrics-CSV existence
 
 ## Measure agent-run behavior programmatically
 
-`research_agent.utils.eval_tracking` provides a separate record model for complete agent results. Use it when an evaluation harness can retain the LangGraph result, runtime, stream-fallback status, output path, model, and Git SHA.
+`research_agent.research_subagent.utils.eval_tracking` provides a separate record model for complete agent results. Use it when an evaluation harness can retain the LangGraph result, runtime, stream-fallback status, output path, model, and Git SHA.
 
 The supported sequence is:
 
@@ -134,7 +134,7 @@ Persistence differs by middleware path. Synchronous `after_model` schedules `log
 Analyze recent JSONL files and render improvement suggestions:
 
 ```bash
-uv run python -c "from pathlib import Path; from research_agent.utils.learning import analyze_eval_trends, generate_improvement_suggestions; a = analyze_eval_trends(Path('./output/eval_history')); print(generate_improvement_suggestions(a))"
+uv run python -c "from pathlib import Path; from research_agent.research_subagent.utils.learning import analyze_eval_trends, generate_improvement_suggestions; a = analyze_eval_trends(Path('./output/eval_history')); print(generate_improvement_suggestions(a))"
 ```
 
 `analyze_eval_trends` summarizes record count, average tool success, tokens, latency, failure patterns, topic buckets, and experiments over a time window. `compute_baseline_from_history` can calculate a median success-rate baseline across a bounded recent window; it is separate from `score_dataset.py`'s simple artifact comparison.

@@ -5,7 +5,7 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
-from research_agent.utils.text_search import (
+from research_agent.research_subagent.utils.text_search import (
     BM25SearchIndex,
     _tokenize,
     build_search_index,

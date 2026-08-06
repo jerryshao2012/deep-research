@@ -9,7 +9,7 @@ from typing import Any
 from langchain.agents.middleware import AgentMiddleware, ModelRequest
 from langgraph.config import get_config
 
-from research_agent.clarification.policy import (
+from research_agent.research_subagent.clarification.policy import (
     ClarificationPolicyDecision,
     evaluate_clarification_policy,
 )

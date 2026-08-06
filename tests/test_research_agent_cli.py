@@ -1,8 +1,8 @@
 """Tests for the research agent CLI module."""
 
-from research_agent.utils import skill_registry
-from research_agent.utils.cli import build_parser
-from research_agent.utils.skill_registry import get_skill_registry
+from research_agent.research_subagent.utils import skill_registry
+from research_agent.research_subagent.utils.cli import build_parser
+from research_agent.research_subagent.utils.skill_registry import get_skill_registry
 
 
 def test_parser_accepts_doc_folder_and_skill() -> None:
@@ -18,11 +18,11 @@ def test_parser_accepts_doc_folder_and_skill() -> None:
 
 
 def test_list_skills(capsys, monkeypatch) -> None:
-    from research_agent.utils.cli import list_skills
+    from research_agent.research_subagent.utils.cli import list_skills
     class DummyRegistry:
         SKILL_IDS = {"test-skill"}
 
-    monkeypatch.setattr("research_agent.utils.cli.get_skill_registry", lambda: DummyRegistry())
+    monkeypatch.setattr("research_agent.research_subagent.utils.cli.get_skill_registry", lambda: DummyRegistry())
     list_skills()
     captured = capsys.readouterr()
     assert "Available research skills:" in captured.out

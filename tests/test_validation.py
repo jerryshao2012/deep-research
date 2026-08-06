@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from research_agent.utils.citation_validator import (
+from research_agent.research_subagent.utils.citation_validator import (
     _extract_claim_for_citation,
     _extract_claim_for_url,
     _is_claim_grounded,
@@ -64,9 +64,9 @@ async def test_validate_web_citations() -> None:
         return True, "Reachable"
 
     # Patch explicitly using context managers to avoid ordering issues
-    with patch("research_agent.utils.citation_validator._check_url_reachable",
+    with patch("research_agent.research_subagent.utils.citation_validator._check_url_reachable",
                new_callable=AsyncMock) as mock_reachable, \
-            patch("research_agent.utils.citation_validator.get_cached_webpage") as mock_get_cached:
+            patch("research_agent.research_subagent.utils.citation_validator.get_cached_webpage") as mock_get_cached:
 
         mock_reachable.side_effect = side_effect
 

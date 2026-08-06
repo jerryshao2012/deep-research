@@ -19,7 +19,7 @@ from typing import Any
 import yaml
 
 from logger_utils import setup_logger
-from research_agent.utils.json_utils import robust_json_loads
+from research_agent.research_subagent.utils.json_utils import robust_json_loads
 
 logger = setup_logger(__name__)
 
@@ -96,7 +96,7 @@ class SkillRegistry:
             skills_dir: Path or list of paths to skills directories.
                 Defaults to [.deepagents/skills/, docs/.deepagents/skills/].
         """
-        base_dir = Path(__file__).resolve().parent.parent.parent
+        base_dir = Path(__file__).resolve().parent.parent.parent.parent
         if skills_dir is None:
             self.skills_dirs: list[Path] = [
                 base_dir / ".deepagents" / "skills",

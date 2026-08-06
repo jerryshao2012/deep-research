@@ -10,7 +10,7 @@ from langchain.agents.middleware import ModelRequest
 from langchain.agents.middleware.todo import PlanningState
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
-from research_agent.resume import (
+from research_agent.research_subagent.resume import (
     ACCEPTED_RESUME_PHRASES,
     BASE_RESUME_PHRASES,
     DEFAULT_MAX_RESUME_ROUNDS,
