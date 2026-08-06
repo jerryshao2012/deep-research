@@ -2129,7 +2129,10 @@ async def delete_thread(
     ok = db.delete_thread(thread_id)
     if not ok:
         raise HTTPException(status_code=404, detail="Thread not found")
-    from research_agent.research_subagent.utils.knowledge_filesystem import clear_thread_cache
+    from research_agent.research_subagent.utils.knowledge_filesystem import (
+        clear_thread_cache,
+    )
+
     clear_thread_cache(thread_id)
     return {}
 

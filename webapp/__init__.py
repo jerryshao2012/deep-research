@@ -139,7 +139,10 @@ def _generic_s3_upload_loop(
         interval_seconds: float,
 ) -> None:
     """Periodically mirror generic runtime folders without LangGraph state."""
-    from research_agent.s3_storage import _resolve_tracked_folders, upload_directory_sync
+    from research_agent.s3_storage import (
+        _resolve_tracked_folders,
+        upload_directory_sync,
+    )
 
     while not stop_event.wait(interval_seconds):
         try:
@@ -188,7 +191,10 @@ def _generic_azure_upload_loop(
         interval_seconds: float,
 ) -> None:
     """Periodically mirror generic runtime folders to Azure Blob Storage."""
-    from research_agent.azure_storage import _resolve_tracked_folders, upload_directory_sync
+    from research_agent.azure_storage import (
+        _resolve_tracked_folders,
+        upload_directory_sync,
+    )
 
     while not stop_event.wait(interval_seconds):
         try:

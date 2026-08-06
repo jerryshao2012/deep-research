@@ -18,7 +18,9 @@ from research_agent.research_subagent.clarification.policy import (
     ClarificationPolicyDecision,
     evaluate_clarification_policy,
 )
-from research_agent.research_subagent.clarification.use_case import complete_clarification
+from research_agent.research_subagent.clarification.use_case import (
+    complete_clarification,
+)
 
 __all__ = [
     "ClarificationAnswer",

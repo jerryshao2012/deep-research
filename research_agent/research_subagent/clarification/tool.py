@@ -17,7 +17,9 @@ from research_agent.research_subagent.clarification.contracts import (
     ClarificationQuestion,
     ClarificationResponse,
 )
-from research_agent.research_subagent.clarification.use_case import complete_clarification
+from research_agent.research_subagent.clarification.use_case import (
+    complete_clarification,
+)
 
 InterruptFunction = Callable[[dict[str, Any]], Any]
 

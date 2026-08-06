@@ -36,6 +36,7 @@ from langchain_core.messages import (
 from langchain_core.runnables import RunnableConfig
 from langgraph.config import get_config
 
+from research_agent.cli_utils import get_ssl_verify_config, str2bool
 from research_agent.logger_utils import setup_logger
 from research_agent.model_factory import create_memory_saver, get_configured_model
 from research_agent.research_subagent import (
@@ -43,7 +44,9 @@ from research_agent.research_subagent import (
     RESEARCHER_INSTRUCTIONS,
     SUBAGENT_DELEGATION_INSTRUCTIONS,
 )
-from research_agent.research_subagent.clarification.middleware import ClarificationMiddleware
+from research_agent.research_subagent.clarification.middleware import (
+    ClarificationMiddleware,
+)
 from research_agent.research_subagent.clarification.tool import clarify_requirements
 from research_agent.research_subagent.prompts import RESEARCHER_DESCRIPTION
 from research_agent.research_subagent.resume.middleware import ResumeMiddleware
@@ -74,7 +77,6 @@ from research_agent.research_subagent.utils.verification import (
     format_feedback,
     verify_report,
 )
-from research_agent.cli_utils import get_ssl_verify_config, str2bool
 
 # Load environment variables
 load_dotenv()

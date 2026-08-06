@@ -12,7 +12,10 @@ from pathlib import Path
 
 import yaml
 
-from research_agent.research_subagent.utils.skill_registry import SkillRegistry, get_skill_registry
+from research_agent.research_subagent.utils.skill_registry import (
+    SkillRegistry,
+    get_skill_registry,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
