@@ -16,7 +16,6 @@ from research_agent.research_subagent.utils.learning import (
     generate_improvement_suggestions,
 )
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -83,21 +82,22 @@ def history_dir_with_experiments():
     """Synthetic history with A/B experiment data."""
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
+        now = datetime.now(timezone.utc)
         records = [
             _make_record(
-                "2026-07-01T10:00:00Z", 0.80, 15000, 70.0,
+                (now - timedelta(days=3)).isoformat(), 0.80, 15000, 70.0,
                 experiment_id="prompt-v2", variant="control",
             ),
             _make_record(
-                "2026-07-02T10:00:00Z", 0.82, 14800, 68.0,
+                (now - timedelta(days=2)).isoformat(), 0.82, 14800, 68.0,
                 experiment_id="prompt-v2", variant="control",
             ),
             _make_record(
-                "2026-07-03T10:00:00Z", 0.90, 12000, 55.0,
+                (now - timedelta(days=1)).isoformat(), 0.90, 12000, 55.0,
                 experiment_id="prompt-v2", variant="treatment",
             ),
             _make_record(
-                "2026-07-04T10:00:00Z", 0.91, 11800, 52.0,
+                now.isoformat(), 0.91, 11800, 52.0,
                 experiment_id="prompt-v2", variant="treatment",
             ),
         ]

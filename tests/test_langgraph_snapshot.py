@@ -48,6 +48,19 @@ from research_agent.langgraph_snapshot import (
 
 UPDATED_AT = "2026-07-23T10:00:00+00:00"
 BUCKET = "snapshot-bucket"
+_LOCAL_RUNTIME_VERSIONS = snapshot_module._runtime_versions
+
+
+@pytest.fixture(autouse=True)
+def _run_snapshot_contracts_as_pinned_aws_runtime(
+        monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercise publish/restore contracts with the runtime used by the AWS image."""
+    monkeypatch.setattr(
+        snapshot_module,
+        "_runtime_versions",
+        lambda: dict(AWS_IMAGE_RUNTIME_VERSIONS),
+    )
 
 
 class FakeS3Error(RuntimeError):
@@ -315,12 +328,26 @@ def test_validate_snapshot_returns_thread_versions_and_checksums(
     assert result.thread_versions == {"t1": UPDATED_AT}
     assert result.created_at.endswith("+00:00")
     assert result.generation
-    assert result.runtime_versions == {
+    assert result.runtime_versions == AWS_IMAGE_RUNTIME_VERSIONS
+
+
+def test_runtime_versions_reports_local_interpreter_and_packages() -> None:
+    assert _LOCAL_RUNTIME_VERSIONS() == {
         "python": sys.version.split()[0],
         "langgraph": version("langgraph"),
         "langgraph-api": version("langgraph-api"),
         "langgraph-runtime-inmem": version("langgraph-runtime-inmem"),
     }
+
+
+def test_validate_snapshot_reports_file_checksums(tmp_path: Path) -> None:
+    snapshot = make_snapshot(
+        tmp_path,
+        threads=[thread("t1", updated_at=UPDATED_AT)],
+    )
+
+    result = validate_snapshot(snapshot, require_non_empty=True)
+
     assert set(result.files) == {
         ".langgraph_ops.pckl",
         "checkpoints.pckl",

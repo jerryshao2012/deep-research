@@ -57,8 +57,15 @@ def test_passkey_sqlite_deployment_is_single_replica_on_persistent_azure_file():
 
 def test_passkey_demo_configuration_documents_safe_azure_sqlite_contract():
     env_example = (PROJECT_ROOT / ".env.example").read_text(encoding="utf-8")
-    readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
-
+    auth_guide = (
+        PROJECT_ROOT / "documents/guides/authentication.md"
+    ).read_text(encoding="utf-8")
+    storage_guide = (
+        PROJECT_ROOT / "documents/deployment/azure/storage.md"
+    ).read_text(encoding="utf-8")
+    security_guide = (
+        PROJECT_ROOT / "documents/deployment/azure/security.md"
+    ).read_text(encoding="utf-8")
     assert re.search(r"(?m)^PASSKEY_ENABLED=false$", env_example)
     for setting in (
             "PASSKEY_RP_ID",
@@ -67,22 +74,31 @@ def test_passkey_demo_configuration_documents_safe_azure_sqlite_contract():
             "PASSKEY_PROXY_ID",
             "PASSKEY_PROXY_SECRET",
             "OAUTH_SECRET_KEY",
-            "SQLITE_DB_PATH",
-            "AUTH_SQLITE_JOURNAL_MODE",
-    ):
+        ):
         assert setting in env_example
-        assert setting in readme
+        assert setting in auth_guide
 
-    assert "Azure File" in readme
-    assert "one replica" in readme.lower()
-    assert "DELETE" in readme
-    assert "OAuth recovery" in readme
-    assert "PASSKEY_PROXY_SECRET" in readme and "Key Vault" in readme
+    for setting in ("SQLITE_DB_PATH", "AUTH_SQLITE_JOURNAL_MODE"):
+        assert setting in env_example
+        assert setting in storage_guide
+
+    assert "Azure Files" in storage_guide
+    assert "one replica" in storage_guide.lower()
+    assert "DELETE" in storage_guide
+    assert "OAuth recovery" in auth_guide
+    assert re.search(
+        r"(?m)^- Store .*`OAUTH_SECRET_KEY`.*`PASSKEY_PROXY_SECRET` "
+        r"in a secret manager\.",
+        auth_guide,
+    )
+    assert "Key Vault" in security_guide
 
 
 def test_passkey_demo_documents_requested_multi_domain_rp_configuration():
     env_example = (PROJECT_ROOT / ".env.example").read_text(encoding="utf-8")
-    readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+    auth_guide = (
+        PROJECT_ROOT / "documents/guides/authentication.md"
+    ).read_text(encoding="utf-8")
     expected = (
         'PASSKEY_RP_IDS="bmo-deepagent-ui-0312.azurewebsites.net,'
         'bmo-deepagent-ui.vercel.app"'
@@ -94,17 +110,27 @@ def test_passkey_demo_documents_requested_multi_domain_rp_configuration():
 
     assert expected in env_example
     assert expected_origins in env_example
-    assert expected in readme
-    assert expected_origins in readme
+    assert (
+        "`PASSKEY_ORIGINS` and either `PASSKEY_RP_IDS` or `PASSKEY_RP_ID`"
+        in auth_guide
+    )
 
 
 def test_passkey_documentation_never_presents_an_accepted_oauth_secret_placeholder():
-    readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
-    assignments = re.findall(r"(?m)^OAUTH_SECRET_KEY=(.*)$", readme)
+    env_example = (PROJECT_ROOT / ".env.example").read_text(encoding="utf-8")
+    auth_guide = (
+        PROJECT_ROOT / "documents/guides/authentication.md"
+    ).read_text(encoding="utf-8")
+    maintained_docs = "\n".join((env_example, auth_guide))
+    assignments = re.findall(r"(?m)^OAUTH_SECRET_KEY=(.*)$", maintained_docs)
 
     assert assignments
     assert all(value.strip() in {"", '""', "''"} for value in assignments)
-    assert "inject `OAUTH_SECRET_KEY` at runtime" in readme
+    assert re.search(
+        r"(?m)^- Store .*`OAUTH_SECRET_KEY`.*`PASSKEY_PROXY_SECRET` "
+        r"in a secret manager\.",
+        auth_guide,
+    )
 
 
 def test_generic_azure_sync_includes_langgraph_state(monkeypatch) -> None:

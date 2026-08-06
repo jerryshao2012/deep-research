@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-import pytest
+from langchain_core.messages import AIMessage
 
+from research_agent.research_subagent.utils import verification as verification_module
 from research_agent.research_subagent.utils.verification import (
     VerificationVerdict,
     _adversarial_gap_analysis,
@@ -12,6 +13,15 @@ from research_agent.research_subagent.utils.verification import (
     format_feedback,
     make_verdict,
 )
+
+
+class _FakeJudgeModel:
+    def __init__(self, content: str) -> None:
+        self.content = content
+
+    def invoke(self, messages):
+        assert messages
+        return AIMessage(content=self.content)
 
 
 # ---------------------------------------------------------------------------
@@ -64,7 +74,9 @@ class TestFormatFeedback:
         assert "Missing counter-argument about X." in text
 
     def test_produces_xml_block_with_grounding_issues(self):
-        from research_agent.research_subagent.utils.citation_validator import ValidationResult
+        from research_agent.research_subagent.utils.citation_validator import (
+            ValidationResult,
+        )
 
         verdict = VerificationVerdict(
             status="needs_revision",
@@ -129,19 +141,26 @@ Some findings [1]. More info [2].
 
 
 # ---------------------------------------------------------------------------
-# _check_report_sufficiency  (requires model — skipped in CI w/o keys)
+# _check_report_sufficiency  (model boundary replaced with deterministic fake)
 # ---------------------------------------------------------------------------
 
 
 class TestCheckReportSufficiency:
-    @pytest.mark.skip(reason="Requires configured model — manual / integration only.")
-    def test_complete_report_scores_high(self):
+    def test_complete_report_scores_high(self, monkeypatch):
+        monkeypatch.setattr(
+            verification_module,
+            "get_configured_model",
+            lambda: _FakeJudgeModel(
+                '{"sufficiency_score": 0.95, "reason": "Complete."}'
+            ),
+        )
+
         score, reason = _check_report_sufficiency(
             question="What is 2+2?",
             report="2+2 equals 4. This is a fundamental arithmetic fact.",
         )
-        assert score >= 0.7
-        assert reason
+        assert score == 0.95
+        assert reason == "Complete."
 
     def test_empty_report_scores_zero(self):
         score, reason = _check_report_sufficiency(
@@ -153,19 +172,26 @@ class TestCheckReportSufficiency:
 
 
 # ---------------------------------------------------------------------------
-# _adversarial_gap_analysis  (requires model — skipped in CI w/o keys)
+# _adversarial_gap_analysis  (model boundary replaced with deterministic fake)
 # ---------------------------------------------------------------------------
 
 
 class TestAdversarialGapAnalysis:
-    @pytest.mark.skip(reason="Requires configured model — manual / integration only.")
-    def test_thin_report_finds_gaps(self):
+    def test_thin_report_finds_gaps(self, monkeypatch):
+        monkeypatch.setattr(
+            verification_module,
+            "get_configured_model",
+            lambda: _FakeJudgeModel(
+                '{"gaps": ["Missing framework-specific tradeoffs."], '
+                '"critique_summary": "Too thin."}'
+            ),
+        )
+
         gaps = _adversarial_gap_analysis(
             question="Compare Python vs JavaScript for web development.",
             report="Python is good. JavaScript is also good.",
         )
-        # A thin report should have gaps.
-        assert len(gaps) > 0
+        assert gaps == ["Missing framework-specific tradeoffs."]
 
     def test_empty_report_returns_gap(self):
         gaps = _adversarial_gap_analysis(question="What is X?", report="")

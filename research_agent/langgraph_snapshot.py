@@ -30,8 +30,8 @@ AWS_IMAGE_RUNTIME_VERSIONS: Mapping[str, str] = MappingProxyType(
     {
         "python": "3.12.13",
         "langgraph": "1.2.6",
-        "langgraph-api": "0.10.0",
-        "langgraph-runtime-inmem": "0.30.0",
+        "langgraph-api": "0.11.2",
+        "langgraph-runtime-inmem": "0.31.2",
     }
 )
 
