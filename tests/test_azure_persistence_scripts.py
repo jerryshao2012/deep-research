@@ -20,8 +20,8 @@ def test_azure_build_stages_context_without_git_metadata() -> None:
     assert 'tar -xf - -C "$BUILD_CONTEXT_DIR"' in source
     assert 'cp .env.docker "$BUILD_CONTEXT_DIR/.env.docker"' in source
     assert (
-            'container build --platform linux/amd64 -t $FULL_IMAGE_NAME "$BUILD_CONTEXT_DIR"'
-            in source
+        'container_runtime_build --platform linux/amd64 -t "$FULL_IMAGE_NAME" '
+        '"$BUILD_CONTEXT_DIR"' in source
     )
     assert "trap cleanup_build_context EXIT" in source
 

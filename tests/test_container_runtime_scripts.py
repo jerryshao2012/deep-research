@@ -11,6 +11,56 @@ _UNSET = object()
 _SUBPROCESS_TIMEOUT_SECONDS = 10
 
 
+@pytest.mark.parametrize(
+    ("script_name", "environment_script"),
+    [("build.sh", "env.sh"), ("build-aws.sh", "env-aws.sh")],
+)
+def test_build_scripts_use_selected_container_runtime_after_environment_loading(
+    script_name: str,
+    environment_script: str,
+) -> None:
+    source = (PROJECT_ROOT / script_name).read_text(encoding="utf-8")
+    environment_source = f"source ./{environment_script}"
+
+    assert 'source "$SCRIPT_DIR/scripts/container_runtime.sh"' in source
+    assert source.index(environment_source) < source.index("select_container_runtime")
+    for runtime_call in (
+        "ensure_container_runtime_ready",
+        "container_runtime_build",
+        "container_runtime_login",
+        "container_runtime_tag",
+        "container_runtime_push",
+    ):
+        assert runtime_call in source
+    for raw_apple_operation in (
+        "container system status",
+        "container system start",
+        "container registry login",
+        "container image tag",
+        "container image push",
+    ):
+        assert raw_apple_operation not in source
+
+
+@pytest.mark.parametrize(
+    "script_path",
+    [ADAPTER, PROJECT_ROOT / "build.sh", PROJECT_ROOT / "build-aws.sh"],
+    ids=("adapter", "azure-build", "aws-build"),
+)
+def test_container_runtime_shell_scripts_have_valid_bash_syntax(
+    script_path: Path,
+) -> None:
+    result = subprocess.run(
+        ["/bin/bash", "-n", str(script_path)],
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=_SUBPROCESS_TIMEOUT_SECONDS,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
 def _install_runtime(tmp_path: Path, name: str, body: str = "exit 0") -> Path:
     runtime = tmp_path / name
     runtime.write_text(f"#!/bin/bash\n{body}\n", encoding="utf-8")

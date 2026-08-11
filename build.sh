@@ -2,6 +2,9 @@
 set -e
 set -o pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/scripts/container_runtime.sh"
+
 # Timer tracking
 TOTAL_START_TIME=$(date +%s)
 STEP_TIMES=()
@@ -56,6 +59,10 @@ if [ -f "./.env" ]; then
   set +a
 fi
 
+select_container_runtime
+ensure_container_runtime_ready
+echo "Using container runtime: $CONTAINER_RUNTIME"
+
 echo "🚀 Starting Deep Research Agent build..."
 
 # 1. Set Azure Subscription
@@ -90,13 +97,8 @@ if [ -z "$DOCKER_HUB_USERNAME" ]; then
 fi
 echo "✅ Using Docker Hub user: $DOCKER_HUB_USERNAME"
 if [ -n "$DOCKER_HUB_PAT" ]; then
-  # Ensure container service is started
-  if ! container system status &>/dev/null; then
-    echo "🚀 Container system is not running. Auto-starting..."
-    container system start --disable-kernel-install
-  fi
   echo "🔐 Logging into Docker Hub..."
-  echo "$DOCKER_HUB_PAT" | container registry login -u "$DOCKER_HUB_USERNAME" --password-stdin docker.io
+  printf '%s\n' "$DOCKER_HUB_PAT" | container_runtime_login "$DOCKER_HUB_USERNAME" docker.io
 fi
 end_step
 
@@ -115,7 +117,6 @@ BUILD_VERSION=$(date +%Y%m%d%H%M%S)
 echo $BUILD_VERSION > .build_version
 echo "🔨 Building Container image with tags: latest, $BUILD_VERSION"
 # Ensure we're in the correct directory (where Dockerfile is located)
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 BUILD_CONTEXT_DIR="$(mktemp -d "$SCRIPT_DIR/.container-build-context.XXXXXX")"
 trap cleanup_build_context EXIT
@@ -123,18 +124,13 @@ git ls-files --cached --others --exclude-standard -z \
   | tar --null -T - -cf - \
   | tar -xf - -C "$BUILD_CONTEXT_DIR"
 cp .env.docker "$BUILD_CONTEXT_DIR/.env.docker"
-# The container tool requires the full registry host in the image name for pushing.
+# Registry pushes require the full registry host in the image name.
 FULL_IMAGE_NAME="docker.io/$DOCKER_HUB_USERNAME/deep-research-agent:latest"
-# Ensure container service is started
-if ! container system status &>/dev/null; then
-  echo "🚀 Container system is not running. Auto-starting..."
-  container system start --disable-kernel-install
-fi
 
-container build --platform linux/amd64 -t $FULL_IMAGE_NAME "$BUILD_CONTEXT_DIR"
+container_runtime_build --platform linux/amd64 -t "$FULL_IMAGE_NAME" "$BUILD_CONTEXT_DIR"
 cleanup_build_context
 BUILD_CONTEXT_DIR=""
-container image push $FULL_IMAGE_NAME
+container_runtime_push "$FULL_IMAGE_NAME"
 if [ $? -ne 0 ]; then
   echo "❌ Container push failed for '$FULL_IMAGE_NAME'."
   exit 1
@@ -142,9 +138,9 @@ fi
 
 VERSIONED_IMAGE_NAME="docker.io/$DOCKER_HUB_USERNAME/deep-research-agent:$BUILD_VERSION"
 echo "🏷️  Tagging versioned image: $VERSIONED_IMAGE_NAME"
-container image tag $FULL_IMAGE_NAME $VERSIONED_IMAGE_NAME
+container_runtime_tag "$FULL_IMAGE_NAME" "$VERSIONED_IMAGE_NAME"
 echo "🚀 Pushing versioned image..."
-container image push $VERSIONED_IMAGE_NAME
+container_runtime_push "$VERSIONED_IMAGE_NAME"
 if [ $? -ne 0 ]; then
   echo "❌ Container push failed for '$VERSIONED_IMAGE_NAME'."
   exit 1

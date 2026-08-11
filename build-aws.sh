@@ -1,6 +1,9 @@
 #!/bin/bash
 set -e
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/scripts/container_runtime.sh"
+
 # Timer tracking
 TOTAL_START_TIME=$(date +%s)
 STEP_TIMES=()
@@ -38,6 +41,10 @@ print_timing_summary() {
 # Configuration
 source ./env-aws.sh
 
+select_container_runtime
+ensure_container_runtime_ready
+echo "Using container runtime: $CONTAINER_RUNTIME"
+
 echo "🚀 Starting Deep Research Agent AWS build..."
 
 # 1. Set AWS CLI Session
@@ -70,8 +77,7 @@ echo "✅ New API version: $NEW_VERSION"
 end_step
 
 # 4. Build and push image
-start_step "Docker Image Build & Push"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+start_step "Container Image Build & Push"
 cd "$SCRIPT_DIR"
 
 ECR_URL="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
@@ -79,21 +85,15 @@ IMAGE_TAG="$ECR_URL/$ECR_REPO_NAME:latest"
 
 BUILD_VERSION=$(date +%Y%m%d%H%M%S)
 echo $BUILD_VERSION > .build_version
-echo "🔨 Building Docker image with tags: latest, $BUILD_VERSION"
+echo "🔨 Building container image with tags: latest, $BUILD_VERSION"
 
-# Ensure container service is started
-if ! container system status &>/dev/null; then
-  echo "🚀 Container system is not running. Auto-starting..."
-  container system start --disable-kernel-install
-fi
-
-container build --no-cache --platform linux/amd64 -f Dockerfile-aws -t "$IMAGE_TAG" .
+container_runtime_build --no-cache --platform linux/amd64 -f Dockerfile-aws -t "$IMAGE_TAG" .
 
 echo "🔑 Logging in to AWS ECR..."
-aws ecr get-login-password --region "$AWS_REGION" | container registry login --username AWS --password-stdin "$ECR_URL"
+aws ecr get-login-password --region "$AWS_REGION" | container_runtime_login AWS "$ECR_URL"
 
 echo "⬆️  Pushing image to ECR..."
-container image push "$IMAGE_TAG"
+container_runtime_push "$IMAGE_TAG"
 if [ $? -ne 0 ]; then
   echo "❌ Container push failed for '$IMAGE_TAG'."
   exit 1
@@ -101,9 +101,9 @@ fi
 
 VERSIONED_IMAGE_TAG="$ECR_URL/$ECR_REPO_NAME:$BUILD_VERSION"
 echo "🏷️  Tagging versioned image: $VERSIONED_IMAGE_TAG"
-container image tag "$IMAGE_TAG" "$VERSIONED_IMAGE_TAG"
+container_runtime_tag "$IMAGE_TAG" "$VERSIONED_IMAGE_TAG"
 echo "🚀 Pushing versioned image..."
-container image push "$VERSIONED_IMAGE_TAG"
+container_runtime_push "$VERSIONED_IMAGE_TAG"
 if [ $? -ne 0 ]; then
   echo "❌ Container push failed for '$VERSIONED_IMAGE_TAG'."
   exit 1
