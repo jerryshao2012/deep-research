@@ -70,3 +70,48 @@ ensure_container_runtime_ready() {
 
     return 0
 }
+
+container_runtime_build() {
+    "$CONTAINER_RUNTIME" build "$@"
+}
+
+container_runtime_login() {
+    local username="$1"
+    local registry="$2"
+
+    case "$CONTAINER_RUNTIME" in
+        container)
+            container registry login -u "$username" --password-stdin "$registry"
+            ;;
+        podman | docker)
+            "$CONTAINER_RUNTIME" login --username "$username" --password-stdin "$registry"
+            ;;
+    esac
+}
+
+container_runtime_tag() {
+    local source="$1"
+    local target="$2"
+
+    case "$CONTAINER_RUNTIME" in
+        container)
+            container image tag "$source" "$target"
+            ;;
+        podman | docker)
+            "$CONTAINER_RUNTIME" tag "$source" "$target"
+            ;;
+    esac
+}
+
+container_runtime_push() {
+    local image="$1"
+
+    case "$CONTAINER_RUNTIME" in
+        container)
+            container image push "$image"
+            ;;
+        podman | docker)
+            "$CONTAINER_RUNTIME" push "$image"
+            ;;
+    esac
+}

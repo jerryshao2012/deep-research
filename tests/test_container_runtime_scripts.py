@@ -18,6 +18,21 @@ def _install_runtime(tmp_path: Path, name: str, body: str = "exit 0") -> Path:
     return runtime
 
 
+def _install_recording_runtime(tmp_path: Path, name: str) -> Path:
+    return _install_runtime(
+        tmp_path,
+        name,
+        r'''printf '%s\0' "${0##*/}" "$@" > "$RUNTIME_ARGV_LOG"
+for arg in "$@"; do
+    if [[ "$arg" == "--password-stdin" ]]; then
+        /bin/cat > "$RUNTIME_STDIN_LOG"
+        exit 0
+    fi
+done
+: > "$RUNTIME_STDIN_LOG"''',
+    )
+
+
 def _run_adapter(
     tmp_path: Path,
     command: str,
@@ -49,6 +64,135 @@ def _select_runtime(tmp_path: Path, *, override: str | object = _UNSET):
         'select_container_runtime && printf "%s\\n" "$CONTAINER_RUNTIME"',
         override=override,
     )
+
+
+def _run_recorded_runtime_command(
+    tmp_path: Path,
+    runtime: str,
+    command: str,
+    *,
+    stdin: str | None = None,
+) -> tuple[subprocess.CompletedProcess[str], bytes, bytes]:
+    argv_log = tmp_path / "runtime-argv.log"
+    stdin_log = tmp_path / "runtime-stdin.log"
+    argv_log.write_bytes(b"")
+    stdin_log.write_bytes(b"")
+    _install_recording_runtime(tmp_path, runtime)
+
+    result = _run_adapter(
+        tmp_path,
+        f"select_container_runtime && {command}",
+        override=runtime,
+        stdin=stdin,
+        extra_env={
+            "RUNTIME_ARGV_LOG": str(argv_log),
+            "RUNTIME_STDIN_LOG": str(stdin_log),
+        },
+    )
+
+    return result, argv_log.read_bytes(), stdin_log.read_bytes()
+
+
+@pytest.mark.parametrize("runtime", ["container", "podman", "docker"])
+def test_build_maps_to_selected_runtime_and_preserves_arguments(
+    tmp_path: Path,
+    runtime: str,
+) -> None:
+    result, argv, stdin = _run_recorded_runtime_command(
+        tmp_path,
+        runtime,
+        'container_runtime_build --platform linux/amd64 -t "image tag" .',
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert argv == (
+        f"{runtime}\0build\0--platform\0linux/amd64\0-t\0image tag\0.\0"
+    ).encode()
+    assert stdin == b""
+
+
+@pytest.mark.parametrize(
+    ("runtime", "expected_command"),
+    [
+        ("container", ("image", "tag")),
+        ("podman", ("tag",)),
+        ("docker", ("tag",)),
+    ],
+)
+def test_tag_maps_to_selected_runtime(
+    tmp_path: Path,
+    runtime: str,
+    expected_command: tuple[str, ...],
+) -> None:
+    result, argv, stdin = _run_recorded_runtime_command(
+        tmp_path,
+        runtime,
+        "container_runtime_tag source:tag target:tag",
+    )
+
+    assert result.returncode == 0, result.stderr
+    expected = (runtime, *expected_command, "source:tag", "target:tag")
+    assert argv == ("\0".join(expected) + "\0").encode()
+    assert stdin == b""
+
+
+@pytest.mark.parametrize(
+    ("runtime", "expected_command"),
+    [
+        ("container", ("image", "push")),
+        ("podman", ("push",)),
+        ("docker", ("push",)),
+    ],
+)
+def test_push_maps_to_selected_runtime(
+    tmp_path: Path,
+    runtime: str,
+    expected_command: tuple[str, ...],
+) -> None:
+    result, argv, stdin = _run_recorded_runtime_command(
+        tmp_path,
+        runtime,
+        "container_runtime_push registry.example/image:tag",
+    )
+
+    assert result.returncode == 0, result.stderr
+    expected = (runtime, *expected_command, "registry.example/image:tag")
+    assert argv == ("\0".join(expected) + "\0").encode()
+    assert stdin == b""
+
+
+@pytest.mark.parametrize(
+    ("runtime", "expected_command"),
+    [
+        ("container", ("registry", "login", "-u")),
+        ("podman", ("login", "--username")),
+        ("docker", ("login", "--username")),
+    ],
+)
+def test_login_maps_to_selected_runtime_and_passes_secret_only_via_stdin(
+    tmp_path: Path,
+    runtime: str,
+    expected_command: tuple[str, ...],
+) -> None:
+    secret = "registry-secret\n"
+    result, argv, stdin = _run_recorded_runtime_command(
+        tmp_path,
+        runtime,
+        "container_runtime_login build-user registry.example",
+        stdin=secret,
+    )
+
+    assert result.returncode == 0, result.stderr
+    expected = (
+        runtime,
+        *expected_command,
+        "build-user",
+        "--password-stdin",
+        "registry.example",
+    )
+    assert argv == ("\0".join(expected) + "\0").encode()
+    assert b"registry-secret" not in argv
+    assert stdin == secret.encode()
 
 
 def test_selection_prefers_apple_container(tmp_path: Path) -> None:
