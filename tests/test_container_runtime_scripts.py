@@ -23,13 +23,19 @@ def _install_recording_runtime(tmp_path: Path, name: str) -> Path:
         tmp_path,
         name,
         r'''printf '%s\0' "${0##*/}" "$@" > "$RUNTIME_ARGV_LOG"
+read_stdin=0
 for arg in "$@"; do
     if [[ "$arg" == "--password-stdin" ]]; then
-        /bin/cat > "$RUNTIME_STDIN_LOG"
-        exit 0
+        read_stdin=1
+        break
     fi
 done
-: > "$RUNTIME_STDIN_LOG"''',
+if (( read_stdin == 1 )); then
+    /bin/cat > "$RUNTIME_STDIN_LOG"
+else
+    : > "$RUNTIME_STDIN_LOG"
+fi
+exit "${RUNTIME_EXIT_CODE:-0}"''',
     )
 
 
@@ -72,6 +78,7 @@ def _run_recorded_runtime_command(
     command: str,
     *,
     stdin: str | None = None,
+    extra_env: dict[str, str] | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], bytes, bytes]:
     argv_log = tmp_path / "runtime-argv.log"
     stdin_log = tmp_path / "runtime-stdin.log"
@@ -79,10 +86,42 @@ def _run_recorded_runtime_command(
     stdin_log.write_bytes(b"")
     _install_recording_runtime(tmp_path, runtime)
 
+    runtime_env = {
+        "RUNTIME_ARGV_LOG": str(argv_log),
+        "RUNTIME_STDIN_LOG": str(stdin_log),
+    }
+    if extra_env:
+        runtime_env.update(extra_env)
+
     result = _run_adapter(
         tmp_path,
         f"select_container_runtime && {command}",
         override=runtime,
+        stdin=stdin,
+        extra_env=runtime_env,
+    )
+
+    return result, argv_log.read_bytes(), stdin_log.read_bytes()
+
+
+def _run_recorded_wrapper_without_selection(
+    tmp_path: Path,
+    command: str,
+    *,
+    override: str | object = _UNSET,
+    stdin: str | None = None,
+) -> tuple[subprocess.CompletedProcess[str], bytes, bytes]:
+    argv_log = tmp_path / "runtime-argv.log"
+    stdin_log = tmp_path / "runtime-stdin.log"
+    argv_log.write_bytes(b"")
+    stdin_log.write_bytes(b"")
+    runtime_name = "container" if override is _UNSET else str(override)
+    _install_recording_runtime(tmp_path, runtime_name)
+
+    result = _run_adapter(
+        tmp_path,
+        command,
+        override=override,
         stdin=stdin,
         extra_env={
             "RUNTIME_ARGV_LOG": str(argv_log),
@@ -127,11 +166,11 @@ def test_tag_maps_to_selected_runtime(
     result, argv, stdin = _run_recorded_runtime_command(
         tmp_path,
         runtime,
-        "container_runtime_tag source:tag target:tag",
+        'container_runtime_tag "source image" "target image"',
     )
 
     assert result.returncode == 0, result.stderr
-    expected = (runtime, *expected_command, "source:tag", "target:tag")
+    expected = (runtime, *expected_command, "source image", "target image")
     assert argv == ("\0".join(expected) + "\0").encode()
     assert stdin == b""
 
@@ -193,6 +232,111 @@ def test_login_maps_to_selected_runtime_and_passes_secret_only_via_stdin(
     assert argv == ("\0".join(expected) + "\0").encode()
     assert b"registry-secret" not in argv
     assert stdin == secret.encode()
+
+
+@pytest.mark.parametrize(
+    "override",
+    [_UNSET, "buildah"],
+    ids=("unset", "invalid"),
+)
+@pytest.mark.parametrize(
+    ("command", "stdin"),
+    [
+        ("container_runtime_build .", None),
+        ("container_runtime_login user registry.example", "secret\n"),
+        ("container_runtime_tag source target", None),
+        ("container_runtime_push image:tag", None),
+    ],
+    ids=("build", "login", "tag", "push"),
+)
+def test_wrapper_rejects_unsupported_runtime_without_invocation(
+    tmp_path: Path,
+    override: str | object,
+    command: str,
+    stdin: str | None,
+) -> None:
+    result, argv, captured_stdin = _run_recorded_wrapper_without_selection(
+        tmp_path,
+        command,
+        override=override,
+        stdin=stdin,
+    )
+
+    assert result.returncode != 0
+    assert "container, podman, or docker" in result.stderr
+    assert argv == b""
+    assert captured_stdin == b""
+
+
+@pytest.mark.parametrize(
+    ("command", "stdin"),
+    [
+        ("container_runtime_build .", None),
+        ("container_runtime_login user registry.example", "registry-secret\n"),
+        ("container_runtime_tag source target", None),
+        ("container_runtime_push image:tag", None),
+    ],
+    ids=("build", "login", "tag", "push"),
+)
+def test_wrapper_propagates_runtime_failure(
+    tmp_path: Path,
+    command: str,
+    stdin: str | None,
+) -> None:
+    result, argv, captured_stdin = _run_recorded_runtime_command(
+        tmp_path,
+        "container",
+        command,
+        stdin=stdin,
+        extra_env={"RUNTIME_EXIT_CODE": "23"},
+    )
+
+    assert result.returncode == 23
+    assert argv != b""
+    assert captured_stdin == (stdin or "").encode()
+
+
+@pytest.mark.parametrize(
+    ("command", "usage"),
+    [
+        ("container_runtime_login user", "container_runtime_login USER REGISTRY"),
+        (
+            "container_runtime_login user registry.example extra",
+            "container_runtime_login USER REGISTRY",
+        ),
+        ("container_runtime_tag source", "container_runtime_tag SOURCE TARGET"),
+        (
+            "container_runtime_tag source target extra",
+            "container_runtime_tag SOURCE TARGET",
+        ),
+        ("container_runtime_push", "container_runtime_push IMAGE"),
+        ("container_runtime_push image extra", "container_runtime_push IMAGE"),
+    ],
+    ids=(
+        "login-missing",
+        "login-extra",
+        "tag-missing",
+        "tag-extra",
+        "push-missing",
+        "push-extra",
+    ),
+)
+def test_fixed_arity_wrapper_rejects_wrong_argument_count_without_invocation(
+    tmp_path: Path,
+    command: str,
+    usage: str,
+) -> None:
+    result, argv, stdin = _run_recorded_runtime_command(
+        tmp_path,
+        "docker",
+        command,
+        stdin="",
+    )
+
+    assert result.returncode == 2
+    assert f"Usage: {usage}" in result.stderr
+    assert argv == b""
+    assert stdin == b""
 
 
 def test_selection_prefers_apple_container(tmp_path: Path) -> None:

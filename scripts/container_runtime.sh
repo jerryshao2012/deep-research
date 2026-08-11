@@ -71,11 +71,31 @@ ensure_container_runtime_ready() {
     return 0
 }
 
+_require_container_runtime() {
+    case "${CONTAINER_RUNTIME-}" in
+        container | podman | docker)
+            return 0
+            ;;
+        *)
+            printf '%s\n' \
+                'Error: select container, podman, or docker before using container runtime commands.' >&2
+            return 1
+            ;;
+    esac
+}
+
 container_runtime_build() {
+    _require_container_runtime || return
     "$CONTAINER_RUNTIME" build "$@"
 }
 
 container_runtime_login() {
+    _require_container_runtime || return
+    if (( $# != 2 )); then
+        printf '%s\n' 'Usage: container_runtime_login USER REGISTRY' >&2
+        return 2
+    fi
+
     local username="$1"
     local registry="$2"
 
@@ -90,6 +110,12 @@ container_runtime_login() {
 }
 
 container_runtime_tag() {
+    _require_container_runtime || return
+    if (( $# != 2 )); then
+        printf '%s\n' 'Usage: container_runtime_tag SOURCE TARGET' >&2
+        return 2
+    fi
+
     local source="$1"
     local target="$2"
 
@@ -104,6 +130,12 @@ container_runtime_tag() {
 }
 
 container_runtime_push() {
+    _require_container_runtime || return
+    if (( $# != 1 )); then
+        printf '%s\n' 'Usage: container_runtime_push IMAGE' >&2
+        return 2
+    fi
+
     local image="$1"
 
     case "$CONTAINER_RUNTIME" in
