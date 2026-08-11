@@ -24,7 +24,7 @@ You need:
 
 - AWS CLI v2 authenticated to the intended account and region;
 - IAM permission to manage the scoped ECR repository, App Runner service, two App Runner roles, one Secrets Manager secret, and one S3 bucket;
-- one supported local container runtime: Apple's `container` CLI, daemonless Podman, or Docker;
+- one supported local container runtime: Apple's `container` CLI on an Apple silicon Mac running a macOS release listed in [Apple's current requirements](https://github.com/apple/container#requirements), Podman, or Docker;
 - Python 3 for version management and guarded snapshot tooling;
 - provider, upload, and OAuth credentials stored outside Git.
 
@@ -82,7 +82,14 @@ Never echo the JSON secret, paste real keys into commands, or include `aws secre
 
 ## Build and push the image
 
-`build-aws.sh` auto-detects installed runtimes in `container → podman → docker` order. Setting `CONTAINER_RUNTIME` forces one installed supported runtime. Apple's runtime can start its system automatically; daemonless Podman needs no service; Docker must pass `docker info`. If the selected runtime fails its readiness check, the build stops instead of falling through to another runtime.
+`build-aws.sh` auto-detects installed runtimes in `container → podman → docker` order. Setting `CONTAINER_RUNTIME` forces one installed supported runtime. Readiness depends on the selected runtime:
+
+- Apple's runtime can start its system automatically.
+- Native Linux Podman is daemonless and needs no daemon service, but `podman info` must pass.
+- On macOS, Podman runs through a Podman machine. Run `podman machine init` once, then `podman machine start`, and require `podman info` to pass.
+- Docker requires a running daemon and must pass `docker info`.
+
+If the selected runtime fails its readiness check, the build stops instead of falling through to another runtime.
 
 ```bash
 ./build-aws.sh

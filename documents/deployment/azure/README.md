@@ -31,7 +31,7 @@ You need:
 
 - an Azure subscription and rights to manage resource groups, Container Apps, managed identities, Key Vault access policies, and Storage;
 - Azure CLI with the Container Apps extension available;
-- one supported local container runtime: Apple's `container` CLI, daemonless Podman, or Docker;
+- one supported local container runtime: Apple's `container` CLI on an Apple silicon Mac running a macOS release listed in [Apple's current requirements](https://github.com/apple/container#requirements), Podman, or Docker;
 - Python 3 for API-version management inside the build script;
 - a Docker Hub account and personal access token;
 - a repository-root `.env.docker` containing only non-secret defaults safe to include in a published image;
@@ -94,7 +94,14 @@ For identity and secret-reference behavior, see [Security](security.md).
 
 ### 2. Build and publish an image
 
-`build.sh` auto-detects installed runtimes in `container → podman → docker` order. Setting `CONTAINER_RUNTIME` forces one installed supported runtime. Apple's runtime can start its system automatically; daemonless Podman needs no service; Docker must pass `docker info`. If the selected runtime fails its readiness check, the build stops instead of falling through to another runtime.
+`build.sh` auto-detects installed runtimes in `container → podman → docker` order. Setting `CONTAINER_RUNTIME` forces one installed supported runtime. Readiness depends on the selected runtime:
+
+- Apple's runtime can start its system automatically.
+- Native Linux Podman is daemonless and needs no daemon service, but `podman info` must pass.
+- On macOS, Podman runs through a Podman machine. Run `podman machine init` once, then `podman machine start`, and require `podman info` to pass.
+- Docker requires a running daemon and must pass `docker info`.
+
+If the selected runtime fails its readiness check, the build stops instead of falling through to another runtime.
 
 ```bash
 ./build.sh

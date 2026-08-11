@@ -78,7 +78,11 @@ def test_deployment_docs_explain_container_runtime_selection(
         "container → podman → docker",
         "CONTAINER_RUNTIME",
         "daemonless",
+        "podman info",
+        "podman machine init",
+        "podman machine start",
         "docker info",
+        "Apple silicon",
     ):
         assert expected_text in guide
 
