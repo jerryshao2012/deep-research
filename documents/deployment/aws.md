@@ -24,7 +24,7 @@ You need:
 
 - AWS CLI v2 authenticated to the intended account and region;
 - IAM permission to manage the scoped ECR repository, App Runner service, two App Runner roles, one Secrets Manager secret, and one S3 bucket;
-- Apple's `container` CLI running locally, because `build-aws.sh` uses `container build`, `container image push`, and `container registry login`;
+- one supported local container runtime: Apple's `container` CLI, daemonless Podman, or Docker;
 - Python 3 for version management and guarded snapshot tooling;
 - provider, upload, and OAuth credentials stored outside Git.
 
@@ -32,7 +32,7 @@ Run non-mutating checks from repository root:
 
 ```bash
 aws sts get-caller-identity
-container system status
+command -v container || command -v podman || command -v docker
 python3 --version
 ./deploy-aws.sh --help
 ./sync-files-aws.sh --help
@@ -82,8 +82,12 @@ Never echo the JSON secret, paste real keys into commands, or include `aws secre
 
 ## Build and push the image
 
+`build-aws.sh` auto-detects installed runtimes in `container → podman → docker` order. Setting `CONTAINER_RUNTIME` forces one installed supported runtime. Apple's runtime can start its system automatically; daemonless Podman needs no service; Docker must pass `docker info`. If the selected runtime fails its readiness check, the build stops instead of falling through to another runtime.
+
 ```bash
 ./build-aws.sh
+CONTAINER_RUNTIME=podman ./build-aws.sh
+CONTAINER_RUNTIME=docker ./build-aws.sh
 ```
 
 The script verifies AWS identity, creates the ECR repository when absent, increments `API_VERSION`, writes `.build_version`, builds a no-cache `linux/amd64` image from `Dockerfile-aws`, and pushes `latest` plus the timestamped tag.
@@ -228,17 +232,17 @@ Monitor CPU, memory, request count, latency, HTTP status, App Runner operations,
 
 ### Image build or push fails
 
-Recheck AWS identity, ECR repository, `container` daemon, and ECR login:
+Recheck AWS identity, ECR repository, selected local runtime, and ECR login:
 
 ```bash
 aws sts get-caller-identity
-container system status
+command -v container || command -v podman || command -v docker
 aws ecr describe-repositories \
   --repository-names "$ECR_REPO_NAME" \
   --region "$AWS_REGION"
 ```
 
-Then rerun `./build-aws.sh`. Do not mix `docker` and `container` commands unless the build script is intentionally changed and tested.
+Then rerun `./build-aws.sh`. Use `CONTAINER_RUNTIME` when you need to force a specific installed supported runtime.
 
 ### App Runner create or update fails
 

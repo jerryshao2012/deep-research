@@ -31,7 +31,7 @@ You need:
 
 - an Azure subscription and rights to manage resource groups, Container Apps, managed identities, Key Vault access policies, and Storage;
 - Azure CLI with the Container Apps extension available;
-- Apple's `container` CLI running locally, because the current build script invokes `container build`, `container image push`, and `container registry login` rather than Docker;
+- one supported local container runtime: Apple's `container` CLI, daemonless Podman, or Docker;
 - Python 3 for API-version management inside the build script;
 - a Docker Hub account and personal access token;
 - a repository-root `.env.docker` containing only non-secret defaults safe to include in a published image;
@@ -42,7 +42,7 @@ Run these non-mutating checks from repository root:
 ```bash
 az version
 az account show --output table
-container system status
+command -v container || command -v podman || command -v docker
 python3 --version
 ./deploy.sh --help
 ./sync-files.sh --help
@@ -94,8 +94,12 @@ For identity and secret-reference behavior, see [Security](security.md).
 
 ### 2. Build and publish an image
 
+`build.sh` auto-detects installed runtimes in `container → podman → docker` order. Setting `CONTAINER_RUNTIME` forces one installed supported runtime. Apple's runtime can start its system automatically; daemonless Podman needs no service; Docker must pass `docker info`. If the selected runtime fails its readiness check, the build stops instead of falling through to another runtime.
+
 ```bash
 ./build.sh
+CONTAINER_RUNTIME=podman ./build.sh
+CONTAINER_RUNTIME=docker ./build.sh
 ```
 
 The script increments `API_VERSION`, creates `.build_version`, builds a `linux/amd64` image, and pushes both `latest` and the timestamped version to Docker Hub. Review those source changes before committing; an image build is not read-only.

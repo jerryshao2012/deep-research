@@ -61,6 +61,28 @@ def test_container_runtime_shell_scripts_have_valid_bash_syntax(
     assert result.returncode == 0, result.stderr
 
 
+@pytest.mark.parametrize(
+    "guide_path",
+    [
+        PROJECT_ROOT / "documents" / "deployment" / "azure" / "README.md",
+        PROJECT_ROOT / "documents" / "deployment" / "aws.md",
+    ],
+    ids=("azure", "aws"),
+)
+def test_deployment_docs_explain_container_runtime_selection(
+    guide_path: Path,
+) -> None:
+    guide = guide_path.read_text(encoding="utf-8")
+
+    for expected_text in (
+        "container → podman → docker",
+        "CONTAINER_RUNTIME",
+        "daemonless",
+        "docker info",
+    ):
+        assert expected_text in guide
+
+
 def _install_runtime(tmp_path: Path, name: str, body: str = "exit 0") -> Path:
     runtime = tmp_path / name
     runtime.write_text(f"#!/bin/bash\n{body}\n", encoding="utf-8")
