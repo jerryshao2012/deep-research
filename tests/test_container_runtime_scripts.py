@@ -484,17 +484,30 @@ def test_selection_fails_when_no_supported_runtime_exists(tmp_path: Path) -> Non
     assert result.stdout == ""
 
 
-def test_selection_ignores_inherited_exported_runtime_function(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("BASH_FUNC_container%%", "() {  return 0\n}")
+def test_selection_ignores_exported_runtime_function(tmp_path: Path) -> None:
+    _install_runtime(tmp_path, "podman")
 
-    result = _select_runtime(tmp_path)
+    result = _run_adapter(
+        tmp_path,
+        'select_container_runtime && printf "%s\\n" "$CONTAINER_RUNTIME"',
+        extra_env={"BASH_FUNC_container%%": "() {  return 0\n}"},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "podman\n"
+
+
+def test_explicit_override_rejects_exported_runtime_function(tmp_path: Path) -> None:
+    result = _run_adapter(
+        tmp_path,
+        "select_container_runtime",
+        override="container",
+        extra_env={"BASH_FUNC_container%%": "() {  return 0\n}"},
+    )
 
     assert result.returncode != 0
-    assert "No supported container runtime found" in result.stderr
-    assert result.stdout == ""
+    assert "unavailable" in result.stderr
+    assert "container, podman, or docker" in result.stderr
 
 
 def test_podman_readiness_invokes_only_info(tmp_path: Path) -> None:
@@ -637,6 +650,7 @@ def test_podman_readiness_failure_does_not_fall_back_to_docker(
 
     assert result.returncode != 0
     assert invocation_log.read_text(encoding="utf-8") == "podman info\n"
+    assert "podman info" in result.stderr
     assert "daemonless Podman" in result.stderr
 
 
@@ -658,6 +672,7 @@ def test_docker_readiness_failure_tells_user_to_start_daemon(
 
     assert result.returncode != 0
     assert invocation_log.read_text(encoding="utf-8") == "docker info\n"
+    assert "docker info" in result.stderr
     assert "start the Docker daemon" in result.stderr
 
 

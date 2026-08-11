@@ -1,5 +1,14 @@
 #!/usr/bin/env bash
 
+_container_runtime_executable_available() {
+    local runtime="$1"
+    local executable
+
+    command -v "$runtime" >/dev/null 2>&1 || return 1
+    executable="$(type -P "$runtime" 2>/dev/null)" || return 1
+    [[ -n "$executable" && -f "$executable" && -x "$executable" ]]
+}
+
 select_container_runtime() {
     local runtime
 
@@ -13,7 +22,7 @@ select_container_runtime() {
                 ;;
         esac
 
-        if ! command -v "$CONTAINER_RUNTIME" >/dev/null 2>&1; then
+        if ! _container_runtime_executable_available "$CONTAINER_RUNTIME"; then
             printf 'Error: requested container runtime %q is unavailable; choose container, podman, or docker.\n' \
                 "$CONTAINER_RUNTIME" >&2
             return 1
@@ -23,7 +32,7 @@ select_container_runtime() {
     fi
 
     for runtime in container podman docker; do
-        if command -v "$runtime" >/dev/null 2>&1; then
+        if _container_runtime_executable_available "$runtime"; then
             CONTAINER_RUNTIME="$runtime"
             return 0
         fi
@@ -50,14 +59,14 @@ ensure_container_runtime_ready() {
         podman)
             if ! podman info >/dev/null 2>&1; then
                 printf '%s\n' \
-                    'Error: daemonless Podman is not ready; check the Podman installation and configuration.' >&2
+                    'Error: podman info failed; daemonless Podman is not ready. Check the Podman installation and configuration.' >&2
                 return 1
             fi
             ;;
         docker)
             if ! docker info >/dev/null 2>&1; then
                 printf '%s\n' \
-                    'Error: Docker is not ready; start the Docker daemon and try again.' >&2
+                    'Error: docker info failed; start the Docker daemon and try again.' >&2
                 return 1
             fi
             ;;
