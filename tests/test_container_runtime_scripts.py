@@ -115,6 +115,18 @@ exit "${RUNTIME_EXIT_CODE:-0}"''',
     )
 
 
+def _exported_runtime_function_env(
+    runtime: str,
+    sentinel: Path,
+) -> dict[str, str]:
+    return {
+        f"BASH_FUNC_{runtime}%%": (
+            "() {  printf 'shadowed\\n' > \"$FUNCTION_SENTINEL\"; return 91\n}"
+        ),
+        "FUNCTION_SENTINEL": str(sentinel),
+    }
+
+
 def _run_adapter(
     tmp_path: Path,
     command: str,
@@ -312,8 +324,8 @@ def test_login_maps_to_selected_runtime_and_passes_secret_only_via_stdin(
 
 @pytest.mark.parametrize(
     "override",
-    [_UNSET, "buildah"],
-    ids=("unset", "invalid"),
+    [_UNSET, "buildah", "docker"],
+    ids=("unset", "invalid", "valid-name-without-selection"),
 )
 @pytest.mark.parametrize(
     ("command", "stdin"),
@@ -325,7 +337,7 @@ def test_login_maps_to_selected_runtime_and_passes_secret_only_via_stdin(
     ],
     ids=("build", "login", "tag", "push"),
 )
-def test_wrapper_rejects_unsupported_runtime_without_invocation(
+def test_wrapper_rejects_unselected_or_unsupported_runtime_without_invocation(
     tmp_path: Path,
     override: str | object,
     command: str,
@@ -342,6 +354,32 @@ def test_wrapper_rejects_unsupported_runtime_without_invocation(
     assert "container, podman, or docker" in result.stderr
     assert argv == b""
     assert captured_stdin == b""
+
+
+def test_wrapper_rejects_inherited_resolved_command_without_selection(
+    tmp_path: Path,
+) -> None:
+    invocation_log = tmp_path / "invocations.log"
+    invocation_log.write_text("", encoding="utf-8")
+    runtime = _install_runtime(
+        tmp_path,
+        "docker",
+        'printf "docker %s\\n" "$*" >> "$INVOCATION_LOG"\nexit 0',
+    )
+
+    result = _run_adapter(
+        tmp_path,
+        "container_runtime_build .",
+        override="docker",
+        extra_env={
+            "CONTAINER_RUNTIME_COMMAND": str(runtime),
+            "INVOCATION_LOG": str(invocation_log),
+        },
+    )
+
+    assert result.returncode != 0
+    assert "selected" in result.stderr
+    assert invocation_log.read_text(encoding="utf-8") == ""
 
 
 @pytest.mark.parametrize(
@@ -456,6 +494,41 @@ def test_explicit_valid_override_wins_over_automatic_selection(tmp_path: Path) -
     assert result.stdout == "podman\n"
 
 
+def test_automatic_selection_binds_priority_runtime_executable(tmp_path: Path) -> None:
+    sentinel = tmp_path / "function-called"
+    for runtime in ("container", "podman", "docker"):
+        _install_runtime(tmp_path, runtime)
+
+    result = _run_adapter(
+        tmp_path,
+        "select_container_runtime && "
+        "printf '%s\\n%s\\n' \"$CONTAINER_RUNTIME\" \"$CONTAINER_RUNTIME_COMMAND\"",
+        extra_env=_exported_runtime_function_env("container", sentinel),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == f"container\n{tmp_path / 'container'}\n"
+    assert not sentinel.exists()
+
+
+def test_explicit_selection_binds_override_runtime_executable(tmp_path: Path) -> None:
+    sentinel = tmp_path / "function-called"
+    for runtime in ("container", "podman"):
+        _install_runtime(tmp_path, runtime)
+
+    result = _run_adapter(
+        tmp_path,
+        "select_container_runtime && "
+        "printf '%s\\n%s\\n' \"$CONTAINER_RUNTIME\" \"$CONTAINER_RUNTIME_COMMAND\"",
+        override="podman",
+        extra_env=_exported_runtime_function_env("podman", sentinel),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == f"podman\n{tmp_path / 'podman'}\n"
+    assert not sentinel.exists()
+
+
 @pytest.mark.parametrize(
     ("override", "installed"),
     [
@@ -512,6 +585,127 @@ def test_explicit_override_rejects_exported_runtime_function(tmp_path: Path) -> 
     assert result.returncode != 0
     assert "unavailable" in result.stderr
     assert "container, podman, or docker" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("runtime", "expected_invocation"),
+    [
+        ("container", "container system status\n"),
+        ("podman", "podman info\n"),
+        ("docker", "docker info\n"),
+    ],
+)
+def test_readiness_dispatches_to_bound_executable_not_exported_function(
+    tmp_path: Path,
+    runtime: str,
+    expected_invocation: str,
+) -> None:
+    invocation_log = tmp_path / "invocations.log"
+    sentinel = tmp_path / "function-called"
+    _install_runtime(
+        tmp_path,
+        runtime,
+        f'printf "{runtime} %s\\n" "$*" >> "$INVOCATION_LOG"\nexit 0',
+    )
+    runtime_env = _exported_runtime_function_env(runtime, sentinel)
+    runtime_env["INVOCATION_LOG"] = str(invocation_log)
+
+    result = _run_adapter(
+        tmp_path,
+        "select_container_runtime && ensure_container_runtime_ready",
+        override=runtime,
+        extra_env=runtime_env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert invocation_log.read_text(encoding="utf-8") == expected_invocation
+    assert not sentinel.exists()
+
+
+@pytest.mark.parametrize("runtime", ["container", "podman", "docker"])
+@pytest.mark.parametrize(
+    ("command", "stdin", "expected_by_runtime"),
+    [
+        (
+            'container_runtime_build --platform linux/amd64 -t "image tag" .',
+            None,
+            {
+                "container": ("build", "--platform", "linux/amd64", "-t", "image tag", "."),
+                "podman": ("build", "--platform", "linux/amd64", "-t", "image tag", "."),
+                "docker": ("build", "--platform", "linux/amd64", "-t", "image tag", "."),
+            },
+        ),
+        (
+            "container_runtime_login build-user registry.example",
+            "registry-secret\n",
+            {
+                "container": (
+                    "registry",
+                    "login",
+                    "-u",
+                    "build-user",
+                    "--password-stdin",
+                    "registry.example",
+                ),
+                "podman": (
+                    "login",
+                    "--username",
+                    "build-user",
+                    "--password-stdin",
+                    "registry.example",
+                ),
+                "docker": (
+                    "login",
+                    "--username",
+                    "build-user",
+                    "--password-stdin",
+                    "registry.example",
+                ),
+            },
+        ),
+        (
+            'container_runtime_tag "source image" "target image"',
+            None,
+            {
+                "container": ("image", "tag", "source image", "target image"),
+                "podman": ("tag", "source image", "target image"),
+                "docker": ("tag", "source image", "target image"),
+            },
+        ),
+        (
+            "container_runtime_push registry.example/image:tag",
+            None,
+            {
+                "container": ("image", "push", "registry.example/image:tag"),
+                "podman": ("push", "registry.example/image:tag"),
+                "docker": ("push", "registry.example/image:tag"),
+            },
+        ),
+    ],
+    ids=("build", "login", "tag", "push"),
+)
+def test_wrapper_dispatches_to_bound_executable_not_exported_function(
+    tmp_path: Path,
+    runtime: str,
+    command: str,
+    stdin: str | None,
+    expected_by_runtime: dict[str, tuple[str, ...]],
+) -> None:
+    sentinel = tmp_path / "function-called"
+
+    result, argv, captured_stdin = _run_recorded_runtime_command(
+        tmp_path,
+        runtime,
+        command,
+        stdin=stdin,
+        extra_env=_exported_runtime_function_env(runtime, sentinel),
+    )
+
+    expected = (runtime, *expected_by_runtime[runtime])
+    assert result.returncode == 0, result.stderr
+    assert argv == ("\0".join(expected) + "\0").encode()
+    assert captured_stdin == (stdin or "").encode()
+    assert not sentinel.exists()
 
 
 def test_podman_readiness_invokes_only_info(tmp_path: Path) -> None:
