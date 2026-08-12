@@ -12,6 +12,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 SECRET_NAMES = (
     "TAVILY-API-KEY",
@@ -52,7 +53,7 @@ VAULT_QUERY = (
 )
 SECRET_VERSIONS_QUERY = (
     "[].{id:id,name:name,version:version,enabled:attributes.enabled,"
-    "updated:attributes.updated}"
+    "created:attributes.created,updated:attributes.updated}"
 )
 ROLE_QUERY = (
     "[].{id:id,principalId:principalId,roleDefinitionId:roleDefinitionId,"
@@ -505,22 +506,47 @@ def _capture(arguments: argparse.Namespace) -> dict[str, Any]:
             "Key Vault secret versions",
         )
         versions: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
         seen_versions: set[str] = set()
         for raw_version in raw_versions:
             item = _mapping(raw_version, "Key Vault secret version")
             _exact_keys(
                 item,
-                {"id", "name", "version", "enabled", "updated"},
+                {"id", "name", "version", "enabled", "created", "updated"},
                 "Key Vault secret version",
             )
             name = _string(item["name"], "Key Vault secret version name")
-            version = _string(item["version"], "Key Vault secret version")
             secret_id = _string(item["id"], "Key Vault secret version ID")
-            assert name is not None and version is not None and secret_id is not None
+            assert name is not None and secret_id is not None
             if name.casefold() != secret_name.casefold():
                 raise SnapshotError("invalid Key Vault secret version name metadata")
-            if secret_id.rstrip("/").rsplit("/", 1)[-1] != version:
+            parsed_id = urlsplit(secret_id)
+            path_parts = parsed_id.path.split("/")
+            if (
+                parsed_id.scheme != "https"
+                or parsed_id.hostname != f"{arguments.vault_name}.vault.azure.net"
+                or parsed_id.username is not None
+                or parsed_id.password is not None
+                or parsed_id.port is not None
+                or parsed_id.query
+                or parsed_id.fragment
+                or len(path_parts) != 4
+                or path_parts[0] != ""
+                or path_parts[1].casefold() != "secrets"
+                or path_parts[2].casefold() != secret_name.casefold()
+                or not path_parts[3]
+            ):
                 raise SnapshotError("invalid versioned Key Vault secret ID metadata")
+            version = path_parts[3]
+            reported_version = item["version"]
+            if reported_version is not None and (
+                not isinstance(reported_version, str) or reported_version != version
+            ):
+                raise SnapshotError("invalid Key Vault secret version metadata")
+            folded_id = secret_id.casefold()
+            if folded_id in seen_ids:
+                raise SnapshotError("duplicate Key Vault secret version ID metadata")
+            seen_ids.add(folded_id)
             if version.casefold() in seen_versions:
                 raise SnapshotError("duplicate Key Vault secret version metadata")
             seen_versions.add(version.casefold())
@@ -528,38 +554,20 @@ def _capture(arguments: argparse.Namespace) -> dict[str, Any]:
                 raise SnapshotError("invalid secret enabled metadata schema")
             versions.append(
                 {
-                    "name": name,
                     "id": secret_id,
                     "version": version,
                     "enabled": item["enabled"],
-                    "updated": _string(
-                        item["updated"], "secret updated timestamp", nullable=True
-                    ),
+                    "created": _string(item["created"], "secret created timestamp"),
+                    "updated": _string(item["updated"], "secret updated timestamp"),
                 }
             )
         if not versions:
             raise SnapshotError(f"no secret version metadata for {secret_name}")
-        sortable = [version for version in versions if version["updated"] is not None]
-        if len(sortable) != len(versions):
-            raise SnapshotError(
-                f"secret version lacks updated metadata for {secret_name}"
-            )
-        newest_updated = max(str(version["updated"]) for version in sortable)
-        newest = [
-            version for version in sortable if version["updated"] == newest_updated
-        ]
-        if len(newest) != 1:
-            raise SnapshotError(f"ambiguous current secret version for {secret_name}")
-        selected = newest[0]
-        if not selected["enabled"]:
-            raise SnapshotError(f"current secret version is disabled for {secret_name}")
+        versions.sort(key=lambda item: (str(item["version"]).casefold(), item["id"]))
         secrets.append(
             {
                 "name": secret_name,
-                "id": selected["id"],
-                "version": selected["version"],
-                "enabled": selected["enabled"],
-                "updated": selected["updated"],
+                "versions": versions,
             }
         )
 
@@ -871,7 +879,7 @@ def _validate_snapshot_environment_storage(raw: object) -> None:
     _require_canonical(storage, normalized, "snapshot environment storage")
 
 
-def _validate_snapshot_secrets(raw: object) -> None:
+def _validate_snapshot_secrets(raw: object, vault_name: str) -> None:
     secrets = _list(raw, "snapshot Key Vault secrets")
     normalized: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -879,27 +887,67 @@ def _validate_snapshot_secrets(raw: object) -> None:
         secret = _mapping(raw_secret, "snapshot Key Vault secret")
         _exact_keys(
             secret,
-            {"name", "id", "version", "enabled", "updated"},
+            {"name", "versions"},
             "snapshot Key Vault secret",
         )
         name = _string(secret["name"], "snapshot Key Vault secret name")
-        secret_id = _string(secret["id"], "snapshot Key Vault secret ID")
-        version = _string(secret["version"], "snapshot Key Vault secret version")
         assert name is not None
         if name.casefold() in seen:
             raise SnapshotError("duplicate snapshot Key Vault secret metadata")
         seen.add(name.casefold())
-        if not isinstance(secret["enabled"], bool):
-            raise SnapshotError("invalid snapshot secret enabled metadata schema")
+        raw_versions = _list(secret["versions"], "snapshot secret versions")
+        versions: list[dict[str, Any]] = []
+        seen_version_ids: set[str] = set()
+        seen_versions: set[str] = set()
+        for raw_version in raw_versions:
+            version = _mapping(raw_version, "snapshot secret version")
+            _exact_keys(
+                version,
+                {"id", "version", "enabled", "created", "updated"},
+                "snapshot secret version",
+            )
+            version_id = _string(version["id"], "snapshot secret version ID")
+            version_name = _string(version["version"], "snapshot secret version")
+            assert version_id is not None and version_name is not None
+            parsed_id = urlsplit(version_id)
+            path_parts = parsed_id.path.split("/")
+            if (
+                parsed_id.scheme != "https"
+                or parsed_id.hostname != f"{vault_name}.vault.azure.net"
+                or parsed_id.username is not None
+                or parsed_id.password is not None
+                or parsed_id.port is not None
+                or parsed_id.query
+                or parsed_id.fragment
+                or path_parts != ["", "secrets", name, version_name]
+            ):
+                raise SnapshotError("invalid snapshot versioned secret ID metadata")
+            if (
+                version_id.casefold() in seen_version_ids
+                or version_name.casefold() in seen_versions
+            ):
+                raise SnapshotError("duplicate snapshot secret version metadata")
+            seen_version_ids.add(version_id.casefold())
+            seen_versions.add(version_name.casefold())
+            if not isinstance(version["enabled"], bool):
+                raise SnapshotError("invalid snapshot secret enabled metadata schema")
+            versions.append(
+                {
+                    "id": version_id,
+                    "version": version_name,
+                    "enabled": version["enabled"],
+                    "created": _string(version["created"], "snapshot secret created"),
+                    "updated": _string(version["updated"], "snapshot secret updated"),
+                }
+            )
+        if not versions:
+            raise SnapshotError("snapshot secret versions must not be empty")
+        versions.sort(key=lambda item: (str(item["version"]).casefold(), item["id"]))
+        _require_canonical(raw_versions, versions, "snapshot secret versions")
         normalized.append(
             {
                 "name": name,
-                "id": secret_id,
-                "version": version,
-                "enabled": secret["enabled"],
-                "updated": _string(
-                    secret["updated"], "snapshot secret updated", nullable=True
-                ),
+                "versions": versions,
             }
         )
     normalized.sort(key=lambda item: str(item["name"]).casefold())
@@ -1006,12 +1054,16 @@ def _load_snapshot(path: Path) -> dict[str, Any]:
         {"id", "location", "rbac_enabled", "access_policies", "secrets"},
         "snapshot Key Vault",
     )
-    _string(vault["id"], "snapshot Key Vault ID")
+    vault_id = _string(vault["id"], "snapshot Key Vault ID")
+    assert vault_id is not None
+    vault_name = vault_id.rstrip("/").rsplit("/", 1)[-1]
+    if not vault_name:
+        raise SnapshotError("invalid snapshot Key Vault ID metadata schema")
     _string(vault["location"], "snapshot Key Vault location")
     if not isinstance(vault["rbac_enabled"], bool):
         raise SnapshotError("invalid snapshot Key Vault RBAC metadata schema")
     _validate_snapshot_policies(vault["access_policies"])
-    _validate_snapshot_secrets(vault["secrets"])
+    _validate_snapshot_secrets(vault["secrets"], vault_name)
     _validate_snapshot_roles(snapshot["role_assignments"])
     return snapshot
 
