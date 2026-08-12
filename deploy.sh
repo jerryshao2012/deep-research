@@ -38,6 +38,15 @@ print_timing_summary() {
   echo "═══════════════════════════════════════════════════════"
 }
 
+normalize_azure_tsv_array() {
+  local row="$1"
+  if [[ "$row" == *$'\n'* ]]; then
+    [[ "$row" != *$'\t'* ]] || return 1
+    row="${row//$'\n'/$'\t'}"
+  fi
+  printf '%s' "$row"
+}
+
 # Parse command-line arguments
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -198,12 +207,17 @@ if [[ "$IDENTITY_STATUS" != 0 ]]; then
   echo "Error: existing user-assigned managed identity '$USER_IDENTITY_NAME' is required before managed passkey deployment" >&2
   exit "$IDENTITY_STATUS"
 fi
-if [[ "$IDENTITY_ROW" != *$'\t'* || "$IDENTITY_ROW" == *$'\n'* ]]; then
+if ! IDENTITY_ROW=$(normalize_azure_tsv_array "$IDENTITY_ROW"); then
+  echo "Error: existing backend user-assigned identity returned an invalid response" >&2
+  exit 65
+fi
+IDENTITY_REMAINDER="${IDENTITY_ROW#*$'\t'}"
+if [[ "$IDENTITY_ROW" != *$'\t'* || "$IDENTITY_REMAINDER" == *$'\t'* ]]; then
   echo "Error: existing backend user-assigned identity returned an invalid response" >&2
   exit 65
 fi
 USER_IDENTITY_ID="${IDENTITY_ROW%%$'\t'*}"
-USER_IDENTITY_PRINCIPAL_ID="${IDENTITY_ROW#*$'\t'}"
+USER_IDENTITY_PRINCIPAL_ID="$IDENTITY_REMAINDER"
 if [[ -z "$USER_IDENTITY_ID" || -z "$USER_IDENTITY_PRINCIPAL_ID" ]]; then
   echo "Error: existing backend user-assigned identity is incomplete" >&2
   exit 65
@@ -286,7 +300,7 @@ RESTART_TRIGGER=$(date +%s)
 REVISION_SUFFIX="passkeys-$(date +%Y%m%d%H%M%S)"
 DESIRED_CONFIG_YAML=$(mktemp /tmp/desired-config-XXXXXX.yaml 2>/dev/null || mktemp)
 UPDATE_YAML=$(mktemp /tmp/update-config-XXXXXX.yaml 2>/dev/null || mktemp)
-python3 "$SCRIPT_DIR/scripts/render_azure_containerapp_config.py" \
+uv run python "$SCRIPT_DIR/scripts/render_azure_containerapp_config.py" \
   --docker-username "$DOCKER_HUB_USERNAME" \
   --build-version "$BUILD_VERSION" \
   --identity-id "$USER_IDENTITY_ID" \
@@ -297,7 +311,7 @@ python3 "$SCRIPT_DIR/scripts/render_azure_containerapp_config.py" \
   --restart-trigger "$RESTART_TRIGGER" \
   --revision-suffix "$REVISION_SUFFIX" \
   --output "$DESIRED_CONFIG_YAML"
-python3 "$SCRIPT_DIR/scripts/merge_azure_containerapp_config.py" \
+uv run python "$SCRIPT_DIR/scripts/merge_azure_containerapp_config.py" \
   --existing-json "$EXISTING_CONFIG_JSON" \
   --desired-yaml "$DESIRED_CONFIG_YAML" \
   --output-yaml "$UPDATE_YAML"
@@ -451,6 +465,11 @@ if [[ "$ENV_STORAGE_STATUS" != 0 ]]; then
   rm -f "$EXISTING_CONFIG_JSON" "$UPDATE_YAML"
   exit "$ENV_STORAGE_STATUS"
 fi
+if ! ENV_STORAGE_RESULT=$(normalize_azure_tsv_array "$ENV_STORAGE_RESULT"); then
+  echo "Error: Container Apps environment storage '$SQLITE_ENV_STORAGE_NAME' returned an invalid response" >&2
+  rm -f "$EXISTING_CONFIG_JSON" "$UPDATE_YAML"
+  exit 65
+fi
 EXPECTED_ENV_STORAGE_RESULT="${SQLITE_ENV_STORAGE_NAME}"$'\t'"${STORAGE_ACCOUNT_NAME}"$'\t'"${STORAGE_FILE_SHARE_NAME}"$'\t'"ReadWrite"
 if [[ "$ENV_STORAGE_RESULT" != "$EXPECTED_ENV_STORAGE_RESULT" ]]; then
   echo "Error: Container Apps environment storage '$SQLITE_ENV_STORAGE_NAME' does not match required Azure Files binding" >&2
@@ -524,7 +543,11 @@ rm -f "$UPDATE_YAML"
 REVISION_READY=false
 for i in {1..60}; do
   REVISION_STATE=$(az containerapp revision list --name "$AGENT_NAME" --resource-group "$RESOURCE_GROUP" --query "[?name=='${AGENT_NAME}--${REVISION_SUFFIX}'] | [0].[properties.runningState,properties.healthState]" -o tsv)
-  if [[ "$REVISION_STATE" == $'Running\tHealthy' ]]; then
+  if ! REVISION_STATE=$(normalize_azure_tsv_array "$REVISION_STATE"); then
+    echo "Error: Container App revision health query returned an invalid response" >&2
+    exit 65
+  fi
+  if [[ "$REVISION_STATE" == $'Running\tHealthy' || "$REVISION_STATE" == $'RunningAtMaxScale\tHealthy' ]]; then
     REVISION_READY=true
     break
   fi

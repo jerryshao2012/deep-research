@@ -129,7 +129,13 @@ if [[ "$AZ_QUERY_STATUS" != 0 ]]; then
 fi
 
 AZ_QUERY_LINE="${AZ_QUERY_OUTPUT%$'\n'}"
-if [[ "$AZ_QUERY_LINE" == *$'\n'* || "$AZ_QUERY_LINE" != *$'\t'* ]]; then
+if [[ "$AZ_QUERY_LINE" == *$'\n'* ]]; then
+    if [[ "$AZ_QUERY_LINE" == *$'\t'* ]]; then
+        fail "Azure environment query returned an invalid response"
+    fi
+    AZ_QUERY_LINE="${AZ_QUERY_LINE//$'\n'/$'\t'}"
+fi
+if [[ "$AZ_QUERY_LINE" != *$'\t'* ]]; then
     fail "Azure environment query returned an invalid response"
 fi
 AZURE_ENVIRONMENT_ID="${AZ_QUERY_LINE%%$'\t'*}"

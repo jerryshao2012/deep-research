@@ -478,6 +478,21 @@ def test_azure_endpoint_resolver_queries_environment_once_and_emits_schema(tmp_p
     assert not (tmp_path / METADATA_NAME).exists()
 
 
+def test_azure_endpoint_resolver_accepts_current_cli_multiline_tsv(tmp_path):
+    fake_environment, argv_log = _install_fake_az(
+        tmp_path,
+        output=f"{ENVIRONMENT_ID}\n{DEFAULT_DOMAIN}\nSucceeded\n",
+    )
+
+    result = _run_resolver(tmp_path, fake_environment)
+
+    assert result.returncode == 0
+    assert _read_az_calls(argv_log) == [EXPECTED_AZ_ARGV]
+    parsed = _parse_resolver_assignments(result.stdout)
+    assert parsed["AZURE_ENVIRONMENT_ID"] == ENVIRONMENT_ID
+    assert parsed["AZURE_ENVIRONMENT_DEFAULT_DOMAIN"] == DEFAULT_DOMAIN
+
+
 def test_azure_endpoint_resolver_shell_quotes_parenthesized_resource_group(tmp_path):
     resource_group = "demo(rg)"
     environment_id = (
@@ -1688,7 +1703,7 @@ sys.exit(0)
     ]
 
 
-def test_azure_deploy_merges_passkey_config_and_records_only_after_health(tmp_path):
+def test_azure_deploy_accepts_current_cli_multiline_tsv_arrays(tmp_path):
     fixture, argv_log = _install_azure_script_fixture(tmp_path, "deploy.sh")
     (fixture / ".env.docker").write_text("OTHER=value\n", encoding="utf-8")
     deploy_pat_canary = "deploy-must-not-consume-this-pat"
@@ -1717,7 +1732,7 @@ if args[:3] == ["containerapp", "env", "show"] and "--subscription" in args:
 elif args[:2] == ["group", "show"]:
     sys.stdout.write("/subscriptions/demo/resourceGroups/demo-rg\\n")
 elif args[:2] == ["identity", "show"]:
-    sys.stdout.write("/subscriptions/demo/identity\\tprincipal-123\\n")
+    sys.stdout.write("/subscriptions/demo/identity\\nprincipal-123\\n")
 elif args[:2] == ["keyvault", "show"] and "accessPolicies" in " ".join(args):
     sys.stdout.write("/subscriptions/demo/vaults/demo-vault|false|1\\n")
 elif args[:3] == ["keyvault", "secret", "show"]:
@@ -1730,7 +1745,7 @@ elif args[:3] == ["storage", "container-rm", "show"]:
 elif args[:3] == ["storage", "share-rm", "show"]:
     sys.stdout.write("deep-research-auth\\n")
 elif args[:4] == ["containerapp", "env", "storage", "show"]:
-    sys.stdout.write("authsqlite\\tdemostorage\\tdeep-research-auth\\tReadWrite\\n")
+    sys.stdout.write("authsqlite\\ndemostorage\\ndeep-research-auth\\nReadWrite\\n")
 elif args[:2] == ["containerapp", "show"] and "provisioningState" in " ".join(args):
     sys.stdout.write("Succeeded\\n")
 elif args[:2] == ["containerapp", "show"] and "--output" in args and args[args.index("--output") + 1] == "json":
@@ -1760,7 +1775,7 @@ elif args[:3] == ["containerapp", "revision", "list"]:
     if "--query" not in args or args[args.index("--query") + 1] != expected_query:
         sys.stderr.write("revision query did not target exact expected revision\\n")
         raise SystemExit(89)
-    sys.stdout.write("Running\\tHealthy\\n")
+    sys.stdout.write("RunningAtMaxScale\\nHealthy\\n")
 elif args[:2] == ["containerapp", "update"] and "--yaml" in args:
     if "--revision-suffix" in args:
         sys.stderr.write("obsolete revision suffix CLI flag used\\n")
@@ -2011,6 +2026,16 @@ def test_azure_deploy_uses_managed_passkey_runtime_configuration(tmp_path):
     assert source.count('"$SCRIPT_DIR/scripts/resolve_azure_endpoints.sh"') >= 3
     assert "az keyvault secret show" in source
     assert "--query value" not in source
+
+
+def test_azure_deploy_runs_yaml_helpers_in_project_environment():
+    source = (PROJECT_ROOT / "deploy.sh").read_text(encoding="utf-8")
+
+    for helper in (
+        "render_azure_containerapp_config.py",
+        "merge_azure_containerapp_config.py",
+    ):
+        assert f'uv run python "$SCRIPT_DIR/scripts/{helper}"' in source
 
 
 def test_azure_deploy_uses_configured_global_resource_names() -> None:
