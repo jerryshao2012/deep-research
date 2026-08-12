@@ -4,6 +4,7 @@ set -euo pipefail
 METADATA_PATH="$PWD/.resolved-azure-endpoints.json"
 METADATA_TEMP=""
 RECORD=false
+RECORD_EXPECTED_PATH=""
 
 cleanup() {
     if [[ -n "$METADATA_TEMP" ]]; then
@@ -32,6 +33,20 @@ emit_assignment() {
     printf '%s=' "$1"
     shell_quote "$2"
     printf '\n'
+}
+
+emit_all_assignments() {
+    emit_assignment "AZURE_ENVIRONMENT_ID" "$AZURE_ENVIRONMENT_ID"
+    emit_assignment "AZURE_ENVIRONMENT_DEFAULT_DOMAIN" "$AZURE_ENVIRONMENT_DEFAULT_DOMAIN"
+    emit_assignment "BACKEND_APP_NAME" "$BACKEND_APP_NAME"
+    emit_assignment "UI_APP_NAME" "$UI_APP_NAME"
+    emit_assignment "BACKEND_URL" "$BACKEND_URL"
+    emit_assignment "AZURE_UI_URL" "$AZURE_UI_URL"
+    emit_assignment "FRONTEND_URLS" "$FRONTEND_URLS"
+    emit_assignment "GOOGLE_CALLBACK_URL" "$GOOGLE_CALLBACK_URL"
+    emit_assignment "GITHUB_CALLBACK_URL" "$GITHUB_CALLBACK_URL"
+    emit_assignment "GITHUB_HOMEPAGE_URL" "$GITHUB_HOMEPAGE_URL"
+    emit_assignment "CHANGED" "$CHANGED"
 }
 
 is_dns_name() {
@@ -64,15 +79,19 @@ is_container_app_name() {
         [[ "$value" != *--* ]]
 }
 
-if [[ $# -gt 1 ]]; then
-    fail "expected no arguments or --record"
-fi
-if [[ $# -eq 1 ]]; then
-    if [[ "$1" != "--record" ]]; then
-        fail "unknown argument: $1"
-    fi
-    RECORD=true
-fi
+case "$#" in
+    0) ;;
+    1)
+        [[ "$1" == --record ]] || fail "unknown argument: $1"
+        RECORD=true
+        ;;
+    2)
+        [[ "$1" == --record-if-current ]] || fail "unknown argument: $1"
+        RECORD=true
+        RECORD_EXPECTED_PATH="$2"
+        ;;
+    *) fail "expected no arguments, --record, or --record-if-current FILE" ;;
+esac
 
 [[ -n "${AZURE_SUBSCRIPTION_ID:-}" ]] || fail "AZURE_SUBSCRIPTION_ID must be nonempty"
 [[ -n "${RESOURCE_GROUP:-}" ]] || fail "RESOURCE_GROUP must be nonempty"
@@ -198,6 +217,48 @@ sys.exit(0 if existing == current else 3)
     esac
 fi
 
+CURRENT_OUTPUT="$(emit_all_assignments)"
+if [[ -n "$RECORD_EXPECTED_PATH" ]]; then
+    if python3 -c '
+import os
+import stat
+import sys
+
+path = sys.argv[1]
+try:
+    before = os.lstat(path)
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+        raise OSError("expected assignments must be a single-link regular file")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        after = os.fstat(descriptor)
+        content = b""
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            content += chunk
+    finally:
+        os.close(descriptor)
+    if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+        raise OSError("expected assignments changed while opening")
+except OSError as exc:
+    sys.stderr.write(f"Error: guarded record input is unsafe: {exc}\n")
+    sys.exit(66)
+expected = (sys.argv[2] + "\n").encode("utf-8")
+sys.exit(0 if content == expected else 3)
+' "$RECORD_EXPECTED_PATH" "$CURRENT_OUTPUT"; then
+        :
+    else
+        status=$?
+        if [[ "$status" == 3 ]]; then
+            fail "current endpoints do not match expected assignments; metadata was not recorded"
+        fi
+        exit "$status"
+    fi
+fi
+
 if [[ "$RECORD" == true ]]; then
     METADATA_TEMP="$(mktemp "${METADATA_PATH}.tmp.XXXXXX")"
     if python3 -c '
@@ -240,17 +301,7 @@ sys.stdout.write("\n")
     METADATA_TEMP=""
 fi
 
-emit_assignment "AZURE_ENVIRONMENT_ID" "$AZURE_ENVIRONMENT_ID"
-emit_assignment "AZURE_ENVIRONMENT_DEFAULT_DOMAIN" "$AZURE_ENVIRONMENT_DEFAULT_DOMAIN"
-emit_assignment "BACKEND_APP_NAME" "$BACKEND_APP_NAME"
-emit_assignment "UI_APP_NAME" "$UI_APP_NAME"
-emit_assignment "BACKEND_URL" "$BACKEND_URL"
-emit_assignment "AZURE_UI_URL" "$AZURE_UI_URL"
-emit_assignment "FRONTEND_URLS" "$FRONTEND_URLS"
-emit_assignment "GOOGLE_CALLBACK_URL" "$GOOGLE_CALLBACK_URL"
-emit_assignment "GITHUB_CALLBACK_URL" "$GITHUB_CALLBACK_URL"
-emit_assignment "GITHUB_HOMEPAGE_URL" "$GITHUB_HOMEPAGE_URL"
-emit_assignment "CHANGED" "$CHANGED"
+printf '%s\n' "$CURRENT_OUTPUT"
 
 if [[ "$CHANGED" == true ]]; then
     printf '%s\n' \

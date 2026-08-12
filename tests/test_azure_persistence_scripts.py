@@ -525,6 +525,42 @@ def test_azure_endpoint_resolver_record_is_atomic_and_unchanged_is_reminder(tmp_
     assert _read_az_calls(argv_log) == [EXPECTED_AZ_ARGV, EXPECTED_AZ_ARGV]
 
 
+def test_azure_endpoint_resolver_guarded_record_requires_exact_current_assignments(
+    tmp_path,
+):
+    fake_environment, _ = _install_fake_az(tmp_path)
+    expected_path = tmp_path / "expected-assignments"
+    initial = _run_resolver(tmp_path, fake_environment)
+    assert initial.returncode == 0
+    expected_path.write_text(initial.stdout, encoding="utf-8")
+
+    recorded = _run_resolver(
+        tmp_path,
+        fake_environment,
+        "--record-if-current",
+        str(expected_path),
+    )
+
+    assert recorded.returncode == 0
+    metadata_path = tmp_path / METADATA_NAME
+    prior = metadata_path.read_bytes()
+    expected_path.write_text(
+        initial.stdout.replace(DEFAULT_DOMAIN, "drift.example.test"),
+        encoding="utf-8",
+    )
+    rejected = _run_resolver(
+        tmp_path,
+        fake_environment,
+        "--record-if-current",
+        str(expected_path),
+    )
+    assert rejected.returncode == 2
+    assert "current endpoints" in rejected.stderr.lower()
+    assert rejected.stdout == ""
+    assert metadata_path.read_bytes() == prior
+    assert not list(tmp_path.glob(f"{METADATA_NAME}.tmp.*"))
+
+
 def test_azure_endpoint_resolver_reports_metadata_changes_without_writing(tmp_path):
     metadata_path = tmp_path / METADATA_NAME
     metadata_path.write_text(
@@ -1797,8 +1833,8 @@ sys.stdout.write('{"version":"9.8.7","status":"ok"}\\n')
         ["keyvault", "secret"],
     ]
     curl_index = next(index for index, call in enumerate(calls) if call[0] == "curl")
-    assert calls[-1] == EXPECTED_AZ_ARGV
-    assert curl_index < len(calls) - 1
+    assert calls[-2:] == [EXPECTED_AZ_ARGV, EXPECTED_AZ_ARGV]
+    assert curl_index < len(calls) - 2
     assert json.loads((fixture / METADATA_NAME).read_text()) == _expected_metadata()
 
 
@@ -1909,11 +1945,12 @@ def test_azure_deploy_uses_managed_passkey_runtime_configuration(tmp_path):
     assert "--revision-suffix" in source
     assert "revision list" in source
     assert source.index("revision list") < source.index(
-        'resolve_azure_endpoints.sh" --record'
+        'resolve_azure_endpoints.sh" --record-if-current'
     )
     assert source.index("VERSION_MATCHED=true") < source.index(
-        'resolve_azure_endpoints.sh" --record'
+        'resolve_azure_endpoints.sh" --record-if-current'
     )
+    assert source.count('"$SCRIPT_DIR/scripts/resolve_azure_endpoints.sh"') >= 3
     assert "az keyvault secret show" in source
     assert "--query value" not in source
 

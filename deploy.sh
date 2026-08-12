@@ -524,7 +524,31 @@ else
 fi
 end_step
 
-BACKEND_APP_NAME="$BACKEND_APP_NAME" UI_APP_NAME="$UI_APP_NAME" \
-  "$SCRIPT_DIR/scripts/resolve_azure_endpoints.sh" --record >/dev/null
+if FINAL_RESOLVER_OUTPUT=$(BACKEND_APP_NAME="$BACKEND_APP_NAME" UI_APP_NAME="$UI_APP_NAME" \
+  "$SCRIPT_DIR/scripts/resolve_azure_endpoints.sh"); then :; else
+  status=$?
+  echo "Error: final endpoint comparison failed; metadata was not recorded." >&2
+  exit "$status"
+fi
+if [[ "$FINAL_RESOLVER_OUTPUT" != "$RESOLVER_OUTPUT" ]]; then
+  echo "Error: endpoint assignments changed during deployment; metadata was not recorded." >&2
+  exit 1
+fi
+RESOLVER_EXPECTED_PATH=$(umask 077; mktemp)
+printf '%s\n' "$RESOLVER_OUTPUT" >"$RESOLVER_EXPECTED_PATH"
+if FINAL_RESOLVER_OUTPUT=$(BACKEND_APP_NAME="$BACKEND_APP_NAME" UI_APP_NAME="$UI_APP_NAME" \
+  "$SCRIPT_DIR/scripts/resolve_azure_endpoints.sh" --record-if-current "$RESOLVER_EXPECTED_PATH"); then
+  rm -f "$RESOLVER_EXPECTED_PATH"
+else
+  status=$?
+  rm -f "$RESOLVER_EXPECTED_PATH"
+  echo "Error: endpoint metadata recording failed." >&2
+  exit "$status"
+fi
+if [[ "$FINAL_RESOLVER_OUTPUT" != "$RESOLVER_OUTPUT" ]]; then
+  echo "Error: endpoint assignments changed while recording metadata." >&2
+  exit 1
+fi
+unset FINAL_RESOLVER_OUTPUT RESOLVER_OUTPUT RESOLVER_EXPECTED_PATH
 
 print_timing_summary
