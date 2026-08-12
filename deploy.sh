@@ -125,7 +125,14 @@ RESOLVED_GITHUB_CALLBACK_URL=""
 RESOLVED_GITHUB_HOMEPAGE_URL=""
 RESOLVED_CHANGED=""
 SEEN_RESOLVER_KEYS="|"
-while IFS='=' read -r key value; do
+RESOLVER_ASSIGNMENT_PATTERN="^([A-Z][A-Z0-9_]*)='([^']*)'$"
+while IFS= read -r line; do
+  if [[ ! "$line" =~ $RESOLVER_ASSIGNMENT_PATTERN ]]; then
+    echo "Error: malformed resolver output assignment" >&2
+    exit 65
+  fi
+  key="${BASH_REMATCH[1]}"
+  value="${BASH_REMATCH[2]}"
   if [[ "$SEEN_RESOLVER_KEYS" == *"|$key|"* ]]; then
     echo "Error: duplicate resolver output key: $key" >&2
     exit 65

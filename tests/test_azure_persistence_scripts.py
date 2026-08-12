@@ -141,6 +141,19 @@ def _read_az_calls(argv_log: Path) -> list[list[str]]:
     return [json.loads(line) for line in argv_log.read_text().splitlines()]
 
 
+def _parse_resolver_assignments(stdout: str) -> dict[str, str]:
+    assignments: dict[str, str] = {}
+    for line in stdout.splitlines():
+        match = re.fullmatch(r"([A-Z][A-Z0-9_]*)='((?:[^']|'\"'\"')*)'", line)
+        if match is None:
+            raise ValueError(f"unsafe resolver assignment: {line!r}")
+        key, encoded = match.groups()
+        if key in assignments:
+            raise ValueError(f"duplicate resolver assignment: {key}")
+        assignments[key] = encoded.replace("'\"'\"'", "'")
+    return assignments
+
+
 def _run_sanitizer(*args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, str(SANITIZER), *args],
@@ -443,17 +456,17 @@ def test_azure_endpoint_resolver_queries_environment_once_and_emits_schema(tmp_p
     assert result.returncode == 0
     assert _read_az_calls(argv_log) == [EXPECTED_AZ_ARGV]
     assert result.stdout.splitlines() == [
-        f"AZURE_ENVIRONMENT_ID={ENVIRONMENT_ID}",
-        f"AZURE_ENVIRONMENT_DEFAULT_DOMAIN={DEFAULT_DOMAIN}",
-        "BACKEND_APP_NAME=demo-api",
-        "UI_APP_NAME=demo-ui",
-        f"BACKEND_URL={BACKEND_URL}",
-        f"AZURE_UI_URL={UI_URL}",
-        f"FRONTEND_URLS={UI_URL},https://bmo-deepagent-ui.vercel.app",
-        f"GOOGLE_CALLBACK_URL={BACKEND_URL}/auth/callback/google",
-        f"GITHUB_CALLBACK_URL={BACKEND_URL}/auth/callback/github",
-        f"GITHUB_HOMEPAGE_URL={UI_URL}",
-        "CHANGED=true",
+        f"AZURE_ENVIRONMENT_ID='{ENVIRONMENT_ID}'",
+        f"AZURE_ENVIRONMENT_DEFAULT_DOMAIN='{DEFAULT_DOMAIN}'",
+        "BACKEND_APP_NAME='demo-api'",
+        "UI_APP_NAME='demo-ui'",
+        f"BACKEND_URL='{BACKEND_URL}'",
+        f"AZURE_UI_URL='{UI_URL}'",
+        f"FRONTEND_URLS='{UI_URL},https://bmo-deepagent-ui.vercel.app'",
+        f"GOOGLE_CALLBACK_URL='{BACKEND_URL}/auth/callback/google'",
+        f"GITHUB_CALLBACK_URL='{BACKEND_URL}/auth/callback/github'",
+        f"GITHUB_HOMEPAGE_URL='{UI_URL}'",
+        "CHANGED='true'",
     ]
     assert result.stderr.splitlines() == [
         "ACTION REQUIRED: update and verify Google/GitHub OAuth provider settings before deployment.",
@@ -462,6 +475,31 @@ def test_azure_endpoint_resolver_queries_environment_once_and_emits_schema(tmp_p
         f"GitHub homepage / frontend origin: {UI_URL}",
     ]
     assert not (tmp_path / METADATA_NAME).exists()
+
+
+def test_azure_endpoint_resolver_shell_quotes_parenthesized_resource_group(tmp_path):
+    resource_group = "demo(rg)"
+    environment_id = (
+        "/subscriptions/00000000-1111-2222-3333-444444444444/"
+        f"resourceGroups/{resource_group}/providers/Microsoft.App/"
+        "managedEnvironments/demo-env"
+    )
+    fake_environment, _ = _install_fake_az(
+        tmp_path,
+        output=f"{environment_id}\t{DEFAULT_DOMAIN}\tSucceeded\n",
+    )
+
+    result = _run_resolver(
+        tmp_path,
+        fake_environment,
+        environment_update={"RESOURCE_GROUP": resource_group},
+    )
+
+    assert result.returncode == 0
+    parsed = _parse_resolver_assignments(result.stdout)
+    assert parsed["AZURE_ENVIRONMENT_ID"] == environment_id
+    assert parsed["BACKEND_URL"] == BACKEND_URL
+    assert parsed["CHANGED"] == "true"
 
 
 def test_azure_endpoint_resolver_record_is_atomic_and_unchanged_is_reminder(tmp_path):
@@ -477,7 +515,7 @@ def test_azure_endpoint_resolver_record_is_atomic_and_unchanged_is_reminder(tmp_
 
     unchanged = _run_resolver(tmp_path, fake_environment)
     assert unchanged.returncode == 0
-    assert unchanged.stdout.splitlines()[-1] == "CHANGED=false"
+    assert _parse_resolver_assignments(unchanged.stdout)["CHANGED"] == "false"
     assert unchanged.stderr.splitlines() == [
         "OAuth provider reminder: verify the following URLs remain configured.",
         f"Google authorized redirect URI: {BACKEND_URL}/auth/callback/google",
@@ -498,7 +536,7 @@ def test_azure_endpoint_resolver_reports_metadata_changes_without_writing(tmp_pa
     result = _run_resolver(tmp_path, fake_environment)
 
     assert result.returncode == 0
-    assert result.stdout.splitlines()[-1] == "CHANGED=true"
+    assert _parse_resolver_assignments(result.stdout)["CHANGED"] == "true"
     assert result.stderr.startswith("ACTION REQUIRED:")
     assert metadata_path.read_bytes() == before
 
@@ -559,8 +597,9 @@ def test_azure_endpoint_resolver_accepts_aca_app_name_length_boundaries(tmp_path
 
     assert result.returncode == 0
     assert _read_az_calls(argv_log) == [EXPECTED_AZ_ARGV]
-    assert f"BACKEND_URL=https://{backend_name}.{DEFAULT_DOMAIN}" in result.stdout
-    assert f"AZURE_UI_URL=https://{ui_name}.{DEFAULT_DOMAIN}" in result.stdout
+    parsed = _parse_resolver_assignments(result.stdout)
+    assert parsed["BACKEND_URL"] == f"https://{backend_name}.{DEFAULT_DOMAIN}"
+    assert parsed["AZURE_UI_URL"] == f"https://{ui_name}.{DEFAULT_DOMAIN}"
 
 
 @pytest.mark.parametrize(
@@ -639,7 +678,7 @@ def test_azure_endpoint_resolver_matches_environment_resource_id_case_insensitiv
 
     assert result.returncode == 0
     assert _read_az_calls(argv_log) == [EXPECTED_AZ_ARGV]
-    assert result.stdout.splitlines()[-1] == "CHANGED=true"
+    assert _parse_resolver_assignments(result.stdout)["CHANGED"] == "true"
 
 
 def test_azure_endpoint_resolver_compare_only_never_creates_temp_files(tmp_path):
@@ -662,7 +701,7 @@ def test_azure_endpoint_resolver_compare_only_never_creates_temp_files(tmp_path)
     )
 
     assert result.returncode == 0
-    assert result.stdout.splitlines()[-1] == "CHANGED=false"
+    assert _parse_resolver_assignments(result.stdout)["CHANGED"] == "false"
     assert _read_az_calls(argv_log) == [EXPECTED_AZ_ARGV]
     assert not write_sentinel.exists()
     assert not list(tmp_path.glob(f"{METADATA_NAME}.tmp.*"))
@@ -996,6 +1035,41 @@ def test_azure_build_rejects_all_deployment_owned_passkey_keys_before_az(tmp_pat
     assert not argv_log.exists()
 
 
+def test_azure_build_strictly_decodes_quoted_resolver_assignments(tmp_path):
+    fixture, argv_log = _install_azure_script_fixture(tmp_path, "build.sh")
+    runtime_marker = fixture / "runtime-selected"
+    (fixture / "scripts/container_runtime.sh").write_text(
+        f"select_container_runtime() {{ printf selected > '{runtime_marker}'; }}\n"
+        "ensure_container_runtime_ready() { :; }\n",
+        encoding="utf-8",
+    )
+    (fixture / ".env.docker").write_text("OTHER=value\n", encoding="utf-8")
+    fake_resolver = fixture / "scripts/resolve_azure_endpoints.sh"
+    fake_resolver.write_text("#!/bin/sh\nprintf 'CHANGED=true\\n'\n", encoding="utf-8")
+    fake_resolver.chmod(0o700)
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{fixture / 'bin'}:{env['PATH']}",
+            "FAKE_AZ_ARGV_LOG": str(argv_log),
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", "build.sh"],
+        cwd=fixture,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 65
+    assert "malformed resolver output assignment" in result.stderr
+    assert not runtime_marker.exists()
+    assert not argv_log.exists()
+
+
 def test_azure_build_uses_root_dotenv_docker_credentials_without_leaking_pat(tmp_path):
     fixture, argv_log = _install_azure_script_fixture(tmp_path, "build.sh")
     login_capture = fixture / "login-pat"
@@ -1113,6 +1187,52 @@ def test_azure_deploy_first_resolution_blocks_before_any_mutation(tmp_path):
     ]
     assert _read_az_calls(argv_log) == [EXPECTED_AZ_ARGV]
     assert not (fixture / METADATA_NAME).exists()
+
+
+@pytest.mark.parametrize(
+    ("resolver_output", "message"),
+    [
+        ("CHANGED=true\n", "malformed resolver output assignment"),
+        ("CHANGED='true'junk\n", "malformed resolver output assignment"),
+        ("CHANGED='true'\nCHANGED='false'\n", "duplicate resolver output key"),
+        ("UNKNOWN='value'\n", "unexpected resolver output key"),
+    ],
+)
+def test_azure_deploy_strictly_decodes_quoted_resolver_assignments_before_az(
+    tmp_path, resolver_output, message
+):
+    fixture, argv_log = _install_azure_script_fixture(tmp_path, "deploy.sh")
+    (fixture / ".env.docker").write_text("OTHER=value\n", encoding="utf-8")
+    fake_resolver = fixture / "scripts/resolve_azure_endpoints.sh"
+    fake_resolver.write_text(
+        "#!/usr/bin/python3\n"
+        "import os\n"
+        "print(os.environ['FAKE_RESOLVER_OUTPUT'], end='')\n",
+        encoding="utf-8",
+    )
+    fake_resolver.chmod(0o700)
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{fixture / 'bin'}:{env['PATH']}",
+            "FAKE_AZ_ARGV_LOG": str(argv_log),
+            "FAKE_RESOLVER_OUTPUT": resolver_output,
+            "DOCKER_HUB_USERNAME": "demo-user",
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", "deploy.sh"],
+        cwd=fixture,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 65
+    assert message in result.stderr
+    assert not argv_log.exists()
 
 
 def test_azure_deploy_preserves_resolver_failure_status_and_bytes(tmp_path):

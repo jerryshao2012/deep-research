@@ -90,8 +90,57 @@ if [ "$XTRACE_WAS_ENABLED" = true ]; then
 fi
 
 python3 "$SCRIPT_DIR/scripts/sanitize_passkey_dotenv.py" --input "$SCRIPT_DIR/.env.docker" --check
+RESOLVER_STDOUT="$DOCKER_CREDENTIAL_DIR/resolver.stdout"
+RESOLVER_STDERR="$DOCKER_CREDENTIAL_DIR/resolver.stderr"
+set +e
 BACKEND_APP_NAME="$BACKEND_APP_NAME" UI_APP_NAME="$UI_APP_NAME" \
-  "$SCRIPT_DIR/scripts/resolve_azure_endpoints.sh" >/dev/null
+  "$SCRIPT_DIR/scripts/resolve_azure_endpoints.sh" >"$RESOLVER_STDOUT" 2>"$RESOLVER_STDERR"
+RESOLVER_STATUS=$?
+set -e
+cat "$RESOLVER_STDERR" >&2
+if [ "$RESOLVER_STATUS" -ne 0 ]; then
+  cat "$RESOLVER_STDOUT"
+  exit "$RESOLVER_STATUS"
+fi
+SEEN_RESOLVER_KEYS="|"
+RESOLVER_ASSIGNMENT_PATTERN="^([A-Z][A-Z0-9_]*)='([^']*)'$"
+while IFS= read -r line; do
+  if [[ ! "$line" =~ $RESOLVER_ASSIGNMENT_PATTERN ]]; then
+    echo "Error: malformed resolver output assignment" >&2
+    exit 65
+  fi
+  key="${BASH_REMATCH[1]}"
+  value="${BASH_REMATCH[2]}"
+  if [[ "$SEEN_RESOLVER_KEYS" == *"|$key|"* ]]; then
+    echo "Error: duplicate resolver output key: $key" >&2
+    exit 65
+  fi
+  case "$key" in
+    AZURE_ENVIRONMENT_ID|AZURE_ENVIRONMENT_DEFAULT_DOMAIN|BACKEND_URL|AZURE_UI_URL|FRONTEND_URLS|GOOGLE_CALLBACK_URL|GITHUB_CALLBACK_URL|GITHUB_HOMEPAGE_URL) ;;
+    BACKEND_APP_NAME) RESOLVED_BACKEND_APP_NAME="$value" ;;
+    UI_APP_NAME) RESOLVED_UI_APP_NAME="$value" ;;
+    CHANGED) RESOLVED_CHANGED="$value" ;;
+    *)
+      echo "Error: unexpected resolver output key: $key" >&2
+      exit 65
+      ;;
+  esac
+  SEEN_RESOLVER_KEYS="${SEEN_RESOLVER_KEYS}${key}|"
+done <"$RESOLVER_STDOUT"
+for key in AZURE_ENVIRONMENT_ID AZURE_ENVIRONMENT_DEFAULT_DOMAIN BACKEND_APP_NAME UI_APP_NAME BACKEND_URL AZURE_UI_URL FRONTEND_URLS GOOGLE_CALLBACK_URL GITHUB_CALLBACK_URL GITHUB_HOMEPAGE_URL CHANGED; do
+  if [[ "$SEEN_RESOLVER_KEYS" != *"|$key|"* ]]; then
+    echo "Error: missing resolver output key: $key" >&2
+    exit 65
+  fi
+done
+if [[ "$RESOLVED_BACKEND_APP_NAME" != "$BACKEND_APP_NAME" || "$RESOLVED_UI_APP_NAME" != "$UI_APP_NAME" ]]; then
+  echo "Error: resolver app names do not match canonical env.sh names" >&2
+  exit 65
+fi
+if [[ "$RESOLVED_CHANGED" != true && "$RESOLVED_CHANGED" != false ]]; then
+  echo "Error: invalid resolver CHANGED value" >&2
+  exit 65
+fi
 
 select_container_runtime
 ensure_container_runtime_ready

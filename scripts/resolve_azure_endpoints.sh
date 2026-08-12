@@ -22,6 +22,18 @@ fail() {
     exit 2
 }
 
+shell_quote() {
+    local value="$1"
+    value="${value//\'/\'\"\'\"\'}"
+    printf "'%s'" "$value"
+}
+
+emit_assignment() {
+    printf '%s=' "$1"
+    shell_quote "$2"
+    printf '\n'
+}
+
 is_dns_name() {
     local value="$1"
     [[ ${#value} -le 253 ]] &&
@@ -228,18 +240,17 @@ sys.stdout.write("\n")
     METADATA_TEMP=""
 fi
 
-printf '%s\n' \
-    "AZURE_ENVIRONMENT_ID=$AZURE_ENVIRONMENT_ID" \
-    "AZURE_ENVIRONMENT_DEFAULT_DOMAIN=$AZURE_ENVIRONMENT_DEFAULT_DOMAIN" \
-    "BACKEND_APP_NAME=$BACKEND_APP_NAME" \
-    "UI_APP_NAME=$UI_APP_NAME" \
-    "BACKEND_URL=$BACKEND_URL" \
-    "AZURE_UI_URL=$AZURE_UI_URL" \
-    "FRONTEND_URLS=$FRONTEND_URLS" \
-    "GOOGLE_CALLBACK_URL=$GOOGLE_CALLBACK_URL" \
-    "GITHUB_CALLBACK_URL=$GITHUB_CALLBACK_URL" \
-    "GITHUB_HOMEPAGE_URL=$GITHUB_HOMEPAGE_URL" \
-    "CHANGED=$CHANGED"
+emit_assignment "AZURE_ENVIRONMENT_ID" "$AZURE_ENVIRONMENT_ID"
+emit_assignment "AZURE_ENVIRONMENT_DEFAULT_DOMAIN" "$AZURE_ENVIRONMENT_DEFAULT_DOMAIN"
+emit_assignment "BACKEND_APP_NAME" "$BACKEND_APP_NAME"
+emit_assignment "UI_APP_NAME" "$UI_APP_NAME"
+emit_assignment "BACKEND_URL" "$BACKEND_URL"
+emit_assignment "AZURE_UI_URL" "$AZURE_UI_URL"
+emit_assignment "FRONTEND_URLS" "$FRONTEND_URLS"
+emit_assignment "GOOGLE_CALLBACK_URL" "$GOOGLE_CALLBACK_URL"
+emit_assignment "GITHUB_CALLBACK_URL" "$GITHUB_CALLBACK_URL"
+emit_assignment "GITHUB_HOMEPAGE_URL" "$GITHUB_HOMEPAGE_URL"
+emit_assignment "CHANGED" "$CHANGED"
 
 if [[ "$CHANGED" == true ]]; then
     printf '%s\n' \
