@@ -34,8 +34,8 @@ Bootstrap these prerequisites separately before using this workflow:
 - the Key Vault named by `KV_NAME`, with that identity granted secret `get` access;
 - a pre-created, rotated `PASSKEY-PROXY-SECRET` in that Key Vault;
 - all other provider and runtime secrets referenced by the existing Container App configuration;
-- storage prerequisites required by the current deployment, or rights for its existing storage-management steps;
-- an Azure subscription and rights to update Container Apps, Key Vault access policies, and Storage;
+- the existing storage account, Blob container, Azure Files share, and Container Apps environment storage binding required by the app;
+- an Azure subscription with read-only access to each prerequisite and permission to update the existing backend Container App; existing resource permissions remain unchanged;
 - Azure CLI with the Container Apps extension available;
 - one supported local container runtime: Apple's `container` CLI on an Apple silicon Mac running a macOS release listed in [Apple's current requirements](https://github.com/apple/container#requirements), Podman, or Docker;
 - Python 3 for API-version management inside the build script;
@@ -126,15 +126,11 @@ The script increments `API_VERSION`, creates `.build_version`, builds a `linux/a
 OAUTH_REDIRECTS_CONFIRMED=true ./deploy.sh
 ```
 
-The confirmation is required only when resolver metadata is new or changed; unchanged endpoints produce a nonblocking reminder. Deployment reads `.build_version`, validates existing app configuration and managed prerequisites, updates supporting storage where configured, applies a named Container App revision, and waits for that exact revision plus `/health` to report the expected API version.
+The confirmation is required only when resolver metadata is new or changed; unchanged endpoints produce a nonblocking reminder. Deployment reads `.build_version`, validates existing app configuration and managed prerequisites without changing permissions, identities, storage, or secret values, applies a named Container App revision, and waits for that exact revision plus `/health` to report the expected API version.
 
-For a repeat deployment where Key Vault access-policy updates are known to be correct:
-
-```bash
-./deploy.sh --skip-kv-access
-```
-
-This flag skips only the current-user Key Vault access update. It does not bypass the read-only check that the backend identity already has secret `get` access, nor storage, application configuration, revision readiness, or health verification.
+Deployment performs read-only prerequisite checks. It does not change Key Vault
+permissions, identities, storage resources, or secret values. Provision or rotate
+those resources through their separately approved operator workflows.
 
 ### 4. Synchronize runtime files when needed
 

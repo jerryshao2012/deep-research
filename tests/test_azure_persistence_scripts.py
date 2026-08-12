@@ -1327,13 +1327,14 @@ def _prepare_deploy_preflight_fixture(tmp_path: Path) -> tuple[Path, Path]:
         (
             "identity",
             "existing user-assigned managed identity",
-            [["containerapp", "env"], ["identity", "show"]],
+            [["containerapp", "env"], ["group", "show"], ["identity", "show"]],
         ),
         (
             "app",
             "existing Container App",
             [
                 ["containerapp", "env"],
+                ["group", "show"],
                 ["identity", "show"],
                 ["containerapp", "show"],
             ],
@@ -1343,6 +1344,7 @@ def _prepare_deploy_preflight_fixture(tmp_path: Path) -> tuple[Path, Path]:
             "existing Key Vault",
             [
                 ["containerapp", "env"],
+                ["group", "show"],
                 ["identity", "show"],
                 ["containerapp", "show"],
                 ["keyvault", "show"],
@@ -1366,6 +1368,8 @@ with open(os.environ["FAKE_AZ_ARGV_LOG"], "a", encoding="utf-8") as stream:
 missing = os.environ["FAKE_MISSING"]
 if args[:3] == ["containerapp", "env", "show"]:
     sys.stdout.write(os.environ["FAKE_ENV_ROW"])
+elif args[:2] == ["group", "show"]:
+    sys.stdout.write("/subscriptions/demo/resourceGroups/demo-rg\\n")
 elif args[:2] == ["identity", "show"]:
     if missing == "identity":
         raise SystemExit(3)
@@ -1373,7 +1377,7 @@ elif args[:2] == ["identity", "show"]:
 elif args[:2] == ["containerapp", "show"] and "--output" in args:
     if missing == "app":
         raise SystemExit(3)
-    sys.stdout.write('{"properties":{"configuration":{},"template":{}}}')
+    sys.stdout.write('{"identity":{"userAssignedIdentities":{"/subscriptions/demo/identity":{}}},"properties":{"configuration":{},"template":{}}}')
 elif args[:2] == ["keyvault", "show"]:
     if missing == "vault":
         raise SystemExit(3)
@@ -1420,14 +1424,20 @@ with open(os.environ["FAKE_AZ_ARGV_LOG"], "a", encoding="utf-8") as stream:
     stream.write(json.dumps(args) + "\\n")
 if args[:3] == ["containerapp", "env", "show"]:
     sys.stdout.write(os.environ["FAKE_ENV_ROW"])
+elif args[:2] == ["group", "show"]:
+    sys.stdout.write("/subscriptions/demo/resourceGroups/demo-rg\\n")
 elif args[:2] == ["identity", "show"]:
     sys.stdout.write("/subscriptions/demo/identity\\tprincipal-123\\n")
 elif args[:2] == ["containerapp", "show"] and "--output" in args:
-    sys.stdout.write('{"properties":{"configuration":{},"template":{}}}')
+    sys.stdout.write('{"identity":{"userAssignedIdentities":{"/subscriptions/demo/identity":{}}},"properties":{"configuration":{},"template":{}}}')
 elif args[:2] == ["keyvault", "show"]:
     sys.stdout.write("principal-123\\n")
 elif args[:3] == ["keyvault", "secret", "show"]:
-    sys.stdout.write(os.environ["FAKE_SECRET_ID"])
+    name = args[args.index("--name") + 1]
+    if name == "PASSKEY-PROXY-SECRET":
+        sys.stdout.write(os.environ["FAKE_SECRET_ID"])
+    else:
+        sys.stdout.write(f"https://demo-vault.vault.azure.net/secrets/{name}\\n")
 sys.exit(0)
 """,
         encoding="utf-8",
@@ -1470,16 +1480,21 @@ with open(os.environ["FAKE_AZ_ARGV_LOG"], "a", encoding="utf-8") as stream:
     stream.write(json.dumps(args) + "\\n")
 if args[:3] == ["containerapp", "env", "show"]:
     sys.stdout.write(os.environ["FAKE_ENV_ROW"])
+elif args[:2] == ["group", "show"]:
+    sys.stdout.write("/subscriptions/demo/resourceGroups/demo-rg\\n")
 elif args[:2] == ["identity", "show"]:
     sys.stdout.write("/subscriptions/demo/identity\\tprincipal-123\\n")
 elif args[:2] == ["containerapp", "show"] and "--output" in args:
-    sys.stdout.write('{"properties":{"configuration":{},"template":{}}}')
+    sys.stdout.write('{"identity":{"userAssignedIdentities":{"/subscriptions/demo/identity":{}}},"properties":{"configuration":{},"template":{}}}')
 elif args[:2] == ["keyvault", "show"]:
     sys.stdout.write("principal-123\\n")
 elif args[:3] == ["keyvault", "secret", "show"]:
-    sys.stdout.write("secret query stdout bytes\\n")
-    sys.stderr.write("secret query stderr bytes\\n")
-    raise SystemExit(47)
+    name = args[args.index("--name") + 1]
+    if name == "PASSKEY-PROXY-SECRET":
+        sys.stdout.write("secret query stdout bytes\\n")
+        sys.stderr.write("secret query stderr bytes\\n")
+        raise SystemExit(47)
+    sys.stdout.write(f"https://demo-vault.vault.azure.net/secrets/{name}\\n")
 sys.exit(0)
 """,
         encoding="utf-8",
@@ -1519,6 +1534,8 @@ with open(os.environ["FAKE_AZ_ARGV_LOG"], "a", encoding="utf-8") as stream:
     stream.write(json.dumps(args) + "\\n")
 if args[:3] == ["containerapp", "env", "show"]:
     sys.stdout.write(os.environ["FAKE_ENV_ROW"])
+elif args[:2] == ["group", "show"]:
+    sys.stdout.write("/subscriptions/demo/resourceGroups/demo-rg\\n")
 elif args[:2] == ["identity", "show"]:
     sys.stdout.write("/subscriptions/demo/identity\\tprincipal-123\\n")
 elif args[:2] == ["containerapp", "show"] and "--output" in args:
@@ -1547,6 +1564,7 @@ sys.exit(0)
     calls = _read_az_calls(argv_log)
     assert [call[:2] for call in calls] == [
         ["containerapp", "env"],
+        ["group", "show"],
         ["identity", "show"],
         ["containerapp", "show"],
     ]
@@ -1567,6 +1585,8 @@ with open(os.environ["FAKE_AZ_ARGV_LOG"], "a", encoding="utf-8") as stream:
     stream.write(json.dumps(args) + "\\n")
 if args[:3] == ["containerapp", "env", "show"]:
     sys.stdout.write(os.environ["FAKE_ENV_ROW"])
+elif args[:2] == ["group", "show"]:
+    sys.stdout.write("/subscriptions/demo/resourceGroups/demo-rg\\n")
 elif args[:2] == ["identity", "show"]:
     sys.stdout.write("/subscriptions/demo/identity\\tprincipal-123\\n")
 elif args[:2] == ["containerapp", "show"] and "--output" in args:
@@ -1599,6 +1619,7 @@ sys.exit(0)
     assert stderr_canary not in result.stdout + result.stderr
     assert [call[:2] for call in _read_az_calls(argv_log)] == [
         ["containerapp", "env"],
+        ["group", "show"],
         ["identity", "show"],
         ["containerapp", "show"],
     ]
@@ -1627,10 +1648,12 @@ with open(os.environ["FAKE_AZ_ARGV_LOG"], "a", encoding="utf-8") as stream:
     stream.write(json.dumps(args) + "\\n")
 if args[:3] == ["containerapp", "env", "show"]:
     sys.stdout.write(os.environ["FAKE_ENV_ROW"])
+elif args[:2] == ["group", "show"]:
+    sys.stdout.write("/subscriptions/demo/resourceGroups/demo-rg\\n")
 elif args[:2] == ["identity", "show"]:
     sys.stdout.write("/subscriptions/demo/identity\\tprincipal-123\\n")
 elif args[:2] == ["containerapp", "show"] and "--output" in args:
-    sys.stdout.write('{"properties":{"configuration":{},"template":{}}}')
+    sys.stdout.write('{"identity":{"userAssignedIdentities":{"/subscriptions/demo/identity":{}}},"properties":{"configuration":{},"template":{}}}')
 sys.exit(0)
 """,
         encoding="utf-8",
@@ -1656,6 +1679,7 @@ sys.exit(0)
     calls = _read_az_calls(argv_log)
     assert [call[:2] for call in calls] == [
         ["containerapp", "env"],
+        ["group", "show"],
         ["identity", "show"],
         ["containerapp", "show"],
     ]
@@ -1687,24 +1711,30 @@ with open(os.environ["FAKE_AZ_ARGV_LOG"], "a", encoding="utf-8") as stream:
     stream.write(json.dumps(args) + "\\n")
 if args[:3] == ["containerapp", "env", "show"] and "--subscription" in args:
     sys.stdout.write(os.environ["FAKE_ENV_ROW"])
+elif args[:2] == ["group", "show"]:
+    sys.stdout.write("/subscriptions/demo/resourceGroups/demo-rg\\n")
 elif args[:2] == ["identity", "show"]:
     sys.stdout.write("/subscriptions/demo/identity\\tprincipal-123\\n")
 elif args[:2] == ["keyvault", "show"] and "accessPolicies" in " ".join(args):
     sys.stdout.write("principal-123\\n")
 elif args[:3] == ["keyvault", "secret", "show"]:
-    sys.stdout.write("https://demo-vault.vault.azure.net/secrets/PASSKEY-PROXY-SECRET\\n")
-elif args[:3] == ["storage", "account", "list"]:
-    sys.stdout.write("demostorage\\n")
-elif args[:4] == ["storage", "account", "keys", "list"]:
-    sys.stdout.write("storage-key\\n")
-elif args[:3] == ["storage", "container", "list"]:
+    name = args[args.index("--name") + 1]
+    sys.stdout.write(f"https://demo-vault.vault.azure.net/secrets/{name}\\n")
+elif args[:3] == ["storage", "account", "show"]:
+    sys.stdout.write("/subscriptions/demo/storageAccounts/demostorage\\n")
+elif args[:3] == ["storage", "container-rm", "show"]:
     sys.stdout.write("deep-research-blobs\\n")
+elif args[:3] == ["storage", "share-rm", "show"]:
+    sys.stdout.write("deep-research-auth\\n")
+elif args[:4] == ["containerapp", "env", "storage", "show"]:
+    sys.stdout.write("authsqlite\\tdemostorage\\tdeep-research-auth\\tReadWrite\\n")
 elif args[:2] == ["containerapp", "show"] and "provisioningState" in " ".join(args):
     sys.stdout.write("Succeeded\\n")
 elif args[:2] == ["containerapp", "show"] and "--output" in args and args[args.index("--output") + 1] == "json":
     json.dump({
         "name": "demo-api",
         "tags": {"unrelated": "preserved"},
+        "identity": {"userAssignedIdentities": {"/subscriptions/demo/identity": {}}},
         "properties": {
             "configuration": {
                 "secrets": [{"name": "unrelated-secret", "value": "opaque"}],
@@ -1778,7 +1808,7 @@ sys.stdout.write('{"version":"9.8.7","status":"ok"}\\n')
     )
 
     result = subprocess.run(
-        ["bash", "deploy.sh", "--skip-kv-access"],
+        ["bash", "deploy.sh"],
         cwd=fixture,
         env=env,
         text=True,
@@ -1820,6 +1850,21 @@ sys.stdout.write('{"version":"9.8.7","status":"ok"}\\n')
     assert volume_mounts["auth-sqlite"]["mountPath"] == "/mnt/auth"
     calls = _read_az_calls(argv_log)
     assert deploy_pat_canary not in json.dumps(calls)
+    secret_calls = [
+        call for call in calls if call[:3] == ["keyvault", "secret", "show"]
+    ]
+    assert {call[call.index("--name") + 1] for call in secret_calls} == {
+        "TAVILY-API-KEY",
+        "LANGCHAIN-API-KEY",
+        "UPLOAD-API-KEY",
+        "STORAGE-ACCOUNT-NAME",
+        "STORAGE-ACCOUNT-KEY",
+        "AZURE-STORAGE-CONTAINER-NAME",
+        "GOOGLE-API-KEY",
+        "DOCKER-HUB-PAT",
+        "PASSKEY-PROXY-SECRET",
+    }
+    assert all(call[call.index("--query") + 1] == "id" for call in secret_calls)
     update_call = next(call for call in calls if call[:2] == ["containerapp", "update"])
     assert "--revision-suffix" not in update_call
     account_set = next(
@@ -1827,10 +1872,15 @@ sys.stdout.write('{"version":"9.8.7","status":"ok"}\\n')
     )
     assert [call[:2] for call in calls[:account_set]] == [
         ["containerapp", "env"],
+        ["group", "show"],
         ["identity", "show"],
         ["containerapp", "show"],
         ["keyvault", "show"],
-        ["keyvault", "secret"],
+        *(["keyvault", "secret"] for _ in range(9)),
+        ["storage", "account"],
+        ["storage", "container-rm"],
+        ["storage", "share-rm"],
+        ["containerapp", "env"],
     ]
     curl_index = next(index for index, call in enumerate(calls) if call[0] == "curl")
     assert calls[-2:] == [EXPECTED_AZ_ARGV, EXPECTED_AZ_ARGV]
@@ -1983,9 +2033,220 @@ def test_azure_deploy_help_describes_update_only_managed_passkey_cutover():
         "Key Vault",
         "secret get access",
         "PASSKEY-PROXY-SECRET",
+        "storage account",
+        "Blob container",
+        "Azure Files share",
+        "Container Apps environment storage",
     ):
         assert prerequisite in result.stdout
     assert "Full deployment" not in result.stdout
+    assert "--skip-kv-access" not in result.stdout
+
+
+def test_azure_deploy_contains_no_bootstrap_permission_or_secret_mutations():
+    source = (PROJECT_ROOT / "deploy.sh").read_text(encoding="utf-8")
+
+    for forbidden in (
+        "--skip-kv-access",
+        "az group create",
+        "az containerapp env create",
+        "az containerapp create",
+        "az keyvault update",
+        "az keyvault create",
+        "az keyvault set-policy",
+        "az keyvault delete-policy",
+        "az keyvault secret set",
+        "az identity create",
+        "az containerapp identity assign",
+        "az containerapp identity remove",
+        "az role assignment create",
+        "az role assignment delete",
+        "az storage account create",
+        "az storage container create",
+        "az storage container show",
+        "az storage share-rm create",
+        "az containerapp env storage set",
+        "./secrets.sh",
+    ):
+        assert forbidden not in source
+    assert "az storage container-rm show" in source
+
+
+@pytest.mark.parametrize(
+    ("missing", "expected_message"),
+    [
+        ("environment", "existing Container Apps environment"),
+        ("resource_group", "existing resource group"),
+        ("identity_assignment", "assigned to the existing Container App"),
+        ("vault_access", "lacks Key Vault secret get access"),
+        ("required_secret", "TAVILY-API-KEY"),
+        ("storage_account", "existing storage account"),
+        ("blob_container", "existing Blob container"),
+        ("file_share", "existing Azure Files share"),
+        ("environment_storage", "existing Container Apps environment storage"),
+        ("environment_storage_account", "does not match required Azure Files binding"),
+        ("environment_storage_share", "does not match required Azure Files binding"),
+        ("environment_storage_access", "does not match required Azure Files binding"),
+    ],
+)
+def test_azure_deploy_all_update_only_prerequisites_preflight_before_mutation(
+    tmp_path, missing, expected_message
+):
+    fixture, argv_log = _prepare_deploy_preflight_fixture(tmp_path)
+    fake_az = fixture / "bin/az"
+    fake_az.write_text(
+        """#!/usr/bin/python3
+import json
+import os
+import sys
+args = sys.argv[1:]
+with open(os.environ["FAKE_AZ_ARGV_LOG"], "a", encoding="utf-8") as stream:
+    stream.write(json.dumps(args) + "\\n")
+missing = os.environ["FAKE_MISSING"]
+if args[:3] == ["containerapp", "env", "show"] and "--query" in args and "defaultDomain" in args[args.index("--query") + 1]:
+    if missing == "environment":
+        raise SystemExit(3)
+    sys.stdout.write(os.environ["FAKE_ENV_ROW"])
+elif args[:2] == ["group", "show"]:
+    if missing == "resource_group":
+        raise SystemExit(3)
+    sys.stdout.write("/subscriptions/demo/resourceGroups/demo-rg\\n")
+elif args[:2] == ["identity", "show"]:
+    sys.stdout.write("/subscriptions/demo/identity\\tprincipal-123\\n")
+elif args[:2] == ["containerapp", "show"] and "--output" in args:
+    identity = {} if missing == "identity_assignment" else {"/subscriptions/demo/identity": {}}
+    json.dump({"identity": {"userAssignedIdentities": identity}, "properties": {"configuration": {}, "template": {}}}, sys.stdout)
+elif args[:2] == ["keyvault", "show"]:
+    if missing != "vault_access":
+        sys.stdout.write("principal-123\\n")
+elif args[:3] == ["keyvault", "secret", "show"]:
+    name = args[args.index("--name") + 1]
+    if missing == "required_secret" and name == "TAVILY-API-KEY":
+        raise SystemExit(3)
+    sys.stdout.write(f"https://demo-vault.vault.azure.net/secrets/{name}\\n")
+elif args[:3] == ["storage", "account", "show"]:
+    if missing == "storage_account":
+        raise SystemExit(3)
+    sys.stdout.write("/subscriptions/demo/storageAccounts/demostorage\\n")
+elif args[:3] == ["storage", "container-rm", "show"]:
+    if missing == "blob_container":
+        raise SystemExit(3)
+    sys.stdout.write("deep-research-blobs\\n")
+elif args[:3] == ["storage", "share-rm", "show"]:
+    if missing == "file_share":
+        raise SystemExit(3)
+    sys.stdout.write("deep-research-auth\\n")
+elif args[:4] == ["containerapp", "env", "storage", "show"]:
+    if missing == "environment_storage":
+        raise SystemExit(3)
+    account = "wrongstorage" if missing == "environment_storage_account" else "demostorage"
+    share = "wrong-share" if missing == "environment_storage_share" else "deep-research-auth"
+    access = "ReadOnly" if missing == "environment_storage_access" else "ReadWrite"
+    query = args[args.index("--query") + 1]
+    if query == "name":
+        sys.stdout.write("authsqlite\\n")
+    else:
+        sys.stdout.write(f"authsqlite\\t{account}\\t{share}\\t{access}\\n")
+sys.exit(0)
+""",
+        encoding="utf-8",
+    )
+    fake_az.chmod(0o700)
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{fixture / 'bin'}:{env['PATH']}",
+            "FAKE_AZ_ARGV_LOG": str(argv_log),
+            "FAKE_ENV_ROW": f"{ENVIRONMENT_ID}\t{DEFAULT_DOMAIN}\tSucceeded\n",
+            "FAKE_MISSING": missing,
+            "DOCKER_HUB_USERNAME": "demo-user",
+            "OAUTH_REDIRECTS_CONFIRMED": "true",
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", "deploy.sh"], cwd=fixture, env=env, capture_output=True, text=True
+    )
+
+    assert result.returncode != 0
+    assert expected_message in result.stderr
+    calls = _read_az_calls(argv_log)
+    assert not any(call[:2] == ["account", "set"] for call in calls)
+    assert not any(call[:2] == ["containerapp", "update"] for call in calls)
+
+
+def test_azure_deploy_arm_blob_container_failure_is_exact_and_never_leaks(tmp_path):
+    fixture, argv_log = _prepare_deploy_preflight_fixture(tmp_path)
+    stdout_canary = "arm-container-stdout-canary"
+    stderr_canary = "arm-container-stderr-canary"
+    fake_az = fixture / "bin/az"
+    fake_az.write_text(
+        f"""#!/usr/bin/python3
+import json
+import os
+import sys
+args = sys.argv[1:]
+with open(os.environ["FAKE_AZ_ARGV_LOG"], "a", encoding="utf-8") as stream:
+    stream.write(json.dumps(args) + "\\n")
+if args[:3] == ["containerapp", "env", "show"]:
+    sys.stdout.write(os.environ["FAKE_ENV_ROW"])
+elif args[:2] == ["group", "show"]:
+    sys.stdout.write("/subscriptions/demo/resourceGroups/demo-rg\\n")
+elif args[:2] == ["identity", "show"]:
+    sys.stdout.write("/subscriptions/demo/identity\\tprincipal-123\\n")
+elif args[:2] == ["containerapp", "show"] and "--output" in args:
+    sys.stdout.write('{{"identity":{{"userAssignedIdentities":{{"/subscriptions/demo/identity":{{}}}}}},"properties":{{"configuration":{{}},"template":{{}}}}}}')
+elif args[:2] == ["keyvault", "show"]:
+    sys.stdout.write("principal-123\\n")
+elif args[:3] == ["keyvault", "secret", "show"]:
+    name = args[args.index("--name") + 1]
+    sys.stdout.write(f"https://demo-vault.vault.azure.net/secrets/{{name}}\\n")
+elif args[:3] == ["storage", "account", "show"]:
+    sys.stdout.write("/subscriptions/demo/storageAccounts/demostorage\\n")
+elif args[:3] == ["storage", "container-rm", "show"]:
+    sys.stdout.write("{stdout_canary}\\n")
+    sys.stderr.write("{stderr_canary}\\n")
+    raise SystemExit(47)
+sys.exit(0)
+""",
+        encoding="utf-8",
+    )
+    fake_az.chmod(0o700)
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{fixture / 'bin'}:{env['PATH']}",
+            "FAKE_AZ_ARGV_LOG": str(argv_log),
+            "FAKE_ENV_ROW": f"{ENVIRONMENT_ID}\t{DEFAULT_DOMAIN}\tSucceeded\n",
+            "DOCKER_HUB_USERNAME": "demo-user",
+            "OAUTH_REDIRECTS_CONFIRMED": "true",
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", "deploy.sh"], cwd=fixture, env=env, capture_output=True, text=True
+    )
+
+    assert result.returncode == 47
+    assert stdout_canary not in result.stdout + result.stderr
+    assert stderr_canary not in result.stdout + result.stderr
+    assert [
+        "storage",
+        "container-rm",
+        "show",
+        "--subscription",
+        "00000000-1111-2222-3333-444444444444",
+        "--resource-group",
+        "demo-rg",
+        "--storage-account",
+        "demostorage",
+        "--name",
+        "deep-research-blobs",
+        "--query",
+        "name",
+        "-o",
+        "tsv",
+    ] in _read_az_calls(argv_log)
 
 
 def test_azure_deployment_guide_matches_update_only_cutover_workflow():
@@ -1999,6 +2260,8 @@ def test_azure_deployment_guide_matches_update_only_cutover_workflow():
         "### 3. Create or update Azure resources",
         "`deploy.sh` writes the resolved HTTPS endpoint back to `env.sh`",
         "It creates or reuses the resource group, Container Apps environment, Key Vault",
+        "rights to update Container Apps, Key Vault access policies, and Storage",
+        "rights for its existing storage-management steps",
     ):
         assert stale not in guide
     for required in (
@@ -2009,6 +2272,8 @@ def test_azure_deployment_guide_matches_update_only_cutover_workflow():
         ".resolved-azure-endpoints.json",
         'curl --fail --silent --show-error "$BACKEND_URL/health"',
         "OAUTH_REDIRECTS_CONFIRMED=true ./deploy.sh",
+        "read-only access to each prerequisite",
+        "permission to update the existing backend Container App",
     ):
         assert required in guide
     resolver = "./scripts/resolve_azure_endpoints.sh"
@@ -2057,8 +2322,8 @@ def test_passkey_sqlite_deployment_is_single_replica_on_persistent_azure_file(tm
     container = template["containers"][0]
     environment = {item["name"]: item for item in container["env"]}
 
-    assert "az storage share-rm create" in source
-    assert "az containerapp env storage set" in source
+    assert "az storage share-rm show" in source
+    assert "az containerapp env storage show" in source
     assert container["volumeMounts"] == [
         {"volumeName": "auth-sqlite", "mountPath": "/mnt/auth"}
     ]

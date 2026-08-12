@@ -39,36 +39,29 @@ print_timing_summary() {
 }
 
 # Parse command-line arguments
-SKIP_KV_ACCESS=false
-
 while [[ $# -gt 0 ]]; do
   case $1 in
-    --skip-kv-access)
-      SKIP_KV_ACCESS=true
-      shift
-      ;;
     --help|-h)
-      echo "Usage: ./deploy.sh [OPTIONS]"
+      echo "Usage: ./deploy.sh [--help]"
       echo ""
       echo "Update existing deployment for managed passkey cutover."
       echo ""
       echo "Prerequisites (this script does not bootstrap them):"
       echo "  - Existing resource group and Container Apps environment"
       echo "  - Existing backend Container App"
-      echo "  - Existing user-assigned managed identity"
+      echo "  - Existing user-assigned managed identity assigned to the backend app"
       echo "  - Existing Key Vault with identity secret get access"
       echo "  - Pre-created Key Vault secret PASSKEY-PROXY-SECRET"
       echo "  - Existing provider/runtime secrets referenced by the app configuration"
+      echo "  - Existing storage account, Blob container, Azure Files share, and Container Apps environment storage"
       echo "  - Successful build producing .build_version and Docker Hub image"
       echo "  - Confirmed Google/GitHub OAuth URLs when endpoint metadata changes"
       echo ""
       echo "Options:"
-      echo "  --skip-kv-access Skip Key Vault access policy updates (faster re-deployment)"
       echo "  --help, -h       Show this help message"
       echo ""
       echo "Examples:"
       echo "  OAUTH_REDIRECTS_CONFIRMED=true ./deploy.sh     # Update existing deployment after OAuth confirmation"
-      echo "  ./deploy.sh --skip-kv-access                   # Update with current-user KV policy step skipped"
       echo ""
       echo "Note: For bi-directional file sync with Azure File Share, use:"
       echo "  ./sync-files.sh"
@@ -107,6 +100,9 @@ set -e
 cat "$RESOLVER_STDERR" >&2
 if [ "$RESOLVER_STATUS" -ne 0 ]; then
   cat "$RESOLVER_STDOUT"
+  if [[ "$RESOLVER_STATUS" == 3 ]]; then
+    echo "Error: existing Container Apps environment '$ENV_NAME' in resource group '$RESOURCE_GROUP' is required and must be readable" >&2
+  fi
   rm -f "$RESOLVER_STDOUT" "$RESOLVER_STDERR"
   exit "$RESOLVER_STATUS"
 fi
@@ -176,6 +172,21 @@ if [[ "$RESOLVED_CHANGED" == true && "${OAUTH_REDIRECTS_CONFIRMED:-}" != true ]]
   exit 3
 fi
 
+RESOURCE_GROUP_STDERR=$(mktemp)
+set +e
+RESOURCE_GROUP_ID=$(az group show --subscription "$AZURE_SUBSCRIPTION_ID" --name "$RESOURCE_GROUP" --query id -o tsv 2>"$RESOURCE_GROUP_STDERR")
+RESOURCE_GROUP_STATUS=$?
+set -e
+rm -f "$RESOURCE_GROUP_STDERR"
+if [[ "$RESOURCE_GROUP_STATUS" != 0 ]]; then
+  echo "Error: existing resource group '$RESOURCE_GROUP' is required and must be readable" >&2
+  exit "$RESOURCE_GROUP_STATUS"
+fi
+if [[ -z "${RESOURCE_GROUP_ID//[[:space:]]/}" ]]; then
+  echo "Error: existing resource group '$RESOURCE_GROUP' returned an empty resource ID" >&2
+  exit 65
+fi
+
 USER_IDENTITY_NAME="${AGENT_NAME}-identity"
 IDENTITY_STDERR=$(mktemp)
 set +e
@@ -214,6 +225,27 @@ if [[ "$APP_CONFIG_STATUS" != 0 ]]; then
   exit "$APP_CONFIG_STATUS"
 fi
 rm -f "$APP_CONFIG_STDERR"
+
+set +e
+python3 -c '
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    config = json.load(stream)
+identities = config.get("identity", {}).get("userAssignedIdentities", {})
+if not isinstance(identities, dict):
+    raise SystemExit(2)
+expected = sys.argv[2].casefold()
+raise SystemExit(0 if any(str(key).casefold() == expected for key in identities) else 3)
+' "$EXISTING_CONFIG_JSON" "$USER_IDENTITY_ID"
+IDENTITY_ASSIGNMENT_STATUS=$?
+set -e
+if [[ "$IDENTITY_ASSIGNMENT_STATUS" != 0 ]]; then
+  echo "Error: required user-assigned managed identity '$USER_IDENTITY_NAME' must already be assigned to the existing Container App '$AGENT_NAME'" >&2
+  rm -f "$EXISTING_CONFIG_JSON"
+  exit 4
+fi
 
 if [ -z "$DOCKER_HUB_USERNAME" ]; then
   echo "❌ Error: Please set DOCKER_HUB_USERNAME before running deploy.sh" >&2
@@ -261,23 +293,96 @@ if [[ "$KV_ACCESS_OBJECT_ID" != "$USER_IDENTITY_PRINCIPAL_ID" ]]; then
   echo "Error: backend identity lacks Key Vault secret get access" >&2
   exit 4
 fi
-PASSKEY_SECRET_STDOUT=$(mktemp)
-PASSKEY_SECRET_STDERR=$(mktemp)
+
+REQUIRED_KEY_VAULT_SECRETS=(
+  TAVILY-API-KEY
+  LANGCHAIN-API-KEY
+  UPLOAD-API-KEY
+  STORAGE-ACCOUNT-NAME
+  STORAGE-ACCOUNT-KEY
+  AZURE-STORAGE-CONTAINER-NAME
+  GOOGLE-API-KEY
+  DOCKER-HUB-PAT
+  PASSKEY-PROXY-SECRET
+)
+for REQUIRED_SECRET_NAME in "${REQUIRED_KEY_VAULT_SECRETS[@]}"; do
+  SECRET_ID_STDOUT=$(mktemp)
+  SECRET_ID_STDERR=$(mktemp)
+  set +e
+  az keyvault secret show --subscription "$AZURE_SUBSCRIPTION_ID" --vault-name "$KV_NAME" --name "$REQUIRED_SECRET_NAME" --query id -o tsv >"$SECRET_ID_STDOUT" 2>"$SECRET_ID_STDERR"
+  SECRET_ID_STATUS=$?
+  set -e
+  if [[ "$SECRET_ID_STATUS" != 0 ]]; then
+    echo "Error: required pre-created Key Vault secret '$REQUIRED_SECRET_NAME' is missing or unreadable" >&2
+    cat "$SECRET_ID_STDOUT"
+    cat "$SECRET_ID_STDERR" >&2
+    rm -f "$SECRET_ID_STDOUT" "$SECRET_ID_STDERR" "$EXISTING_CONFIG_JSON" "$UPDATE_YAML"
+    exit "$SECRET_ID_STATUS"
+  fi
+  SECRET_ID=$(cat "$SECRET_ID_STDOUT")
+  rm -f "$SECRET_ID_STDOUT" "$SECRET_ID_STDERR"
+  if [[ -z "${SECRET_ID//[[:space:]]/}" ]]; then
+    echo "Error: $REQUIRED_SECRET_NAME id is empty" >&2
+    rm -f "$EXISTING_CONFIG_JSON" "$UPDATE_YAML"
+    exit 65
+  fi
+done
+unset REQUIRED_SECRET_NAME SECRET_ID SECRET_ID_STATUS
+
+BLOB_CONTAINER_NAME="deep-research-blobs"
+STORAGE_FILE_SHARE_NAME="deep-research-auth"
+
+STORAGE_ACCOUNT_STDERR=$(mktemp)
 set +e
-az keyvault secret show --subscription "$AZURE_SUBSCRIPTION_ID" --vault-name "$KV_NAME" --name PASSKEY-PROXY-SECRET --query id -o tsv >"$PASSKEY_SECRET_STDOUT" 2>"$PASSKEY_SECRET_STDERR"
-PASSKEY_SECRET_STATUS=$?
+STORAGE_ACCOUNT_ID=$(az storage account show --subscription "$AZURE_SUBSCRIPTION_ID" --name "$STORAGE_ACCOUNT_NAME" --resource-group "$RESOURCE_GROUP" --query id -o tsv 2>"$STORAGE_ACCOUNT_STDERR")
+STORAGE_ACCOUNT_STATUS=$?
 set -e
-if [[ "$PASSKEY_SECRET_STATUS" != 0 ]]; then
-  cat "$PASSKEY_SECRET_STDOUT"
-  cat "$PASSKEY_SECRET_STDERR" >&2
-  rm -f "$PASSKEY_SECRET_STDOUT" "$PASSKEY_SECRET_STDERR" "$EXISTING_CONFIG_JSON"
-  exit "$PASSKEY_SECRET_STATUS"
+rm -f "$STORAGE_ACCOUNT_STDERR"
+if [[ "$STORAGE_ACCOUNT_STATUS" != 0 || -z "${STORAGE_ACCOUNT_ID//[[:space:]]/}" ]]; then
+  echo "Error: existing storage account '$STORAGE_ACCOUNT_NAME' is required and must be readable" >&2
+  rm -f "$EXISTING_CONFIG_JSON" "$UPDATE_YAML"
+  if [[ "$STORAGE_ACCOUNT_STATUS" != 0 ]]; then exit "$STORAGE_ACCOUNT_STATUS"; else exit 65; fi
 fi
-PASSKEY_SECRET_ID=$(cat "$PASSKEY_SECRET_STDOUT")
-rm -f "$PASSKEY_SECRET_STDOUT" "$PASSKEY_SECRET_STDERR"
-if [[ -z "${PASSKEY_SECRET_ID//[[:space:]]/}" ]]; then
-  echo "Error: PASSKEY-PROXY-SECRET id is empty" >&2
-  rm -f "$EXISTING_CONFIG_JSON"
+
+BLOB_CONTAINER_STDERR=$(mktemp)
+set +e
+BLOB_CONTAINER_RESULT=$(az storage container-rm show --subscription "$AZURE_SUBSCRIPTION_ID" --resource-group "$RESOURCE_GROUP" --storage-account "$STORAGE_ACCOUNT_NAME" --name "$BLOB_CONTAINER_NAME" --query name -o tsv 2>"$BLOB_CONTAINER_STDERR")
+BLOB_CONTAINER_STATUS=$?
+set -e
+rm -f "$BLOB_CONTAINER_STDERR"
+if [[ "$BLOB_CONTAINER_STATUS" != 0 || "$BLOB_CONTAINER_RESULT" != "$BLOB_CONTAINER_NAME" ]]; then
+  echo "Error: existing Blob container '$BLOB_CONTAINER_NAME' in storage account '$STORAGE_ACCOUNT_NAME' is required and must be readable" >&2
+  rm -f "$EXISTING_CONFIG_JSON" "$UPDATE_YAML"
+  if [[ "$BLOB_CONTAINER_STATUS" != 0 ]]; then exit "$BLOB_CONTAINER_STATUS"; else exit 65; fi
+fi
+
+FILE_SHARE_STDERR=$(mktemp)
+set +e
+FILE_SHARE_RESULT=$(az storage share-rm show --subscription "$AZURE_SUBSCRIPTION_ID" --resource-group "$RESOURCE_GROUP" --storage-account "$STORAGE_ACCOUNT_NAME" --name "$STORAGE_FILE_SHARE_NAME" --query name -o tsv 2>"$FILE_SHARE_STDERR")
+FILE_SHARE_STATUS=$?
+set -e
+rm -f "$FILE_SHARE_STDERR"
+if [[ "$FILE_SHARE_STATUS" != 0 || "$FILE_SHARE_RESULT" != "$STORAGE_FILE_SHARE_NAME" ]]; then
+  echo "Error: existing Azure Files share '$STORAGE_FILE_SHARE_NAME' is required and must be readable" >&2
+  rm -f "$EXISTING_CONFIG_JSON" "$UPDATE_YAML"
+  if [[ "$FILE_SHARE_STATUS" != 0 ]]; then exit "$FILE_SHARE_STATUS"; else exit 65; fi
+fi
+
+ENV_STORAGE_STDERR=$(mktemp)
+set +e
+ENV_STORAGE_RESULT=$(az containerapp env storage show --subscription "$AZURE_SUBSCRIPTION_ID" --name "$ENV_NAME" --resource-group "$RESOURCE_GROUP" --storage-name "$SQLITE_ENV_STORAGE_NAME" --query '[name,properties.azureFile.accountName,properties.azureFile.shareName,properties.azureFile.accessMode]' -o tsv 2>"$ENV_STORAGE_STDERR")
+ENV_STORAGE_STATUS=$?
+set -e
+rm -f "$ENV_STORAGE_STDERR"
+if [[ "$ENV_STORAGE_STATUS" != 0 ]]; then
+  echo "Error: existing Container Apps environment storage '$SQLITE_ENV_STORAGE_NAME' is required and must be readable" >&2
+  rm -f "$EXISTING_CONFIG_JSON" "$UPDATE_YAML"
+  exit "$ENV_STORAGE_STATUS"
+fi
+EXPECTED_ENV_STORAGE_RESULT="${SQLITE_ENV_STORAGE_NAME}"$'\t'"${STORAGE_ACCOUNT_NAME}"$'\t'"${STORAGE_FILE_SHARE_NAME}"$'\t'"ReadWrite"
+if [[ "$ENV_STORAGE_RESULT" != "$EXPECTED_ENV_STORAGE_RESULT" ]]; then
+  echo "Error: Container Apps environment storage '$SQLITE_ENV_STORAGE_NAME' does not match required Azure Files binding" >&2
+  rm -f "$EXISTING_CONFIG_JSON" "$UPDATE_YAML"
   exit 65
 fi
 
@@ -292,16 +397,6 @@ az account set --subscription "$AZURE_SUBSCRIPTION_ID"
 echo "✅ Subscription set to $AZURE_SUBSCRIPTION_ID"
 end_step
 
-# 1.5. Resource Group Setup
-start_step "Resource Group Setup"
-if az group show --name $RESOURCE_GROUP &> /dev/null; then
-  echo "✅ Resource group '$RESOURCE_GROUP' already exists. Skipping creation."
-else
-  echo "✨ Creating Resource group '$RESOURCE_GROUP'..."
-  az group create --name $RESOURCE_GROUP --location $LOCATION
-fi
-end_step
-
 # 2. Verify image exists in ACR
 start_step "Verify Container Image"
 # No direct ACR check for Docker Hub image in bash
@@ -310,101 +405,6 @@ echo "✅ Verified image exists in ACR"
 NEW_VERSION=$(grep -E 'API_VERSION(:\s*\w+)?\s*=\s*' webapp/config.py | grep -o '"[^"]*"')
 NEW_VERSION=${NEW_VERSION//\"/}
 echo "ℹ️  Current API version: $NEW_VERSION"
-end_step
-
-# 3. Create environment
-start_step "Container Apps Environment Setup"
-if az containerapp env show --name $ENV_NAME --resource-group $RESOURCE_GROUP &> /dev/null; then
-  echo "✅ Container Apps environment '$ENV_NAME' already exists. Skipping creation."
-else
-  az containerapp env create \
-    --name $ENV_NAME \
-    --resource-group $RESOURCE_GROUP \
-    --location $LOCATION
-fi
-end_step
-
-# 4. Create Key Vault and store secrets
-start_step "Key Vault Setup & Secrets"
-echo "✅ Using required existing Key Vault '$KV_NAME'."
-
-if [ "$SKIP_KV_ACCESS" = false ]; then
-  echo "🔑 Ensuring Key Vault access configuration uses Access Policies..."
-  az keyvault update --name $KV_NAME --resource-group $RESOURCE_GROUP --enable-rbac-authorization false 2>/dev/null || true
-
-  echo "🔑 Granting current user access to manage secrets..."
-  CURRENT_USER_OID=$(az ad signed-in-user show --query id -o tsv 2>/dev/null || echo "")
-  if [ -z "$CURRENT_USER_OID" ]; then
-    echo "   Attempting to get Object ID from access token..."
-    CURRENT_USER_OID=$(az account get-access-token --query accessToken -o tsv | python3 -c "import sys, jwt; print(jwt.decode(sys.stdin.read().strip(), options={'verify_signature': False}).get('oid', ''))" 2>/dev/null || echo "")
-  fi
-
-  if [ -n "$CURRENT_USER_OID" ]; then
-    echo "   Setting Key Vault Access Policy for Object ID: $CURRENT_USER_OID..."
-    az keyvault set-policy --name $KV_NAME --secret-permissions all --object-id "$CURRENT_USER_OID" 2>/dev/null || echo "   ⚠️  Could not set access policy."
-  else
-    echo "   ⚠️  Could not determine current user Object ID. Secret updates might fail."
-  fi
-else
-  echo "⏭️  Skipping Key Vault access policy updates (--skip-kv-access)"
-fi
-
-if [ -f "./secrets.sh" ]; then
-  echo "🔑 Running secrets.sh to populate API keys..."
-  ./secrets.sh
-  echo "💡 Tip: Create a secrets.sh file to automatically populate API keys."
-fi
-
-end_step
-
-# 5. Setup Persistent Storage (Azure Blob Storage for Free Tier)
-start_step "Persistent Storage Setup"
-echo ""
-echo "📦 Setting up Azure Blob Storage container..."
-BLOB_CONTAINER_NAME="deep-research-blobs"
-SQLITE_FILE_SHARE_NAME="deep-research-auth"
-SQLITE_ENV_STORAGE_NAME="authsqlite"
-
-EXISTING_STORAGE=$(az storage account list --resource-group $RESOURCE_GROUP --query "[?starts_with(name, 'stdeepagents')].name" -o tsv 2>/dev/null || echo "")
-if [ -n "$EXISTING_STORAGE" ]; then
-  echo "✅ Found existing storage account: $EXISTING_STORAGE"
-  STORAGE_ACCOUNT_NAME=$EXISTING_STORAGE
-  STORAGE_KEY=$(az storage account keys list --account-name $STORAGE_ACCOUNT_NAME --resource-group $RESOURCE_GROUP --query '[0].value' -o tsv)
-  EXISTING_CONTAINER=$(az storage container list --account-name $STORAGE_ACCOUNT_NAME --account-key $STORAGE_KEY --query "[?name=='$BLOB_CONTAINER_NAME'].name" -o tsv 2>/dev/null || echo "")
-  if [ -n "$EXISTING_CONTAINER" ]; then
-    echo "✅ Blob container '$BLOB_CONTAINER_NAME' already exists. Skipping creation."
-  else
-    echo "📁 Creating Blob Container: $BLOB_CONTAINER_NAME"
-    az storage container create --name $BLOB_CONTAINER_NAME --account-name $STORAGE_ACCOUNT_NAME --account-key $STORAGE_KEY
-  fi
-else
-  echo "🗄️  Creating Storage Account: $STORAGE_ACCOUNT_NAME"
-  az storage account create --name $STORAGE_ACCOUNT_NAME --resource-group $RESOURCE_GROUP --location $LOCATION --sku Standard_LRS --kind StorageV2 --access-tier Hot --allow-blob-public-access false
-  STORAGE_KEY=$(az storage account keys list --account-name $STORAGE_ACCOUNT_NAME --resource-group $RESOURCE_GROUP --query '[0].value' -o tsv)
-  echo "📁 Creating Blob Container: $BLOB_CONTAINER_NAME"
-  az storage container create --name $BLOB_CONTAINER_NAME --account-name $STORAGE_ACCOUNT_NAME --account-key $STORAGE_KEY
-fi
-
-echo "📁 Ensuring persistent Azure File share for SQLite auth state..."
-az storage share-rm create \
-  --resource-group "$RESOURCE_GROUP" \
-  --storage-account "$STORAGE_ACCOUNT_NAME" \
-  --name "$SQLITE_FILE_SHARE_NAME" \
-  --quota 1 > /dev/null
-az containerapp env storage set \
-  --name "$ENV_NAME" \
-  --resource-group "$RESOURCE_GROUP" \
-  --storage-name "$SQLITE_ENV_STORAGE_NAME" \
-  --azure-file-account-name "$STORAGE_ACCOUNT_NAME" \
-  --azure-file-account-key "$STORAGE_KEY" \
-  --azure-file-share-name "$SQLITE_FILE_SHARE_NAME" \
-  --access-mode ReadWrite > /dev/null
-
-echo "🔐 Storing storage credentials in Key Vault..."
-az keyvault secret set --vault-name $KV_NAME --name STORAGE-ACCOUNT-NAME --value $STORAGE_ACCOUNT_NAME > /dev/null
-az keyvault secret set --vault-name $KV_NAME --name STORAGE-ACCOUNT-KEY --value $STORAGE_KEY > /dev/null
-az keyvault secret set --vault-name $KV_NAME --name AZURE-STORAGE-CONTAINER-NAME --value $BLOB_CONTAINER_NAME > /dev/null
-echo "✅ Persistent storage setup complete"
 end_step
 
 # 6. Deploy or update agent
