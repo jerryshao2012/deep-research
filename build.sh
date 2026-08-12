@@ -11,6 +11,12 @@ STEP_TIMES=()
 BUILD_CONTEXT_DIR=""
 DOCKER_CREDENTIAL_DIR=""
 DOCKER_PAT_FILE=""
+BUILD_TRANSACTION_ARMED=false
+CONFIG_BACKUP=""
+EXPECTED_CONFIG=""
+MARKER_BACKUP=""
+MARKER_TEMP=""
+MARKER_EXISTED=false
 
 # Function to track step timing
 start_step() {
@@ -51,12 +57,105 @@ cleanup_build_context() {
   fi
 }
 
+file_mode() {
+  stat -f '%Lp' "$1" 2>/dev/null || stat -c '%a' "$1"
+}
+
+same_file_state() {
+  [ -f "$1" ] && [ -f "$2" ] && cmp -s "$1" "$2" && [ "$(file_mode "$1")" = "$(file_mode "$2")" ]
+}
+
+cleanup_transaction_files() {
+  [ -z "$CONFIG_BACKUP" ] || rm -f -- "$CONFIG_BACKUP"
+  [ -z "$EXPECTED_CONFIG" ] || rm -f -- "$EXPECTED_CONFIG"
+  [ -z "$MARKER_BACKUP" ] || rm -f -- "$MARKER_BACKUP"
+  [ -z "$MARKER_TEMP" ] || rm -f -- "$MARKER_TEMP"
+}
+
+rollback_build_owned_files() {
+  if ! same_file_state "$SCRIPT_DIR/webapp/config.py" "$EXPECTED_CONFIG"; then
+    echo "Error: concurrent change detected in webapp/config.py; refusing to overwrite it during rollback." >&2
+    return 70
+  fi
+  if [ "$MARKER_EXISTED" = true ]; then
+    if ! same_file_state "$SCRIPT_DIR/.build_version" "$MARKER_BACKUP"; then
+      echo "Error: concurrent change detected in .build_version; refusing to overwrite it during rollback." >&2
+      return 70
+    fi
+  elif [ -e "$SCRIPT_DIR/.build_version" ]; then
+    echo "Error: concurrent change detected in .build_version; refusing to overwrite it during rollback." >&2
+    return 70
+  fi
+  cp -p "$CONFIG_BACKUP" "$SCRIPT_DIR/webapp/config.py" || return $?
+  if [ "$MARKER_EXISTED" = true ]; then
+    cp -p "$MARKER_BACKUP" "$SCRIPT_DIR/.build_version" || return $?
+  else
+    rm -f -- "$SCRIPT_DIR/.build_version" || return $?
+  fi
+}
+
+finish_build() {
+  status=$?
+  set +e
+  cleanup_build_context
+  cleanup_status=$?
+  if [ "$status" -eq 0 ] && [ "$cleanup_status" -ne 0 ]; then
+    status=$cleanup_status
+  fi
+  if [ "$BUILD_TRANSACTION_ARMED" = true ] && [ "$status" -ne 0 ]; then
+    rollback_build_owned_files
+    rollback_status=$?
+    if [ "$rollback_status" -ne 0 ]; then
+      status=$rollback_status
+    fi
+  fi
+  cleanup_transaction_files
+  trap - EXIT
+  exit "$status"
+}
+
+begin_build_transaction() {
+  if ! git diff --quiet HEAD -- webapp/config.py; then
+    echo "Error: webapp/config.py is dirty; commit or restore it before building." >&2
+    return 64
+  fi
+  git ls-files --error-unmatch webapp/config.py >/dev/null 2>&1 || {
+    echo "Error: webapp/config.py must be tracked by Git before building." >&2
+    return 64
+  }
+  CONFIG_BACKUP=$(mktemp "$SCRIPT_DIR/webapp/.config.py.build-backup.XXXXXX")
+  cp -p "$SCRIPT_DIR/webapp/config.py" "$CONFIG_BACKUP"
+  EXPECTED_CONFIG=$(mktemp "$SCRIPT_DIR/webapp/.config.py.build-expected.XXXXXX")
+  if [ -e "$SCRIPT_DIR/.build_version" ]; then
+    MARKER_EXISTED=true
+    MARKER_BACKUP=$(mktemp "$SCRIPT_DIR/.build_version.build-backup.XXXXXX")
+    cp -p "$SCRIPT_DIR/.build_version" "$MARKER_BACKUP"
+  fi
+  BUILD_TRANSACTION_ARMED=true
+}
+
+verify_build_owned_files_unchanged() {
+  if ! same_file_state "$SCRIPT_DIR/webapp/config.py" "$EXPECTED_CONFIG"; then
+    echo "Error: concurrent change detected in webapp/config.py before build completion." >&2
+    return 70
+  fi
+  if [ "$MARKER_EXISTED" = true ]; then
+    if ! same_file_state "$SCRIPT_DIR/.build_version" "$MARKER_BACKUP"; then
+      echo "Error: concurrent change detected in .build_version before build completion." >&2
+      return 70
+    fi
+  elif [ -e "$SCRIPT_DIR/.build_version" ]; then
+    echo "Error: concurrent change detected in .build_version before build completion." >&2
+    return 70
+  fi
+}
+
 # Configuration
 source "$SCRIPT_DIR/env.sh"
 : "${BACKEND_APP_NAME:?Set BACKEND_APP_NAME in env.sh}"
 : "${UI_APP_NAME:?Set UI_APP_NAME in env.sh}"
 
-trap cleanup_build_context EXIT
+trap finish_build EXIT
 OLD_UMASK=$(umask)
 umask 077
 DOCKER_CREDENTIAL_DIR="$(mktemp -d "/tmp/deep-research-docker-credentials.XXXXXX")"
@@ -194,7 +293,9 @@ end_step
 # 5. Increment API version
 start_step "API Version Management"
 echo "🔢 Incrementing API version..."
+begin_build_transaction
 python3 ./increment_version.py
+cp -p "$SCRIPT_DIR/webapp/config.py" "$EXPECTED_CONFIG"
 NEW_VERSION=$(grep -E 'API_VERSION(:\s*\w+)?\s*=\s*' webapp/config.py | grep -o '"[^"]*"')
 NEW_VERSION=${NEW_VERSION//\"/}
 echo "✅ New API version: $NEW_VERSION"
@@ -203,12 +304,10 @@ end_step
 # 6. Build and push image
 start_step "Container Image Build & Push"
 BUILD_VERSION=$(date +%Y%m%d%H%M%S)
-echo $BUILD_VERSION > .build_version
 echo "🔨 Building Container image with tags: latest, $BUILD_VERSION"
 # Ensure we're in the correct directory (where Dockerfile is located)
 cd "$SCRIPT_DIR"
 BUILD_CONTEXT_DIR="$(mktemp -d "$SCRIPT_DIR/.container-build-context.XXXXXX")"
-trap cleanup_build_context EXIT
 git ls-files --cached --others --exclude-standard -z \
   | tar --null -T - -cf - \
   | tar -xf - -C "$BUILD_CONTEXT_DIR"
@@ -235,6 +334,13 @@ if [ $? -ne 0 ]; then
   exit 1
 fi
 echo "✅ Image built and pushed successfully"
+verify_build_owned_files_unchanged
+MARKER_TEMP=$(mktemp "$SCRIPT_DIR/.build_version.tmp.XXXXXX")
+chmod 600 "$MARKER_TEMP"
+printf '%s\n' "$BUILD_VERSION" >"$MARKER_TEMP"
+mv -f "$MARKER_TEMP" "$SCRIPT_DIR/.build_version"
+MARKER_TEMP=""
+BUILD_TRANSACTION_ARMED=false
 end_step
 
 print_timing_summary

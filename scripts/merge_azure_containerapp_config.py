@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Merge managed Azure Container App YAML into an existing JSON resource."""
+"""Build a narrow Azure Container App template JSON Merge Patch."""
 
 from __future__ import annotations
 
@@ -56,7 +56,7 @@ def _merge(existing: object, desired: object, path: tuple[str, ...] = ()) -> obj
 
 
 def main() -> int:
-    """Parse, validate, merge, and write resulting resource YAML."""
+    """Parse, validate, merge template state, and write a narrow patch."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--existing-json", required=True, type=Path)
     parser.add_argument("--desired-yaml", required=True, type=Path)
@@ -68,9 +68,29 @@ def main() -> int:
         desired = yaml.safe_load(stream)
     if not isinstance(existing, dict) or not isinstance(desired, dict):
         raise ValueError("Azure Container App configurations must be mappings")
-    merged = _merge(existing, desired)
+    existing_location = existing.get("location")
+    existing_properties = existing.get("properties")
+    desired_properties = desired.get("properties")
+    if not isinstance(existing_location, str) or not existing_location:
+        raise ValueError("existing Azure Container App location is required")
+    if not isinstance(existing_properties, dict) or not isinstance(
+        desired_properties, dict
+    ):
+        raise ValueError("Azure Container App properties must be mappings")
+    existing_template = existing_properties.get("template")
+    desired_template = desired_properties.get("template")
+    if not isinstance(existing_template, dict) or not isinstance(
+        desired_template, dict
+    ):
+        raise ValueError("Azure Container App templates must be mappings")
+    merged_template = _merge(existing_template, desired_template, ("template",))
+    merged = {
+        "location": existing_location,
+        "properties": {"template": merged_template},
+    }
     with arguments.output_yaml.open("w", encoding="utf-8") as stream:
-        yaml.safe_dump(merged, stream, sort_keys=False)
+        json.dump(merged, stream, indent=2, sort_keys=True)
+        stream.write("\n")
     return 0
 
 

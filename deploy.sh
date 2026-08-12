@@ -284,6 +284,84 @@ if [[ "$CONTAINER_TOPOLOGY_STATUS" != 0 || -z "$MANAGED_CONTAINER_NAME" ]]; then
   exit 4
 fi
 
+validate_existing_app_metadata() {
+APP_METADATA_STDOUT=$(mktemp)
+APP_METADATA_STDERR=$(mktemp)
+set +e
+az containerapp secret list --subscription "$AZURE_SUBSCRIPTION_ID" --name "$AGENT_NAME" --resource-group "$RESOURCE_GROUP" --query '[].{name:name,keyVaultUrl:keyVaultUrl,identity:identity}' --output json >"$APP_METADATA_STDOUT" 2>"$APP_METADATA_STDERR"
+APP_METADATA_STATUS=$?
+set -e
+rm -f "$APP_METADATA_STDERR"
+if [[ "$APP_METADATA_STATUS" != 0 ]]; then
+  echo "Error: existing Container App secret-reference metadata is required and must be readable" >&2
+  rm -f "$APP_METADATA_STDOUT" "$EXISTING_CONFIG_JSON"
+  exit "$APP_METADATA_STATUS"
+fi
+set +e
+python3 - "$APP_METADATA_STDOUT" "$EXISTING_CONFIG_JSON" "$USER_IDENTITY_ID" "$KV_NAME" "${DOCKER_HUB_USERNAME:-}" <<'PY'
+import json
+import sys
+
+secret_path, app_path, identity, vault, username = sys.argv[1:]
+with open(secret_path, encoding="utf-8") as stream:
+    secrets = json.load(stream)
+with open(app_path, encoding="utf-8") as stream:
+    app = json.load(stream)
+required = {
+    "tavily-api-key": "TAVILY-API-KEY",
+    "langchain-api-key": "LANGCHAIN-API-KEY",
+    "upload-api-key": "UPLOAD-API-KEY",
+    "storage-account-name": "STORAGE-ACCOUNT-NAME",
+    "storage-account-key": "STORAGE-ACCOUNT-KEY",
+    "azure-storage-container-name": "AZURE-STORAGE-CONTAINER-NAME",
+    "google-api-key": "GOOGLE-API-KEY",
+    "docker-hub-pat": "DOCKER-HUB-PAT",
+    "passkey-proxy-secret": "PASSKEY-PROXY-SECRET",
+}
+if not isinstance(secrets, list):
+    raise SystemExit(2)
+by_name = {}
+for item in secrets:
+    if not isinstance(item, dict) or set(item) != {"name", "keyVaultUrl", "identity"}:
+        raise SystemExit(2)
+    name = item.get("name")
+    if not isinstance(name, str) or name in by_name:
+        raise SystemExit(2)
+    by_name[name] = item
+for name, vault_name in required.items():
+    expected = {
+        "name": name,
+        "keyVaultUrl": f"https://{vault}.vault.azure.net/secrets/{vault_name}",
+        "identity": identity,
+    }
+    if by_name.get(name) != expected:
+        raise SystemExit(3)
+configuration = app.get("properties", {}).get("configuration", {})
+registries = configuration.get("registries")
+if not isinstance(registries, list):
+    raise SystemExit(2)
+matching = [
+    item for item in registries
+    if isinstance(item, dict) and str(item.get("server", "")).casefold() == "docker.io"
+]
+expected_registry = {
+    "server": "docker.io",
+    "username": username,
+    "passwordSecretRef": "docker-hub-pat",
+}
+if len(matching) != 1 or matching[0] != expected_registry:
+    raise SystemExit(4)
+PY
+APP_METADATA_VALIDATE_STATUS=$?
+set -e
+rm -f "$APP_METADATA_STDOUT"
+if [[ "$APP_METADATA_VALIDATE_STATUS" != 0 ]]; then
+  echo "Error: existing Container App secret references or Docker Hub registry metadata do not match required immutable configuration" >&2
+  rm -f "$EXISTING_CONFIG_JSON"
+  exit 4
+fi
+}
+
 if [ -z "$DOCKER_HUB_USERNAME" ]; then
   echo "❌ Error: Please set DOCKER_HUB_USERNAME before running deploy.sh" >&2
   rm -f "$EXISTING_CONFIG_JSON"
@@ -299,7 +377,7 @@ SQLITE_ENV_STORAGE_NAME="authsqlite"
 RESTART_TRIGGER=$(date +%s)
 REVISION_SUFFIX="passkeys-$(date +%Y%m%d%H%M%S)"
 DESIRED_CONFIG_YAML=$(mktemp /tmp/desired-config-XXXXXX.yaml 2>/dev/null || mktemp)
-UPDATE_YAML=$(mktemp /tmp/update-config-XXXXXX.yaml 2>/dev/null || mktemp)
+UPDATE_PATCH_JSON=$(mktemp /tmp/update-config-XXXXXX.json 2>/dev/null || mktemp)
 uv run python "$SCRIPT_DIR/scripts/render_azure_containerapp_config.py" \
   --docker-username "$DOCKER_HUB_USERNAME" \
   --build-version "$BUILD_VERSION" \
@@ -311,11 +389,13 @@ uv run python "$SCRIPT_DIR/scripts/render_azure_containerapp_config.py" \
   --restart-trigger "$RESTART_TRIGGER" \
   --revision-suffix "$REVISION_SUFFIX" \
   --output "$DESIRED_CONFIG_YAML"
+generate_update_patch() {
 uv run python "$SCRIPT_DIR/scripts/merge_azure_containerapp_config.py" \
   --existing-json "$EXISTING_CONFIG_JSON" \
   --desired-yaml "$DESIRED_CONFIG_YAML" \
-  --output-yaml "$UPDATE_YAML"
+  --output-yaml "$UPDATE_PATCH_JSON"
 rm -f "$DESIRED_CONFIG_YAML"
+}
 
 KV_ACCESS_STDERR=$(mktemp)
 set +e
@@ -402,14 +482,14 @@ for REQUIRED_SECRET_NAME in "${REQUIRED_KEY_VAULT_SECRETS[@]}"; do
     echo "Error: required pre-created Key Vault secret '$REQUIRED_SECRET_NAME' is missing or unreadable" >&2
     cat "$SECRET_ID_STDOUT"
     cat "$SECRET_ID_STDERR" >&2
-    rm -f "$SECRET_ID_STDOUT" "$SECRET_ID_STDERR" "$EXISTING_CONFIG_JSON" "$UPDATE_YAML"
+    rm -f "$SECRET_ID_STDOUT" "$SECRET_ID_STDERR" "$EXISTING_CONFIG_JSON" "$UPDATE_PATCH_JSON"
     exit "$SECRET_ID_STATUS"
   fi
   SECRET_ID=$(cat "$SECRET_ID_STDOUT")
   rm -f "$SECRET_ID_STDOUT" "$SECRET_ID_STDERR"
   if [[ -z "${SECRET_ID//[[:space:]]/}" ]]; then
     echo "Error: $REQUIRED_SECRET_NAME id is empty" >&2
-    rm -f "$EXISTING_CONFIG_JSON" "$UPDATE_YAML"
+    rm -f "$EXISTING_CONFIG_JSON" "$UPDATE_PATCH_JSON"
     exit 65
   fi
 done
@@ -426,7 +506,7 @@ set -e
 rm -f "$STORAGE_ACCOUNT_STDERR"
 if [[ "$STORAGE_ACCOUNT_STATUS" != 0 || -z "${STORAGE_ACCOUNT_ID//[[:space:]]/}" ]]; then
   echo "Error: existing storage account '$STORAGE_ACCOUNT_NAME' is required and must be readable" >&2
-  rm -f "$EXISTING_CONFIG_JSON" "$UPDATE_YAML"
+  rm -f "$EXISTING_CONFIG_JSON" "$UPDATE_PATCH_JSON"
   if [[ "$STORAGE_ACCOUNT_STATUS" != 0 ]]; then exit "$STORAGE_ACCOUNT_STATUS"; else exit 65; fi
 fi
 
@@ -438,7 +518,7 @@ set -e
 rm -f "$BLOB_CONTAINER_STDERR"
 if [[ "$BLOB_CONTAINER_STATUS" != 0 || "$BLOB_CONTAINER_RESULT" != "$BLOB_CONTAINER_NAME" ]]; then
   echo "Error: existing Blob container '$BLOB_CONTAINER_NAME' in storage account '$STORAGE_ACCOUNT_NAME' is required and must be readable" >&2
-  rm -f "$EXISTING_CONFIG_JSON" "$UPDATE_YAML"
+  rm -f "$EXISTING_CONFIG_JSON" "$UPDATE_PATCH_JSON"
   if [[ "$BLOB_CONTAINER_STATUS" != 0 ]]; then exit "$BLOB_CONTAINER_STATUS"; else exit 65; fi
 fi
 
@@ -450,7 +530,7 @@ set -e
 rm -f "$FILE_SHARE_STDERR"
 if [[ "$FILE_SHARE_STATUS" != 0 || "$FILE_SHARE_RESULT" != "$STORAGE_FILE_SHARE_NAME" ]]; then
   echo "Error: existing Azure Files share '$STORAGE_FILE_SHARE_NAME' is required and must be readable" >&2
-  rm -f "$EXISTING_CONFIG_JSON" "$UPDATE_YAML"
+  rm -f "$EXISTING_CONFIG_JSON" "$UPDATE_PATCH_JSON"
   if [[ "$FILE_SHARE_STATUS" != 0 ]]; then exit "$FILE_SHARE_STATUS"; else exit 65; fi
 fi
 
@@ -462,20 +542,23 @@ set -e
 rm -f "$ENV_STORAGE_STDERR"
 if [[ "$ENV_STORAGE_STATUS" != 0 ]]; then
   echo "Error: existing Container Apps environment storage '$SQLITE_ENV_STORAGE_NAME' is required and must be readable" >&2
-  rm -f "$EXISTING_CONFIG_JSON" "$UPDATE_YAML"
+  rm -f "$EXISTING_CONFIG_JSON" "$UPDATE_PATCH_JSON"
   exit "$ENV_STORAGE_STATUS"
 fi
 if ! ENV_STORAGE_RESULT=$(normalize_azure_tsv_array "$ENV_STORAGE_RESULT"); then
   echo "Error: Container Apps environment storage '$SQLITE_ENV_STORAGE_NAME' returned an invalid response" >&2
-  rm -f "$EXISTING_CONFIG_JSON" "$UPDATE_YAML"
+  rm -f "$EXISTING_CONFIG_JSON" "$UPDATE_PATCH_JSON"
   exit 65
 fi
 EXPECTED_ENV_STORAGE_RESULT="${SQLITE_ENV_STORAGE_NAME}"$'\t'"${STORAGE_ACCOUNT_NAME}"$'\t'"${STORAGE_FILE_SHARE_NAME}"$'\t'"ReadWrite"
 if [[ "$ENV_STORAGE_RESULT" != "$EXPECTED_ENV_STORAGE_RESULT" ]]; then
   echo "Error: Container Apps environment storage '$SQLITE_ENV_STORAGE_NAME' does not match required Azure Files binding" >&2
-  rm -f "$EXISTING_CONFIG_JSON" "$UPDATE_YAML"
+  rm -f "$EXISTING_CONFIG_JSON" "$UPDATE_PATCH_JSON"
   exit 65
 fi
+
+generate_update_patch
+validate_existing_app_metadata
 
 echo "🚀 Starting Deep Research Agent deployment (using existing image)..."
 
@@ -537,9 +620,14 @@ echo "⚙️  Applying comprehensive configuration update..."
 #            secretRef: azure-openai-deployment
 #          - name: AZURE_OPENAI_API_KEY
 #            secretRef: azure-openai-api-key
+APP_RESOURCE_ID=$(python3 -c 'import json,sys; value=json.load(open(sys.argv[1], encoding="utf-8")).get("id"); print(value) if isinstance(value,str) and value.startswith("/") else sys.exit(2)' "$EXISTING_CONFIG_JSON")
 rm -f "$EXISTING_CONFIG_JSON"
-az containerapp update --name "$AGENT_NAME" --resource-group "$RESOURCE_GROUP" --yaml "$UPDATE_YAML"
-rm -f "$UPDATE_YAML"
+az rest --method patch \
+  --uri "${APP_RESOURCE_ID}?api-version=2025-07-01" \
+  --headers Content-Type=application/merge-patch+json \
+  --body "@$UPDATE_PATCH_JSON" \
+  --output none
+rm -f "$UPDATE_PATCH_JSON"
 REVISION_READY=false
 for i in {1..60}; do
   REVISION_STATE=$(az containerapp revision list --name "$AGENT_NAME" --resource-group "$RESOURCE_GROUP" --query "[?name=='${AGENT_NAME}--${REVISION_SUFFIX}'] | [0].[properties.runningState,properties.healthState]" -o tsv)

@@ -33,14 +33,6 @@ def _validate_frontend_urls(value: str) -> str:
     return value
 
 
-def _secret(name: str, vault_name: str, secret_name: str, identity: str) -> dict:
-    return {
-        "name": name,
-        "keyVaultUrl": f"https://{vault_name}.vault.azure.net/secrets/{secret_name}",
-        "identity": identity,
-    }
-
-
 def _value(name: str, value: str) -> dict[str, str]:
     return {"name": name, "value": value}
 
@@ -68,7 +60,7 @@ def main() -> int:
         "Docker Hub username", arguments.docker_username, r"[a-z0-9][a-z0-9_-]{0,254}"
     )
     version = _require_match("build version", arguments.build_version, r"[0-9]{14}")
-    identity = _require_match(
+    _require_match(
         "managed identity resource ID", arguments.identity_id, r"/[A-Za-z0-9_./()-]+"
     )
     container_name = _require_match(
@@ -76,7 +68,7 @@ def main() -> int:
     )
     if "--" in container_name or container_name.endswith("-"):
         raise ValueError("invalid existing container name")
-    vault_name = _require_match(
+    _require_match(
         "Key Vault name",
         arguments.key_vault_name,
         r"[A-Za-z0-9][A-Za-z0-9-]{1,22}[A-Za-z0-9]",
@@ -98,17 +90,6 @@ def main() -> int:
     if "--" in revision_suffix:
         raise ValueError("invalid revision suffix")
 
-    secret_specs = (
-        ("tavily-api-key", "TAVILY-API-KEY"),
-        ("langchain-api-key", "LANGCHAIN-API-KEY"),
-        ("upload-api-key", "UPLOAD-API-KEY"),
-        ("storage-account-name", "STORAGE-ACCOUNT-NAME"),
-        ("storage-account-key", "STORAGE-ACCOUNT-KEY"),
-        ("azure-storage-container-name", "AZURE-STORAGE-CONTAINER-NAME"),
-        ("google-api-key", "GOOGLE-API-KEY"),
-        ("docker-hub-pat", "DOCKER-HUB-PAT"),
-        ("passkey-proxy-secret", "PASSKEY-PROXY-SECRET"),
-    )
     values = (
         ("RESTART_TRIGGER", restart_trigger),
         ("VERIFY_SSL", "false"),
@@ -160,20 +141,6 @@ def main() -> int:
     )
     desired = {
         "properties": {
-            "configuration": {
-                "ingress": {"external": True, "targetPort": 2024, "transport": "auto"},
-                "secrets": [
-                    _secret(name, vault_name, secret_name, identity)
-                    for name, secret_name in secret_specs
-                ],
-                "registries": [
-                    {
-                        "server": "docker.io",
-                        "username": username,
-                        "passwordSecretRef": "docker-hub-pat",
-                    }
-                ],
-            },
             "template": {
                 "revisionSuffix": revision_suffix,
                 "containers": [

@@ -22,6 +22,7 @@ CONFIG_MERGER = PROJECT_ROOT / "scripts/merge_azure_containerapp_config.py"
 CONFIG_RENDERER = PROJECT_ROOT / "scripts/render_azure_containerapp_config.py"
 DOCKER_CREDENTIALS = PROJECT_ROOT / "scripts/load_docker_credentials.py"
 KEY_VAULT_RBAC = PROJECT_ROOT / "scripts/evaluate_keyvault_rbac.py"
+AZURE_METADATA_SNAPSHOT = PROJECT_ROOT / "scripts/snapshot_azure_passkey_metadata.py"
 METADATA_NAME = ".resolved-azure-endpoints.json"
 RESOLVER_ENV = {
     "AZURE_SUBSCRIPTION_ID": "00000000-1111-2222-3333-444444444444",
@@ -1703,7 +1704,7 @@ sys.exit(0)
     ]
 
 
-def test_azure_deploy_accepts_current_cli_multiline_tsv_arrays(tmp_path):
+def test_azure_deploy_secret_immutable_rest_patch_and_multiline_tsv(tmp_path):
     fixture, argv_log = _install_azure_script_fixture(tmp_path, "deploy.sh")
     (fixture / ".env.docker").write_text("OTHER=value\n", encoding="utf-8")
     deploy_pat_canary = "deploy-must-not-consume-this-pat"
@@ -1716,7 +1717,7 @@ def test_azure_deploy_accepts_current_cli_multiline_tsv_arrays(tmp_path):
     (fixture / "webapp/config.py").write_text(
         'API_VERSION = "9.8.7"\n', encoding="utf-8"
     )
-    update_yaml = fixture / "captured-update.yaml"
+    update_patch = fixture / "captured-update.json"
     fake_az = fixture / "bin/az"
     fake_az.write_text(
         """#!/usr/bin/python3
@@ -1749,14 +1750,29 @@ elif args[:4] == ["containerapp", "env", "storage", "show"]:
 elif args[:2] == ["containerapp", "show"] and "provisioningState" in " ".join(args):
     sys.stdout.write("Succeeded\\n")
 elif args[:2] == ["containerapp", "show"] and "--output" in args and args[args.index("--output") + 1] == "json":
+    required = [
+        ("tavily-api-key", "TAVILY-API-KEY"),
+        ("langchain-api-key", "LANGCHAIN-API-KEY"),
+        ("upload-api-key", "UPLOAD-API-KEY"),
+        ("storage-account-name", "STORAGE-ACCOUNT-NAME"),
+        ("storage-account-key", "STORAGE-ACCOUNT-KEY"),
+        ("azure-storage-container-name", "AZURE-STORAGE-CONTAINER-NAME"),
+        ("google-api-key", "GOOGLE-API-KEY"),
+        ("docker-hub-pat", "DOCKER-HUB-PAT"),
+        ("passkey-proxy-secret", "PASSKEY-PROXY-SECRET"),
+    ]
     json.dump({
+        "id": "/subscriptions/demo/resourceGroups/demo-rg/providers/Microsoft.App/containerApps/demo-api",
         "name": "demo-api",
-        "tags": {"unrelated": "preserved"},
+        "location": "canadacentral",
         "identity": {"userAssignedIdentities": {"/subscriptions/demo/identity": {}}},
         "properties": {
             "configuration": {
-                "secrets": [{"name": "unrelated-secret", "value": "opaque"}],
-                "registries": [{"server": "private.example.test", "username": "kept-user", "passwordSecretRef": "unrelated-secret"}],
+                "secrets": [
+                    {"name": name, "keyVaultUrl": f"https://demo-vault.vault.azure.net/secrets/{secret}", "identity": "/subscriptions/demo/identity"}
+                    for name, secret in required
+                ],
+                "registries": [{"server": "docker.io", "username": "wrong-user" if os.environ.get("FAKE_REGISTRY_DRIFT") else "demo-user", "passwordSecretRef": "docker-hub-pat"}],
             },
             "template": {"containers": [{
                 "name": "renamed-main",
@@ -1765,6 +1781,22 @@ elif args[:2] == ["containerapp", "show"] and "--output" in args and args[args.i
             }]},
         },
     }, sys.stdout)
+elif args[:3] == ["containerapp", "secret", "list"]:
+    required = [
+        ("tavily-api-key", "TAVILY-API-KEY"),
+        ("langchain-api-key", "LANGCHAIN-API-KEY"),
+        ("upload-api-key", "UPLOAD-API-KEY"),
+        ("storage-account-name", "STORAGE-ACCOUNT-NAME"),
+        ("storage-account-key", "STORAGE-ACCOUNT-KEY"),
+        ("azure-storage-container-name", "AZURE-STORAGE-CONTAINER-NAME"),
+        ("google-api-key", "GOOGLE-API-KEY"),
+        ("docker-hub-pat", "DOCKER-HUB-PAT"),
+        ("passkey-proxy-secret", "PASSKEY-PROXY-SECRET"),
+    ]
+    json.dump([
+        {"name": name, "keyVaultUrl": f"https://demo-vault.vault.azure.net/secrets/{secret}", "identity": "/subscriptions/demo/wrong" if os.environ.get("FAKE_SECRET_DRIFT") else "/subscriptions/demo/identity"}
+        for name, secret in required
+    ], sys.stdout)
 elif args[:2] == ["containerapp", "show"] and "ingress.fqdn" in " ".join(args):
     sys.stdout.write("demo-api.calmpond-123.eastus.azurecontainerapps.io\\n")
 elif args[:3] == ["containerapp", "revision", "list"]:
@@ -1776,12 +1808,12 @@ elif args[:3] == ["containerapp", "revision", "list"]:
         sys.stderr.write("revision query did not target exact expected revision\\n")
         raise SystemExit(89)
     sys.stdout.write("RunningAtMaxScale\\nHealthy\\n")
-elif args[:2] == ["containerapp", "update"] and "--yaml" in args:
-    if "--revision-suffix" in args:
-        sys.stderr.write("obsolete revision suffix CLI flag used\\n")
+elif args[:1] == ["rest"]:
+    source_argument = args[args.index("--body") + 1]
+    if not source_argument.startswith("@"):
         raise SystemExit(88)
-    source = pathlib.Path(args[args.index("--yaml") + 1])
-    pathlib.Path(os.environ["FAKE_UPDATE_YAML"]).write_bytes(source.read_bytes())
+    source = pathlib.Path(source_argument[1:])
+    pathlib.Path(os.environ["FAKE_UPDATE_PATCH"]).write_bytes(source.read_bytes())
 sys.exit(0)
 """,
         encoding="utf-8",
@@ -1818,7 +1850,7 @@ sys.stdout.write('{"version":"9.8.7","status":"ok"}\\n')
             "PATH": f"{fixture / 'bin'}:{env['PATH']}",
             "FAKE_AZ_ARGV_LOG": str(argv_log),
             "FAKE_ENV_ROW": f"{ENVIRONMENT_ID}\t{DEFAULT_DOMAIN}\tSucceeded\n",
-            "FAKE_UPDATE_YAML": str(update_yaml),
+            "FAKE_UPDATE_PATCH": str(update_patch),
             "FAKE_EXPECTED_REVISION": "demo-api--passkeys-20260812010101",
             "DOCKER_HUB_PAT": "",
             "OAUTH_REDIRECTS_CONFIRMED": "true",
@@ -1836,26 +1868,12 @@ sys.stdout.write('{"version":"9.8.7","status":"ok"}\\n')
 
     assert result.returncode == 0, result.stderr
     assert deploy_pat_canary not in result.stdout + result.stderr
-    rendered = yaml.safe_load(update_yaml.read_text(encoding="utf-8"))
+    rendered = json.loads(update_patch.read_text(encoding="utf-8"))
+    assert set(rendered) == {"location", "properties"}
+    assert set(rendered["properties"]) == {"template"}
+    assert rendered["location"] == "canadacentral"
     revision_suffix = rendered["properties"]["template"]["revisionSuffix"]
     assert revision_suffix == "passkeys-20260812010101"
-    assert rendered["tags"] == {"unrelated": "preserved"}
-    secrets = {
-        item["name"]: item
-        for item in rendered["properties"]["configuration"]["secrets"]
-    }
-    assert secrets["unrelated-secret"]["value"] == "opaque"
-    assert secrets["passkey-proxy-secret"] == {
-        "name": "passkey-proxy-secret",
-        "keyVaultUrl": "https://demo-vault.vault.azure.net/secrets/PASSKEY-PROXY-SECRET",
-        "identity": "/subscriptions/demo/identity",
-    }
-    registries = rendered["properties"]["configuration"]["registries"]
-    assert {item["server"]: item for item in registries}["private.example.test"] == {
-        "server": "private.example.test",
-        "username": "kept-user",
-        "passwordSecretRef": "unrelated-secret",
-    }
     container = rendered["properties"]["template"]["containers"][0]
     assert container["name"] == "renamed-main"
     runtime_env = {item["name"]: item for item in container["env"]}
@@ -1884,8 +1902,17 @@ sys.stdout.write('{"version":"9.8.7","status":"ok"}\\n')
         "PASSKEY-PROXY-SECRET",
     }
     assert all(call[call.index("--query") + 1] == "id" for call in secret_calls)
-    update_call = next(call for call in calls if call[:2] == ["containerapp", "update"])
-    assert "--revision-suffix" not in update_call
+    update_call = next(call for call in calls if call[:1] == ["rest"])
+    assert update_call[:3] == ["rest", "--method", "patch"]
+    assert update_call[update_call.index("--uri") + 1] == (
+        "/subscriptions/demo/resourceGroups/demo-rg/providers/Microsoft.App/"
+        "containerApps/demo-api?api-version=2025-07-01"
+    )
+    assert update_call[update_call.index("--headers") + 1] == (
+        "Content-Type=application/merge-patch+json"
+    )
+    assert "containerapp update" not in json.dumps(calls)
+    assert "--show-values" not in json.dumps(calls)
     account_set = next(
         index for index, call in enumerate(calls) if call[:2] == ["account", "set"]
     )
@@ -1900,11 +1927,31 @@ sys.stdout.write('{"version":"9.8.7","status":"ok"}\\n')
         ["storage", "container-rm"],
         ["storage", "share-rm"],
         ["containerapp", "env"],
+        ["containerapp", "secret"],
     ]
     curl_index = next(index for index, call in enumerate(calls) if call[0] == "curl")
     assert calls[-2:] == [EXPECTED_AZ_ARGV, EXPECTED_AZ_ARGV]
     assert curl_index < len(calls) - 2
     assert json.loads((fixture / METADATA_NAME).read_text()) == _expected_metadata()
+
+    for drift_variable in ("FAKE_SECRET_DRIFT", "FAKE_REGISTRY_DRIFT"):
+        argv_log.unlink()
+        update_patch.unlink(missing_ok=True)
+        drift_environment = env | {drift_variable: "true"}
+        drifted = subprocess.run(
+            ["bash", "deploy.sh"],
+            cwd=fixture,
+            env=drift_environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert drifted.returncode == 4
+        assert "immutable configuration" in drifted.stderr
+        drift_calls = _read_az_calls(argv_log)
+        assert not any(call[:1] == ["rest"] for call in drift_calls)
+        assert not any(call[:2] == ["account", "set"] for call in drift_calls)
+        assert not update_patch.exists()
 
 
 def test_azure_deploy_gates_mutation_on_oauth_confirmation_and_strict_output():
@@ -1996,16 +2043,10 @@ def test_azure_config_renderer_rejects_invalid_revision_suffix(tmp_path):
 def test_azure_deploy_uses_managed_passkey_runtime_configuration(tmp_path):
     source = (PROJECT_ROOT / "deploy.sh").read_text(encoding="utf-8")
     rendered = _render_desired_config(tmp_path)
-    configuration = rendered["properties"]["configuration"]
+    assert "configuration" not in rendered["properties"]
     container = rendered["properties"]["template"]["containers"][0]
-    secrets = {item["name"]: item for item in configuration["secrets"]}
     environment = {item["name"]: item for item in container["env"]}
 
-    assert secrets["passkey-proxy-secret"] == {
-        "name": "passkey-proxy-secret",
-        "keyVaultUrl": "https://demo-vault.vault.azure.net/secrets/PASSKEY-PROXY-SECRET",
-        "identity": "/subscriptions/demo/identity",
-    }
     assert environment["PASSKEY_PROXY_SECRET"]["secretRef"] == "passkey-proxy-secret"
     expected_values = {
         "FRONTEND_URLS": f"{UI_URL},https://bmo-deepagent-ui.vercel.app",
@@ -2084,6 +2125,8 @@ def test_azure_deploy_contains_no_bootstrap_permission_or_secret_mutations():
         "az group create",
         "az containerapp env create",
         "az containerapp create",
+        "az containerapp update",
+        "az containerapp secret set",
         "az keyvault update",
         "az keyvault create",
         "az keyvault set-policy",
@@ -2103,6 +2146,7 @@ def test_azure_deploy_contains_no_bootstrap_permission_or_secret_mutations():
     ):
         assert forbidden not in source
     assert "az storage container-rm show" in source
+    assert "--show-values" not in source
 
 
 @pytest.mark.parametrize(
@@ -2362,7 +2406,11 @@ def test_azure_build_stages_context_without_git_metadata() -> None:
         'container_runtime_build --platform linux/amd64 -t "$FULL_IMAGE_NAME" '
         '"$BUILD_CONTEXT_DIR"' in source
     )
-    assert "trap cleanup_build_context EXIT" in source
+    assert "trap finish_build EXIT" in source
+    assert source.index("finish_build()") < source.index("trap finish_build EXIT")
+    assert source.index(
+        "cleanup_build_context", source.index("finish_build()")
+    ) < source.index("trap - EXIT")
 
 
 def test_azure_deploy_uses_sqlite_without_cosmos(tmp_path) -> None:
@@ -2760,3 +2808,533 @@ def test_azure_download_prefix_sync(monkeypatch, tmp_path) -> None:
     assert (dest_dir / "file1.txt").is_file()
     assert (dest_dir / "sub" / "file2.txt").is_file()
     assert (dest_dir / "file1.txt").read_bytes() == b"downloaded"
+
+
+def _prepare_build_rollback_fixture(tmp_path: Path) -> tuple[Path, Path]:
+    fixture, argv_log = _install_azure_script_fixture(tmp_path, "build.sh")
+    shutil.copy2(
+        PROJECT_ROOT / "increment_version.py", fixture / "increment_version.py"
+    )
+    (fixture / "webapp").mkdir()
+    (fixture / "webapp/config.py").write_text(
+        'API_VERSION = "1.8.126"\n', encoding="utf-8"
+    )
+    (fixture / ".env.docker").write_text("OTHER=value\n", encoding="utf-8")
+    (fixture / ".env").write_text(
+        "DOCKER_HUB_USERNAME=demo-user\nDOCKER_HUB_PAT=private-pat\n",
+        encoding="utf-8",
+    )
+    (fixture / ".gitignore").write_text(
+        ".container-build-context.*\n", encoding="utf-8"
+    )
+    runtime = fixture / "scripts/container_runtime.sh"
+    runtime.write_text(
+        """select_container_runtime() { CONTAINER_RUNTIME=fake; }
+ensure_container_runtime_ready() { :; }
+container_runtime_login() {
+  cat >/dev/null
+  [ "${FAKE_BUILD_FAILURE:-}" != login ] || return 41
+}
+container_runtime_build() {
+  if [ "${FAKE_BUILD_FAILURE:-}" = concurrent ]; then
+    printf '# concurrent edit\\n' >> webapp/config.py
+    return 42
+  fi
+  [ "${FAKE_BUILD_FAILURE:-}" != build ] || return 42
+}
+container_runtime_push() {
+  count_file="${FAKE_PUSH_COUNT_FILE:?}"
+  count=0
+  [ ! -f "$count_file" ] || count=$(cat "$count_file")
+  count=$((count + 1))
+  printf '%s\\n' "$count" >"$count_file"
+  if [ "${FAKE_BUILD_FAILURE:-}" = latest_push ] && [ "$count" -eq 1 ]; then
+    return 43
+  fi
+  if [ "${FAKE_BUILD_FAILURE:-}" = versioned_push ] && [ "$count" -eq 2 ]; then
+    return 44
+  fi
+  if [ "${FAKE_BUILD_FAILURE:-}" = success_concurrent_config ] && [ "$count" -eq 2 ]; then
+    printf '# concurrent success edit\\n' >> webapp/config.py
+  fi
+  if [ "${FAKE_BUILD_FAILURE:-}" = success_concurrent_marker ] && [ "$count" -eq 2 ]; then
+    printf 'concurrent marker\\n' > .build_version
+  fi
+}
+container_runtime_tag() { :; }
+""",
+        encoding="utf-8",
+    )
+    fake_az = fixture / "bin/az"
+    fake_az.write_text(
+        """#!/usr/bin/python3
+import json
+import os
+import sys
+args = sys.argv[1:]
+with open(os.environ["FAKE_AZ_ARGV_LOG"], "a", encoding="utf-8") as stream:
+    stream.write(json.dumps(args) + "\\n")
+if args[:3] == ["containerapp", "env", "show"]:
+    sys.stdout.write(os.environ["FAKE_ENV_ROW"])
+elif args[:2] in (["account", "set"], ["group", "show"]):
+    pass
+else:
+    raise SystemExit(91)
+""",
+        encoding="utf-8",
+    )
+    fake_az.chmod(0o700)
+    fake_date = fixture / "bin/date"
+    fake_date.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "+%Y%m%d%H%M%S" ]; then printf "20260812010101\\n"; '
+        'else printf "1786500061\\n"; fi\n',
+        encoding="utf-8",
+    )
+    fake_date.chmod(0o700)
+    subprocess.run(["git", "init", "-q"], cwd=fixture, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "tests@example.invalid"],
+        cwd=fixture,
+        check=True,
+    )
+    subprocess.run(["git", "config", "user.name", "Tests"], cwd=fixture, check=True)
+    subprocess.run(["git", "add", "."], cwd=fixture, check=True)
+    subprocess.run(["git", "commit", "-qm", "fixture"], cwd=fixture, check=True)
+    return fixture, argv_log
+
+
+def _run_build_fixture(
+    fixture: Path,
+    argv_log: Path,
+    *,
+    failure: str = "",
+    extra_path: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    path = f"{fixture / 'bin'}:{env['PATH']}"
+    if extra_path:
+        path = f"{extra_path}:{path}"
+    env.update(
+        {
+            "PATH": path,
+            "FAKE_AZ_ARGV_LOG": str(argv_log),
+            "FAKE_ENV_ROW": f"{ENVIRONMENT_ID}\t{DEFAULT_DOMAIN}\tSucceeded\n",
+            "FAKE_BUILD_FAILURE": failure,
+            "FAKE_PUSH_COUNT_FILE": str(fixture / "push-count"),
+        }
+    )
+    return subprocess.run(
+        ["bash", "build.sh"],
+        cwd=fixture,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+@pytest.mark.parametrize(
+    ("failure", "status"),
+    [("build", 42), ("latest_push", 43), ("versioned_push", 44)],
+)
+@pytest.mark.parametrize("marker_exists", [False, True])
+def test_backend_build_rollback_restores_owned_files_exactly(
+    tmp_path, failure, status, marker_exists
+):
+    fixture, argv_log = _prepare_build_rollback_fixture(tmp_path)
+    config = fixture / "webapp/config.py"
+    marker = fixture / ".build_version"
+    config.chmod(0o640)
+    if marker_exists:
+        marker.write_bytes(b"old-build-marker\r\n")
+        marker.chmod(0o604)
+    config_before = config.read_bytes()
+    config_mode = stat.S_IMODE(config.stat().st_mode)
+    marker_before = marker.read_bytes() if marker_exists else None
+    marker_mode = stat.S_IMODE(marker.stat().st_mode) if marker_exists else None
+    unrelated = fixture / "unrelated.txt"
+    unrelated.write_text("operator edit\n", encoding="utf-8")
+
+    result = _run_build_fixture(fixture, argv_log, failure=failure)
+
+    assert result.returncode == status, result.stderr
+    assert config.read_bytes() == config_before
+    assert stat.S_IMODE(config.stat().st_mode) == config_mode
+    assert marker.exists() is marker_exists
+    if marker_exists:
+        assert marker.read_bytes() == marker_before
+        assert stat.S_IMODE(marker.stat().st_mode) == marker_mode
+    assert unrelated.read_text(encoding="utf-8") == "operator edit\n"
+
+
+def test_backend_build_rollback_covers_cleanup_failure(tmp_path):
+    fixture, argv_log = _prepare_build_rollback_fixture(tmp_path)
+    config = fixture / "webapp/config.py"
+    before = config.read_bytes()
+    fake_bin = tmp_path / "cleanup-bin"
+    fake_bin.mkdir()
+    fake_rm = fake_bin / "rm"
+    fake_rm.write_text(
+        "#!/bin/sh\n"
+        'case "$*" in *container-build-context*) exit 45;; esac\n'
+        'exec /bin/rm "$@"\n',
+        encoding="utf-8",
+    )
+    fake_rm.chmod(0o700)
+
+    result = _run_build_fixture(
+        fixture, argv_log, failure="cleanup", extra_path=str(fake_bin)
+    )
+
+    assert result.returncode == 45
+    assert config.read_bytes() == before
+    assert not (fixture / ".build_version").exists()
+
+
+def test_backend_build_version_refuses_dirty_owned_config_before_mutation(tmp_path):
+    fixture, argv_log = _prepare_build_rollback_fixture(tmp_path)
+    config = fixture / "webapp/config.py"
+    config.write_text('API_VERSION = "7.7.7"\n# operator edit\n', encoding="utf-8")
+    before = config.read_bytes()
+
+    result = _run_build_fixture(fixture, argv_log)
+
+    assert result.returncode != 0
+    assert "webapp/config.py" in result.stderr
+    assert "dirty" in result.stderr.lower()
+    assert config.read_bytes() == before
+    assert not (fixture / ".build_version").exists()
+    assert not (fixture / "push-count").exists()
+
+
+def test_backend_build_version_concurrent_edit_fails_closed_without_overwrite(tmp_path):
+    fixture, argv_log = _prepare_build_rollback_fixture(tmp_path)
+
+    result = _run_build_fixture(fixture, argv_log, failure="concurrent")
+
+    assert result.returncode == 70
+    assert "concurrent" in result.stderr.lower()
+    assert "# concurrent edit\n" in (fixture / "webapp/config.py").read_text()
+    assert not (fixture / ".build_version").exists()
+
+
+@pytest.mark.parametrize(
+    ("failure", "owned_path", "expected"),
+    [
+        (
+            "success_concurrent_config",
+            "webapp/config.py",
+            "# concurrent success edit\n",
+        ),
+        ("success_concurrent_marker", ".build_version", "concurrent marker\n"),
+    ],
+)
+def test_backend_build_version_detects_concurrent_edit_before_success(
+    tmp_path, failure, owned_path, expected
+):
+    fixture, argv_log = _prepare_build_rollback_fixture(tmp_path)
+
+    result = _run_build_fixture(fixture, argv_log, failure=failure)
+
+    assert result.returncode == 70
+    assert "concurrent" in result.stderr.lower()
+    assert (fixture / owned_path).read_text(encoding="utf-8").endswith(expected)
+
+
+def test_backend_build_version_retry_advances_once_and_publishes_marker_after_push(
+    tmp_path,
+):
+    fixture, argv_log = _prepare_build_rollback_fixture(tmp_path)
+
+    failed = _run_build_fixture(fixture, argv_log, failure="latest_push")
+    assert failed.returncode == 43
+    assert (fixture / "webapp/config.py").read_text() == 'API_VERSION = "1.8.126"\n'
+    assert not (fixture / ".build_version").exists()
+    (fixture / "push-count").unlink()
+
+    succeeded = _run_build_fixture(fixture, argv_log)
+
+    assert succeeded.returncode == 0, succeeded.stderr
+    assert (fixture / "webapp/config.py").read_text() == 'API_VERSION = "1.8.127"\n'
+    assert (fixture / ".build_version").read_text() == "20260812010101\n"
+    assert stat.S_IMODE((fixture / ".build_version").stat().st_mode) == 0o600
+    assert (
+        subprocess.run(
+            ["git", "diff", "--quiet", "--", "webapp/config.py"], cwd=fixture
+        ).returncode
+        == 1
+    )
+
+
+def _snapshot_fake_app(name: str, principal: str) -> dict:
+    return {
+        "id": f"/subscriptions/demo/resourceGroups/demo-rg/providers/Microsoft.App/containerApps/{name}",
+        "location": "canadacentral",
+        "identity": {
+            "type": "SystemAssigned",
+            "principalId": principal,
+            "tenantId": "tenant-1",
+            "userAssignedIdentities": {},
+        },
+        "environmentId": "/subscriptions/demo/resourceGroups/demo-rg/providers/Microsoft.App/managedEnvironments/demo-env",
+        "secretMetadata": [
+            {
+                "name": "passkey-proxy-secret",
+                "keyVaultUrl": "https://demo-vault.vault.azure.net/secrets/PASSKEY-PROXY-SECRET",
+                "identity": "system",
+            }
+        ],
+        "registries": [
+            {
+                "server": "docker.io",
+                "username": "demo-user",
+                "passwordSecretRef": "docker-hub-pat",
+            }
+        ],
+        "revisionSuffix": "passkeys-before",
+        "latestRevisionName": f"{name}--passkeys-before",
+        "containers": [
+            {
+                "name": name,
+                "image": f"demo-user/{name}:before",
+                "volumeMounts": [],
+            }
+        ],
+        "volumes": [],
+    }
+
+
+def _install_snapshot_fake_az(tmp_path: Path) -> tuple[Path, Path]:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    argv_log = tmp_path / "snapshot-az.jsonl"
+    fake_az = bin_dir / "az"
+    fake_az.write_text(
+        """#!/usr/bin/python3
+import json
+import os
+import sys
+args = sys.argv[1:]
+with open(os.environ["FAKE_AZ_ARGV_LOG"], "a", encoding="utf-8") as stream:
+    stream.write(json.dumps(args) + "\\n")
+if args[:2] == ["containerapp", "show"]:
+    name = args[args.index("--name") + 1]
+    payload = json.loads(os.environ[f"FAKE_APP_{name.replace('-', '_').upper()}"])
+elif args[:2] == ["keyvault", "show"]:
+    payload = {
+        "id": "/subscriptions/demo/resourceGroups/demo-rg/providers/Microsoft.KeyVault/vaults/demo-vault",
+        "location": "canadacentral",
+        "enableRbacAuthorization": True,
+        "accessPolicies": [],
+    }
+elif args[:3] == ["keyvault", "secret", "show"]:
+    name = args[args.index("--name") + 1]
+    payload = {
+        "id": f"https://demo-vault.vault.azure.net/secrets/{name}/version-1",
+        "attributes": {"enabled": True, "created": "2026-01-01", "updated": "2026-01-02", "recoveryLevel": "Recoverable"},
+    }
+elif args[:3] == ["role", "assignment", "list"]:
+    principal = args[args.index("--assignee-object-id") + 1]
+    payload = [{"id": f"/roles/{principal}", "principalId": principal, "roleDefinitionId": "/definitions/reader", "scope": "/subscriptions/demo", "condition": None, "conditionVersion": None}]
+elif args[:3] == ["containerapp", "env", "show"]:
+    payload = {"id": "/subscriptions/demo/resourceGroups/demo-rg/providers/Microsoft.App/managedEnvironments/demo-env", "location": "canadacentral"}
+elif args[:4] == ["containerapp", "env", "storage", "list"]:
+    payload = [{"name": "authsqlite", "azureFile": {"accountName": "demostorage", "shareName": "deep-research-auth", "accessMode": "ReadWrite"}}]
+else:
+    raise SystemExit(91)
+json.dump(payload, sys.stdout)
+""",
+        encoding="utf-8",
+    )
+    fake_az.chmod(0o700)
+    return bin_dir, argv_log
+
+
+def _run_snapshot_capture(
+    tmp_path: Path, output: Path
+) -> tuple[subprocess.CompletedProcess[str], Path]:
+    bin_dir, argv_log = _install_snapshot_fake_az(tmp_path)
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{bin_dir}:{env['PATH']}",
+            "FAKE_AZ_ARGV_LOG": str(argv_log),
+            "FAKE_APP_DEMO_API": json.dumps(
+                _snapshot_fake_app("demo-api", "backend-principal")
+            ),
+            "FAKE_APP_DEMO_UI": json.dumps(
+                _snapshot_fake_app("demo-ui", "ui-principal")
+            ),
+        }
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(AZURE_METADATA_SNAPSHOT),
+            "capture",
+            "--subscription",
+            "demo-subscription",
+            "--resource-group",
+            "demo-rg",
+            "--vault-name",
+            "demo-vault",
+            "--backend-app",
+            "demo-api",
+            "--ui-app",
+            "demo-ui",
+            "--output",
+            str(output),
+        ],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    return result, argv_log
+
+
+def test_azure_metadata_snapshot_capture_is_canonical_metadata_only_and_mode_0600(
+    tmp_path,
+):
+    output = tmp_path / "before.json"
+
+    result, argv_log = _run_snapshot_capture(tmp_path, output)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == ""
+    assert stat.S_IMODE(output.stat().st_mode) == 0o600
+    raw = output.read_text(encoding="utf-8")
+    assert raw == json.dumps(json.loads(raw), indent=2, sort_keys=True) + "\n"
+    calls = _read_az_calls(argv_log)
+    assert (
+        len([call for call in calls if call[:3] == ["keyvault", "secret", "show"]]) == 9
+    )
+    assert all("--query" in call for call in calls)
+    query_text = "\n".join(
+        call[call.index("--query") + 1] for call in calls if "--query" in call
+    )
+    assert "value" not in query_text.casefold()
+    assert "--show-values" not in json.dumps(calls)
+
+
+def test_azure_metadata_snapshot_capture_rejects_malformed_query_output(tmp_path):
+    output = tmp_path / "before.json"
+    bin_dir, argv_log = _install_snapshot_fake_az(tmp_path)
+    fake_az = bin_dir / "az"
+    fake_az.write_text("#!/bin/sh\nprintf '{bad json'\n", encoding="utf-8")
+    fake_az.chmod(0o700)
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{bin_dir}:{env['PATH']}",
+            "FAKE_AZ_ARGV_LOG": str(argv_log),
+        }
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(AZURE_METADATA_SNAPSHOT),
+            "capture",
+            "--subscription",
+            "demo-subscription",
+            "--resource-group",
+            "demo-rg",
+            "--vault-name",
+            "demo-vault",
+            "--backend-app",
+            "demo-api",
+            "--ui-app",
+            "demo-ui",
+            "--output",
+            str(output),
+        ],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert not output.exists()
+    assert "{bad json" not in result.stdout + result.stderr
+
+
+def test_azure_metadata_snapshot_compare_ignores_only_revision_and_image(tmp_path):
+    before = tmp_path / "before.json"
+    capture, _ = _run_snapshot_capture(tmp_path, before)
+    assert capture.returncode == 0, capture.stderr
+    after = tmp_path / "after.json"
+    payload = json.loads(before.read_text(encoding="utf-8"))
+    payload["apps"]["backend"]["deployment"]["revision_suffix"] = "passkeys-after"
+    payload["apps"]["backend"]["deployment"]["latest_revision_name"] = (
+        "demo-api--passkeys-after"
+    )
+    payload["apps"]["backend"]["deployment"]["images"] = ["demo-user/demo-api:after"]
+    after.write_text(json.dumps(payload), encoding="utf-8")
+
+    allowed = subprocess.run(
+        [
+            sys.executable,
+            str(AZURE_METADATA_SNAPSHOT),
+            "compare",
+            "--before",
+            str(before),
+            "--after",
+            str(after),
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert allowed.returncode == 0, allowed.stderr
+
+    payload["apps"]["backend"]["secret_references"][0]["identity"] = "drifted"
+    after.write_text(json.dumps(payload), encoding="utf-8")
+    protected = subprocess.run(
+        [
+            sys.executable,
+            str(AZURE_METADATA_SNAPSHOT),
+            "compare",
+            "--before",
+            str(before),
+            "--after",
+            str(after),
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert protected.returncode != 0
+    assert "secret_references" in protected.stderr
+    assert "value" not in protected.stdout.casefold()
+
+
+def test_azure_metadata_snapshot_compare_rejects_malformed_protected_schema(tmp_path):
+    before = tmp_path / "before.json"
+    capture, _ = _run_snapshot_capture(tmp_path, before)
+    assert capture.returncode == 0, capture.stderr
+    after = tmp_path / "after.json"
+    payload = json.loads(before.read_text(encoding="utf-8"))
+    payload["apps"]["ui"].pop("secret_references")
+    after.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(AZURE_METADATA_SNAPSHOT),
+            "compare",
+            "--before",
+            str(before),
+            "--after",
+            str(after),
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "schema" in result.stderr.lower()
