@@ -107,24 +107,43 @@ Set `PASSKEY_ENABLED=true` only after all prerequisites are present:
 - a durable auth store;
 - `OAUTH_SECRET_KEY` containing 32-4096 unpredictable bytes;
 - `PASSKEY_PROXY_ID` and a separately generated `PASSKEY_PROXY_SECRET` containing 32-4096 bytes;
-- `PASSKEY_ORIGINS` and either `PASSKEY_RP_IDS` or `PASSKEY_RP_ID`; `PASSKEY_RP_NAME` is optional and defaults to `BMO Deep Agent`.
+- canonical origin derivation from `FRONTEND_URLS`, or a deliberately selected legacy explicit configuration; `PASSKEY_RP_NAME` is optional and defaults to `BMO Deep Agent`.
 
-Startup fails closed when enabled passkey configuration is incomplete. Never define both RP-ID variables: `PASSKEY_RP_ID` is an absent-only single-domain fallback.
+Startup fails closed when enabled passkey configuration is incomplete. Enabling derivation does not enable passkeys; both switches remain explicit:
+
+```dotenv
+FRONTEND_URLS=https://ui.example.com,https://bmo-deepagent-ui.vercel.app
+PASSKEY_DERIVE_FROM_FRONTEND_URLS=true
+PASSKEY_ENABLED=true
+PASSKEY_PROXY_ID=web-bff
+```
+
+Keep `PASSKEY_PROXY_SECRET` server-side and inject it from the deployment secret manager. UI BFF and backend must use the same proxy ID and secret.
 
 ### Configure origins and relying parties
 
-`PASSKEY_ORIGINS` contains exact browser origins. Outside localhost, each origin must use HTTPS and its hostname must equal or be a subdomain of the most-specific configured RP ID.
+Canonical mode treats `FRONTEND_URLS` as sole multi-origin source. Each comma-separated entry must be an exact origin: scheme plus host and optional port, root path only, no credentials, query, fragment, or wildcard. Production origins require HTTPS; loopback development may use HTTP. Hostnames must be valid, and duplicate origins after lowercase/default-port/root normalization are rejected. `PASSKEY_RP_ID`, `PASSKEY_RP_IDS`, and `PASSKEY_ORIGINS` must all be absent, including empty assignments, when derivation is enabled.
 
-RP IDs are normalized to lowercase ASCII DNS names. Schemes, ports, paths, wildcards, malformed labels, IP addresses, and public suffixes are rejected; every configured RP ID must map to an origin. Unrelated RP domains require separate passkey enrollment.
+Each accepted origin maps to its own normalized hostname RP ID, never a shared parent. Reserved rollout mapping is exact:
 
-For local development, omit `PASSKEY_RP_IDS`, then use:
-
-```dotenv
-PASSKEY_RP_ID=localhost
-PASSKEY_ORIGINS=http://localhost:3000
+```text
+("https://bmo-deepagent-ui.vercel.app", "bmo-deepagent-ui.vercel.app")
 ```
 
-The BFF must send the same proxy identity and secret configured by the backend. Never expose the proxy secret through browser-visible variables.
+Unrelated RP domains require separate passkey enrollment. Reserved Vercel origin is included in backend derivation and tests only during current rollout; it is not evidence that Vercel UI is configured, built, deployed, or verified.
+
+For local development, canonical mode is:
+
+```dotenv
+FRONTEND_URLS=http://localhost:3000
+PASSKEY_DERIVE_FROM_FRONTEND_URLS=true
+```
+
+### Legacy explicit mode
+
+When `PASSKEY_DERIVE_FROM_FRONTEND_URLS` is absent or `false`, legacy explicit mode remains available. Set `PASSKEY_ORIGINS` and exactly one of `PASSKEY_RP_IDS` or absent-only single-domain fallback `PASSKEY_RP_ID`. Explicit RP IDs are lowercase ASCII DNS names without schemes, ports, paths, wildcards, IP addresses, or public suffixes; every RP ID must map to a compatible exact origin. Never define both RP-ID variables.
+
+The BFF must send same proxy identity and secret configured by backend. Never expose proxy secret through browser-visible variables.
 
 ### Tune passkey windows and limits
 

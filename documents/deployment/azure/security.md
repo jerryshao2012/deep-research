@@ -15,15 +15,14 @@ flowchart LR
 
 Current `deploy.sh`:
 
-- creates Key Vault with Azure RBAC authorization disabled;
-- creates a user-assigned managed identity named from the agent;
-- grants that identity `get` and `list` through a Key Vault access policy;
+- requires existing Key Vault and existing user-assigned managed identity already assigned to backend app;
+- runs read-only preflight proving identity has secret `get` access through existing Key Vault access policy;
 - configures versionless Key Vault references for application and storage secrets;
 - uses the same identity reference for those Container App secrets;
-- stores the Docker Hub PAT in Key Vault and exposes it to Container Apps as a registry secret reference;
+- requires pre-created Docker Hub PAT and passkey proxy secrets in Key Vault and exposes them only through secret references;
 - deploys external ingress and sets `VERIFY_SSL=false`.
 
-The older guide's system-assigned identity and `Key Vault Secrets User` RBAC flow does not match the current script. Choose one Key Vault authorization model deliberately; do not mix access-policy and RBAC commands without a migration plan.
+Deployment does not grant roles or access policies, does not create identities, and does not write secret values. If read-only preflight reports missing effective access or assignment, contact Azure administrator. Older system-assigned identity and `Key Vault Secrets User` RBAC flow does not match backend UAI/access-policy prerequisite; authorization-model migration is separate approved infrastructure work.
 
 ## Populate Key Vault without exposing values
 
@@ -36,7 +35,7 @@ chmod 600 secrets.sh
 
 Keep `secrets.sh`, `.env`, storage keys, Docker Hub tokens, provider keys, OAuth secrets, and exported configuration out of Git and shared logs. Prefer an approved secret-delivery system over interactive command lines. Never pass a real secret in a copied documentation command or screenshot.
 
-`deploy.sh` expects Key Vault entries for the secret references it emits. The current generated application configuration includes Tavily, LangChain, upload, Google, storage, Blob-container, and Docker Hub references. Azure OpenAI secret blocks exist only as commented source and are not injected into the live YAML. If Azure OpenAI is the selected provider, add and test its managed-identity or Key Vault configuration before release; see [Configuration](../../guides/configuration.md).
+`deploy.sh` expects Key Vault entries for secret references it emits, including pre-created `PASSKEY-PROXY-SECRET`; it never reads or writes values. Current generated application configuration includes Tavily, LangChain, upload, Google, storage, Blob-container, Docker Hub, and passkey proxy references. Azure OpenAI secret blocks exist only as commented source and are not injected into live YAML. If Azure OpenAI is selected, administrator must preprovision and test managed-identity or Key Vault configuration before release; see [Configuration](../../guides/configuration.md).
 
 List metadata without reading secret values:
 
@@ -82,7 +81,7 @@ az containerapp show \
   --query '{identities:identity.userAssignedIdentities,secrets:properties.configuration.secrets[].{name:name,keyVaultUrl:keyVaultUrl,identity:identity}}'
 ```
 
-Expected result: Container App includes `$IDENTITY_ID`, Key Vault access-policy mode is reported consistently, and every Key Vault secret reference uses that identity. These commands expose names and resource URLs, not values; still treat exported configuration as internal operational data.
+Expected result: Container App includes `$IDENTITY_ID`, Key Vault access-policy mode is reported consistently, identity has `get`, and every Key Vault secret reference uses that identity. These commands are read-only preflight and expose names/resource URLs, not values; still treat exported configuration as internal operational data. Missing result requires Azure administrator action before deployment.
 
 ## Rotate secrets
 
@@ -135,14 +134,14 @@ Do not confuse application outbound verification with Container Apps inbound HTT
 Infrastructure identity does not authenticate API callers. Before exposing external ingress:
 
 - configure stable `UPLOAD_API_KEY` and `LANGCHAIN_API_KEY` values according to each API surface;
-- set `FRONTEND_URLS` to exact allowed frontend origins;
+- use deployment-derived `FRONTEND_URLS` as sole exact frontend-origin list with `PASSKEY_DERIVE_FROM_FRONTEND_URLS=true` and explicit `PASSKEY_ENABLED=true`;
 - configure OAuth callback URLs from the deployed public origin;
 - use a stable `OAUTH_SECRET_KEY` for signed sessions;
 - persist the auth SQLite database at `/mnt/auth/auth.db`;
-- for passkeys, set exact HTTPS origins and registrable RP IDs—public suffixes such as `vercel.app` are invalid RP IDs;
+- for passkeys, each exact HTTPS origin derives its own hostname RP ID; reserved `bmo-deepagent-ui.vercel.app` is full host RP ID, not public suffix `vercel.app`;
 - keep one replica while SQLite is the auth store.
 
-The current Azure script does not fully provision OAuth providers, passkey variables, or a stable OAuth signing key. Treat those as required production configuration, not implicit platform features. Follow [Authentication](../../guides/authentication.md) for runtime behavior and hardening.
+Current Azure script configures passkey runtime references but does not provision OAuth providers, secrets, or stable OAuth signing key. Treat them as required preprovisioned production configuration. Current rollout activates Azure only; Vercel remains reserved backend mapping until separately configured, deployed, and verified. Follow [Authentication](../../guides/authentication.md).
 
 ## Audit without leaking secrets
 

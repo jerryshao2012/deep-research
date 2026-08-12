@@ -50,6 +50,8 @@ az containerapp show \
 
 Do not add `printenv`, secret values, access tokens, or `/storage/info` output to a support bundle. Capture timestamps, revision name, image tag, HTTP status, and redacted errors.
 
+All prerequisite diagnostics in this runbook are read-only preflight. Current deployment updates existing app only: it does not grant roles or access policies, does not create identities, and does not create storage resources. If required resource or effective access is absent, stop and contact the Azure administrator with failing command and redacted output.
+
 ## Image and startup failures
 
 ### Image is missing or cannot be pulled
@@ -166,18 +168,7 @@ az containerapp show \
   --query 'properties.configuration.secrets[].{name:name,keyVaultUrl:keyVaultUrl,identity:identity}'
 ```
 
-**Repair:** current scripts use access-policy mode. Restore least-privilege read access, then redeploy:
-
-```bash
-az keyvault set-policy \
-  --name "$KV_NAME" \
-  --object-id "$IDENTITY_PRINCIPAL_ID" \
-  --secret-permissions get list
-
-./deploy.sh --skip-kv-access
-```
-
-If the vault uses RBAC, stop and migrate the deployment consistently instead of applying the access-policy command. For a missing secret, populate a new version through `secrets.sh` or the approved secret system; never put its value in the command transcript.
+**Repair:** stop before deployment mutation. Contact Azure administrator to restore effective secret `get` through vault's existing authorization model and confirm user-assigned identity remains assigned to backend app. Do not switch RBAC/access-policy mode or grant permissions from deployment workflow. For missing/disabled secret, secret owner creates or rotates version through approved secret system without putting value in command transcript. Rerun read-only checks, then deploy only after prerequisites pass.
 
 ### Provider authentication fails after deployment
 
@@ -195,7 +186,7 @@ az containerapp show \
 
 Compare the selected provider's required names with [Configuration](../../guides/configuration.md). Current Azure YAML does not inject the commented Azure OpenAI references.
 
-**Repair:** add the missing Key Vault secret and Container App secret reference in the deployment configuration, rotate through the approved workflow, then create a new revision with `./deploy.sh`. Test the smallest provider-dependent request.
+**Repair:** contact secret owner or Azure administrator to preprovision missing Key Vault secret and effective backend-identity access through approved workflow. Add only secret-reference name to reviewed deployment configuration; never value. After read-only preflight passes, create revision with `./deploy.sh` and test smallest provider-dependent request.
 
 ## Networking and port failures
 
@@ -270,7 +261,7 @@ az keyvault secret list \
   --output table
 ```
 
-**Repair:** rerun `./deploy.sh` to reconcile the account, Blob container, Key Vault references, and revision. If data exists in another container, back it up and follow [migration](storage.md#migrate-or-roll-back); do not point the app at an unverified empty container.
+**Repair:** contact Azure administrator to preprovision or restore expected storage account, `deep-research-blobs` container, Key Vault references, and identity access. Deployment does not create or repair them. If data exists in another container, back it up and follow [migration](storage.md#migrate-or-roll-back); do not point app at unverified empty container. Rerun read-only preflight before deployment.
 
 ### Auth database is not durable or SQLite reports locks
 
@@ -295,7 +286,7 @@ az containerapp exec \
   --command "sh -c 'ls -ld /mnt/auth && test -f /mnt/auth/auth.db && ls -l /mnt/auth/auth.db'"
 ```
 
-**Repair:** rerun `./deploy.sh` to restore the `authsqlite` environment storage and `/mnt/auth` mount. Keep `SQLITE_DB_PATH=/mnt/auth/auth.db`, `AUTH_SQLITE_JOURNAL_MODE=DELETE`, and `maxReplicas: 1`. Restore `auth.db` only from a verified backup while the app is stopped.
+**Repair:** contact Azure administrator to preprovision or restore `deep-research-auth` share and existing Container Apps environment storage `authsqlite` binding with expected account/share and `ReadWrite` access. Deployment does not create or change binding. After read-only preflight passes, deploy app config with `/mnt/auth`, `SQLITE_DB_PATH=/mnt/auth/auth.db`, `AUTH_SQLITE_JOURNAL_MODE=DELETE`, and `maxReplicas: 1`. Restore `auth.db` only from verified backup while app is stopped.
 
 ### Files or LangGraph threads appear stale
 
@@ -402,9 +393,9 @@ az monitor log-analytics workspace list \
   --output table
 ```
 
-On first creation, the bare `az containerapp env create` in `deploy.sh` normally provisions a generated Log Analytics workspace. The commands above reveal the effective customer ID and matching workspace without displaying a shared key.
+Current deployment uses existing Container Apps environment log destination. Commands above reveal effective customer ID and matching workspace without displaying shared key.
 
-**Repair:** if the environment has a customer ID, fix workspace read permissions, retention, or query scope, then generate a known health request and allow for ingestion delay. If the destination or customer ID is missing, inspect environment creation/provisioning history before configuring an approved Log Analytics destination. Use metric names returned by `list-definitions` when creating alerts. For future environments that need controlled naming and ownership, pass an approved existing workspace during environment creation rather than accepting the generated default.
+**Repair:** if environment has customer ID, contact workspace administrator to fix read permissions, retention, or query scope, then generate known health request and allow ingestion delay. If destination or customer ID is missing, contact environment administrator to configure approved existing Log Analytics destination outside deployment workflow. Use metric names returned by `list-definitions` when creating alerts.
 
 ### LangSmith traces are absent
 

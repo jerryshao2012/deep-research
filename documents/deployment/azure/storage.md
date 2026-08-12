@@ -18,30 +18,43 @@ The SQLite file contains authentication/session data and the compatibility datab
 
 Cosmos adapters remain available for other deployments, but current Azure scripts do not provision Cosmos, set Cosmos environment variables, or synchronize Cosmos records with `.langgraph_api`. Do not enable both as competing thread catalogs.
 
-## Create and mount storage
+## Verify preprovisioned storage
 
-`deploy.sh` performs the supported setup:
+Current deployment is update-only. Before deployment, administrator must provision storage account named by `STORAGE_ACCOUNT_NAME`, `deep-research-blobs` Blob container, `deep-research-auth` Azure Files share, and existing Container Apps environment storage binding `authsqlite` pointing to that account/share with `ReadWrite` access. Required Key Vault storage secrets and access must also already exist.
 
-1. Create or find a StorageV2 account with public Blob access disabled.
-2. Create the `deep-research-blobs` Blob container.
-3. Create the 1 GiB `deep-research-auth` Azure Files share.
-4. Register that share as Container Apps environment storage `authsqlite`.
-5. Store the account name, account key, and Blob container name in Key Vault.
-6. Mount the share as `auth-sqlite` at `/mnt/auth`.
-7. set `SQLITE_DB_PATH=/mnt/auth/auth.db` and `AUTH_SQLITE_JOURNAL_MODE=DELETE`.
+`deploy.sh` runs read-only ARM preflight for these exact prerequisites. It does not create storage resources, write account keys or secret values, or change environment storage binding. It only preserves existing binding while updating backend app configuration to mount `authsqlite` as `auth-sqlite` at `/mnt/auth`, set `SQLITE_DB_PATH=/mnt/auth/auth.db`, and set `AUTH_SQLITE_JOURNAL_MODE=DELETE`. Contact the Azure administrator when prerequisite or read access is missing; do not attempt to bypass preflight.
 
 Blob prefixes do not need pre-created directories. `azure_storage.py` creates local `docs`, `output`, `input`, and `.langgraph_api` paths and downloads matching prefixes at startup.
 
 The current Blob mode takes precedence in `entrypoint.sh`, so it does not symlink those four directories into a broad Azure Files mount. No Dockerfile rewrite or `cifs-utils` installation is required for the platform-managed `/mnt/auth` mount.
 
-Inspect effective storage configuration without exposing account keys:
+Inspect effective storage configuration without exposing account keys or secret values:
 
 ```bash
 source ./env.sh
 
-az containerapp env storage list \
+az storage account show \
+  --name "$STORAGE_ACCOUNT_NAME" \
+  --resource-group "$RESOURCE_GROUP" \
+  --query id --output tsv
+
+az storage container-rm show \
+  --name deep-research-blobs \
+  --storage-account "$STORAGE_ACCOUNT_NAME" \
+  --resource-group "$RESOURCE_GROUP" \
+  --query name --output tsv
+
+az storage share-rm show \
+  --name deep-research-auth \
+  --storage-account "$STORAGE_ACCOUNT_NAME" \
+  --resource-group "$RESOURCE_GROUP" \
+  --query name --output tsv
+
+az containerapp env storage show \
   --name "$ENV_NAME" \
   --resource-group "$RESOURCE_GROUP" \
+  --storage-name authsqlite \
+  --query '{name:name,account:properties.accountName,share:properties.shareName,access:properties.accessMode}' \
   --output table
 
 az containerapp show \
@@ -87,20 +100,12 @@ For routine document transfer, prefer the directional flags instead of the no-fl
 
 ## Monitor storage
 
-Use identity-based reads where your Azure role permits them:
+Use identity-based reads where your Azure role permits them. Set names from reviewed environment configuration; do not retrieve or print storage keys:
 
 ```bash
 source ./env.sh
 
-STORAGE_ACCOUNT_NAME=$(az keyvault secret show \
-  --vault-name "$KV_NAME" \
-  --name STORAGE-ACCOUNT-NAME \
-  --query value --output tsv)
-
-BLOB_CONTAINER_NAME=$(az keyvault secret show \
-  --vault-name "$KV_NAME" \
-  --name AZURE-STORAGE-CONTAINER-NAME \
-  --query value --output tsv)
+BLOB_CONTAINER_NAME=deep-research-blobs
 
 az storage blob list \
   --account-name "$STORAGE_ACCOUNT_NAME" \
@@ -115,7 +120,7 @@ az monitor metrics list \
   --output table
 ```
 
-If your account lacks data-plane role access, use `sync-files.sh --download` rather than printing or pasting the storage key. Configure capacity alerts against the storage account and choose thresholds from measured usage, not the dated price and capacity examples in the retired monolithic guide.
+If account lacks data-plane role access, contact Azure administrator for approved diagnostic access. Do not print or paste storage key. `sync-files.sh --download` is an authorized data-transfer action, not read-only preflight. Configure capacity alerts against storage account using measured usage.
 
 ## Verify persistence
 

@@ -57,7 +57,7 @@ python3 --version
 Review [configuration](../../guides/configuration.md) and [authentication](../../guides/authentication.md) before exposing the service.
 
 > [!IMPORTANT]
-> `env.sh`, `build.sh`, and `deploy.sh` contain repository-specific names, region, and subscription selection. Verify them against already-bootstrapped resources. Historical bootstrap steps must remain a separate operator procedure; the current cutover script fails closed when the backend app, identity, Key Vault, access policy, or passkey proxy secret is missing.
+> `env.sh`, `build.sh`, and `deploy.sh` contain repository-specific names, region, and subscription selection. Verify them against already-bootstrapped resources. Historical bootstrap steps remain a separate administrator procedure; current cutover fails closed when app, identity, Key Vault access, secret, or storage prerequisite is missing. Run read-only preflight and contact the Azure administrator when access is missing. Scripts do not grant roles or access policies, create identities, or create storage resources.
 
 ## Prepare local deployment values
 
@@ -68,7 +68,7 @@ Review [configuration](../../guides/configuration.md) and [authentication](../..
    touch .env.docker
    ```
 
-   Add only non-secret runtime defaults that are safe to publish. `build.sh` unconditionally copies this file into its build context, `.dockerignore` re-includes it, and `Dockerfile` copies it to `/deps/deep_research/.env` inside the image. Never put OAuth/API secrets, cloud credentials, storage keys, or tokens in this file.
+   Add only non-secret runtime defaults safe to publish. `build.sh` runs strict passkey dotenv check, then copies this file into build context; `Dockerfile` places it at `/deps/deep_research/.env` inside image. Never put OAuth/API secrets, cloud credentials, storage keys, tokens, `FRONTEND_URLS`, or passkey origin/RP/proxy settings in this file. If an older private file contains them, use `scripts/sanitize_passkey_dotenv.py --sanitize` through approved rotation procedure; its optional secret capture is a mode-`0600` recovery artifact and no value is printed.
 3. Create a repository-root `.env` with `DOCKER_HUB_USERNAME` and `DOCKER_HUB_PAT`. The build script reads this ignored local file for registry login; it must not be copied into the image.
 4. Copy the secret template, fill it locally, and restrict its permissions:
 
@@ -97,7 +97,19 @@ source ./env.sh
 ./scripts/resolve_azure_endpoints.sh
 ```
 
-First deployment through this workflow, or any endpoint change, is blocked until OAuth settings are confirmed process-locally. Do not add the confirmation to `.env`, `env.sh`, or another persisted file. Resolver metadata is recorded in `.resolved-azure-endpoints.json` only after revision readiness and health verification succeed.
+Resolver performs one read-only `az containerapp env show`, validates environment resource ID, `Succeeded` state, default domain, and app names, then derives both app URLs before any build. It never creates placeholder apps or queries app FQDNs. Stdout contains single-quoted assignments; deployment scripts parse exact known keys without `eval`, including resource-group names containing parentheses. `env.sh` is not rewritten.
+
+Resolver stderr prints exact provider values:
+
+```text
+Google authorized redirect URI: https://<backend-app>.<environment-default-domain>/auth/callback/google
+GitHub authorization callback URL: https://<backend-app>.<environment-default-domain>/auth/callback/github
+GitHub homepage / frontend origin: https://<ui-app>.<environment-default-domain>
+```
+
+New metadata or endpoint change is blocked until provider settings are updated and process-local `OAUTH_REDIRECTS_CONFIRMED=true` is supplied. Do not persist confirmation in `.env`, `env.sh`, or another file. Recreating Container Apps environment can change `defaultDomain`; update both providers before traffic. Resolver metadata is recorded atomically in `.resolved-azure-endpoints.json` only after exact revision readiness and health verification.
+
+Derived runtime config uses `FRONTEND_URLS` as sole multi-origin source with `PASSKEY_DERIVE_FROM_FRONTEND_URLS=true`, `PASSKEY_ENABLED=true`, and proxy ID `web-bff`. It includes Azure UI plus reserved `https://bmo-deepagent-ui.vercel.app`; backend maps each exact origin to its own hostname RP ID. Current rollout does not configure, build, deploy, or verify Vercel. Future activation requires then-current server-only proxy secret, canonical origin/proxy ID, deployment and verification before traffic; never derive canonical origin from ephemeral `VERCEL_URL`, and preserve existing credential RP continuity.
 
 Before continuing, verify existing Key Vault inputs, including `PASSKEY-PROXY-SECRET`, and rotate/populate them through the separate approved secret-management procedure. `deploy.sh` does not create the vault, managed identity, backend app, or passkey proxy secret. For identity and secret-reference behavior, see [Security](security.md).
 
@@ -118,7 +130,7 @@ CONTAINER_RUNTIME=podman ./build.sh
 CONTAINER_RUNTIME=docker ./build.sh
 ```
 
-The script increments `API_VERSION`, creates `.build_version`, builds a `linux/amd64` image, and pushes both `latest` and the timestamped version to Docker Hub. Review those source changes before committing; an image build is not read-only.
+The script increments `API_VERSION`, creates `.build_version`, builds a `linux/amd64` image, and pushes both `latest` and timestamped version to Docker Hub. Review source changes before committing; image build is not read-only. Backend must be built and deployed before Azure UI. Then run UI `./build.sh` once and UI `./deploy-azure-container-app.sh` once; UI deploy consumes its `.deployment-build.json` Docker Hub artifact and never builds. Run no Vercel deployment command for this rollout.
 
 ### 3. Update the existing backend deployment
 

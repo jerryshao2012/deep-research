@@ -29,7 +29,7 @@ The current script deploys external HTTPS ingress to container port `2024`, scal
 
 ### Use the current external endpoint
 
-External ingress supports browser clients and a separately hosted Vercel UI. Allow only intended frontend origins through `FRONTEND_URLS` and the application authentication settings; see [Authentication](../../guides/authentication.md). Container Apps terminates HTTPS for its managed domain.
+External ingress supports browser clients. Allow only intended exact frontend origins through `FRONTEND_URLS` and application authentication settings; see [Authentication](../../guides/authentication.md). Reserved Vercel origin in current backend config is not an active deployment. Container Apps terminates HTTPS for its managed domain.
 
 Verify ingress:
 
@@ -92,10 +92,9 @@ Make permanent configuration changes in the deployment source, then rebuild only
 
 ```text
 ./deploy.sh
-./deploy.sh --skip-kv-access
 ```
 
-The old `--skip-build` and `--sync-files` flags are not implemented. Build with `./build.sh`; synchronize with `./sync-files.sh`.
+The old `--skip-build`, `--skip-kv-access`, and `--sync-files` flags are not implemented. Build with `./build.sh`; synchronize with `./sync-files.sh`. Deployment runs read-only preflight for existing resource, identity, Key Vault access, secret metadata, and storage prerequisites. It does not grant roles or access policies, does not create identities, and does not create storage resources. Contact the Azure administrator if preflight shows a missing prerequisite or permission.
 
 Use [Configuration](../../guides/configuration.md) as the canonical variable reference. Do not maintain a second copy here.
 
@@ -118,7 +117,7 @@ az containerapp logs show \
   --tail 50
 ```
 
-On first creation, the bare `az containerapp env create` in `deploy.sh` uses Container Apps' default Log Analytics destination, and Azure CLI provisions a generated workspace. Existing environments retain their configured destination. Discover the effective workspace customer ID, then find its workspace resource:
+Current deployment updates an existing Container Apps environment and retains its configured log destination. Discover effective workspace customer ID, then find its workspace resource:
 
 ```bash
 source ./env.sh
@@ -180,7 +179,7 @@ az monitor metrics list-definitions \
 
 ### Use Application Insights and LangSmith deliberately
 
-The current deployment script relies on the CLI-generated Log Analytics workspace and does not create Application Insights. Verify generated workspace ownership, access, retention, and cost controls. For production naming, retention, private access, or centralized ownership, explicitly provide an approved existing workspace when creating the Container Apps environment instead of relying on automatic generation.
+Current deployment script uses existing environment log configuration and does not create Log Analytics or Application Insights resources. Verify workspace ownership, access, retention, and cost controls. Environment creation and approved workspace association are administrator-owned bootstrap work.
 
 LangSmith tracing is enabled in generated configuration, but usable traces still require a valid `LANGCHAIN_API_KEY`, reachable endpoint, and intended project. Confirm only the variable references and inspect the LangSmith project; never print the key.
 
