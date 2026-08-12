@@ -55,6 +55,7 @@ def main() -> int:
     parser.add_argument("--docker-username", required=True)
     parser.add_argument("--build-version", required=True)
     parser.add_argument("--identity-id", required=True)
+    parser.add_argument("--container-name", required=True)
     parser.add_argument("--key-vault-name", required=True)
     parser.add_argument("--frontend-urls", required=True)
     parser.add_argument("--storage-name", required=True)
@@ -70,6 +71,11 @@ def main() -> int:
     identity = _require_match(
         "managed identity resource ID", arguments.identity_id, r"/[A-Za-z0-9_./()-]+"
     )
+    container_name = _require_match(
+        "existing container name", arguments.container_name, r"[a-z][a-z0-9-]{0,62}"
+    )
+    if "--" in container_name or container_name.endswith("-"):
+        raise ValueError("invalid existing container name")
     vault_name = _require_match(
         "Key Vault name",
         arguments.key_vault_name,
@@ -172,7 +178,7 @@ def main() -> int:
                 "revisionSuffix": revision_suffix,
                 "containers": [
                     {
-                        "name": "deep-research-agent",
+                        "name": container_name,
                         "image": f"{username}/deep-research-agent:{version}",
                         "resources": {"cpu": 2.0, "memory": "4Gi"},
                         "env": [

@@ -247,6 +247,29 @@ if [[ "$IDENTITY_ASSIGNMENT_STATUS" != 0 ]]; then
   exit 4
 fi
 
+set +e
+MANAGED_CONTAINER_NAME=$(python3 -c '
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    config = json.load(stream)
+containers = config.get("properties", {}).get("template", {}).get("containers")
+if not isinstance(containers, list) or len(containers) != 1:
+    raise SystemExit(2)
+name = containers[0].get("name") if isinstance(containers[0], dict) else None
+if not isinstance(name, str) or not name:
+    raise SystemExit(2)
+print(name)
+' "$EXISTING_CONFIG_JSON")
+CONTAINER_TOPOLOGY_STATUS=$?
+set -e
+if [[ "$CONTAINER_TOPOLOGY_STATUS" != 0 || -z "$MANAGED_CONTAINER_NAME" ]]; then
+  echo "Error: existing backend Container App must contain exactly one named application container" >&2
+  rm -f "$EXISTING_CONFIG_JSON"
+  exit 4
+fi
+
 if [ -z "$DOCKER_HUB_USERNAME" ]; then
   echo "❌ Error: Please set DOCKER_HUB_USERNAME before running deploy.sh" >&2
   rm -f "$EXISTING_CONFIG_JSON"
@@ -267,6 +290,7 @@ python3 "$SCRIPT_DIR/scripts/render_azure_containerapp_config.py" \
   --docker-username "$DOCKER_HUB_USERNAME" \
   --build-version "$BUILD_VERSION" \
   --identity-id "$USER_IDENTITY_ID" \
+  --container-name "$MANAGED_CONTAINER_NAME" \
   --key-vault-name "$KV_NAME" \
   --frontend-urls "$FRONTEND_URLS" \
   --storage-name "$SQLITE_ENV_STORAGE_NAME" \
@@ -281,7 +305,7 @@ rm -f "$DESIRED_CONFIG_YAML"
 
 KV_ACCESS_STDERR=$(mktemp)
 set +e
-KV_ACCESS_OBJECT_ID=$(az keyvault show --subscription "$AZURE_SUBSCRIPTION_ID" --name "$KV_NAME" --resource-group "$RESOURCE_GROUP" --query "properties.accessPolicies[?objectId=='$USER_IDENTITY_PRINCIPAL_ID' && contains(permissions.secrets, 'get')].objectId | [0]" -o tsv 2>"$KV_ACCESS_STDERR")
+KV_ACCESS_ROW=$(az keyvault show --subscription "$AZURE_SUBSCRIPTION_ID" --name "$KV_NAME" --resource-group "$RESOURCE_GROUP" --query "join('|', [id, to_string(properties.enableRbacAuthorization), to_string(length(properties.accessPolicies[?objectId=='$USER_IDENTITY_PRINCIPAL_ID' && (contains(permissions.secrets, 'get') || contains(permissions.secrets, 'all'))]))])" -o tsv 2>"$KV_ACCESS_STDERR")
 KV_ACCESS_STATUS=$?
 set -e
 rm -f "$KV_ACCESS_STDERR"
@@ -289,9 +313,57 @@ if [[ "$KV_ACCESS_STATUS" != 0 ]]; then
   echo "Error: existing Key Vault '$KV_NAME' is required before managed passkey deployment" >&2
   exit "$KV_ACCESS_STATUS"
 fi
-if [[ "$KV_ACCESS_OBJECT_ID" != "$USER_IDENTITY_PRINCIPAL_ID" ]]; then
-  echo "Error: backend identity lacks Key Vault secret get access" >&2
-  exit 4
+IFS='|' read -r KEY_VAULT_RESOURCE_ID KEY_VAULT_RBAC_ENABLED KEY_VAULT_POLICY_MATCHES <<<"$KV_ACCESS_ROW"
+if [[ -z "$KEY_VAULT_RESOURCE_ID" || "$KEY_VAULT_RBAC_ENABLED" != "true" && "$KEY_VAULT_RBAC_ENABLED" != "false" || ! "$KEY_VAULT_POLICY_MATCHES" =~ ^[0-9]+$ ]]; then
+  echo "Error: existing Key Vault returned invalid authorization metadata" >&2
+  exit 65
+fi
+if [[ "$KEY_VAULT_RBAC_ENABLED" == "false" ]]; then
+  if [[ "$KEY_VAULT_POLICY_MATCHES" == 0 ]]; then
+    echo "Error: backend identity lacks Key Vault secret get access under the vault access-policy mode" >&2
+    exit 4
+  fi
+else
+  ROLE_IDS_STDERR=$(mktemp)
+  set +e
+  ROLE_DEFINITION_IDS=$(az role assignment list --subscription "$AZURE_SUBSCRIPTION_ID" --assignee-object-id "$USER_IDENTITY_PRINCIPAL_ID" --scope "$KEY_VAULT_RESOURCE_ID" --include-inherited --query '[].roleDefinitionId' -o tsv 2>"$ROLE_IDS_STDERR")
+  ROLE_IDS_STATUS=$?
+  set -e
+  rm -f "$ROLE_IDS_STDERR"
+  if [[ "$ROLE_IDS_STATUS" != 0 ]]; then
+    echo "Error: unable to verify existing Key Vault RBAC access" >&2
+    exit "$ROLE_IDS_STATUS"
+  fi
+  KEY_VAULT_RBAC_ALLOWED=false
+  while IFS= read -r ROLE_DEFINITION_ID; do
+    [[ -n "$ROLE_DEFINITION_ID" ]] || continue
+    ROLE_JSON=$(mktemp)
+    set +e
+    az role definition list --subscription "$AZURE_SUBSCRIPTION_ID" --name "$ROLE_DEFINITION_ID" -o json >"$ROLE_JSON" 2>/dev/null
+    ROLE_DEFINITION_STATUS=$?
+    if [[ "$ROLE_DEFINITION_STATUS" == 0 ]]; then
+      python3 "$SCRIPT_DIR/scripts/evaluate_keyvault_rbac.py" <"$ROLE_JSON" >/dev/null 2>&1
+      ROLE_ACCESS_STATUS=$?
+    else
+      ROLE_ACCESS_STATUS=2
+    fi
+    set -e
+    rm -f "$ROLE_JSON"
+    if [[ "$ROLE_DEFINITION_STATUS" != 0 || "$ROLE_ACCESS_STATUS" == 2 ]]; then
+      echo "Error: unable to validate existing Key Vault RBAC role definition" >&2
+      if [[ "$ROLE_DEFINITION_STATUS" != 0 ]]; then
+        exit "$ROLE_DEFINITION_STATUS"
+      fi
+      exit 65
+    fi
+    if [[ "$ROLE_ACCESS_STATUS" == 0 ]]; then
+      KEY_VAULT_RBAC_ALLOWED=true
+    fi
+  done <<<"$ROLE_DEFINITION_IDS"
+  if [[ "$KEY_VAULT_RBAC_ALLOWED" != true ]]; then
+    echo "Error: backend identity lacks effective Key Vault secret read data access" >&2
+    exit 4
+  fi
 fi
 
 REQUIRED_KEY_VAULT_SECRETS=(

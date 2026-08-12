@@ -21,6 +21,7 @@ SANITIZER = PROJECT_ROOT / "scripts/sanitize_passkey_dotenv.py"
 CONFIG_MERGER = PROJECT_ROOT / "scripts/merge_azure_containerapp_config.py"
 CONFIG_RENDERER = PROJECT_ROOT / "scripts/render_azure_containerapp_config.py"
 DOCKER_CREDENTIALS = PROJECT_ROOT / "scripts/load_docker_credentials.py"
+KEY_VAULT_RBAC = PROJECT_ROOT / "scripts/evaluate_keyvault_rbac.py"
 METADATA_NAME = ".resolved-azure-endpoints.json"
 RESOLVER_ENV = {
     "AZURE_SUBSCRIPTION_ID": "00000000-1111-2222-3333-444444444444",
@@ -895,6 +896,8 @@ def _install_azure_script_fixture(
     shutil.copy2(CONFIG_MERGER, scripts_dir / CONFIG_MERGER.name)
     shutil.copy2(CONFIG_RENDERER, scripts_dir / CONFIG_RENDERER.name)
     shutil.copy2(DOCKER_CREDENTIALS, scripts_dir / DOCKER_CREDENTIALS.name)
+    if KEY_VAULT_RBAC.exists():
+        shutil.copy2(KEY_VAULT_RBAC, scripts_dir / KEY_VAULT_RBAC.name)
     (fixture / "env.sh").write_text(
         "\n".join(
             [
@@ -1377,11 +1380,11 @@ elif args[:2] == ["identity", "show"]:
 elif args[:2] == ["containerapp", "show"] and "--output" in args:
     if missing == "app":
         raise SystemExit(3)
-    sys.stdout.write('{"identity":{"userAssignedIdentities":{"/subscriptions/demo/identity":{}}},"properties":{"configuration":{},"template":{}}}')
+    sys.stdout.write('{"identity":{"userAssignedIdentities":{"/subscriptions/demo/identity":{}}},"properties":{"configuration":{},"template":{"containers":[{"name":"deep-research-agent"}]}}}')
 elif args[:2] == ["keyvault", "show"]:
     if missing == "vault":
         raise SystemExit(3)
-    sys.stdout.write("principal-123\\n")
+    sys.stdout.write("/subscriptions/demo/vaults/demo-vault|false|1\\n")
 sys.exit(0)
 """,
         encoding="utf-8",
@@ -1429,9 +1432,9 @@ elif args[:2] == ["group", "show"]:
 elif args[:2] == ["identity", "show"]:
     sys.stdout.write("/subscriptions/demo/identity\\tprincipal-123\\n")
 elif args[:2] == ["containerapp", "show"] and "--output" in args:
-    sys.stdout.write('{"identity":{"userAssignedIdentities":{"/subscriptions/demo/identity":{}}},"properties":{"configuration":{},"template":{}}}')
+    sys.stdout.write('{"identity":{"userAssignedIdentities":{"/subscriptions/demo/identity":{}}},"properties":{"configuration":{},"template":{"containers":[{"name":"deep-research-agent"}]}}}')
 elif args[:2] == ["keyvault", "show"]:
-    sys.stdout.write("principal-123\\n")
+    sys.stdout.write("/subscriptions/demo/vaults/demo-vault|false|1\\n")
 elif args[:3] == ["keyvault", "secret", "show"]:
     name = args[args.index("--name") + 1]
     if name == "PASSKEY-PROXY-SECRET":
@@ -1485,9 +1488,9 @@ elif args[:2] == ["group", "show"]:
 elif args[:2] == ["identity", "show"]:
     sys.stdout.write("/subscriptions/demo/identity\\tprincipal-123\\n")
 elif args[:2] == ["containerapp", "show"] and "--output" in args:
-    sys.stdout.write('{"identity":{"userAssignedIdentities":{"/subscriptions/demo/identity":{}}},"properties":{"configuration":{},"template":{}}}')
+    sys.stdout.write('{"identity":{"userAssignedIdentities":{"/subscriptions/demo/identity":{}}},"properties":{"configuration":{},"template":{"containers":[{"name":"deep-research-agent"}]}}}')
 elif args[:2] == ["keyvault", "show"]:
-    sys.stdout.write("principal-123\\n")
+    sys.stdout.write("/subscriptions/demo/vaults/demo-vault|false|1\\n")
 elif args[:3] == ["keyvault", "secret", "show"]:
     name = args[args.index("--name") + 1]
     if name == "PASSKEY-PROXY-SECRET":
@@ -1653,7 +1656,7 @@ elif args[:2] == ["group", "show"]:
 elif args[:2] == ["identity", "show"]:
     sys.stdout.write("/subscriptions/demo/identity\\tprincipal-123\\n")
 elif args[:2] == ["containerapp", "show"] and "--output" in args:
-    sys.stdout.write('{"identity":{"userAssignedIdentities":{"/subscriptions/demo/identity":{}}},"properties":{"configuration":{},"template":{}}}')
+    sys.stdout.write('{"identity":{"userAssignedIdentities":{"/subscriptions/demo/identity":{}}},"properties":{"configuration":{},"template":{"containers":[{"name":"deep-research-agent"}]}}}')
 sys.exit(0)
 """,
         encoding="utf-8",
@@ -1716,7 +1719,7 @@ elif args[:2] == ["group", "show"]:
 elif args[:2] == ["identity", "show"]:
     sys.stdout.write("/subscriptions/demo/identity\\tprincipal-123\\n")
 elif args[:2] == ["keyvault", "show"] and "accessPolicies" in " ".join(args):
-    sys.stdout.write("principal-123\\n")
+    sys.stdout.write("/subscriptions/demo/vaults/demo-vault|false|1\\n")
 elif args[:3] == ["keyvault", "secret", "show"]:
     name = args[args.index("--name") + 1]
     sys.stdout.write(f"https://demo-vault.vault.azure.net/secrets/{name}\\n")
@@ -1741,7 +1744,7 @@ elif args[:2] == ["containerapp", "show"] and "--output" in args and args[args.i
                 "registries": [{"server": "private.example.test", "username": "kept-user", "passwordSecretRef": "unrelated-secret"}],
             },
             "template": {"containers": [{
-                "name": "deep-research-agent",
+                "name": "renamed-main",
                 "env": [{"name": "UNRELATED_ENV", "value": "kept"}],
                 "volumeMounts": [{"volumeName": "unrelated-volume", "mountPath": "/kept"}],
             }]},
@@ -1839,6 +1842,7 @@ sys.stdout.write('{"version":"9.8.7","status":"ok"}\\n')
         "passwordSecretRef": "unrelated-secret",
     }
     container = rendered["properties"]["template"]["containers"][0]
+    assert container["name"] == "renamed-main"
     runtime_env = {item["name"]: item for item in container["env"]}
     assert runtime_env["UNRELATED_ENV"]["value"] == "kept"
     assert runtime_env["FRONTEND_URLS"]["value"] == (
@@ -1914,6 +1918,8 @@ def _render_desired_config(tmp_path: Path) -> dict:
             "20260812010101",
             "--identity-id",
             "/subscriptions/demo/identity",
+            "--container-name",
+            "deep-research-agent",
             "--key-vault-name",
             "demo-vault",
             "--frontend-urls",
@@ -1947,6 +1953,8 @@ def test_azure_config_renderer_rejects_invalid_revision_suffix(tmp_path):
             "20260812010101",
             "--identity-id",
             "/subscriptions/demo/identity",
+            "--container-name",
+            "deep-research-agent",
             "--key-vault-name",
             "demo-vault",
             "--frontend-urls",
@@ -2115,10 +2123,10 @@ elif args[:2] == ["identity", "show"]:
     sys.stdout.write("/subscriptions/demo/identity\\tprincipal-123\\n")
 elif args[:2] == ["containerapp", "show"] and "--output" in args:
     identity = {} if missing == "identity_assignment" else {"/subscriptions/demo/identity": {}}
-    json.dump({"identity": {"userAssignedIdentities": identity}, "properties": {"configuration": {}, "template": {}}}, sys.stdout)
+    json.dump({"identity": {"userAssignedIdentities": identity}, "properties": {"configuration": {}, "template": {"containers": [{"name": "deep-research-agent"}]}}}, sys.stdout)
 elif args[:2] == ["keyvault", "show"]:
-    if missing != "vault_access":
-        sys.stdout.write("principal-123\\n")
+    policy_matches = "0" if missing == "vault_access" else "1"
+    sys.stdout.write(f"/subscriptions/demo/vaults/demo-vault|false|{policy_matches}\\n")
 elif args[:3] == ["keyvault", "secret", "show"]:
     name = args[args.index("--name") + 1]
     if missing == "required_secret" and name == "TAVILY-API-KEY":
@@ -2195,9 +2203,9 @@ elif args[:2] == ["group", "show"]:
 elif args[:2] == ["identity", "show"]:
     sys.stdout.write("/subscriptions/demo/identity\\tprincipal-123\\n")
 elif args[:2] == ["containerapp", "show"] and "--output" in args:
-    sys.stdout.write('{{"identity":{{"userAssignedIdentities":{{"/subscriptions/demo/identity":{{}}}}}},"properties":{{"configuration":{{}},"template":{{}}}}}}')
+    sys.stdout.write('{{"identity":{{"userAssignedIdentities":{{"/subscriptions/demo/identity":{{}}}}}},"properties":{{"configuration":{{}},"template":{{"containers":[{{"name":"deep-research-agent"}}]}}}}}}')
 elif args[:2] == ["keyvault", "show"]:
-    sys.stdout.write("principal-123\\n")
+    sys.stdout.write("/subscriptions/demo/vaults/demo-vault|false|1\\n")
 elif args[:3] == ["keyvault", "secret", "show"]:
     name = args[args.index("--name") + 1]
     sys.stdout.write(f"https://demo-vault.vault.azure.net/secrets/{{name}}\\n")
@@ -2412,6 +2420,179 @@ def test_passkey_demo_configuration_documents_safe_azure_sqlite_contract():
         auth_guide,
     )
     assert "Key Vault" in security_guide
+
+
+def test_backend_build_keeps_docker_credentials_outside_repository():
+    source = (PROJECT_ROOT / "build.sh").read_text(encoding="utf-8")
+    ignore = (PROJECT_ROOT / ".gitignore").read_text(encoding="utf-8")
+
+    assert 'mktemp -d "$SCRIPT_DIR/.docker-credentials.' not in source
+    assert "/tmp/deep-research-docker-credentials." in source
+    assert ".docker-credentials.*" in ignore
+
+
+@pytest.mark.parametrize(
+    ("definition", "expected"),
+    [
+        (
+            {
+                "permissions": [
+                    {
+                        "actions": ["*"],
+                        "notActions": [],
+                        "dataActions": [],
+                        "notDataActions": [],
+                    }
+                ]
+            },
+            1,
+        ),
+        (
+            {
+                "permissions": [
+                    {
+                        "actions": [],
+                        "notActions": [],
+                        "dataActions": ["Microsoft.KeyVault/vaults/secrets/read"],
+                        "notDataActions": [],
+                    }
+                ]
+            },
+            1,
+        ),
+        (
+            {
+                "permissions": [
+                    {
+                        "actions": [],
+                        "notActions": [],
+                        "dataActions": [
+                            "Microsoft.KeyVault/vaults/*/read",
+                            "Microsoft.KeyVault/vaults/secrets/readMetadata/action",
+                        ],
+                        "notDataActions": [],
+                    }
+                ]
+            },
+            1,
+        ),
+        (
+            {
+                "permissions": [
+                    {
+                        "actions": [],
+                        "notActions": [],
+                        "dataActions": [
+                            "Microsoft.KeyVault/vaults/secrets/getSecret/action",
+                            "Microsoft.KeyVault/vaults/secrets/readMetadata/action",
+                        ],
+                        "notDataActions": [],
+                    }
+                ]
+            },
+            0,
+        ),
+        (
+            {
+                "permissions": [
+                    {
+                        "actions": [],
+                        "notActions": [],
+                        "dataActions": ["*"],
+                        "notDataActions": ["Microsoft.KeyVault/vaults/secrets/*"],
+                    }
+                ]
+            },
+            1,
+        ),
+    ],
+)
+def test_backend_keyvault_rbac_uses_effective_data_actions(
+    tmp_path, definition, expected
+):
+    result = subprocess.run(
+        [sys.executable, str(KEY_VAULT_RBAC)],
+        input=json.dumps([definition]),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == expected
+
+
+def test_backend_config_renderer_targets_existing_container_name(tmp_path):
+    output = tmp_path / "desired.yaml"
+    command = [
+        sys.executable,
+        str(CONFIG_RENDERER),
+        "--docker-username",
+        "demo-user",
+        "--build-version",
+        "20260812010101",
+        "--identity-id",
+        "/subscriptions/demo/identity",
+        "--container-name",
+        "renamed-main",
+        "--key-vault-name",
+        "demo-vault",
+        "--frontend-urls",
+        f"{UI_URL},https://bmo-deepagent-ui.vercel.app",
+        "--storage-name",
+        "authsqlite",
+        "--restart-trigger",
+        "1234567890",
+        "--revision-suffix",
+        "passkeys-20260812010101",
+        "--output",
+        str(output),
+    ]
+    result = subprocess.run(command, text=True, capture_output=True, check=False)
+    assert result.returncode == 0, result.stderr
+    rendered = yaml.safe_load(output.read_text(encoding="utf-8"))
+    assert [
+        item["name"] for item in rendered["properties"]["template"]["containers"]
+    ] == ["renamed-main"]
+
+
+def test_backend_rbac_role_definition_lookup_uses_target_subscription():
+    source = (PROJECT_ROOT / "deploy.sh").read_text(encoding="utf-8")
+    assert (
+        'az role definition list --subscription "$AZURE_SUBSCRIPTION_ID" '
+        '--name "$ROLE_DEFINITION_ID" -o json' in source
+    )
+
+
+def test_backend_config_merge_refuses_to_append_missing_container(tmp_path):
+    existing = tmp_path / "existing.json"
+    desired = tmp_path / "desired.yaml"
+    output = tmp_path / "output.yaml"
+    existing.write_text(
+        json.dumps(
+            {"properties": {"template": {"containers": [{"name": "renamed-main"}]}}}
+        ),
+        encoding="utf-8",
+    )
+    desired.write_text(
+        "properties:\n  template:\n    containers:\n      - name: deep-research-agent\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(CONFIG_MERGER),
+            "--existing-json",
+            str(existing),
+            "--desired-yaml",
+            str(desired),
+            "--output-yaml",
+            str(output),
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert not output.exists()
 
 
 def test_passkey_demo_documents_requested_multi_domain_rp_configuration():

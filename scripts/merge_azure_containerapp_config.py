@@ -45,6 +45,10 @@ def _merge(existing: object, desired: object, path: tuple[str, ...] = ()) -> obj
                 index = positions[item_identity]
                 result[index] = _merge(result[index], item, (*path, str(item_identity)))
             else:
+                if path and path[-1] == "containers":
+                    raise ValueError(
+                        "managed container is absent from existing topology"
+                    )
                 positions[item_identity] = len(result)
                 result.append(item)
         return result
@@ -64,8 +68,9 @@ def main() -> int:
         desired = yaml.safe_load(stream)
     if not isinstance(existing, dict) or not isinstance(desired, dict):
         raise ValueError("Azure Container App configurations must be mappings")
+    merged = _merge(existing, desired)
     with arguments.output_yaml.open("w", encoding="utf-8") as stream:
-        yaml.safe_dump(_merge(existing, desired), stream, sort_keys=False)
+        yaml.safe_dump(merged, stream, sort_keys=False)
     return 0
 
 

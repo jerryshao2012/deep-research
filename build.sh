@@ -46,7 +46,7 @@ cleanup_build_context() {
   if [[ "$BUILD_CONTEXT_DIR" == "$SCRIPT_DIR"/.container-build-context.* ]] && [ -d "$BUILD_CONTEXT_DIR" ]; then
     rm -rf -- "$BUILD_CONTEXT_DIR"
   fi
-  if [[ "$DOCKER_CREDENTIAL_DIR" == "$SCRIPT_DIR"/.docker-credentials.* ]] && [ -d "$DOCKER_CREDENTIAL_DIR" ]; then
+  if [[ "$DOCKER_CREDENTIAL_DIR" == /tmp/deep-research-docker-credentials.* ]] && [ -d "$DOCKER_CREDENTIAL_DIR" ]; then
     rm -rf -- "$DOCKER_CREDENTIAL_DIR"
   fi
 }
@@ -57,7 +57,10 @@ source "$SCRIPT_DIR/env.sh"
 : "${UI_APP_NAME:?Set UI_APP_NAME in env.sh}"
 
 trap cleanup_build_context EXIT
-DOCKER_CREDENTIAL_DIR="$(mktemp -d "$SCRIPT_DIR/.docker-credentials.XXXXXX")"
+OLD_UMASK=$(umask)
+umask 077
+DOCKER_CREDENTIAL_DIR="$(mktemp -d "/tmp/deep-research-docker-credentials.XXXXXX")"
+umask "$OLD_UMASK"
 DOCKER_PAT_FILE="$DOCKER_CREDENTIAL_DIR/pat"
 XTRACE_WAS_ENABLED=false
 case "$-" in
