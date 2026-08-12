@@ -1396,7 +1396,7 @@ elif args[:2] == ["identity", "show"]:
 elif args[:2] == ["containerapp", "show"] and "--output" in args:
     if missing == "app":
         raise SystemExit(3)
-    sys.stdout.write('{"identity":{"userAssignedIdentities":{"/subscriptions/demo/identity":{}}},"properties":{"configuration":{},"template":{"containers":[{"name":"deep-research-agent"}]}}}')
+    sys.stdout.write(json.dumps({"etag": '\"etag-before\"', "identity": {"userAssignedIdentities": {"/subscriptions/demo/identity": {}}}, "properties": {"configuration": {}, "template": {"containers": [{"name": "deep-research-agent"}]}}}))
 elif args[:2] == ["keyvault", "show"]:
     if missing == "vault":
         raise SystemExit(3)
@@ -1448,7 +1448,7 @@ elif args[:2] == ["group", "show"]:
 elif args[:2] == ["identity", "show"]:
     sys.stdout.write("/subscriptions/demo/identity\\tprincipal-123\\n")
 elif args[:2] == ["containerapp", "show"] and "--output" in args:
-    sys.stdout.write('{"identity":{"userAssignedIdentities":{"/subscriptions/demo/identity":{}}},"properties":{"configuration":{},"template":{"containers":[{"name":"deep-research-agent"}]}}}')
+    sys.stdout.write(json.dumps({"etag": '\"etag-before\"', "identity": {"userAssignedIdentities": {"/subscriptions/demo/identity": {}}}, "properties": {"configuration": {}, "template": {"containers": [{"name": "deep-research-agent"}]}}}))
 elif args[:2] == ["keyvault", "show"]:
     sys.stdout.write("/subscriptions/demo/vaults/demo-vault|false|1\\n")
 elif args[:3] == ["keyvault", "secret", "show"]:
@@ -1504,7 +1504,7 @@ elif args[:2] == ["group", "show"]:
 elif args[:2] == ["identity", "show"]:
     sys.stdout.write("/subscriptions/demo/identity\\tprincipal-123\\n")
 elif args[:2] == ["containerapp", "show"] and "--output" in args:
-    sys.stdout.write('{"identity":{"userAssignedIdentities":{"/subscriptions/demo/identity":{}}},"properties":{"configuration":{},"template":{"containers":[{"name":"deep-research-agent"}]}}}')
+    sys.stdout.write(json.dumps({"etag": '\"etag-before\"', "identity": {"userAssignedIdentities": {"/subscriptions/demo/identity": {}}}, "properties": {"configuration": {}, "template": {"containers": [{"name": "deep-research-agent"}]}}}))
 elif args[:2] == ["keyvault", "show"]:
     sys.stdout.write("/subscriptions/demo/vaults/demo-vault|false|1\\n")
 elif args[:3] == ["keyvault", "secret", "show"]:
@@ -1672,7 +1672,7 @@ elif args[:2] == ["group", "show"]:
 elif args[:2] == ["identity", "show"]:
     sys.stdout.write("/subscriptions/demo/identity\\tprincipal-123\\n")
 elif args[:2] == ["containerapp", "show"] and "--output" in args:
-    sys.stdout.write('{"identity":{"userAssignedIdentities":{"/subscriptions/demo/identity":{}}},"properties":{"configuration":{},"template":{"containers":[{"name":"deep-research-agent"}]}}}')
+    sys.stdout.write(json.dumps({"etag": '\"etag-before\"', "identity": {"userAssignedIdentities": {"/subscriptions/demo/identity": {}}}, "properties": {"configuration": {}, "template": {"containers": [{"name": "deep-research-agent"}]}}}))
 sys.exit(0)
 """,
         encoding="utf-8",
@@ -1763,6 +1763,7 @@ elif args[:2] == ["containerapp", "show"] and "--output" in args and args[args.i
     ]
     json.dump({
         "id": "/subscriptions/demo/resourceGroups/demo-rg/providers/Microsoft.App/containerApps/demo-api",
+        "etag": os.environ.get("FAKE_APP_ETAG", '"etag-before"'),
         "name": "demo-api",
         "location": "canadacentral",
         "identity": {"userAssignedIdentities": {"/subscriptions/demo/identity": {}}},
@@ -1813,6 +1814,8 @@ elif args[:1] == ["rest"]:
     if not source_argument.startswith("@"):
         raise SystemExit(88)
     source = pathlib.Path(source_argument[1:])
+    if os.environ.get("FAKE_PRECONDITION_FAILURE"):
+        raise SystemExit(49)
     pathlib.Path(os.environ["FAKE_UPDATE_PATCH"]).write_bytes(source.read_bytes())
 sys.exit(0)
 """,
@@ -1911,6 +1914,7 @@ sys.stdout.write('{"version":"9.8.7","status":"ok"}\\n')
     assert update_call[update_call.index("--headers") + 1] == (
         "Content-Type=application/merge-patch+json"
     )
+    assert update_call[update_call.index("--headers") + 2] == 'If-Match="etag-before"'
     assert "containerapp update" not in json.dumps(calls)
     assert "--show-values" not in json.dumps(calls)
     account_set = next(
@@ -1953,6 +1957,23 @@ sys.stdout.write('{"version":"9.8.7","status":"ok"}\\n')
         assert not any(call[:2] == ["account", "set"] for call in drift_calls)
         assert not update_patch.exists()
 
+    argv_log.unlink()
+    precondition_environment = env | {"FAKE_PRECONDITION_FAILURE": "true"}
+    precondition = subprocess.run(
+        ["bash", "deploy.sh"],
+        cwd=fixture,
+        env=precondition_environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert precondition.returncode == 49
+    precondition_calls = _read_az_calls(argv_log)
+    assert len([call for call in precondition_calls if call[:1] == ["rest"]]) == 1
+    assert not any(
+        call[:3] == ["containerapp", "revision", "list"] for call in precondition_calls
+    )
+
 
 def test_azure_deploy_gates_mutation_on_oauth_confirmation_and_strict_output():
     source = (PROJECT_ROOT / "deploy.sh").read_text(encoding="utf-8")
@@ -1966,6 +1987,60 @@ def test_azure_deploy_gates_mutation_on_oauth_confirmation_and_strict_output():
     assert source.index(resolver) < source.index("az account set")
     assert source.index(confirmation) < source.index("az account set")
     assert ".resolved-azure-endpoints.json" not in source
+
+
+@pytest.mark.parametrize("etag", [None, "", "malformed\nvalue"])
+def test_azure_deploy_missing_or_malformed_etag_fails_before_update(tmp_path, etag):
+    fixture, argv_log = _prepare_deploy_preflight_fixture(tmp_path)
+    fake_az = fixture / "bin/az"
+    fake_az.write_text(
+        """#!/usr/bin/python3
+import json
+import os
+import sys
+args = sys.argv[1:]
+with open(os.environ["FAKE_AZ_ARGV_LOG"], "a", encoding="utf-8") as stream:
+    stream.write(json.dumps(args) + "\\n")
+if args[:3] == ["containerapp", "env", "show"]:
+    sys.stdout.write(os.environ["FAKE_ENV_ROW"])
+elif args[:2] == ["group", "show"]:
+    sys.stdout.write("/subscriptions/demo/resourceGroups/demo-rg\\n")
+elif args[:2] == ["identity", "show"]:
+    sys.stdout.write("/subscriptions/demo/identity\\tprincipal-123\\n")
+elif args[:2] == ["containerapp", "show"] and "--output" in args:
+    payload = {
+        "id": "/subscriptions/demo/resourceGroups/demo-rg/providers/Microsoft.App/containerApps/demo-api",
+        "location": "canadacentral",
+        "identity": {"userAssignedIdentities": {"/subscriptions/demo/identity": {}}},
+        "properties": {"configuration": {}, "template": {"containers": [{"name": "deep-research-agent"}]}}
+    }
+    if os.environ.get("FAKE_ETAG") != "__missing__":
+        payload["etag"] = os.environ.get("FAKE_ETAG", "")
+    json.dump(payload, sys.stdout)
+sys.exit(0)
+""",
+        encoding="utf-8",
+    )
+    fake_az.chmod(0o700)
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{fixture / 'bin'}:{env['PATH']}",
+            "FAKE_AZ_ARGV_LOG": str(argv_log),
+            "FAKE_ENV_ROW": f"{ENVIRONMENT_ID}\t{DEFAULT_DOMAIN}\tSucceeded\n",
+            "FAKE_ETAG": "__missing__" if etag is None else etag,
+            "DOCKER_HUB_USERNAME": "demo-user",
+            "OAUTH_REDIRECTS_CONFIRMED": "true",
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", "deploy.sh"], cwd=fixture, env=env, text=True, capture_output=True
+    )
+
+    assert result.returncode == 65
+    assert "ETag" in result.stderr
+    assert not any(call[:1] == ["rest"] for call in _read_az_calls(argv_log))
 
 
 def _render_desired_config(tmp_path: Path) -> dict:
@@ -2192,7 +2267,7 @@ elif args[:2] == ["identity", "show"]:
     sys.stdout.write("/subscriptions/demo/identity\\tprincipal-123\\n")
 elif args[:2] == ["containerapp", "show"] and "--output" in args:
     identity = {} if missing == "identity_assignment" else {"/subscriptions/demo/identity": {}}
-    json.dump({"identity": {"userAssignedIdentities": identity}, "properties": {"configuration": {}, "template": {"containers": [{"name": "deep-research-agent"}]}}}, sys.stdout)
+    json.dump({"etag": '\"etag-before\"', "identity": {"userAssignedIdentities": identity}, "properties": {"configuration": {}, "template": {"containers": [{"name": "deep-research-agent"}]}}}, sys.stdout)
 elif args[:2] == ["keyvault", "show"]:
     policy_matches = "0" if missing == "vault_access" else "1"
     sys.stdout.write(f"/subscriptions/demo/vaults/demo-vault|false|{policy_matches}\\n")
@@ -2272,7 +2347,7 @@ elif args[:2] == ["group", "show"]:
 elif args[:2] == ["identity", "show"]:
     sys.stdout.write("/subscriptions/demo/identity\\tprincipal-123\\n")
 elif args[:2] == ["containerapp", "show"] and "--output" in args:
-    sys.stdout.write('{{"identity":{{"userAssignedIdentities":{{"/subscriptions/demo/identity":{{}}}}}},"properties":{{"configuration":{{}},"template":{{"containers":[{{"name":"deep-research-agent"}}]}}}}}}')
+    sys.stdout.write(json.dumps({{"etag": '\"etag-before\"', "identity": {{"userAssignedIdentities": {{"/subscriptions/demo/identity": {{}}}}}}, "properties": {{"configuration": {{}}, "template": {{"containers": [{{"name": "deep-research-agent"}}]}}}}}}))
 elif args[:2] == ["keyvault", "show"]:
     sys.stdout.write("/subscriptions/demo/vaults/demo-vault|false|1\\n")
 elif args[:3] == ["keyvault", "secret", "show"]:
@@ -2992,6 +3067,45 @@ def test_backend_build_rollback_covers_cleanup_failure(tmp_path):
     assert not (fixture / ".build_version").exists()
 
 
+@pytest.mark.parametrize(("exit_kind", "status"), [("exit", 46), ("signal", 143)])
+def test_backend_build_rollback_restores_partial_increment_failure_status(
+    tmp_path, exit_kind, status
+):
+    fixture, argv_log = _prepare_build_rollback_fixture(tmp_path)
+    config = fixture / "webapp/config.py"
+    marker = fixture / ".build_version"
+    marker.write_bytes(b"old-marker\r\n")
+    marker.chmod(0o604)
+    config.chmod(0o640)
+    before_config = config.read_bytes()
+    before_marker = marker.read_bytes()
+    fake_increment = fixture / "increment_version.py"
+    if exit_kind == "exit":
+        fake_increment.write_text(
+            "import sys\n"
+            "from pathlib import Path\n"
+            "Path(sys.argv[1]).write_text('API_VERSION = \\\"1.8.')\n"
+            "raise SystemExit(46)\n",
+            encoding="utf-8",
+        )
+    else:
+        fake_increment.write_text(
+            "import os, signal, sys\n"
+            "from pathlib import Path\n"
+            "Path(sys.argv[1]).write_text('API_VERSION = \\\"1.8.127\\\"\\n')\n"
+            "os.kill(os.getpid(), signal.SIGTERM)\n",
+            encoding="utf-8",
+        )
+
+    result = _run_build_fixture(fixture, argv_log)
+
+    assert result.returncode == status
+    assert config.read_bytes() == before_config
+    assert marker.read_bytes() == before_marker
+    assert stat.S_IMODE(config.stat().st_mode) == 0o640
+    assert stat.S_IMODE(marker.stat().st_mode) == 0o604
+
+
 def test_backend_build_version_refuses_dirty_owned_config_before_mutation(tmp_path):
     fixture, argv_log = _prepare_build_rollback_fixture(tmp_path)
     config = fixture / "webapp/config.py"
@@ -3128,12 +3242,15 @@ elif args[:2] == ["keyvault", "show"]:
         "enableRbacAuthorization": True,
         "accessPolicies": [],
     }
-elif args[:3] == ["keyvault", "secret", "show"]:
+elif args[:3] == ["keyvault", "secret", "list-versions"]:
     name = args[args.index("--name") + 1]
-    payload = {
+    payload = json.loads(os.environ["FAKE_SECRET_VERSIONS"]) if os.environ.get("FAKE_SECRET_VERSIONS") else [{
         "id": f"https://demo-vault.vault.azure.net/secrets/{name}/version-1",
-        "attributes": {"enabled": True, "created": "2026-01-01", "updated": "2026-01-02", "recoveryLevel": "Recoverable"},
-    }
+        "name": name,
+        "version": "version-1",
+        "enabled": True,
+        "updated": "2026-01-02",
+    }]
 elif args[:3] == ["role", "assignment", "list"]:
     principal = args[args.index("--assignee-object-id") + 1]
     payload = [{"id": f"/roles/{principal}", "principalId": principal, "roleDefinitionId": "/definitions/reader", "scope": "/subscriptions/demo", "condition": None, "conditionVersion": None}]
@@ -3152,7 +3269,11 @@ json.dump(payload, sys.stdout)
 
 
 def _run_snapshot_capture(
-    tmp_path: Path, output: Path, *, backend_app: dict | None = None
+    tmp_path: Path,
+    output: Path,
+    *,
+    backend_app: dict | None = None,
+    secret_versions: list[dict] | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], Path]:
     bin_dir, argv_log = _install_snapshot_fake_az(tmp_path)
     env = os.environ.copy()
@@ -3167,6 +3288,9 @@ def _run_snapshot_capture(
             ),
             "FAKE_APP_DEMO_UI": json.dumps(
                 _snapshot_fake_app("demo-ui", "ui-principal")
+            ),
+            "FAKE_SECRET_VERSIONS": (
+                json.dumps(secret_versions) if secret_versions is not None else ""
             ),
         }
     )
@@ -3210,14 +3334,107 @@ def test_azure_metadata_snapshot_capture_is_canonical_metadata_only_and_mode_060
     assert raw == json.dumps(json.loads(raw), indent=2, sort_keys=True) + "\n"
     calls = _read_az_calls(argv_log)
     assert (
-        len([call for call in calls if call[:3] == ["keyvault", "secret", "show"]]) == 9
+        len(
+            [
+                call
+                for call in calls
+                if call[:3] == ["keyvault", "secret", "list-versions"]
+            ]
+        )
+        == 9
     )
+    assert not any(call[:3] == ["keyvault", "secret", "show"] for call in calls)
     assert all("--query" in call for call in calls)
     query_text = "\n".join(
         call[call.index("--query") + 1] for call in calls if "--query" in call
     )
     assert "value" not in query_text.casefold()
     assert "--show-values" not in json.dumps(calls)
+
+
+@pytest.mark.parametrize(
+    ("versions", "message"),
+    [
+        ([], "version"),
+        (
+            [
+                {
+                    "id": "https://demo-vault.vault.azure.net/secrets/TAVILY-API-KEY/v1",
+                    "name": "TAVILY-API-KEY",
+                    "version": "v1",
+                    "enabled": True,
+                    "updated": "2026-01-01",
+                },
+                {
+                    "id": "https://demo-vault.vault.azure.net/secrets/TAVILY-API-KEY/v2",
+                    "name": "TAVILY-API-KEY",
+                    "version": "v2",
+                    "enabled": False,
+                    "updated": "2026-01-02",
+                },
+            ],
+            "current secret version is disabled",
+        ),
+        (
+            [
+                {
+                    "id": "https://demo-vault.vault.azure.net/secrets/TAVILY-API-KEY/v1",
+                    "name": "TAVILY-API-KEY",
+                    "version": "v1",
+                    "enabled": False,
+                    "updated": "2026-01-02",
+                }
+            ],
+            "disabled",
+        ),
+        (
+            [
+                {
+                    "id": "https://demo-vault.vault.azure.net/secrets/TAVILY-API-KEY/v1",
+                    "name": "TAVILY-API-KEY",
+                    "version": "v1",
+                    "enabled": True,
+                    "updated": "2026-01-02",
+                },
+                {
+                    "id": "https://demo-vault.vault.azure.net/secrets/TAVILY-API-KEY/v2",
+                    "name": "TAVILY-API-KEY",
+                    "version": "v2",
+                    "enabled": True,
+                    "updated": "2026-01-02",
+                },
+            ],
+            "ambiguous",
+        ),
+        (
+            [
+                {
+                    "id": "https://demo-vault.vault.azure.net/secrets/TAVILY-API-KEY/v1",
+                    "name": "TAVILY-API-KEY",
+                    "version": "v1",
+                    "enabled": True,
+                    "updated": "2026-01-02",
+                    "value": "secret-canary",
+                }
+            ],
+            "schema",
+        ),
+    ],
+)
+def test_azure_metadata_snapshot_secret_version_selection_fails_closed(
+    tmp_path, versions, message
+):
+    output = tmp_path / "before.json"
+
+    result, argv_log = _run_snapshot_capture(tmp_path, output, secret_versions=versions)
+
+    assert result.returncode == 2
+    assert message in result.stderr.lower()
+    assert "secret-canary" not in result.stdout + result.stderr
+    assert not output.exists()
+    assert not any(
+        call[:3] == ["keyvault", "secret", "show"] for call in _read_az_calls(argv_log)
+    )
 
 
 def test_azure_metadata_snapshot_capture_rejects_malformed_query_output(tmp_path):
@@ -3368,7 +3585,7 @@ def test_azure_metadata_snapshot_compare_rejects_malformed_protected_schema(tmp_
         lambda payload: payload["key_vault"]["access_policies"].append(
             {"value": "secret-canary"}
         ),
-        lambda payload: payload["key_vault"]["secrets"][0]["attributes"].__setitem__(
+        lambda payload: payload["key_vault"]["secrets"][0].__setitem__(
             "value", "secret-canary"
         ),
         lambda payload: payload["role_assignments"].append(
@@ -3379,7 +3596,7 @@ def test_azure_metadata_snapshot_compare_rejects_malformed_protected_schema(tmp_
         "identity-value",
         "storage-extra",
         "policy-malformed",
-        "secret-attribute-value",
+        "secret-value",
         "duplicate-role",
     ),
 )

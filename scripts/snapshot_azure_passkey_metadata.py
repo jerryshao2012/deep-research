@@ -50,9 +50,9 @@ VAULT_QUERY = (
     "permissions:{certificates:permissions.certificates,keys:permissions.keys,"
     "secrets:permissions.secrets,storage:permissions.storage}}}"
 )
-SECRET_QUERY = (
-    "{id:id,attributes:{enabled:attributes.enabled,created:attributes.created,"
-    "updated:attributes.updated,recoveryLevel:attributes.recoveryLevel}}"
+SECRET_VERSIONS_QUERY = (
+    "[].{id:id,name:name,version:version,enabled:attributes.enabled,"
+    "updated:attributes.updated}"
 )
 ROLE_QUERY = (
     "[].{id:id,principalId:principalId,roleDefinitionId:roleDefinitionId,"
@@ -484,58 +484,82 @@ def _capture(arguments: argparse.Namespace) -> dict[str, Any]:
     normalized_policies = _normalize_access_policies(vault_raw["accessPolicies"] or [])
     secrets: list[dict[str, Any]] = []
     for secret_name in SECRET_NAMES:
-        raw_secret = _mapping(
+        raw_versions = _list(
             _az_json(
                 [
                     "keyvault",
                     "secret",
-                    "show",
+                    "list-versions",
                     *common,
                     "--vault-name",
                     arguments.vault_name,
                     "--name",
                     secret_name,
                     "--query",
-                    SECRET_QUERY,
+                    SECRET_VERSIONS_QUERY,
                     "--output",
                     "json",
                 ],
                 f"Key Vault secret {secret_name}",
             ),
-            "Key Vault secret",
+            "Key Vault secret versions",
         )
-        _exact_keys(raw_secret, {"id", "attributes"}, "Key Vault secret")
-        secret_id = _string(raw_secret["id"], "Key Vault secret ID")
-        assert secret_id is not None
-        version = secret_id.rstrip("/").rsplit("/", 1)[-1]
-        if not version or version.casefold() == secret_name.casefold():
-            raise SnapshotError("invalid versioned Key Vault secret ID metadata")
-        attributes = _mapping(raw_secret["attributes"], "Key Vault secret attributes")
-        _exact_keys(
-            attributes,
-            {"enabled", "created", "updated", "recoveryLevel"},
-            "secret attributes",
-        )
-        if not isinstance(attributes["enabled"], bool):
-            raise SnapshotError("invalid secret enabled metadata schema")
-        normalized_attributes = {
-            "enabled": attributes["enabled"],
-            "created": _string(
-                attributes["created"], "secret created timestamp", nullable=True
-            ),
-            "updated": _string(
-                attributes["updated"], "secret updated timestamp", nullable=True
-            ),
-            "recovery_level": _string(
-                attributes["recoveryLevel"], "secret recovery level", nullable=True
-            ),
-        }
+        versions: list[dict[str, Any]] = []
+        seen_versions: set[str] = set()
+        for raw_version in raw_versions:
+            item = _mapping(raw_version, "Key Vault secret version")
+            _exact_keys(
+                item,
+                {"id", "name", "version", "enabled", "updated"},
+                "Key Vault secret version",
+            )
+            name = _string(item["name"], "Key Vault secret version name")
+            version = _string(item["version"], "Key Vault secret version")
+            secret_id = _string(item["id"], "Key Vault secret version ID")
+            assert name is not None and version is not None and secret_id is not None
+            if name.casefold() != secret_name.casefold():
+                raise SnapshotError("invalid Key Vault secret version name metadata")
+            if secret_id.rstrip("/").rsplit("/", 1)[-1] != version:
+                raise SnapshotError("invalid versioned Key Vault secret ID metadata")
+            if version.casefold() in seen_versions:
+                raise SnapshotError("duplicate Key Vault secret version metadata")
+            seen_versions.add(version.casefold())
+            if not isinstance(item["enabled"], bool):
+                raise SnapshotError("invalid secret enabled metadata schema")
+            versions.append(
+                {
+                    "name": name,
+                    "id": secret_id,
+                    "version": version,
+                    "enabled": item["enabled"],
+                    "updated": _string(
+                        item["updated"], "secret updated timestamp", nullable=True
+                    ),
+                }
+            )
+        if not versions:
+            raise SnapshotError(f"no secret version metadata for {secret_name}")
+        sortable = [version for version in versions if version["updated"] is not None]
+        if len(sortable) != len(versions):
+            raise SnapshotError(
+                f"secret version lacks updated metadata for {secret_name}"
+            )
+        newest_updated = max(str(version["updated"]) for version in sortable)
+        newest = [
+            version for version in sortable if version["updated"] == newest_updated
+        ]
+        if len(newest) != 1:
+            raise SnapshotError(f"ambiguous current secret version for {secret_name}")
+        selected = newest[0]
+        if not selected["enabled"]:
+            raise SnapshotError(f"current secret version is disabled for {secret_name}")
         secrets.append(
             {
                 "name": secret_name,
-                "id": secret_id,
-                "version": version,
-                "attributes": normalized_attributes,
+                "id": selected["id"],
+                "version": selected["version"],
+                "enabled": selected["enabled"],
+                "updated": selected["updated"],
             }
         )
 
@@ -854,7 +878,9 @@ def _validate_snapshot_secrets(raw: object) -> None:
     for raw_secret in secrets:
         secret = _mapping(raw_secret, "snapshot Key Vault secret")
         _exact_keys(
-            secret, {"name", "id", "version", "attributes"}, "snapshot Key Vault secret"
+            secret,
+            {"name", "id", "version", "enabled", "updated"},
+            "snapshot Key Vault secret",
         )
         name = _string(secret["name"], "snapshot Key Vault secret name")
         secret_id = _string(secret["id"], "snapshot Key Vault secret ID")
@@ -863,33 +889,17 @@ def _validate_snapshot_secrets(raw: object) -> None:
         if name.casefold() in seen:
             raise SnapshotError("duplicate snapshot Key Vault secret metadata")
         seen.add(name.casefold())
-        attributes = _mapping(secret["attributes"], "snapshot secret attributes")
-        _exact_keys(
-            attributes,
-            {"enabled", "created", "updated", "recovery_level"},
-            "snapshot secret attributes",
-        )
-        if not isinstance(attributes["enabled"], bool):
+        if not isinstance(secret["enabled"], bool):
             raise SnapshotError("invalid snapshot secret enabled metadata schema")
         normalized.append(
             {
                 "name": name,
                 "id": secret_id,
                 "version": version,
-                "attributes": {
-                    "enabled": attributes["enabled"],
-                    "created": _string(
-                        attributes["created"], "snapshot secret created", nullable=True
-                    ),
-                    "updated": _string(
-                        attributes["updated"], "snapshot secret updated", nullable=True
-                    ),
-                    "recovery_level": _string(
-                        attributes["recovery_level"],
-                        "snapshot secret recovery level",
-                        nullable=True,
-                    ),
-                },
+                "enabled": secret["enabled"],
+                "updated": _string(
+                    secret["updated"], "snapshot secret updated", nullable=True
+                ),
             }
         )
     normalized.sort(key=lambda item: str(item["name"]).casefold())

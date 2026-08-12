@@ -17,6 +17,7 @@ EXPECTED_CONFIG=""
 MARKER_BACKUP=""
 MARKER_TEMP=""
 MARKER_EXISTED=false
+CONFIG_LIVE_MUTATED=false
 
 # Function to track step timing
 start_step() {
@@ -73,7 +74,11 @@ cleanup_transaction_files() {
 }
 
 rollback_build_owned_files() {
-  if ! same_file_state "$SCRIPT_DIR/webapp/config.py" "$EXPECTED_CONFIG"; then
+  expected_live_config="$CONFIG_BACKUP"
+  if [ "$CONFIG_LIVE_MUTATED" = true ]; then
+    expected_live_config="$EXPECTED_CONFIG"
+  fi
+  if ! same_file_state "$SCRIPT_DIR/webapp/config.py" "$expected_live_config"; then
     echo "Error: concurrent change detected in webapp/config.py; refusing to overwrite it during rollback." >&2
     return 70
   fi
@@ -126,6 +131,7 @@ begin_build_transaction() {
   CONFIG_BACKUP=$(mktemp "$SCRIPT_DIR/webapp/.config.py.build-backup.XXXXXX")
   cp -p "$SCRIPT_DIR/webapp/config.py" "$CONFIG_BACKUP"
   EXPECTED_CONFIG=$(mktemp "$SCRIPT_DIR/webapp/.config.py.build-expected.XXXXXX")
+  cp -p "$CONFIG_BACKUP" "$EXPECTED_CONFIG"
   if [ -e "$SCRIPT_DIR/.build_version" ]; then
     MARKER_EXISTED=true
     MARKER_BACKUP=$(mktemp "$SCRIPT_DIR/.build_version.build-backup.XXXXXX")
@@ -294,8 +300,13 @@ end_step
 start_step "API Version Management"
 echo "🔢 Incrementing API version..."
 begin_build_transaction
-python3 ./increment_version.py
-cp -p "$SCRIPT_DIR/webapp/config.py" "$EXPECTED_CONFIG"
+python3 ./increment_version.py "$EXPECTED_CONFIG"
+if ! same_file_state "$SCRIPT_DIR/webapp/config.py" "$CONFIG_BACKUP"; then
+  echo "Error: concurrent change detected in webapp/config.py before version publication." >&2
+  exit 70
+fi
+cp -p "$EXPECTED_CONFIG" "$SCRIPT_DIR/webapp/config.py"
+CONFIG_LIVE_MUTATED=true
 NEW_VERSION=$(grep -E 'API_VERSION(:\s*\w+)?\s*=\s*' webapp/config.py | grep -o '"[^"]*"')
 NEW_VERSION=${NEW_VERSION//\"/}
 echo "✅ New API version: $NEW_VERSION"

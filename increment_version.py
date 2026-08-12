@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Auto-increment API version in webapp.py"""
+"""Auto-increment API version in webapp.py."""
+
 import re
 import sys
 from pathlib import Path
@@ -10,7 +11,9 @@ def increment_version(file_path: Path) -> str:
     content = file_path.read_text()
 
     # Find the API_VERSION line (supporting optional type hint like : str)
-    match = re.search(r'API_VERSION(?:\s*:\s*\w+)?\s*=\s*"(\d+)\.(\d+)\.(\d+)"', content)
+    match = re.search(
+        r'API_VERSION(?:\s*:\s*\w+)?\s*=\s*"(\d+)\.(\d+)\.(\d+)"', content
+    )
     if not match:
         raise ValueError("Could not find API_VERSION in webapp/config.py")
 
@@ -22,7 +25,9 @@ def increment_version(file_path: Path) -> str:
 
     # Replace in content using the exact matched pattern
     old_match_str = match.group(0)
-    new_match_str = old_match_str.replace(f'"{major}.{minor}.{patch}"', f'"{new_version}"')
+    new_match_str = old_match_str.replace(
+        f'"{major}.{minor}.{patch}"', f'"{new_version}"'
+    )
     new_content = content.replace(old_match_str, new_match_str)
 
     # Write back
@@ -32,13 +37,23 @@ def increment_version(file_path: Path) -> str:
 
 
 if __name__ == "__main__":
-    webapp_path = Path(__file__).parent / "webapp/config.py"
+    webapp_path = (
+        Path(sys.argv[1])
+        if len(sys.argv) == 2
+        else Path(__file__).parent / "webapp/config.py"
+    )
+
+    if len(sys.argv) > 2:
+        print(  # noqa: T201
+            "❌ Error: expected at most one config path", file=sys.stderr
+        )
+        sys.exit(2)
 
     try:
-        print(webapp_path)
+        print(webapp_path)  # noqa: T201
         new_version = increment_version(webapp_path)
-        print(f"✅ Version incremented to {new_version}")
+        print(f"✅ Version incremented to {new_version}")  # noqa: T201
         sys.exit(0)
     except Exception as e:
-        print(f"❌ Error: {e}", file=sys.stderr)
+        print(f"❌ Error: {e}", file=sys.stderr)  # noqa: T201
         sys.exit(1)

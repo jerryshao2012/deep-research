@@ -284,6 +284,21 @@ if [[ "$CONTAINER_TOPOLOGY_STATUS" != 0 || -z "$MANAGED_CONTAINER_NAME" ]]; then
   exit 4
 fi
 
+APP_ETAG=$(python3 -c '
+import json
+import re
+import sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    value = json.load(stream).get("etag")
+if not isinstance(value, str) or re.fullmatch(r"(?:W/)?\"[^\"\r\n]+\"", value) is None:
+    raise SystemExit(2)
+print(value)
+' "$EXISTING_CONFIG_JSON") || {
+  echo "Error: existing Container App returned a missing or malformed ETag" >&2
+  rm -f "$EXISTING_CONFIG_JSON"
+  exit 65
+}
+
 validate_existing_app_metadata() {
 APP_METADATA_STDOUT=$(mktemp)
 APP_METADATA_STDERR=$(mktemp)
@@ -624,7 +639,7 @@ APP_RESOURCE_ID=$(python3 -c 'import json,sys; value=json.load(open(sys.argv[1],
 rm -f "$EXISTING_CONFIG_JSON"
 az rest --method patch \
   --uri "${APP_RESOURCE_ID}?api-version=2025-07-01" \
-  --headers Content-Type=application/merge-patch+json \
+  --headers Content-Type=application/merge-patch+json "If-Match=$APP_ETAG" \
   --body "@$UPDATE_PATCH_JSON" \
   --output none
 rm -f "$UPDATE_PATCH_JSON"
