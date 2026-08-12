@@ -73,6 +73,22 @@ def _multi_rp_env(tmp_path, **overrides: str) -> dict[str, str]:
     return values
 
 
+def _derived_frontend_env(tmp_path, **overrides: str) -> dict[str, str]:
+    values = _enabled_env(tmp_path)
+    values.pop("PASSKEY_RP_ID")
+    values.pop("PASSKEY_ORIGINS")
+    values.update(
+        {
+            "PASSKEY_DERIVE_FROM_FRONTEND_URLS": "true",
+            "FRONTEND_URLS": (
+                "https://ui.example.com,https://bmo-deepagent-ui.vercel.app"
+            ),
+        }
+    )
+    values.update(overrides)
+    return values
+
+
 NUMERIC_ENDING_HOSTS = (
     "127.1",
     "2130706433",
@@ -111,6 +127,172 @@ def test_disabled_passkeys_ignore_incomplete_or_malformed_optional_settings():
     )
 
     assert config == PasskeyConfig(enabled=False)
+
+
+def test_derive_from_frontend_urls_maps_each_origin_to_its_own_hostname(tmp_path):
+    config = PasskeyConfig.from_environ(_derived_frontend_env(tmp_path))
+
+    assert config.origins == (
+        "https://ui.example.com",
+        "https://bmo-deepagent-ui.vercel.app",
+    )
+    assert config.rp_ids == (
+        "ui.example.com",
+        "bmo-deepagent-ui.vercel.app",
+    )
+    assert config.origin_rp_ids == (
+        ("https://ui.example.com", "ui.example.com"),
+        (
+            "https://bmo-deepagent-ui.vercel.app",
+            "bmo-deepagent-ui.vercel.app",
+        ),
+    )
+
+
+def test_derive_from_frontend_urls_normalizes_root_path_and_default_port(tmp_path):
+    config = PasskeyConfig.from_environ(
+        _derived_frontend_env(
+            tmp_path,
+            FRONTEND_URLS="https://UI.example.com:443/",
+        )
+    )
+
+    assert config.origins == ("https://ui.example.com",)
+    assert config.origin_rp_ids == (("https://ui.example.com", "ui.example.com"),)
+
+
+def test_derive_from_frontend_urls_accepts_localhost_development(tmp_path):
+    config = PasskeyConfig.from_environ(
+        _derived_frontend_env(tmp_path, FRONTEND_URLS="http://localhost:3000")
+    )
+
+    assert config.origin_rp_ids == (("http://localhost:3000", "localhost"),)
+    assert config.oauth_cookie_secure is False
+
+
+def test_derive_flag_false_preserves_explicit_passkey_configuration(tmp_path):
+    config = PasskeyConfig.from_environ(
+        _enabled_env(
+            tmp_path,
+            PASSKEY_DERIVE_FROM_FRONTEND_URLS="false",
+            FRONTEND_URLS="https://ignored.example.net",
+        )
+    )
+
+    assert config.origins == ("https://app.example.com",)
+    assert config.rp_ids == ("app.example.com",)
+
+
+def test_derive_flag_does_not_enable_passkeys():
+    config = PasskeyConfig.from_environ(
+        {
+            "PASSKEY_DERIVE_FROM_FRONTEND_URLS": "true",
+            "FRONTEND_URLS": "https://ui.example.com",
+        }
+    )
+
+    assert config == PasskeyConfig(enabled=False)
+
+
+@pytest.mark.parametrize(
+    ("setting", "value"),
+    [
+        ("PASSKEY_RP_ID", ""),
+        ("PASSKEY_RP_ID", "ui.example.com"),
+        ("PASSKEY_RP_IDS", ""),
+        ("PASSKEY_RP_IDS", "ui.example.com"),
+        ("PASSKEY_ORIGINS", ""),
+        ("PASSKEY_ORIGINS", "https://ui.example.com"),
+    ],
+)
+def test_derive_from_frontend_urls_rejects_present_explicit_settings(
+    tmp_path, setting, value
+):
+    env = _derived_frontend_env(tmp_path)
+    env[setting] = value
+
+    with pytest.raises(PasskeyConfigurationError, match="must not be set"):
+        PasskeyConfig.from_environ(env)
+
+
+def test_derive_from_frontend_urls_requires_frontend_urls(tmp_path):
+    env = _derived_frontend_env(tmp_path)
+    env.pop("FRONTEND_URLS")
+
+    with pytest.raises(PasskeyConfigurationError, match="FRONTEND_URLS"):
+        PasskeyConfig.from_environ(env)
+
+
+@pytest.mark.parametrize(
+    "frontend_urls",
+    [
+        "",
+        " ",
+        ",https://ui.example.com",
+        "https://ui.example.com,",
+        "https://ui.example.com,,https://other.example.com",
+    ],
+)
+def test_derive_from_frontend_urls_rejects_empty_tokens(tmp_path, frontend_urls):
+    with pytest.raises(PasskeyConfigurationError, match="FRONTEND_URLS"):
+        PasskeyConfig.from_environ(
+            _derived_frontend_env(tmp_path, FRONTEND_URLS=frontend_urls)
+        )
+
+
+@pytest.mark.parametrize(
+    "frontend_urls",
+    [
+        "https://ui.example.com,https://ui.example.com/",
+        "https://ui.example.com:443,https://UI.example.com",
+        "https://b\u00fccher.com,https://xn--bcher-kva.com",
+    ],
+)
+def test_derive_from_frontend_urls_rejects_duplicate_normalized_origins(
+    tmp_path, frontend_urls
+):
+    with pytest.raises(PasskeyConfigurationError, match="duplicate"):
+        PasskeyConfig.from_environ(
+            _derived_frontend_env(tmp_path, FRONTEND_URLS=frontend_urls)
+        )
+
+
+@pytest.mark.parametrize(
+    "frontend_url",
+    [
+        "https://user:password@ui.example.com",
+        "https://ui.example.com/not-root",
+        "https://ui.example.com?query=yes",
+        "https://ui.example.com#fragment",
+        "https://*.example.com",
+        "http://ui.example.com",
+        "https://bad_label.example.com",
+    ],
+)
+def test_derive_from_frontend_urls_rejects_noncanonical_origins(tmp_path, frontend_url):
+    with pytest.raises(PasskeyConfigurationError) as exc_info:
+        PasskeyConfig.from_environ(
+            _derived_frontend_env(tmp_path, FRONTEND_URLS=frontend_url)
+        )
+
+    message = str(exc_info.value)
+    assert "FRONTEND_URLS" in message
+    assert "PASSKEY_ORIGINS" not in message
+
+
+def test_explicit_origin_validation_keeps_passkey_origins_error_label(tmp_path):
+    with pytest.raises(PasskeyConfigurationError) as exc_info:
+        PasskeyConfig.from_environ(
+            _enabled_env(
+                tmp_path,
+                PASSKEY_ORIGINS="https://user:password@ui.example.com",
+            )
+        )
+
+    assert str(exc_info.value) == (
+        "PASSKEY_ORIGINS entries must be exact origins without credentials, "
+        "paths, queries, or fragments"
+    )
 
 
 def test_plural_rp_ids_map_each_requested_origin(tmp_path):

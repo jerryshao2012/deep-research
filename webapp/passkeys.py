@@ -199,63 +199,77 @@ def _normalize_rp_id(value: str, setting_name: str = "PASSKEY_RP_IDS") -> str:
         raise PasskeyConfigurationError(str(exc)) from exc
 
 
-def _normalize_origin_hostname(hostname: str) -> tuple[str, str]:
+def _normalize_origin_hostname(
+    hostname: str, setting_name: str = "PASSKEY_ORIGINS"
+) -> tuple[str, str]:
     try:
         normalized = str(ipaddress.ip_address(hostname))
     except ValueError:
         trailing_dot = hostname.endswith(".")
-        normalized = _normalize_dns_name(hostname, "PASSKEY_ORIGINS")
+        normalized = _normalize_dns_name(hostname, setting_name)
         if _ends_in_numeric_label(normalized):
+            origin_label = (
+                "Passkey origin" if setting_name == "PASSKEY_ORIGINS" else setting_name
+            )
             raise PasskeyConfigurationError(
-                "Passkey origin contains a noncanonical IP address"
+                f"{origin_label} contains a noncanonical IP address"
             )
         serialized = f"{normalized}." if trailing_dot else normalized
         return normalized, serialized
     return normalized, normalized
 
 
-def _validate_origin(origin: str) -> tuple[str, str]:
+def _validate_origin(
+    origin: str, setting_name: str = "PASSKEY_ORIGINS"
+) -> tuple[str, str]:
     if len(origin) > 2_048:
         raise PasskeyConfigurationError(
-            "PASSKEY_ORIGINS entries must contain at most 2048 characters"
+            f"{setting_name} entries must contain at most 2048 characters"
         )
     parsed = urlsplit(origin)
     hostname = parsed.hostname
     configured_origin = f"{parsed.scheme}://{parsed.netloc}"
     if (
-            not parsed.scheme
-            or not parsed.netloc
-            or not hostname
-            or parsed.username is not None
-            or parsed.password is not None
-            or parsed.path not in {"", "/"}
-            or parsed.query
-            or parsed.fragment
-            or configured_origin.rstrip("/") != origin.rstrip("/")
+        not parsed.scheme
+        or not parsed.netloc
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+        or configured_origin.rstrip("/") != origin.rstrip("/")
     ):
         raise PasskeyConfigurationError(
-            "PASSKEY_ORIGINS entries must be exact origins without credentials, paths, queries, or fragments"
+            f"{setting_name} entries must be exact origins without credentials, paths, queries, or fragments"
         )
     if parsed.scheme != "https" and not (
-            parsed.scheme == "http" and _is_localhost(hostname)
+        parsed.scheme == "http" and _is_localhost(hostname)
     ):
         raise PasskeyConfigurationError(
-            "PASSKEY_ORIGINS must use HTTPS outside localhost"
+            f"{setting_name} must use HTTPS outside localhost"
         )
+    origin_label = (
+        "Passkey origin" if setting_name == "PASSKEY_ORIGINS" else setting_name
+    )
     try:
         port = parsed.port
     except ValueError as exc:
-        raise PasskeyConfigurationError("Passkey origin must use a valid port") from exc
+        raise PasskeyConfigurationError(
+            f"{origin_label} must use a valid port"
+        ) from exc
     if parsed.netloc.endswith(":"):
-        raise PasskeyConfigurationError("Passkey origin must use a valid port")
-    normalized_hostname, serialized_hostname = _normalize_origin_hostname(hostname)
+        raise PasskeyConfigurationError(f"{origin_label} must use a valid port")
+    normalized_hostname, serialized_hostname = _normalize_origin_hostname(
+        hostname, setting_name
+    )
     serialized_hostname = (
         f"[{normalized_hostname}]"
         if ":" in normalized_hostname
         else serialized_hostname
     )
     default_port = (parsed.scheme == "https" and port == 443) or (
-            parsed.scheme == "http" and port == 80
+        parsed.scheme == "http" and port == 80
     )
     port_suffix = f":{port}" if port is not None and not default_port else ""
     normalized_origin = f"{parsed.scheme}://{serialized_hostname}{port_suffix}"
@@ -352,58 +366,93 @@ class PasskeyConfig:
             values, "PASSKEY_AUTHENTICATED_RATE_LIMIT", 20
         )
         anonymous_limit = _positive_int(values, "PASSKEY_ANONYMOUS_RATE_LIMIT", 300)
-        plural_present = "PASSKEY_RP_IDS" in values
-        singular_present = "PASSKEY_RP_ID" in values
-        if plural_present and singular_present:
-            raise PasskeyConfigurationError(
-                "PASSKEY_RP_ID and PASSKEY_RP_IDS must not both be set"
+        derive_from_frontend_urls = _enabled(
+            values.get("PASSKEY_DERIVE_FROM_FRONTEND_URLS")
+        )
+        if derive_from_frontend_urls:
+            explicit_settings = (
+                "PASSKEY_RP_ID",
+                "PASSKEY_RP_IDS",
+                "PASSKEY_ORIGINS",
             )
-        if plural_present:
-            raw_rp_ids = values.get("PASSKEY_RP_IDS", "").split(",")
-            if any(not value.strip() for value in raw_rp_ids):
+            if any(name in values for name in explicit_settings):
                 raise PasskeyConfigurationError(
-                    "PASSKEY_RP_IDS must not contain empty entries"
+                    "PASSKEY_RP_ID, PASSKEY_RP_IDS, and PASSKEY_ORIGINS must not be set "
+                    "when PASSKEY_DERIVE_FROM_FRONTEND_URLS is enabled"
                 )
-            rp_ids = tuple(_normalize_rp_id(value) for value in raw_rp_ids)
-            if len(set(rp_ids)) != len(rp_ids):
+            frontend_values = values.get("FRONTEND_URLS", "").split(",")
+            if any(not value.strip() for value in frontend_values):
                 raise PasskeyConfigurationError(
-                    "PASSKEY_RP_IDS contains a duplicate RP ID after normalization"
+                    "FRONTEND_URLS must contain comma-separated origins without empty entries"
                 )
+            parsed_origins = tuple(
+                _validate_origin(value.strip(), "FRONTEND_URLS")
+                for value in frontend_values
+            )
+            normalized_origins = tuple(origin for origin, _hostname in parsed_origins)
+            if len(set(normalized_origins)) != len(normalized_origins):
+                raise PasskeyConfigurationError(
+                    "FRONTEND_URLS contains a duplicate origin after normalization"
+                )
+            origin_rp_ids = [
+                (origin, _normalize_rp_id(hostname, "FRONTEND_URLS"))
+                for origin, hostname in parsed_origins
+            ]
+            rp_ids = tuple(dict.fromkeys(rp_id for _origin, rp_id in origin_rp_ids))
         else:
-            raw_rp_id = values.get("PASSKEY_RP_ID", "")
-            if not raw_rp_id.strip():
-                raise PasskeyConfigurationError("PASSKEY_RP_ID is required")
-            rp_ids = (_normalize_rp_id(raw_rp_id, "PASSKEY_RP_ID"),)
+            plural_present = "PASSKEY_RP_IDS" in values
+            singular_present = "PASSKEY_RP_ID" in values
+            if plural_present and singular_present:
+                raise PasskeyConfigurationError(
+                    "PASSKEY_RP_ID and PASSKEY_RP_IDS must not both be set"
+                )
+            if plural_present:
+                raw_rp_ids = values.get("PASSKEY_RP_IDS", "").split(",")
+                if any(not value.strip() for value in raw_rp_ids):
+                    raise PasskeyConfigurationError(
+                        "PASSKEY_RP_IDS must not contain empty entries"
+                    )
+                rp_ids = tuple(_normalize_rp_id(value) for value in raw_rp_ids)
+                if len(set(rp_ids)) != len(rp_ids):
+                    raise PasskeyConfigurationError(
+                        "PASSKEY_RP_IDS contains a duplicate RP ID after normalization"
+                    )
+            else:
+                raw_rp_id = values.get("PASSKEY_RP_ID", "")
+                if not raw_rp_id.strip():
+                    raise PasskeyConfigurationError("PASSKEY_RP_ID is required")
+                rp_ids = (_normalize_rp_id(raw_rp_id, "PASSKEY_RP_ID"),)
         rp_name = (values.get("PASSKEY_RP_NAME") or "BMO Deep Agent").strip()
         if not rp_name or len(rp_name) > 200:
             raise PasskeyConfigurationError(
                 "PASSKEY_RP_NAME is required and must contain at most 200 characters"
             )
-        origin_values = [
-            value.strip()
-            for value in (values.get("PASSKEY_ORIGINS") or "").split(",")
-            if value.strip()
-        ]
-        if not origin_values:
-            raise PasskeyConfigurationError("PASSKEY_ORIGINS is required")
-        parsed_origins = tuple(_validate_origin(value) for value in origin_values)
-        origin_rp_ids: list[tuple[str, str]] = []
-        for origin, hostname in parsed_origins:
-            matches = tuple(
-                rp_id
-                for rp_id in rp_ids
-                if hostname == rp_id or hostname.endswith(f".{rp_id}")
-            )
-            if not matches:
-                raise PasskeyConfigurationError(
-                    "Every passkey origin must match a configured RP ID"
+        if not derive_from_frontend_urls:
+            origin_values = [
+                value.strip()
+                for value in (values.get("PASSKEY_ORIGINS") or "").split(",")
+                if value.strip()
+            ]
+            if not origin_values:
+                raise PasskeyConfigurationError("PASSKEY_ORIGINS is required")
+            parsed_origins = tuple(_validate_origin(value) for value in origin_values)
+            origin_rp_ids = []
+            for origin, hostname in parsed_origins:
+                matches = tuple(
+                    rp_id
+                    for rp_id in rp_ids
+                    if hostname == rp_id or hostname.endswith(f".{rp_id}")
                 )
-            origin_rp_ids.append((origin, max(matches, key=len)))
-        used_rp_ids = {rp_id for _origin, rp_id in origin_rp_ids}
-        if used_rp_ids != set(rp_ids):
-            raise PasskeyConfigurationError(
-                "Every passkey RP ID must be used by at least one origin"
-            )
+                if not matches:
+                    raise PasskeyConfigurationError(
+                        "Every passkey origin must match a configured RP ID"
+                    )
+                origin_rp_ids.append((origin, max(matches, key=len)))
+            used_rp_ids = {rp_id for _origin, rp_id in origin_rp_ids}
+            if used_rp_ids != set(rp_ids):
+                raise PasskeyConfigurationError(
+                    "Every passkey RP ID must be used by at least one origin"
+                )
 
         proxy_id = (values.get("PASSKEY_PROXY_ID") or "").strip()
         if not proxy_id or len(proxy_id) > 255:
