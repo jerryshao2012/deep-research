@@ -26,7 +26,9 @@ SECRET_NAMES = (
 )
 
 APP_QUERY = (
-    "{id:id,location:location,identity:identity,"
+    "{id:id,location:location,identity:{type:identity.type,"
+    "principalId:identity.principalId,tenantId:identity.tenantId,"
+    "userAssignedIdentities:identity.userAssignedIdentities},"
     "environmentId:properties.managedEnvironmentId,"
     "secretMetadata:properties.configuration.secrets[]."
     "{name:name,keyVaultUrl:keyVaultUrl,identity:identity},"
@@ -35,13 +37,18 @@ APP_QUERY = (
     "revisionSuffix:properties.template.revisionSuffix,"
     "latestRevisionName:properties.latestRevisionName,"
     "containers:properties.template.containers[]."
-    "{name:name,image:image,volumeMounts:volumeMounts},"
-    "volumes:properties.template.volumes}"
+    "{name:name,image:image,volumeMounts:volumeMounts[]."
+    "{volumeName:volumeName,mountPath:mountPath,subPath:subPath}},"
+    "volumes:properties.template.volumes[]."
+    "{name:name,storageName:storageName,storageType:storageType}}"
 )
 VAULT_QUERY = (
     "{id:id,location:location,"
     "enableRbacAuthorization:properties.enableRbacAuthorization,"
-    "accessPolicies:properties.accessPolicies}"
+    "accessPolicies:properties.accessPolicies[]."
+    "{tenantId:tenantId,objectId:objectId,applicationId:applicationId,"
+    "permissions:{certificates:permissions.certificates,keys:permissions.keys,"
+    "secrets:permissions.secrets,storage:permissions.storage}}}"
 )
 SECRET_QUERY = (
     "{id:id,attributes:{enabled:attributes.enabled,created:attributes.created,"
@@ -88,6 +95,21 @@ def _exact_keys(value: dict[str, Any], expected: set[str], label: str) -> None:
         raise SnapshotError(f"invalid {label} metadata schema")
 
 
+def _nullable_string_list(value: object, label: str) -> list[str]:
+    if value is None:
+        return []
+    result: list[str] = []
+    seen: set[str] = set()
+    for raw in _list(value, label):
+        item = _string(raw, label)
+        assert item is not None
+        if item.casefold() in seen:
+            raise SnapshotError(f"duplicate {label} metadata")
+        seen.add(item.casefold())
+        result.append(item)
+    return sorted(result, key=str.casefold)
+
+
 def _az_json(arguments: list[str], label: str) -> Any:
     result = subprocess.run(
         ["az", *arguments],
@@ -105,25 +127,59 @@ def _az_json(arguments: list[str], label: str) -> Any:
         ) from error
 
 
-def _principal_ids(identity: dict[str, Any], label: str) -> list[str]:
+def _normalize_identity(raw: object, label: str) -> tuple[dict[str, Any], list[str]]:
+    identity = _mapping(raw, f"{label} identity")
+    _exact_keys(
+        identity,
+        {"type", "principalId", "tenantId", "userAssignedIdentities"},
+        f"{label} identity",
+    )
     principals: set[str] = set()
     principal = identity.get("principalId")
     if principal is not None:
         principals.add(_string(principal, f"{label} principal") or "")
-    assigned = identity.get("userAssignedIdentities", {})
-    if not isinstance(assigned, dict):
-        raise SnapshotError(f"invalid {label} identity metadata")
+    assigned = _mapping(
+        identity.get("userAssignedIdentities"), f"{label} user-assigned identities"
+    )
+    normalized_assigned: list[dict[str, str | None]] = []
     for resource_id, metadata in assigned.items():
-        _string(resource_id, f"{label} identity resource ID")
+        normalized_resource_id = _string(resource_id, f"{label} identity resource ID")
         item = _mapping(metadata, f"{label} user-assigned identity")
-        assigned_principal = item.get("principalId")
-        if assigned_principal is not None:
-            principals.add(
-                _string(assigned_principal, f"{label} assigned principal") or ""
+        if set(item) not in (set(), {"clientId", "principalId"}):
+            raise SnapshotError(
+                f"invalid {label} user-assigned identity metadata schema"
             )
+        client_id = _string(
+            item.get("clientId"), f"{label} assigned client", nullable=True
+        )
+        assigned_principal = item.get("principalId")
+        normalized_principal = _string(
+            assigned_principal, f"{label} assigned principal", nullable=True
+        )
+        if assigned_principal is not None:
+            principals.add(normalized_principal or "")
+        normalized_assigned.append(
+            {
+                "resource_id": normalized_resource_id,
+                "client_id": client_id,
+                "principal_id": normalized_principal,
+            }
+        )
     if not principals:
         raise SnapshotError(f"{label} has no capturable identity principal metadata")
-    return sorted(principals)
+    normalized = {
+        "type": _string(identity["type"], f"{label} identity type"),
+        "principal_id": _string(
+            identity["principalId"], f"{label} principal", nullable=True
+        ),
+        "tenant_id": _string(
+            identity["tenantId"], f"{label} identity tenant", nullable=True
+        ),
+        "user_assigned": sorted(
+            normalized_assigned, key=lambda item: str(item["resource_id"]).casefold()
+        ),
+    }
+    return normalized, sorted(principals)
 
 
 def _normalize_named_metadata(
@@ -166,8 +222,7 @@ def _normalize_app(raw: object, label: str) -> tuple[dict[str, Any], list[str]]:
         },
         label,
     )
-    identity = _mapping(app["identity"], f"{label} identity")
-    principals = _principal_ids(identity, label)
+    identity, principals = _normalize_identity(app["identity"], label)
     containers = _list(app["containers"], f"{label} containers")
     images: list[str] = []
     mounts: list[dict[str, Any]] = []
@@ -180,11 +235,34 @@ def _normalize_app(raw: object, label: str) -> tuple[dict[str, Any], list[str]]:
         images.append(image)
         for raw_mount in _list(container["volumeMounts"] or [], f"{label} mounts"):
             mount = _mapping(raw_mount, f"{label} mount")
-            mounts.append({key: mount[key] for key in sorted(mount)})
+            _exact_keys(mount, {"volumeName", "mountPath", "subPath"}, f"{label} mount")
+            mounts.append(
+                {
+                    "container_name": container_name,
+                    "volume_name": _string(
+                        mount["volumeName"], f"{label} mount volume"
+                    ),
+                    "mount_path": _string(mount["mountPath"], f"{label} mount path"),
+                    "sub_path": _string(
+                        mount["subPath"], f"{label} mount subpath", nullable=True
+                    ),
+                }
+            )
     volumes = []
     for raw_volume in _list(app["volumes"] or [], f"{label} volumes"):
         volume = _mapping(raw_volume, f"{label} volume")
-        volumes.append({key: volume[key] for key in sorted(volume) if key != "secrets"})
+        _exact_keys(volume, {"name", "storageName", "storageType"}, f"{label} volume")
+        volumes.append(
+            {
+                "name": _string(volume["name"], f"{label} volume name"),
+                "storage_name": _string(
+                    volume["storageName"], f"{label} storage name", nullable=True
+                ),
+                "storage_type": _string(
+                    volume["storageType"], f"{label} storage type", nullable=True
+                ),
+            }
+        )
     normalized = {
         "id": _string(app["id"], f"{label} resource ID"),
         "location": _string(app["location"], f"{label} location"),
@@ -225,6 +303,7 @@ def _normalize_app(raw: object, label: str) -> tuple[dict[str, Any], list[str]]:
 
 def _normalize_roles(raw: object) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
+    seen: set[str] = set()
     keys = {
         "id",
         "principalId",
@@ -236,6 +315,11 @@ def _normalize_roles(raw: object) -> list[dict[str, Any]]:
     for raw_role in _list(raw, "role assignments"):
         role = _mapping(raw_role, "role assignment")
         _exact_keys(role, keys, "role assignment")
+        role_id = _string(role["id"], "role assignment id")
+        assert role_id is not None
+        if role_id.casefold() in seen:
+            raise SnapshotError("duplicate role assignment metadata")
+        seen.add(role_id.casefold())
         result.append(
             {
                 key: _string(
@@ -247,6 +331,93 @@ def _normalize_roles(raw: object) -> list[dict[str, Any]]:
             }
         )
     return sorted(result, key=lambda item: str(item["id"]).casefold())
+
+
+def _normalize_access_policies(raw: object) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    seen: set[tuple[str, str | None]] = set()
+    for raw_policy in _list(raw, "Key Vault access policies"):
+        policy = _mapping(raw_policy, "Key Vault access policy")
+        _exact_keys(
+            policy,
+            {"tenantId", "objectId", "applicationId", "permissions"},
+            "Key Vault access policy",
+        )
+        tenant_id = _string(policy["tenantId"], "Key Vault policy tenant")
+        object_id = _string(policy["objectId"], "Key Vault policy object")
+        application_id = _string(
+            policy["applicationId"], "Key Vault policy application", nullable=True
+        )
+        assert tenant_id is not None and object_id is not None
+        identity = (
+            object_id.casefold(),
+            application_id.casefold() if application_id else None,
+        )
+        if identity in seen:
+            raise SnapshotError("duplicate Key Vault access policy metadata")
+        seen.add(identity)
+        permissions = _mapping(policy["permissions"], "Key Vault policy permissions")
+        _exact_keys(
+            permissions,
+            {"certificates", "keys", "secrets", "storage"},
+            "Key Vault policy permissions",
+        )
+        result.append(
+            {
+                "tenant_id": tenant_id,
+                "object_id": object_id,
+                "application_id": application_id,
+                "permissions": {
+                    name: _nullable_string_list(
+                        permissions[name], f"Key Vault policy {name} permission"
+                    )
+                    for name in ("certificates", "keys", "secrets", "storage")
+                },
+            }
+        )
+    return sorted(
+        result,
+        key=lambda item: (
+            str(item["object_id"]).casefold(),
+            str(item["application_id"] or "").casefold(),
+        ),
+    )
+
+
+def _normalize_environment_storage(raw: object) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw_item in _list(raw, "environment storage"):
+        item = _mapping(raw_item, "environment storage")
+        _exact_keys(item, {"name", "azureFile"}, "environment storage")
+        name = _string(item["name"], "environment storage name")
+        assert name is not None
+        if name.casefold() in seen:
+            raise SnapshotError("duplicate environment storage metadata")
+        seen.add(name.casefold())
+        azure_file = _mapping(item["azureFile"], "environment Azure Files binding")
+        _exact_keys(
+            azure_file,
+            {"accountName", "shareName", "accessMode"},
+            "environment Azure Files binding",
+        )
+        result.append(
+            {
+                "name": name,
+                "azure_file": {
+                    "account_name": _string(
+                        azure_file["accountName"], "environment storage account"
+                    ),
+                    "share_name": _string(
+                        azure_file["shareName"], "environment storage share"
+                    ),
+                    "access_mode": _string(
+                        azure_file["accessMode"], "environment storage access mode"
+                    ),
+                },
+            }
+        )
+    return sorted(result, key=lambda item: str(item["name"]).casefold())
 
 
 def _arm_name(resource_id: str, resource_type: str) -> tuple[str, str]:
@@ -310,11 +481,7 @@ def _capture(arguments: argparse.Namespace) -> dict[str, Any]:
     )
     if not isinstance(vault_raw["enableRbacAuthorization"], bool):
         raise SnapshotError("invalid Key Vault RBAC metadata")
-    policies = _list(vault_raw["accessPolicies"] or [], "Key Vault access policies")
-    normalized_policies = sorted(
-        (_mapping(policy, "Key Vault access policy") for policy in policies),
-        key=lambda policy: json.dumps(policy, sort_keys=True),
-    )
+    normalized_policies = _normalize_access_policies(vault_raw["accessPolicies"] or [])
     secrets: list[dict[str, Any]] = []
     for secret_name in SECRET_NAMES:
         raw_secret = _mapping(
@@ -349,12 +516,26 @@ def _capture(arguments: argparse.Namespace) -> dict[str, Any]:
             {"enabled", "created", "updated", "recoveryLevel"},
             "secret attributes",
         )
+        if not isinstance(attributes["enabled"], bool):
+            raise SnapshotError("invalid secret enabled metadata schema")
+        normalized_attributes = {
+            "enabled": attributes["enabled"],
+            "created": _string(
+                attributes["created"], "secret created timestamp", nullable=True
+            ),
+            "updated": _string(
+                attributes["updated"], "secret updated timestamp", nullable=True
+            ),
+            "recovery_level": _string(
+                attributes["recoveryLevel"], "secret recovery level", nullable=True
+            ),
+        }
         secrets.append(
             {
                 "name": secret_name,
                 "id": secret_id,
                 "version": version,
-                "attributes": attributes,
+                "attributes": normalized_attributes,
             }
         )
 
@@ -381,6 +562,8 @@ def _capture(arguments: argparse.Namespace) -> dict[str, Any]:
             )
         )
     roles.sort(key=lambda item: str(item["id"]).casefold())
+    if len({str(role["id"]).casefold() for role in roles}) != len(roles):
+        raise SnapshotError("duplicate role assignment metadata")
 
     environment_ids = {str(app["environment_id"]) for app in apps.values()}
     if len(environment_ids) != 1:
@@ -428,13 +611,7 @@ def _capture(arguments: argparse.Namespace) -> dict[str, Any]:
         ],
         "Container Apps environment storage",
     )
-    normalized_storage = sorted(
-        (
-            _mapping(item, "environment storage")
-            for item in _list(storage, "environment storage")
-        ),
-        key=lambda item: json.dumps(item, sort_keys=True),
-    )
+    normalized_storage = _normalize_environment_storage(storage)
     return {
         "schema_version": 1,
         "apps": apps,
@@ -477,6 +654,255 @@ def _write_atomic(path: Path, payload: dict[str, Any]) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _require_canonical(actual: object, normalized: object, label: str) -> None:
+    if actual != normalized:
+        raise SnapshotError(f"invalid {label} metadata schema")
+
+
+def _validate_snapshot_identity(raw: object, label: str) -> None:
+    identity = _mapping(raw, label)
+    _exact_keys(
+        identity,
+        {"type", "principal_id", "tenant_id", "user_assigned"},
+        label,
+    )
+    _string(identity["type"], f"{label} type")
+    _string(identity["principal_id"], f"{label} principal", nullable=True)
+    _string(identity["tenant_id"], f"{label} tenant", nullable=True)
+    assigned = _list(identity["user_assigned"], f"{label} user assigned")
+    normalized: list[dict[str, str | None]] = []
+    seen: set[str] = set()
+    for raw_item in assigned:
+        item = _mapping(raw_item, f"{label} user assigned")
+        _exact_keys(
+            item,
+            {"resource_id", "client_id", "principal_id"},
+            f"{label} user assigned",
+        )
+        resource_id = _string(item["resource_id"], f"{label} resource ID")
+        assert resource_id is not None
+        if resource_id.casefold() in seen:
+            raise SnapshotError(f"duplicate {label} user-assigned metadata")
+        seen.add(resource_id.casefold())
+        normalized.append(
+            {
+                "resource_id": resource_id,
+                "client_id": _string(
+                    item["client_id"], f"{label} client", nullable=True
+                ),
+                "principal_id": _string(
+                    item["principal_id"], f"{label} principal", nullable=True
+                ),
+            }
+        )
+    normalized.sort(key=lambda item: str(item["resource_id"]).casefold())
+    _require_canonical(assigned, normalized, f"{label} user assigned")
+
+
+def _validate_snapshot_storage_bindings(raw: object, label: str) -> None:
+    storage = _mapping(raw, label)
+    _exact_keys(storage, {"volume_mounts", "volumes"}, label)
+    mounts = _list(storage["volume_mounts"], f"{label} volume mounts")
+    normalized_mounts: list[dict[str, str | None]] = []
+    seen_mounts: set[tuple[str, str]] = set()
+    for raw_mount in mounts:
+        mount = _mapping(raw_mount, f"{label} volume mount")
+        _exact_keys(
+            mount,
+            {"container_name", "volume_name", "mount_path", "sub_path"},
+            f"{label} volume mount",
+        )
+        container_name = _string(mount["container_name"], f"{label} mount container")
+        volume_name = _string(mount["volume_name"], f"{label} mount volume")
+        assert container_name is not None and volume_name is not None
+        mount_key = (container_name.casefold(), volume_name.casefold())
+        if mount_key in seen_mounts:
+            raise SnapshotError(f"duplicate {label} volume mount metadata")
+        seen_mounts.add(mount_key)
+        normalized_mounts.append(
+            {
+                "container_name": container_name,
+                "volume_name": volume_name,
+                "mount_path": _string(mount["mount_path"], f"{label} mount path"),
+                "sub_path": _string(
+                    mount["sub_path"], f"{label} mount subpath", nullable=True
+                ),
+            }
+        )
+    normalized_mounts.sort(key=lambda item: json.dumps(item, sort_keys=True))
+    _require_canonical(mounts, normalized_mounts, f"{label} volume mounts")
+    volumes = _list(storage["volumes"], f"{label} volumes")
+    normalized_volumes: list[dict[str, str | None]] = []
+    seen_volumes: set[str] = set()
+    for raw_volume in volumes:
+        volume = _mapping(raw_volume, f"{label} volume")
+        _exact_keys(volume, {"name", "storage_name", "storage_type"}, f"{label} volume")
+        name = _string(volume["name"], f"{label} volume name")
+        assert name is not None
+        if name.casefold() in seen_volumes:
+            raise SnapshotError(f"duplicate {label} volume metadata")
+        seen_volumes.add(name.casefold())
+        normalized_volumes.append(
+            {
+                "name": name,
+                "storage_name": _string(
+                    volume["storage_name"], f"{label} storage name", nullable=True
+                ),
+                "storage_type": _string(
+                    volume["storage_type"], f"{label} storage type", nullable=True
+                ),
+            }
+        )
+    normalized_volumes.sort(key=lambda item: json.dumps(item, sort_keys=True))
+    _require_canonical(volumes, normalized_volumes, f"{label} volumes")
+
+
+def _validate_snapshot_policies(raw: object) -> None:
+    policies = _list(raw, "snapshot Key Vault access policies")
+    normalized: list[dict[str, Any]] = []
+    seen: set[tuple[str, str | None]] = set()
+    for raw_policy in policies:
+        policy = _mapping(raw_policy, "snapshot Key Vault access policy")
+        _exact_keys(
+            policy,
+            {"tenant_id", "object_id", "application_id", "permissions"},
+            "snapshot Key Vault access policy",
+        )
+        tenant_id = _string(policy["tenant_id"], "snapshot policy tenant")
+        object_id = _string(policy["object_id"], "snapshot policy object")
+        application_id = _string(
+            policy["application_id"], "snapshot policy application", nullable=True
+        )
+        assert object_id is not None
+        key = (
+            object_id.casefold(),
+            application_id.casefold() if application_id else None,
+        )
+        if key in seen:
+            raise SnapshotError("duplicate snapshot Key Vault policy metadata")
+        seen.add(key)
+        permissions = _mapping(policy["permissions"], "snapshot policy permissions")
+        _exact_keys(
+            permissions,
+            {"certificates", "keys", "secrets", "storage"},
+            "snapshot policy permissions",
+        )
+        normalized.append(
+            {
+                "tenant_id": tenant_id,
+                "object_id": object_id,
+                "application_id": application_id,
+                "permissions": {
+                    name: _nullable_string_list(
+                        permissions[name], f"snapshot policy {name} permission"
+                    )
+                    for name in ("certificates", "keys", "secrets", "storage")
+                },
+            }
+        )
+    normalized.sort(
+        key=lambda item: (
+            str(item["object_id"]).casefold(),
+            str(item["application_id"] or "").casefold(),
+        )
+    )
+    _require_canonical(policies, normalized, "snapshot Key Vault access policies")
+
+
+def _validate_snapshot_environment_storage(raw: object) -> None:
+    storage = _list(raw, "snapshot environment storage")
+    normalized: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw_item in storage:
+        item = _mapping(raw_item, "snapshot environment storage")
+        _exact_keys(item, {"name", "azure_file"}, "snapshot environment storage")
+        name = _string(item["name"], "snapshot environment storage name")
+        assert name is not None
+        if name.casefold() in seen:
+            raise SnapshotError("duplicate snapshot environment storage metadata")
+        seen.add(name.casefold())
+        azure_file = _mapping(item["azure_file"], "snapshot Azure Files binding")
+        _exact_keys(
+            azure_file,
+            {"account_name", "share_name", "access_mode"},
+            "snapshot Azure Files binding",
+        )
+        normalized.append(
+            {
+                "name": name,
+                "azure_file": {
+                    "account_name": _string(
+                        azure_file["account_name"], "snapshot storage account"
+                    ),
+                    "share_name": _string(
+                        azure_file["share_name"], "snapshot storage share"
+                    ),
+                    "access_mode": _string(
+                        azure_file["access_mode"], "snapshot storage access mode"
+                    ),
+                },
+            }
+        )
+    normalized.sort(key=lambda item: str(item["name"]).casefold())
+    _require_canonical(storage, normalized, "snapshot environment storage")
+
+
+def _validate_snapshot_secrets(raw: object) -> None:
+    secrets = _list(raw, "snapshot Key Vault secrets")
+    normalized: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw_secret in secrets:
+        secret = _mapping(raw_secret, "snapshot Key Vault secret")
+        _exact_keys(
+            secret, {"name", "id", "version", "attributes"}, "snapshot Key Vault secret"
+        )
+        name = _string(secret["name"], "snapshot Key Vault secret name")
+        secret_id = _string(secret["id"], "snapshot Key Vault secret ID")
+        version = _string(secret["version"], "snapshot Key Vault secret version")
+        assert name is not None
+        if name.casefold() in seen:
+            raise SnapshotError("duplicate snapshot Key Vault secret metadata")
+        seen.add(name.casefold())
+        attributes = _mapping(secret["attributes"], "snapshot secret attributes")
+        _exact_keys(
+            attributes,
+            {"enabled", "created", "updated", "recovery_level"},
+            "snapshot secret attributes",
+        )
+        if not isinstance(attributes["enabled"], bool):
+            raise SnapshotError("invalid snapshot secret enabled metadata schema")
+        normalized.append(
+            {
+                "name": name,
+                "id": secret_id,
+                "version": version,
+                "attributes": {
+                    "enabled": attributes["enabled"],
+                    "created": _string(
+                        attributes["created"], "snapshot secret created", nullable=True
+                    ),
+                    "updated": _string(
+                        attributes["updated"], "snapshot secret updated", nullable=True
+                    ),
+                    "recovery_level": _string(
+                        attributes["recovery_level"],
+                        "snapshot secret recovery level",
+                        nullable=True,
+                    ),
+                },
+            }
+        )
+    normalized.sort(key=lambda item: str(item["name"]).casefold())
+    _require_canonical(secrets, normalized, "snapshot Key Vault secrets")
+    if {str(item["name"]) for item in normalized} != set(SECRET_NAMES):
+        raise SnapshotError("invalid snapshot Key Vault secret set metadata schema")
+
+
+def _validate_snapshot_roles(raw: object) -> None:
+    roles = _normalize_roles(raw)
+    _require_canonical(raw, roles, "snapshot role assignments")
+
+
 def _load_snapshot(path: Path) -> dict[str, Any]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -517,29 +943,53 @@ def _load_snapshot(path: Path) -> dict[str, Any]:
         _string(app["id"], f"snapshot {label} resource ID")
         _string(app["location"], f"snapshot {label} location")
         _string(app["environment_id"], f"snapshot {label} environment")
-        _mapping(app["identity"], f"snapshot {label} identity")
-        _list(app["secret_references"], f"snapshot {label} secret references")
-        _list(app["registries"], f"snapshot {label} registries")
-        storage = _mapping(app["storage_bindings"], f"snapshot {label} storage")
-        _exact_keys(
-            storage,
-            {"volume_mounts", "volumes"},
-            f"snapshot {label} storage",
+        _validate_snapshot_identity(app["identity"], f"snapshot {label} identity")
+        secret_references = _normalize_named_metadata(
+            app["secret_references"],
+            {"name", "keyVaultUrl", "identity"},
+            "name",
+            f"snapshot {label} secret reference",
         )
-        _list(storage["volume_mounts"], f"snapshot {label} volume mounts")
-        _list(storage["volumes"], f"snapshot {label} volumes")
+        _require_canonical(
+            app["secret_references"],
+            secret_references,
+            f"snapshot {label} secret references",
+        )
+        registries = _normalize_named_metadata(
+            app["registries"],
+            {"server", "username", "passwordSecretRef"},
+            "server",
+            f"snapshot {label} registry",
+        )
+        _require_canonical(
+            app["registries"], registries, f"snapshot {label} registries"
+        )
+        _validate_snapshot_storage_bindings(
+            app["storage_bindings"], f"snapshot {label} storage"
+        )
         deployment = _mapping(app.get("deployment"), f"snapshot {label} deployment")
         _exact_keys(
             deployment,
             {"revision_suffix", "latest_revision_name", "images"},
             f"snapshot {label} deployment",
         )
-        _list(deployment["images"], f"snapshot {label} images")
+        _string(
+            deployment["revision_suffix"],
+            f"snapshot {label} revision suffix",
+            nullable=True,
+        )
+        _string(
+            deployment["latest_revision_name"],
+            f"snapshot {label} latest revision",
+            nullable=True,
+        )
+        images = _nullable_string_list(deployment["images"], f"snapshot {label} image")
+        _require_canonical(deployment["images"], images, f"snapshot {label} images")
     environment = _mapping(snapshot["azure_environment"], "snapshot environment")
     _exact_keys(environment, {"id", "location", "storage"}, "snapshot environment")
     _string(environment["id"], "snapshot environment ID")
     _string(environment["location"], "snapshot environment location")
-    _list(environment["storage"], "snapshot environment storage")
+    _validate_snapshot_environment_storage(environment["storage"])
     vault = _mapping(snapshot["key_vault"], "snapshot Key Vault")
     _exact_keys(
         vault,
@@ -550,9 +1000,9 @@ def _load_snapshot(path: Path) -> dict[str, Any]:
     _string(vault["location"], "snapshot Key Vault location")
     if not isinstance(vault["rbac_enabled"], bool):
         raise SnapshotError("invalid snapshot Key Vault RBAC metadata schema")
-    _list(vault["access_policies"], "snapshot Key Vault access policies")
-    _list(vault["secrets"], "snapshot Key Vault secrets")
-    _list(snapshot["role_assignments"], "snapshot role assignments")
+    _validate_snapshot_policies(vault["access_policies"])
+    _validate_snapshot_secrets(vault["secrets"])
+    _validate_snapshot_roles(snapshot["role_assignments"])
     return snapshot
 
 

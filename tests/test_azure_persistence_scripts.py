@@ -3152,7 +3152,7 @@ json.dump(payload, sys.stdout)
 
 
 def _run_snapshot_capture(
-    tmp_path: Path, output: Path
+    tmp_path: Path, output: Path, *, backend_app: dict | None = None
 ) -> tuple[subprocess.CompletedProcess[str], Path]:
     bin_dir, argv_log = _install_snapshot_fake_az(tmp_path)
     env = os.environ.copy()
@@ -3161,7 +3161,9 @@ def _run_snapshot_capture(
             "PATH": f"{bin_dir}:{env['PATH']}",
             "FAKE_AZ_ARGV_LOG": str(argv_log),
             "FAKE_APP_DEMO_API": json.dumps(
-                _snapshot_fake_app("demo-api", "backend-principal")
+                backend_app
+                if backend_app is not None
+                else _snapshot_fake_app("demo-api", "backend-principal")
             ),
             "FAKE_APP_DEMO_UI": json.dumps(
                 _snapshot_fake_app("demo-ui", "ui-principal")
@@ -3261,6 +3263,20 @@ def test_azure_metadata_snapshot_capture_rejects_malformed_query_output(tmp_path
     assert "{bad json" not in result.stdout + result.stderr
 
 
+def test_azure_metadata_snapshot_capture_rejects_unapproved_nested_identity_key(
+    tmp_path,
+):
+    output = tmp_path / "before.json"
+    backend = _snapshot_fake_app("demo-api", "backend-principal")
+    backend["identity"]["value"] = "secret-canary"
+
+    result, _ = _run_snapshot_capture(tmp_path, output, backend_app=backend)
+
+    assert result.returncode == 2
+    assert not output.exists()
+    assert "secret-canary" not in result.stdout + result.stderr
+
+
 def test_azure_metadata_snapshot_compare_ignores_only_revision_and_image(tmp_path):
     before = tmp_path / "before.json"
     capture, _ = _run_snapshot_capture(tmp_path, before)
@@ -3338,3 +3354,63 @@ def test_azure_metadata_snapshot_compare_rejects_malformed_protected_schema(tmp_
 
     assert result.returncode == 2
     assert "schema" in result.stderr.lower()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda payload: payload["apps"]["backend"].__setitem__(
+            "identity", {"value": "secret-canary"}
+        ),
+        lambda payload: payload["azure_environment"]["storage"][0].__setitem__(
+            "accountKey", "secret-canary"
+        ),
+        lambda payload: payload["key_vault"]["access_policies"].append(
+            {"value": "secret-canary"}
+        ),
+        lambda payload: payload["key_vault"]["secrets"][0]["attributes"].__setitem__(
+            "value", "secret-canary"
+        ),
+        lambda payload: payload["role_assignments"].append(
+            payload["role_assignments"][0].copy()
+        ),
+    ],
+    ids=(
+        "identity-value",
+        "storage-extra",
+        "policy-malformed",
+        "secret-attribute-value",
+        "duplicate-role",
+    ),
+)
+def test_azure_metadata_snapshot_compare_rejects_identically_malformed_nested_schema(
+    tmp_path, mutation
+):
+    captured = tmp_path / "captured.json"
+    result, _ = _run_snapshot_capture(tmp_path, captured)
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(captured.read_text(encoding="utf-8"))
+    mutation(payload)
+    before = tmp_path / "before.json"
+    after = tmp_path / "after.json"
+    before.write_text(json.dumps(payload), encoding="utf-8")
+    after.write_text(json.dumps(payload), encoding="utf-8")
+
+    compared = subprocess.run(
+        [
+            sys.executable,
+            str(AZURE_METADATA_SNAPSHOT),
+            "compare",
+            "--before",
+            str(before),
+            "--after",
+            str(after),
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert compared.returncode == 2
+    assert "schema" in compared.stderr.lower() or "duplicate" in compared.stderr.lower()
+    assert "secret-canary" not in compared.stdout + compared.stderr
