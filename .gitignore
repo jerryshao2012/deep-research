@@ -67,6 +67,7 @@ setup.md
 .langgraph_api/
 .build_version
 .container-build-context.*
+.resolved-azure-endpoints.json
 
 # Project data
 docs/
