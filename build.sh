@@ -67,8 +67,8 @@ echo "🚀 Starting Deep Research Agent build..."
 
 # 1. Set Azure Subscription
 start_step "Set Azure Subscription"
-AZURE_SUBSCRIPTION_ID="66fadccd-d26d-4dd0-b108-46b3c581cdb3"
-if az account set --subscription $AZURE_SUBSCRIPTION_ID 2>/dev/null; then
+: "${AZURE_SUBSCRIPTION_ID:?Set AZURE_SUBSCRIPTION_ID in env.sh}"
+if az account set --subscription "$AZURE_SUBSCRIPTION_ID" 2>/dev/null; then
   echo "✅ Subscription set to $AZURE_SUBSCRIPTION_ID"
 else
   echo "⚠️  Warning: Could not set Azure subscription $AZURE_SUBSCRIPTION_ID."

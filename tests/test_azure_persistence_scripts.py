@@ -10,6 +10,23 @@ from research_agent import azure_storage
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
+@pytest.mark.parametrize("script_name", ["build.sh", "deploy.sh"])
+def test_azure_script_uses_configured_subscription_id(script_name: str) -> None:
+    source = (PROJECT_ROOT / script_name).read_text(encoding="utf-8")
+
+    assert ': "${AZURE_SUBSCRIPTION_ID:?Set AZURE_SUBSCRIPTION_ID in env.sh}"' in source
+    assert 'az account set --subscription "$AZURE_SUBSCRIPTION_ID"' in source
+    assert 'AZURE_SUBSCRIPTION_ID="66fadccd-d26d-4dd0-b108-46b3c581cdb3"' not in source
+
+
+def test_azure_deploy_uses_configured_global_resource_names() -> None:
+    source = (PROJECT_ROOT / "deploy.sh").read_text(encoding="utf-8")
+
+    assert ': "${KV_NAME:?Set KV_NAME in env.sh}"' in source
+    assert ': "${STORAGE_ACCOUNT_NAME:?Set STORAGE_ACCOUNT_NAME in env.sh}"' in source
+    assert 'STORAGE_ACCOUNT_NAME="stdeepagents"' not in source
+
+
 def test_azure_build_stages_context_without_git_metadata() -> None:
     source = (PROJECT_ROOT / "build.sh").read_text(encoding="utf-8")
 

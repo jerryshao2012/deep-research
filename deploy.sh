@@ -71,6 +71,8 @@ done
 
 # Configuration
 source ./env.sh
+: "${KV_NAME:?Set KV_NAME in env.sh}"
+: "${STORAGE_ACCOUNT_NAME:?Set STORAGE_ACCOUNT_NAME in env.sh}"
 
 echo "🚀 Starting Deep Research Agent deployment (using existing image)..."
 
@@ -88,8 +90,8 @@ echo "✅ Using Docker Hub user: $DOCKER_HUB_USERNAME"
 
 # 1. Set Azure Subscription
 start_step "Set Azure Subscription"
-AZURE_SUBSCRIPTION_ID="66fadccd-d26d-4dd0-b108-46b3c581cdb3"
-az account set --subscription $AZURE_SUBSCRIPTION_ID
+: "${AZURE_SUBSCRIPTION_ID:?Set AZURE_SUBSCRIPTION_ID in env.sh}"
+az account set --subscription "$AZURE_SUBSCRIPTION_ID"
 echo "✅ Subscription set to $AZURE_SUBSCRIPTION_ID"
 end_step
 
@@ -175,7 +177,6 @@ end_step
 start_step "Persistent Storage Setup"
 echo ""
 echo "📦 Setting up Azure Blob Storage container..."
-STORAGE_ACCOUNT_NAME="stdeepagents"
 BLOB_CONTAINER_NAME="deep-research-blobs"
 SQLITE_FILE_SHARE_NAME="deep-research-auth"
 SQLITE_ENV_STORAGE_NAME="authsqlite"
