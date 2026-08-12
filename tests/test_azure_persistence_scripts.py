@@ -3,16 +3,24 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 from research_agent import azure_storage
+from scripts import sanitize_passkey_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 RESOLVER = PROJECT_ROOT / "scripts/resolve_azure_endpoints.sh"
+SANITIZER = PROJECT_ROOT / "scripts/sanitize_passkey_dotenv.py"
+CONFIG_MERGER = PROJECT_ROOT / "scripts/merge_azure_containerapp_config.py"
+CONFIG_RENDERER = PROJECT_ROOT / "scripts/render_azure_containerapp_config.py"
+DOCKER_CREDENTIALS = PROJECT_ROOT / "scripts/load_docker_credentials.py"
 METADATA_NAME = ".resolved-azure-endpoints.json"
 RESOLVER_ENV = {
     "AZURE_SUBSCRIPTION_ID": "00000000-1111-2222-3333-444444444444",
@@ -131,6 +139,300 @@ def _read_az_calls(argv_log: Path) -> list[list[str]]:
     if not argv_log.exists():
         return []
     return [json.loads(line) for line in argv_log.read_text().splitlines()]
+
+
+def _run_sanitizer(*args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, str(SANITIZER), *args],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def test_passkey_dotenv_check_accepts_only_files_without_protected_keys(tmp_path):
+    dotenv = tmp_path / "backend.env"
+    dotenv.write_bytes(b"OTHER=kept\r\n# comment\r\nEMPTY=\r\n")
+
+    result = _run_sanitizer("--input", str(dotenv), "--check")
+
+    assert result.returncode == 0
+    assert result.stdout == ""
+    assert result.stderr == ""
+    assert dotenv.read_bytes() == b"OTHER=kept\r\n# comment\r\nEMPTY=\r\n"
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "PASSKEY_PROXY_SECRET",
+        "FRONTEND_URLS",
+        "PASSKEY_ORIGINS",
+        "PASSKEY_RP_ID",
+        "PASSKEY_RP_IDS",
+        "PASSKEY_DERIVE_FROM_FRONTEND_URLS",
+        "PASSKEY_ENABLED",
+        "PASSKEY_PROXY_ID",
+    ],
+)
+def test_passkey_dotenv_check_rejects_protected_keys_without_leaking_values(
+    tmp_path, key
+):
+    dotenv = tmp_path / "backend.env"
+    canary = "never-print-this-canary"
+    dotenv.write_text(f'{key}="{canary}"\nOTHER=ok\n', encoding="utf-8")
+
+    result = _run_sanitizer("--input", str(dotenv), "--check")
+
+    assert result.returncode == 2
+    assert key in result.stderr
+    assert canary not in result.stdout + result.stderr
+    assert dotenv.read_text(encoding="utf-8") == f'{key}="{canary}"\nOTHER=ok\n'
+
+
+def test_passkey_dotenv_sanitize_preserves_unrelated_bytes_newlines_and_mode(tmp_path):
+    dotenv = tmp_path / "backend.env"
+    original = (
+        b"# private configuration\r\n"
+        b"UNCHANGED = ' spaced # value ' # keep this comment\r\n"
+        b"PASSKEY_ORIGINS=https://old.example.test\r\n"
+        b"PASSKEY_RP_IDS=old.example.test\r\n"
+        b"LAST=kept"
+    )
+    expected = (
+        b"# private configuration\r\n"
+        b"UNCHANGED = ' spaced # value ' # keep this comment\r\n"
+        b"LAST=kept"
+    )
+    dotenv.write_bytes(original)
+    dotenv.chmod(0o640)
+
+    result = _run_sanitizer("--input", str(dotenv), "--sanitize")
+
+    assert result.returncode == 0
+    assert result.stdout == ""
+    assert result.stderr == ""
+    assert dotenv.read_bytes() == expected
+    assert stat.S_IMODE(dotenv.stat().st_mode) == 0o640
+    assert not list(tmp_path.glob(f".{dotenv.name}.sanitize.*"))
+
+
+def test_passkey_dotenv_sanitize_captures_proxy_secret_securely(tmp_path):
+    dotenv = tmp_path / "backend.env"
+    capture = tmp_path / "passkey-secret"
+    canary = "old-secret-canary"
+    dotenv.write_text(
+        f"PASSKEY_PROXY_SECRET='{canary}'\nOTHER=value\n", encoding="utf-8"
+    )
+
+    result = _run_sanitizer(
+        "--input",
+        str(dotenv),
+        "--sanitize",
+        "--capture-secret-to",
+        str(capture),
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == ""
+    assert result.stderr == ""
+    assert dotenv.read_bytes() == b"OTHER=value\n"
+    assert capture.read_bytes() == canary.encode()
+    assert stat.S_IMODE(capture.stat().st_mode) == 0o600
+    assert canary not in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        b"PASSKEY_PROXY_SECRET=one\nPASSKEY_PROXY_SECRET=two\n",
+        b"PASSKEY_PROXY_SECRET\nOTHER=kept\n",
+        b"PASSKEY_PROXY_SECRET=$(unsafe-command)\nOTHER=kept\n",
+        b"OTHER=$(unsafe-command)\nPASSKEY_ORIGINS=https://old.test\n",
+        b"PASSKEY_ORIGINS=one\\\ntwo\n",
+        b"OTHER=one\nOTHER=two\n",
+    ],
+)
+def test_passkey_dotenv_sanitize_rejects_duplicate_or_ambiguous_syntax_atomically(
+    tmp_path, content
+):
+    dotenv = tmp_path / "backend.env"
+    dotenv.write_bytes(content)
+    dotenv.chmod(0o640)
+
+    result = _run_sanitizer("--input", str(dotenv), "--sanitize")
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert dotenv.read_bytes() == content
+    assert stat.S_IMODE(dotenv.stat().st_mode) == 0o640
+    assert not list(tmp_path.glob(f".{dotenv.name}.sanitize.*"))
+
+
+def test_passkey_dotenv_sanitize_capture_failure_leaves_input_unchanged(tmp_path):
+    dotenv = tmp_path / "backend.env"
+    capture = tmp_path / "already-exists"
+    original = b"PASSKEY_PROXY_SECRET=secret-canary\nOTHER=value\n"
+    dotenv.write_bytes(original)
+    capture.write_bytes(b"do-not-overwrite")
+
+    result = _run_sanitizer(
+        "--input",
+        str(dotenv),
+        "--sanitize",
+        "--capture-secret-to",
+        str(capture),
+    )
+
+    assert result.returncode != 0
+    assert "secret-canary" not in result.stdout + result.stderr
+    assert dotenv.read_bytes() == original
+    assert capture.read_bytes() == b"do-not-overwrite"
+
+
+def test_passkey_dotenv_rejects_missing_symlink_and_unsafe_capture_paths(tmp_path):
+    missing = tmp_path / "missing.env"
+    target = tmp_path / "target.env"
+    target.write_bytes(b"PASSKEY_ORIGINS=https://old.test\n")
+    symlink = tmp_path / "linked.env"
+    symlink.symlink_to(target)
+
+    missing_result = _run_sanitizer("--input", str(missing), "--check")
+    symlink_result = _run_sanitizer("--input", str(symlink), "--sanitize")
+
+    assert missing_result.returncode != 0
+    assert "does not exist" in missing_result.stderr.lower()
+    assert symlink_result.returncode != 0
+    assert target.read_bytes() == b"PASSKEY_ORIGINS=https://old.test\n"
+
+
+@pytest.mark.parametrize("failing_operation", ["write", "fsync", "fchmod", "replace"])
+def test_passkey_dotenv_sanitize_io_failures_are_atomic_and_clean(
+    tmp_path, monkeypatch, failing_operation
+):
+    dotenv = tmp_path / "backend.env"
+    capture = tmp_path / "capture"
+    original = b"PASSKEY_PROXY_SECRET=private-canary\nOTHER=value\n"
+    dotenv.write_bytes(original)
+    real_write = sanitize_passkey_dotenv.os.write
+    real_fsync = sanitize_passkey_dotenv.os.fsync
+    real_fchmod = sanitize_passkey_dotenv.os.fchmod
+    real_replace = sanitize_passkey_dotenv.os.replace
+
+    if failing_operation == "write":
+        monkeypatch.setattr(
+            sanitize_passkey_dotenv.os,
+            "write",
+            lambda *_args: (_ for _ in ()).throw(OSError("injected write failure")),
+        )
+    elif failing_operation == "fsync":
+        monkeypatch.setattr(
+            sanitize_passkey_dotenv.os,
+            "fsync",
+            lambda *_args: (_ for _ in ()).throw(OSError("injected fsync failure")),
+        )
+    elif failing_operation == "fchmod":
+        monkeypatch.setattr(
+            sanitize_passkey_dotenv.os,
+            "fchmod",
+            lambda *_args: (_ for _ in ()).throw(OSError("injected chmod failure")),
+        )
+    else:
+        monkeypatch.setattr(
+            sanitize_passkey_dotenv.os,
+            "replace",
+            lambda *_args: (_ for _ in ()).throw(OSError("injected replace failure")),
+        )
+
+    result = sanitize_passkey_dotenv.main(
+        [
+            "--input",
+            str(dotenv),
+            "--sanitize",
+            "--capture-secret-to",
+            str(capture),
+        ]
+    )
+
+    monkeypatch.setattr(sanitize_passkey_dotenv.os, "write", real_write)
+    monkeypatch.setattr(sanitize_passkey_dotenv.os, "fsync", real_fsync)
+    monkeypatch.setattr(sanitize_passkey_dotenv.os, "fchmod", real_fchmod)
+    monkeypatch.setattr(sanitize_passkey_dotenv.os, "replace", real_replace)
+    assert result != 0
+    assert dotenv.read_bytes() == original
+    assert not capture.exists()
+    assert not list(tmp_path.glob(f".{dotenv.name}.sanitize.*"))
+
+
+def test_passkey_dotenv_capture_fsync_failure_removes_partial_capture(
+    tmp_path, monkeypatch
+):
+    dotenv = tmp_path / "backend.env"
+    capture = tmp_path / "capture"
+    original = b"PASSKEY_PROXY_SECRET=private-canary\nOTHER=value\n"
+    dotenv.write_bytes(original)
+    real_fsync = sanitize_passkey_dotenv.os.fsync
+    calls = 0
+
+    def fail_second_fsync(descriptor):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("injected capture fsync failure")
+        return real_fsync(descriptor)
+
+    monkeypatch.setattr(sanitize_passkey_dotenv.os, "fsync", fail_second_fsync)
+
+    result = sanitize_passkey_dotenv.main(
+        [
+            "--input",
+            str(dotenv),
+            "--sanitize",
+            "--capture-secret-to",
+            str(capture),
+        ]
+    )
+
+    assert result != 0
+    assert dotenv.read_bytes() == original
+    assert not capture.exists()
+    assert not list(tmp_path.glob(f".{dotenv.name}.sanitize.*"))
+
+
+def test_passkey_dotenv_concurrent_replacement_is_never_overwritten(
+    tmp_path, monkeypatch
+):
+    dotenv = tmp_path / "backend.env"
+    capture = tmp_path / "capture"
+    original = b"PASSKEY_PROXY_SECRET=old-private-canary\nOTHER=old\n"
+    replacement = b"OTHER=new-concurrent-value\n"
+    dotenv.write_bytes(original)
+    real_assert = sanitize_passkey_dotenv._assert_input_unchanged
+
+    def replace_then_validate(path, expected_stat, expected_content):
+        concurrent = tmp_path / "concurrent.env"
+        concurrent.write_bytes(replacement)
+        os.replace(concurrent, path)
+        real_assert(path, expected_stat, expected_content)
+
+    monkeypatch.setattr(
+        sanitize_passkey_dotenv, "_assert_input_unchanged", replace_then_validate
+    )
+
+    result = sanitize_passkey_dotenv.main(
+        [
+            "--input",
+            str(dotenv),
+            "--sanitize",
+            "--capture-secret-to",
+            str(capture),
+        ]
+    )
+
+    assert result != 0
+    assert dotenv.read_bytes() == replacement
+    assert not capture.exists()
+    assert not list(tmp_path.glob(f".{dotenv.name}.sanitize.*"))
 
 
 def test_azure_endpoint_resolver_queries_environment_once_and_emits_schema(tmp_path):
@@ -471,12 +773,1092 @@ def test_azure_script_uses_configured_subscription_id(script_name: str) -> None:
     assert 'AZURE_SUBSCRIPTION_ID="66fadccd-d26d-4dd0-b108-46b3c581cdb3"' not in source
 
 
+def test_azure_env_exports_canonical_backend_and_ui_app_names() -> None:
+    source = (PROJECT_ROOT / "env.sh").read_text(encoding="utf-8")
+
+    assert 'export BACKEND_APP_NAME="$AGENT_NAME"' in source
+    assert 'export UI_APP_NAME="bmo-deepagent-ui-$SEED"' in source
+    assert source.index("export AGENT_NAME=") < source.index("export BACKEND_APP_NAME=")
+
+
+@pytest.mark.parametrize("script_name", ["build.sh", "deploy.sh"])
+def test_azure_scripts_resolve_canonical_endpoints_without_eval(script_name: str):
+    source = (PROJECT_ROOT / script_name).read_text(encoding="utf-8")
+
+    assert '"$SCRIPT_DIR/scripts/resolve_azure_endpoints.sh"' in source
+    assert 'BACKEND_APP_NAME="$BACKEND_APP_NAME"' in source
+    assert 'UI_APP_NAME="$UI_APP_NAME"' in source
+    assert "eval " not in source
+
+
+def test_azure_build_checks_private_dotenv_before_azure_or_runtime_access():
+    source = (PROJECT_ROOT / "build.sh").read_text(encoding="utf-8")
+    check = (
+        'python3 "$SCRIPT_DIR/scripts/sanitize_passkey_dotenv.py" '
+        '--input "$SCRIPT_DIR/.env.docker" --check'
+    )
+    resolver = '"$SCRIPT_DIR/scripts/resolve_azure_endpoints.sh"'
+
+    assert check in source
+    assert source.index(check) < source.index(resolver)
+    assert source.index(check) < source.index("select_container_runtime")
+    assert source.index(check) < source.index("az account set")
+    assert 'cp .env.docker "$BUILD_CONTEXT_DIR/.env.docker"' in source
+
+
+def _install_azure_script_fixture(
+    tmp_path: Path, script_name: str
+) -> tuple[Path, Path]:
+    fixture = tmp_path / "fixture"
+    scripts_dir = fixture / "scripts"
+    bin_dir = fixture / "bin"
+    scripts_dir.mkdir(parents=True)
+    bin_dir.mkdir()
+    shutil.copy2(PROJECT_ROOT / script_name, fixture / script_name)
+    shutil.copy2(RESOLVER, scripts_dir / RESOLVER.name)
+    shutil.copy2(SANITIZER, scripts_dir / SANITIZER.name)
+    shutil.copy2(CONFIG_MERGER, scripts_dir / CONFIG_MERGER.name)
+    shutil.copy2(CONFIG_RENDERER, scripts_dir / CONFIG_RENDERER.name)
+    shutil.copy2(DOCKER_CREDENTIALS, scripts_dir / DOCKER_CREDENTIALS.name)
+    (fixture / "env.sh").write_text(
+        "\n".join(
+            [
+                'export SEED="0312"',
+                'export AZURE_SUBSCRIPTION_ID="00000000-1111-2222-3333-444444444444"',
+                'export RESOURCE_GROUP="demo-rg"',
+                'export LOCATION="canadacentral"',
+                'export ENV_NAME="demo-env"',
+                'export AGENT_NAME="demo-api"',
+                'export BACKEND_APP_NAME="$AGENT_NAME"',
+                'export UI_APP_NAME="demo-ui"',
+                'export KV_NAME="demo-vault"',
+                'export STORAGE_ACCOUNT_NAME="demostorage"',
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    argv_log = fixture / "az.jsonl"
+    fake_az = bin_dir / "az"
+    fake_az.write_text(
+        """#!/usr/bin/python3
+import json
+import os
+import sys
+with open(os.environ["FAKE_AZ_ARGV_LOG"], "a", encoding="utf-8") as stream:
+    stream.write(json.dumps(sys.argv[1:]) + "\\n")
+if sys.argv[1:4] == ["containerapp", "env", "show"]:
+    sys.stdout.write(os.environ["FAKE_ENV_ROW"])
+    raise SystemExit(0)
+raise SystemExit(91)
+""",
+        encoding="utf-8",
+    )
+    fake_az.chmod(0o700)
+    return fixture, argv_log
+
+
+def _run_docker_credentials(
+    dotenv: Path, *args: str
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, str(DOCKER_CREDENTIALS), "--input", str(dotenv), *args],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def test_docker_credentials_strictly_load_only_requested_values(tmp_path):
+    dotenv = tmp_path / ".env"
+    pat_file = tmp_path / "pat"
+    dotenv.write_text(
+        "OTHER_CONTROL=$(touch never)\n"
+        "DOCKER_HUB_USERNAME=demo-user\n"
+        "DOCKER_HUB_PAT='private-pat-canary'\n",
+        encoding="utf-8",
+    )
+
+    result = _run_docker_credentials(dotenv, "--username", "--pat-file", str(pat_file))
+
+    assert result.returncode == 2
+    assert "private-pat-canary" not in result.stdout + result.stderr
+    assert not pat_file.exists()
+
+
+def test_docker_credentials_normal_dotenv_fallback_and_no_pat_output(tmp_path):
+    dotenv = tmp_path / ".env"
+    pat_file = tmp_path / "pat"
+    dotenv.write_text(
+        "# local Docker credentials\n"
+        "UNRELATED=value\n"
+        "DOCKER_HUB_USERNAME=demo-user\n"
+        "DOCKER_HUB_PAT='private-pat-canary'\n",
+        encoding="utf-8",
+    )
+
+    result = _run_docker_credentials(dotenv, "--username", "--pat-file", str(pat_file))
+
+    assert result.returncode == 0
+    assert result.stdout == "demo-user\n"
+    assert result.stderr == ""
+    assert pat_file.read_text(encoding="utf-8") == "private-pat-canary"
+    assert stat.S_IMODE(pat_file.stat().st_mode) == 0o600
+    assert "private-pat-canary" not in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "DOCKER_HUB_USERNAME=one\nDOCKER_HUB_USERNAME=two\n",
+        "DOCKER_HUB_PAT=$(unsafe)\n",
+        "if true; then DOCKER_HUB_USERNAME=bad; fi\n",
+    ],
+)
+def test_docker_credentials_reject_malformed_duplicates_and_control_syntax(
+    tmp_path, content
+):
+    dotenv = tmp_path / ".env"
+    pat_file = tmp_path / "pat"
+    dotenv.write_text(content, encoding="utf-8")
+
+    result = _run_docker_credentials(dotenv, "--username", "--pat-file", str(pat_file))
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert not pat_file.exists()
+
+
+def test_azure_build_rejects_protected_private_config_before_az_or_runtime(tmp_path):
+    fixture, argv_log = _install_azure_script_fixture(tmp_path, "build.sh")
+    runtime_marker = fixture / "runtime-called"
+    (fixture / "scripts/container_runtime.sh").write_text(
+        f"select_container_runtime() {{ touch '{runtime_marker}'; }}\n"
+        "ensure_container_runtime_ready() { :; }\n",
+        encoding="utf-8",
+    )
+    canary = "private-build-secret-canary"
+    (fixture / ".env.docker").write_text(
+        f"PASSKEY_PROXY_SECRET={canary}\nOTHER=value\n", encoding="utf-8"
+    )
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{fixture / 'bin'}:{env['PATH']}",
+            "FAKE_AZ_ARGV_LOG": str(argv_log),
+            "FAKE_ENV_ROW": f"{ENVIRONMENT_ID}\t{DEFAULT_DOMAIN}\tSucceeded\n",
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", "build.sh"],
+        cwd=fixture,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "PASSKEY_PROXY_SECRET" in result.stderr
+    assert canary not in result.stdout + result.stderr
+    assert not argv_log.exists()
+    assert not runtime_marker.exists()
+
+
+@pytest.mark.parametrize("key", ["PASSKEY_ENABLED", "PASSKEY_PROXY_ID"])
+def test_azure_build_rejects_all_deployment_owned_passkey_keys_before_az(tmp_path, key):
+    fixture, argv_log = _install_azure_script_fixture(tmp_path, "build.sh")
+    (fixture / "scripts/container_runtime.sh").write_text(
+        "select_container_runtime() { exit 99; }\n",
+        encoding="utf-8",
+    )
+    (fixture / ".env.docker").write_text(f"{key}=private-value\n", encoding="utf-8")
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{fixture / 'bin'}:{env['PATH']}",
+            "FAKE_AZ_ARGV_LOG": str(argv_log),
+            "FAKE_ENV_ROW": f"{ENVIRONMENT_ID}\t{DEFAULT_DOMAIN}\tSucceeded\n",
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", "-x", "build.sh"],
+        cwd=fixture,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert key in result.stderr
+    assert not argv_log.exists()
+
+
+def test_azure_build_uses_root_dotenv_docker_credentials_without_leaking_pat(tmp_path):
+    fixture, argv_log = _install_azure_script_fixture(tmp_path, "build.sh")
+    login_capture = fixture / "login-pat"
+    (fixture / "scripts/container_runtime.sh").write_text(
+        'select_container_runtime() { CONTAINER_RUNTIME="fake"; }\n'
+        "ensure_container_runtime_ready() { :; }\n"
+        f"container_runtime_login() {{ cat > '{login_capture}'; return 73; }}\n",
+        encoding="utf-8",
+    )
+    (fixture / ".env.docker").write_text("OTHER=value\n", encoding="utf-8")
+    pat_canary = "private-build-pat-canary"
+    (fixture / ".env").write_text(
+        "DOCKER_HUB_USERNAME=dotenv-user\n"
+        f"DOCKER_HUB_PAT='{pat_canary}'\n"
+        "UNRELATED=value\n",
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env.pop("DOCKER_HUB_USERNAME", None)
+    env.pop("DOCKER_HUB_PAT", None)
+    env.update(
+        {
+            "PATH": f"{fixture / 'bin'}:{env['PATH']}",
+            "FAKE_AZ_ARGV_LOG": str(argv_log),
+            "FAKE_ENV_ROW": f"{ENVIRONMENT_ID}\t{DEFAULT_DOMAIN}\tSucceeded\n",
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", "-x", "build.sh"],
+        cwd=fixture,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 73
+    assert login_capture.read_text(encoding="utf-8") == pat_canary
+    assert "dotenv-user" in result.stdout
+    assert pat_canary not in result.stdout + result.stderr
+
+
+def test_azure_build_process_docker_credentials_override_dotenv_fallback(tmp_path):
+    fixture, argv_log = _install_azure_script_fixture(tmp_path, "build.sh")
+    login_capture = fixture / "login-pat"
+    (fixture / "scripts/container_runtime.sh").write_text(
+        'select_container_runtime() { CONTAINER_RUNTIME="fake"; }\n'
+        "ensure_container_runtime_ready() { :; }\n"
+        f"container_runtime_login() {{ cat > '{login_capture}'; return 73; }}\n",
+        encoding="utf-8",
+    )
+    (fixture / ".env.docker").write_text("OTHER=value\n", encoding="utf-8")
+    (fixture / ".env").write_text(
+        "DOCKER_HUB_USERNAME=fallback-user\nDOCKER_HUB_PAT=fallback-pat\n",
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{fixture / 'bin'}:{env['PATH']}",
+            "FAKE_AZ_ARGV_LOG": str(argv_log),
+            "FAKE_ENV_ROW": f"{ENVIRONMENT_ID}\t{DEFAULT_DOMAIN}\tSucceeded\n",
+            "DOCKER_HUB_USERNAME": "exported-user",
+            "DOCKER_HUB_PAT": "exported-pat",
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", "-x", "build.sh"],
+        cwd=fixture,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 73
+    assert login_capture.read_text(encoding="utf-8") == "exported-pat"
+    assert "exported-user" in result.stdout
+    assert "fallback-user" not in result.stdout + result.stderr
+    for canary in ("exported-pat", "fallback-pat"):
+        assert canary not in result.stdout + result.stderr
+
+
+def test_azure_deploy_first_resolution_blocks_before_any_mutation(tmp_path):
+    fixture, argv_log = _install_azure_script_fixture(tmp_path, "deploy.sh")
+    (fixture / ".env.docker").write_text("OTHER=value\n", encoding="utf-8")
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{fixture / 'bin'}:{env['PATH']}",
+            "FAKE_AZ_ARGV_LOG": str(argv_log),
+            "FAKE_ENV_ROW": f"{ENVIRONMENT_ID}\t{DEFAULT_DOMAIN}\tSucceeded\n",
+            "DOCKER_HUB_USERNAME": "demo-user",
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", "deploy.sh"],
+        cwd=fixture,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 3
+    assert result.stdout == ""
+    assert result.stderr.splitlines() == [
+        "ACTION REQUIRED: update and verify Google/GitHub OAuth provider settings before deployment.",
+        f"Google authorized redirect URI: {BACKEND_URL}/auth/callback/google",
+        f"GitHub authorization callback URL: {BACKEND_URL}/auth/callback/github",
+        f"GitHub homepage / frontend origin: {UI_URL}",
+        "Deployment blocked: set OAUTH_REDIRECTS_CONFIRMED=true for this process "
+        "after updating the exact OAuth URLs above.",
+    ]
+    assert _read_az_calls(argv_log) == [EXPECTED_AZ_ARGV]
+    assert not (fixture / METADATA_NAME).exists()
+
+
+def test_azure_deploy_preserves_resolver_failure_status_and_bytes(tmp_path):
+    fixture, argv_log = _install_azure_script_fixture(tmp_path, "deploy.sh")
+    (fixture / ".env.docker").write_text("OTHER=value\n", encoding="utf-8")
+    fake_az = fixture / "bin/az"
+    fake_az.write_text(
+        "#!/bin/sh\nprintf 'resolver stdout bytes\\n'\n"
+        "printf 'resolver stderr bytes\\n' >&2\nexit 43\n",
+        encoding="utf-8",
+    )
+    fake_az.chmod(0o700)
+    env = os.environ.copy()
+    env["PATH"] = f"{fixture / 'bin'}:{env['PATH']}"
+    env["FAKE_AZ_ARGV_LOG"] = str(argv_log)
+
+    result = subprocess.run(
+        ["bash", "deploy.sh"],
+        cwd=fixture,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 43
+    assert result.stdout == "resolver stdout bytes\n"
+    assert result.stderr == "resolver stderr bytes\n"
+
+
+def _prepare_deploy_preflight_fixture(tmp_path: Path) -> tuple[Path, Path]:
+    fixture, argv_log = _install_azure_script_fixture(tmp_path, "deploy.sh")
+    (fixture / ".env.docker").write_text("OTHER=value\n", encoding="utf-8")
+    (fixture / ".build_version").write_text("20260812010101\n", encoding="utf-8")
+    (fixture / "webapp").mkdir()
+    (fixture / "webapp/config.py").write_text(
+        'API_VERSION = "9.8.7"\n', encoding="utf-8"
+    )
+    fake_sleep = fixture / "bin/sleep"
+    fake_sleep.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_sleep.chmod(0o700)
+    fake_date = fixture / "bin/date"
+    fake_date.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "+%Y%m%d%H%M%S" ]; then printf "20260812010101\\n"; '
+        'else printf "1786500061\\n"; fi\n',
+        encoding="utf-8",
+    )
+    fake_date.chmod(0o700)
+    return fixture, argv_log
+
+
+@pytest.mark.parametrize(
+    ("missing", "expected_message", "expected_calls"),
+    [
+        (
+            "identity",
+            "existing user-assigned managed identity",
+            [["containerapp", "env"], ["identity", "show"]],
+        ),
+        (
+            "app",
+            "existing Container App",
+            [
+                ["containerapp", "env"],
+                ["identity", "show"],
+                ["containerapp", "show"],
+            ],
+        ),
+        (
+            "vault",
+            "existing Key Vault",
+            [
+                ["containerapp", "env"],
+                ["identity", "show"],
+                ["containerapp", "show"],
+                ["keyvault", "show"],
+            ],
+        ),
+    ],
+)
+def test_azure_deploy_missing_managed_prerequisites_fail_before_mutation(
+    tmp_path, missing, expected_message, expected_calls
+):
+    fixture, argv_log = _prepare_deploy_preflight_fixture(tmp_path)
+    fake_az = fixture / "bin/az"
+    fake_az.write_text(
+        """#!/usr/bin/python3
+import json
+import os
+import sys
+args = sys.argv[1:]
+with open(os.environ["FAKE_AZ_ARGV_LOG"], "a", encoding="utf-8") as stream:
+    stream.write(json.dumps(args) + "\\n")
+missing = os.environ["FAKE_MISSING"]
+if args[:3] == ["containerapp", "env", "show"]:
+    sys.stdout.write(os.environ["FAKE_ENV_ROW"])
+elif args[:2] == ["identity", "show"]:
+    if missing == "identity":
+        raise SystemExit(3)
+    sys.stdout.write("/subscriptions/demo/identity\\tprincipal-123\\n")
+elif args[:2] == ["containerapp", "show"] and "--output" in args:
+    if missing == "app":
+        raise SystemExit(3)
+    sys.stdout.write('{"properties":{"configuration":{},"template":{}}}')
+elif args[:2] == ["keyvault", "show"]:
+    if missing == "vault":
+        raise SystemExit(3)
+    sys.stdout.write("principal-123\\n")
+sys.exit(0)
+""",
+        encoding="utf-8",
+    )
+    fake_az.chmod(0o700)
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{fixture / 'bin'}:{env['PATH']}",
+            "FAKE_AZ_ARGV_LOG": str(argv_log),
+            "FAKE_ENV_ROW": f"{ENVIRONMENT_ID}\t{DEFAULT_DOMAIN}\tSucceeded\n",
+            "FAKE_MISSING": missing,
+            "DOCKER_HUB_USERNAME": "demo-user",
+            "OAUTH_REDIRECTS_CONFIRMED": "true",
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", "deploy.sh"], cwd=fixture, env=env, capture_output=True, text=True
+    )
+
+    assert result.returncode != 0
+    assert expected_message in result.stderr
+    assert [call[:2] for call in _read_az_calls(argv_log)] == expected_calls
+
+
+@pytest.mark.parametrize("secret_id", ["", "   \n"])
+def test_azure_deploy_rejects_empty_passkey_secret_id_before_mutation(
+    tmp_path, secret_id
+):
+    fixture, argv_log = _prepare_deploy_preflight_fixture(tmp_path)
+    fake_az = fixture / "bin/az"
+    fake_az.write_text(
+        """#!/usr/bin/python3
+import json
+import os
+import sys
+args = sys.argv[1:]
+with open(os.environ["FAKE_AZ_ARGV_LOG"], "a", encoding="utf-8") as stream:
+    stream.write(json.dumps(args) + "\\n")
+if args[:3] == ["containerapp", "env", "show"]:
+    sys.stdout.write(os.environ["FAKE_ENV_ROW"])
+elif args[:2] == ["identity", "show"]:
+    sys.stdout.write("/subscriptions/demo/identity\\tprincipal-123\\n")
+elif args[:2] == ["containerapp", "show"] and "--output" in args:
+    sys.stdout.write('{"properties":{"configuration":{},"template":{}}}')
+elif args[:2] == ["keyvault", "show"]:
+    sys.stdout.write("principal-123\\n")
+elif args[:3] == ["keyvault", "secret", "show"]:
+    sys.stdout.write(os.environ["FAKE_SECRET_ID"])
+sys.exit(0)
+""",
+        encoding="utf-8",
+    )
+    fake_az.chmod(0o700)
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{fixture / 'bin'}:{env['PATH']}",
+            "FAKE_AZ_ARGV_LOG": str(argv_log),
+            "FAKE_ENV_ROW": f"{ENVIRONMENT_ID}\t{DEFAULT_DOMAIN}\tSucceeded\n",
+            "FAKE_SECRET_ID": secret_id,
+            "DOCKER_HUB_USERNAME": "demo-user",
+            "OAUTH_REDIRECTS_CONFIRMED": "true",
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", "deploy.sh"], cwd=fixture, env=env, capture_output=True, text=True
+    )
+
+    assert result.returncode != 0
+    assert "PASSKEY-PROXY-SECRET id" in result.stderr
+    calls = _read_az_calls(argv_log)
+    assert not any(call[:2] == ["account", "set"] for call in calls)
+    assert not any(call[:2] == ["keyvault", "set-policy"] for call in calls)
+    assert not any(call[:2] == ["containerapp", "update"] for call in calls)
+
+
+def test_azure_deploy_preserves_passkey_secret_query_failure_bytes_and_status(tmp_path):
+    fixture, argv_log = _prepare_deploy_preflight_fixture(tmp_path)
+    fake_az = fixture / "bin/az"
+    fake_az.write_text(
+        """#!/usr/bin/python3
+import json
+import os
+import sys
+args = sys.argv[1:]
+with open(os.environ["FAKE_AZ_ARGV_LOG"], "a", encoding="utf-8") as stream:
+    stream.write(json.dumps(args) + "\\n")
+if args[:3] == ["containerapp", "env", "show"]:
+    sys.stdout.write(os.environ["FAKE_ENV_ROW"])
+elif args[:2] == ["identity", "show"]:
+    sys.stdout.write("/subscriptions/demo/identity\\tprincipal-123\\n")
+elif args[:2] == ["containerapp", "show"] and "--output" in args:
+    sys.stdout.write('{"properties":{"configuration":{},"template":{}}}')
+elif args[:2] == ["keyvault", "show"]:
+    sys.stdout.write("principal-123\\n")
+elif args[:3] == ["keyvault", "secret", "show"]:
+    sys.stdout.write("secret query stdout bytes\\n")
+    sys.stderr.write("secret query stderr bytes\\n")
+    raise SystemExit(47)
+sys.exit(0)
+""",
+        encoding="utf-8",
+    )
+    fake_az.chmod(0o700)
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{fixture / 'bin'}:{env['PATH']}",
+            "FAKE_AZ_ARGV_LOG": str(argv_log),
+            "FAKE_ENV_ROW": f"{ENVIRONMENT_ID}\t{DEFAULT_DOMAIN}\tSucceeded\n",
+            "DOCKER_HUB_USERNAME": "demo-user",
+            "OAUTH_REDIRECTS_CONFIRMED": "true",
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", "deploy.sh"], cwd=fixture, env=env, capture_output=True, text=True
+    )
+
+    assert result.returncode == 47
+    assert result.stdout == "secret query stdout bytes\n"
+    assert result.stderr.endswith("secret query stderr bytes\n")
+    assert not any(call[:2] == ["account", "set"] for call in _read_az_calls(argv_log))
+
+
+def test_azure_deploy_malformed_existing_config_fails_before_mutation(tmp_path):
+    fixture, argv_log = _prepare_deploy_preflight_fixture(tmp_path)
+    fake_az = fixture / "bin/az"
+    fake_az.write_text(
+        """#!/usr/bin/python3
+import json
+import os
+import sys
+args = sys.argv[1:]
+with open(os.environ["FAKE_AZ_ARGV_LOG"], "a", encoding="utf-8") as stream:
+    stream.write(json.dumps(args) + "\\n")
+if args[:3] == ["containerapp", "env", "show"]:
+    sys.stdout.write(os.environ["FAKE_ENV_ROW"])
+elif args[:2] == ["identity", "show"]:
+    sys.stdout.write("/subscriptions/demo/identity\\tprincipal-123\\n")
+elif args[:2] == ["containerapp", "show"] and "--output" in args:
+    sys.stdout.write("{malformed config bytes\\n")
+sys.exit(0)
+""",
+        encoding="utf-8",
+    )
+    fake_az.chmod(0o700)
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{fixture / 'bin'}:{env['PATH']}",
+            "FAKE_AZ_ARGV_LOG": str(argv_log),
+            "FAKE_ENV_ROW": f"{ENVIRONMENT_ID}\t{DEFAULT_DOMAIN}\tSucceeded\n",
+            "DOCKER_HUB_USERNAME": "demo-user",
+            "OAUTH_REDIRECTS_CONFIRMED": "true",
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", "deploy.sh"], cwd=fixture, env=env, capture_output=True, text=True
+    )
+
+    assert result.returncode != 0
+    calls = _read_az_calls(argv_log)
+    assert [call[:2] for call in calls] == [
+        ["containerapp", "env"],
+        ["identity", "show"],
+        ["containerapp", "show"],
+    ]
+
+
+def test_azure_deploy_containerapp_show_failure_never_leaks_response_bytes(tmp_path):
+    fixture, argv_log = _prepare_deploy_preflight_fixture(tmp_path)
+    fake_az = fixture / "bin/az"
+    stdout_canary = "partial-config-secret-canary"
+    stderr_canary = "azure-error-secret-canary"
+    fake_az.write_text(
+        f"""#!/usr/bin/python3
+import json
+import os
+import sys
+args = sys.argv[1:]
+with open(os.environ["FAKE_AZ_ARGV_LOG"], "a", encoding="utf-8") as stream:
+    stream.write(json.dumps(args) + "\\n")
+if args[:3] == ["containerapp", "env", "show"]:
+    sys.stdout.write(os.environ["FAKE_ENV_ROW"])
+elif args[:2] == ["identity", "show"]:
+    sys.stdout.write("/subscriptions/demo/identity\\tprincipal-123\\n")
+elif args[:2] == ["containerapp", "show"] and "--output" in args:
+    sys.stdout.write('{stdout_canary}\\n')
+    sys.stderr.write('{stderr_canary}\\n')
+    raise SystemExit(47)
+sys.exit(0)
+""",
+        encoding="utf-8",
+    )
+    fake_az.chmod(0o700)
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{fixture / 'bin'}:{env['PATH']}",
+            "FAKE_AZ_ARGV_LOG": str(argv_log),
+            "FAKE_ENV_ROW": f"{ENVIRONMENT_ID}\t{DEFAULT_DOMAIN}\tSucceeded\n",
+            "DOCKER_HUB_USERNAME": "demo-user",
+            "OAUTH_REDIRECTS_CONFIRMED": "true",
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", "deploy.sh"], cwd=fixture, env=env, capture_output=True, text=True
+    )
+
+    assert result.returncode == 47
+    assert "Container App configuration query failed" in result.stderr
+    assert stdout_canary not in result.stdout + result.stderr
+    assert stderr_canary not in result.stdout + result.stderr
+    assert [call[:2] for call in _read_az_calls(argv_log)] == [
+        ["containerapp", "env"],
+        ["identity", "show"],
+        ["containerapp", "show"],
+    ]
+
+
+@pytest.mark.parametrize(
+    ("docker_username", "build_version", "expected_message"),
+    [
+        ("bad:user\nsecret: injected", "20260812010101", "Docker Hub username"),
+        ("demo-user", "20260812010101\nsecret: injected", "build version"),
+    ],
+)
+def test_azure_deploy_hostile_render_inputs_fail_before_any_mutation(
+    tmp_path, docker_username, build_version, expected_message
+):
+    fixture, argv_log = _prepare_deploy_preflight_fixture(tmp_path)
+    (fixture / ".build_version").write_text(build_version, encoding="utf-8")
+    fake_az = fixture / "bin/az"
+    fake_az.write_text(
+        """#!/usr/bin/python3
+import json
+import os
+import sys
+args = sys.argv[1:]
+with open(os.environ["FAKE_AZ_ARGV_LOG"], "a", encoding="utf-8") as stream:
+    stream.write(json.dumps(args) + "\\n")
+if args[:3] == ["containerapp", "env", "show"]:
+    sys.stdout.write(os.environ["FAKE_ENV_ROW"])
+elif args[:2] == ["identity", "show"]:
+    sys.stdout.write("/subscriptions/demo/identity\\tprincipal-123\\n")
+elif args[:2] == ["containerapp", "show"] and "--output" in args:
+    sys.stdout.write('{"properties":{"configuration":{},"template":{}}}')
+sys.exit(0)
+""",
+        encoding="utf-8",
+    )
+    fake_az.chmod(0o700)
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{fixture / 'bin'}:{env['PATH']}",
+            "FAKE_AZ_ARGV_LOG": str(argv_log),
+            "FAKE_ENV_ROW": f"{ENVIRONMENT_ID}\t{DEFAULT_DOMAIN}\tSucceeded\n",
+            "DOCKER_HUB_USERNAME": docker_username,
+            "OAUTH_REDIRECTS_CONFIRMED": "true",
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", "deploy.sh"], cwd=fixture, env=env, capture_output=True, text=True
+    )
+
+    assert result.returncode != 0
+    assert expected_message in result.stderr
+    calls = _read_az_calls(argv_log)
+    assert [call[:2] for call in calls] == [
+        ["containerapp", "env"],
+        ["identity", "show"],
+        ["containerapp", "show"],
+    ]
+
+
+def test_azure_deploy_merges_passkey_config_and_records_only_after_health(tmp_path):
+    fixture, argv_log = _install_azure_script_fixture(tmp_path, "deploy.sh")
+    (fixture / ".env.docker").write_text("OTHER=value\n", encoding="utf-8")
+    deploy_pat_canary = "deploy-must-not-consume-this-pat"
+    (fixture / ".env").write_text(
+        f"DOCKER_HUB_USERNAME=demo-user\nDOCKER_HUB_PAT='{deploy_pat_canary}'\n",
+        encoding="utf-8",
+    )
+    (fixture / ".build_version").write_text("20260812010101\n", encoding="utf-8")
+    (fixture / "webapp").mkdir()
+    (fixture / "webapp/config.py").write_text(
+        'API_VERSION = "9.8.7"\n', encoding="utf-8"
+    )
+    update_yaml = fixture / "captured-update.yaml"
+    fake_az = fixture / "bin/az"
+    fake_az.write_text(
+        """#!/usr/bin/python3
+import json
+import os
+import pathlib
+import sys
+args = sys.argv[1:]
+with open(os.environ["FAKE_AZ_ARGV_LOG"], "a", encoding="utf-8") as stream:
+    stream.write(json.dumps(args) + "\\n")
+if args[:3] == ["containerapp", "env", "show"] and "--subscription" in args:
+    sys.stdout.write(os.environ["FAKE_ENV_ROW"])
+elif args[:2] == ["identity", "show"]:
+    sys.stdout.write("/subscriptions/demo/identity\\tprincipal-123\\n")
+elif args[:2] == ["keyvault", "show"] and "accessPolicies" in " ".join(args):
+    sys.stdout.write("principal-123\\n")
+elif args[:3] == ["keyvault", "secret", "show"]:
+    sys.stdout.write("https://demo-vault.vault.azure.net/secrets/PASSKEY-PROXY-SECRET\\n")
+elif args[:3] == ["storage", "account", "list"]:
+    sys.stdout.write("demostorage\\n")
+elif args[:4] == ["storage", "account", "keys", "list"]:
+    sys.stdout.write("storage-key\\n")
+elif args[:3] == ["storage", "container", "list"]:
+    sys.stdout.write("deep-research-blobs\\n")
+elif args[:2] == ["containerapp", "show"] and "provisioningState" in " ".join(args):
+    sys.stdout.write("Succeeded\\n")
+elif args[:2] == ["containerapp", "show"] and "--output" in args and args[args.index("--output") + 1] == "json":
+    json.dump({
+        "name": "demo-api",
+        "tags": {"unrelated": "preserved"},
+        "properties": {
+            "configuration": {
+                "secrets": [{"name": "unrelated-secret", "value": "opaque"}],
+                "registries": [{"server": "private.example.test", "username": "kept-user", "passwordSecretRef": "unrelated-secret"}],
+            },
+            "template": {"containers": [{
+                "name": "deep-research-agent",
+                "env": [{"name": "UNRELATED_ENV", "value": "kept"}],
+                "volumeMounts": [{"volumeName": "unrelated-volume", "mountPath": "/kept"}],
+            }]},
+        },
+    }, sys.stdout)
+elif args[:2] == ["containerapp", "show"] and "ingress.fqdn" in " ".join(args):
+    sys.stdout.write("demo-api.calmpond-123.eastus.azurecontainerapps.io\\n")
+elif args[:3] == ["containerapp", "revision", "list"]:
+    expected_query = (
+        f"[?name=='{os.environ['FAKE_EXPECTED_REVISION']}'] | "
+        "[0].[properties.runningState,properties.healthState]"
+    )
+    if "--query" not in args or args[args.index("--query") + 1] != expected_query:
+        sys.stderr.write("revision query did not target exact expected revision\\n")
+        raise SystemExit(89)
+    sys.stdout.write("Running\\tHealthy\\n")
+elif args[:2] == ["containerapp", "update"] and "--yaml" in args:
+    if "--revision-suffix" in args:
+        sys.stderr.write("obsolete revision suffix CLI flag used\\n")
+        raise SystemExit(88)
+    source = pathlib.Path(args[args.index("--yaml") + 1])
+    pathlib.Path(os.environ["FAKE_UPDATE_YAML"]).write_bytes(source.read_bytes())
+sys.exit(0)
+""",
+        encoding="utf-8",
+    )
+    fake_az.chmod(0o700)
+    fake_curl = fixture / "bin/curl"
+    fake_curl.write_text(
+        """#!/usr/bin/python3
+import json
+import os
+import sys
+with open(os.environ["FAKE_AZ_ARGV_LOG"], "a", encoding="utf-8") as stream:
+    stream.write(json.dumps(["curl", *sys.argv[1:]]) + "\\n")
+sys.stdout.write('{"version":"9.8.7","status":"ok"}\\n')
+""",
+        encoding="utf-8",
+    )
+    fake_curl.chmod(0o700)
+    fake_sleep = fixture / "bin/sleep"
+    fake_sleep.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_sleep.chmod(0o700)
+    fake_date = fixture / "bin/date"
+    fake_date.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "+%Y%m%d%H%M%S" ]; then printf "20260812010101\\n"; '
+        'else printf "1786500061\\n"; fi\n',
+        encoding="utf-8",
+    )
+    fake_date.chmod(0o700)
+    env = os.environ.copy()
+    env.pop("DOCKER_HUB_USERNAME", None)
+    env.update(
+        {
+            "PATH": f"{fixture / 'bin'}:{env['PATH']}",
+            "FAKE_AZ_ARGV_LOG": str(argv_log),
+            "FAKE_ENV_ROW": f"{ENVIRONMENT_ID}\t{DEFAULT_DOMAIN}\tSucceeded\n",
+            "FAKE_UPDATE_YAML": str(update_yaml),
+            "FAKE_EXPECTED_REVISION": "demo-api--passkeys-20260812010101",
+            "DOCKER_HUB_PAT": "",
+            "OAUTH_REDIRECTS_CONFIRMED": "true",
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", "deploy.sh", "--skip-kv-access"],
+        cwd=fixture,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert deploy_pat_canary not in result.stdout + result.stderr
+    rendered = yaml.safe_load(update_yaml.read_text(encoding="utf-8"))
+    revision_suffix = rendered["properties"]["template"]["revisionSuffix"]
+    assert revision_suffix == "passkeys-20260812010101"
+    assert rendered["tags"] == {"unrelated": "preserved"}
+    secrets = {
+        item["name"]: item
+        for item in rendered["properties"]["configuration"]["secrets"]
+    }
+    assert secrets["unrelated-secret"]["value"] == "opaque"
+    assert secrets["passkey-proxy-secret"] == {
+        "name": "passkey-proxy-secret",
+        "keyVaultUrl": "https://demo-vault.vault.azure.net/secrets/PASSKEY-PROXY-SECRET",
+        "identity": "/subscriptions/demo/identity",
+    }
+    registries = rendered["properties"]["configuration"]["registries"]
+    assert {item["server"]: item for item in registries}["private.example.test"] == {
+        "server": "private.example.test",
+        "username": "kept-user",
+        "passwordSecretRef": "unrelated-secret",
+    }
+    container = rendered["properties"]["template"]["containers"][0]
+    runtime_env = {item["name"]: item for item in container["env"]}
+    assert runtime_env["UNRELATED_ENV"]["value"] == "kept"
+    assert runtime_env["FRONTEND_URLS"]["value"] == (
+        f"{UI_URL},https://bmo-deepagent-ui.vercel.app"
+    )
+    assert runtime_env["PASSKEY_PROXY_SECRET"]["secretRef"] == ("passkey-proxy-secret")
+    volume_mounts = {item["volumeName"]: item for item in container["volumeMounts"]}
+    assert volume_mounts["unrelated-volume"]["mountPath"] == "/kept"
+    assert volume_mounts["auth-sqlite"]["mountPath"] == "/mnt/auth"
+    calls = _read_az_calls(argv_log)
+    assert deploy_pat_canary not in json.dumps(calls)
+    update_call = next(call for call in calls if call[:2] == ["containerapp", "update"])
+    assert "--revision-suffix" not in update_call
+    account_set = next(
+        index for index, call in enumerate(calls) if call[:2] == ["account", "set"]
+    )
+    assert [call[:2] for call in calls[:account_set]] == [
+        ["containerapp", "env"],
+        ["identity", "show"],
+        ["containerapp", "show"],
+        ["keyvault", "show"],
+        ["keyvault", "secret"],
+    ]
+    curl_index = next(index for index, call in enumerate(calls) if call[0] == "curl")
+    assert calls[-1] == EXPECTED_AZ_ARGV
+    assert curl_index < len(calls) - 1
+    assert json.loads((fixture / METADATA_NAME).read_text()) == _expected_metadata()
+
+
+def test_azure_deploy_gates_mutation_on_oauth_confirmation_and_strict_output():
+    source = (PROJECT_ROOT / "deploy.sh").read_text(encoding="utf-8")
+    resolver = '"$SCRIPT_DIR/scripts/resolve_azure_endpoints.sh"'
+    confirmation = "OAUTH_REDIRECTS_CONFIRMED:-"
+
+    assert resolver in source
+    assert confirmation in source
+    assert 'SEEN_RESOLVER_KEYS="|"' in source
+    assert "unexpected resolver output key" in source
+    assert source.index(resolver) < source.index("az account set")
+    assert source.index(confirmation) < source.index("az account set")
+    assert ".resolved-azure-endpoints.json" not in source
+
+
+def _render_desired_config(tmp_path: Path) -> dict:
+    output = tmp_path / "desired.yaml"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(CONFIG_RENDERER),
+            "--docker-username",
+            "demo-user",
+            "--build-version",
+            "20260812010101",
+            "--identity-id",
+            "/subscriptions/demo/identity",
+            "--key-vault-name",
+            "demo-vault",
+            "--frontend-urls",
+            f"{UI_URL},https://bmo-deepagent-ui.vercel.app",
+            "--storage-name",
+            "authsqlite",
+            "--restart-trigger",
+            "1234567890",
+            "--revision-suffix",
+            "passkeys-20260812010101",
+            "--output",
+            str(output),
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    return yaml.safe_load(output.read_text(encoding="utf-8"))
+
+
+def test_azure_config_renderer_rejects_invalid_revision_suffix(tmp_path):
+    output = tmp_path / "desired.yaml"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(CONFIG_RENDERER),
+            "--docker-username",
+            "demo-user",
+            "--build-version",
+            "20260812010101",
+            "--identity-id",
+            "/subscriptions/demo/identity",
+            "--key-vault-name",
+            "demo-vault",
+            "--frontend-urls",
+            UI_URL,
+            "--storage-name",
+            "authsqlite",
+            "--restart-trigger",
+            "1234567890",
+            "--revision-suffix",
+            "Bad_Suffix: injected",
+            "--output",
+            str(output),
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "revision suffix" in result.stderr
+    assert not output.exists()
+
+
+def test_azure_deploy_uses_managed_passkey_runtime_configuration(tmp_path):
+    source = (PROJECT_ROOT / "deploy.sh").read_text(encoding="utf-8")
+    rendered = _render_desired_config(tmp_path)
+    configuration = rendered["properties"]["configuration"]
+    container = rendered["properties"]["template"]["containers"][0]
+    secrets = {item["name"]: item for item in configuration["secrets"]}
+    environment = {item["name"]: item for item in container["env"]}
+
+    assert secrets["passkey-proxy-secret"] == {
+        "name": "passkey-proxy-secret",
+        "keyVaultUrl": "https://demo-vault.vault.azure.net/secrets/PASSKEY-PROXY-SECRET",
+        "identity": "/subscriptions/demo/identity",
+    }
+    assert environment["PASSKEY_PROXY_SECRET"]["secretRef"] == "passkey-proxy-secret"
+    expected_values = {
+        "FRONTEND_URLS": f"{UI_URL},https://bmo-deepagent-ui.vercel.app",
+        "PASSKEY_DERIVE_FROM_FRONTEND_URLS": "true",
+        "PASSKEY_ENABLED": "true",
+        "PASSKEY_PROXY_ID": "web-bff",
+    }
+    for name, value in expected_values.items():
+        assert environment[name]["value"] == value
+    assert "--revision-suffix" in source
+    assert "revision list" in source
+    assert source.index("revision list") < source.index(
+        'resolve_azure_endpoints.sh" --record'
+    )
+    assert source.index("VERSION_MATCHED=true") < source.index(
+        'resolve_azure_endpoints.sh" --record'
+    )
+    assert "az keyvault secret show" in source
+    assert "--query value" not in source
+
+
 def test_azure_deploy_uses_configured_global_resource_names() -> None:
     source = (PROJECT_ROOT / "deploy.sh").read_text(encoding="utf-8")
 
     assert ': "${KV_NAME:?Set KV_NAME in env.sh}"' in source
     assert ': "${STORAGE_ACCOUNT_NAME:?Set STORAGE_ACCOUNT_NAME in env.sh}"' in source
     assert 'STORAGE_ACCOUNT_NAME="stdeepagents"' not in source
+
+
+def test_azure_deploy_help_describes_update_only_managed_passkey_cutover():
+    result = subprocess.run(
+        ["bash", str(PROJECT_ROOT / "deploy.sh"), "--help"],
+        cwd=PROJECT_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert "update existing deployment" in result.stdout.lower()
+    assert "managed passkey cutover" in result.stdout.lower()
+    for prerequisite in (
+        "resource group",
+        "Container Apps environment",
+        "backend Container App",
+        "user-assigned managed identity",
+        "Key Vault",
+        "secret get access",
+        "PASSKEY-PROXY-SECRET",
+    ):
+        assert prerequisite in result.stdout
+    assert "Full deployment" not in result.stdout
+
+
+def test_azure_deployment_guide_matches_update_only_cutover_workflow():
+    guide = (PROJECT_ROOT / "documents/deployment/azure/README.md").read_text(
+        encoding="utf-8"
+    )
+
+    for stale in (
+        "`deploy.sh` creates or updates one externally accessible Container App",
+        "`deploy.sh` creates Key Vault when needed",
+        "### 3. Create or update Azure resources",
+        "`deploy.sh` writes the resolved HTTPS endpoint back to `env.sh`",
+        "It creates or reuses the resource group, Container Apps environment, Key Vault",
+    ):
+        assert stale not in guide
+    for required in (
+        "update-only managed passkey cutover",
+        "PASSKEY-PROXY-SECRET",
+        "user-assigned managed identity",
+        "secret `get` access",
+        ".resolved-azure-endpoints.json",
+        'curl --fail --silent --show-error "$BACKEND_URL/health"',
+        "OAUTH_REDIRECTS_CONFIRMED=true ./deploy.sh",
+    ):
+        assert required in guide
+    resolver = "./scripts/resolve_azure_endpoints.sh"
+    assert guide.index(resolver) < guide.index("./build.sh")
+    assert guide.index("./build.sh") < guide.index(
+        "OAUTH_REDIRECTS_CONFIRMED=true ./deploy.sh"
+    )
 
 
 def test_azure_build_stages_context_without_git_metadata() -> None:
@@ -495,33 +1877,44 @@ def test_azure_build_stages_context_without_git_metadata() -> None:
     assert "trap cleanup_build_context EXIT" in source
 
 
-def test_azure_deploy_uses_sqlite_without_cosmos() -> None:
-    source = (PROJECT_ROOT / "deploy.sh").read_text(encoding="utf-8")
-
-    assert re.search(
-        r"(?m)^\s*-\s+name:\s+DB_TYPE\s*\n\s+value:\s+sqlite\s*$",
-        source,
+def test_azure_deploy_uses_sqlite_without_cosmos(tmp_path) -> None:
+    source = "\n".join(
+        (PROJECT_ROOT / name).read_text(encoding="utf-8")
+        for name in ("deploy.sh", "scripts/render_azure_containerapp_config.py")
     )
+    rendered = _render_desired_config(tmp_path)
+    environment = {
+        item["name"]: item
+        for item in rendered["properties"]["template"]["containers"][0]["env"]
+    }
+
+    assert environment["DB_TYPE"]["value"] == "sqlite"
     for forbidden in ("az cosmosdb", "COSMOSDB_", "cosmosdb-", "value: cosmosdb"):
         assert forbidden not in source
 
 
-def test_passkey_sqlite_deployment_is_single_replica_on_persistent_azure_file():
+def test_passkey_sqlite_deployment_is_single_replica_on_persistent_azure_file(tmp_path):
     source = (PROJECT_ROOT / "deploy.sh").read_text(encoding="utf-8")
+    rendered = _render_desired_config(tmp_path)
+    template = rendered["properties"]["template"]
+    container = template["containers"][0]
+    environment = {item["name"]: item for item in container["env"]}
 
     assert "az storage share-rm create" in source
     assert "az containerapp env storage set" in source
-    assert "mountPath: /mnt/auth" in source
-    assert "storageType: AzureFile" in source
-    assert re.search(
-        r"name:\s+SQLITE_DB_PATH\s*\n\s+value:\s+/mnt/auth/auth.db",
-        source,
-    )
-    assert re.search(
-        r"name:\s+AUTH_SQLITE_JOURNAL_MODE\s*\n\s+value:\s+DELETE",
-        source,
-    )
-    assert "maxReplicas: 1" in source
+    assert container["volumeMounts"] == [
+        {"volumeName": "auth-sqlite", "mountPath": "/mnt/auth"}
+    ]
+    assert template["volumes"] == [
+        {
+            "name": "auth-sqlite",
+            "storageType": "AzureFile",
+            "storageName": "authsqlite",
+        }
+    ]
+    assert environment["SQLITE_DB_PATH"]["value"] == "/mnt/auth/auth.db"
+    assert environment["AUTH_SQLITE_JOURNAL_MODE"]["value"] == "DELETE"
+    assert template["scale"]["maxReplicas"] == 1
 
 
 def test_passkey_demo_configuration_documents_safe_azure_sqlite_contract():

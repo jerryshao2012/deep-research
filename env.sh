@@ -11,6 +11,8 @@ export ENV_NAME="env-name-deep-agents-$SEED"
 
 # 3. Deploy agent
 export AGENT_NAME="deep-research-agent-$SEED"
+export BACKEND_APP_NAME="$AGENT_NAME"
+export UI_APP_NAME="bmo-deepagent-ui-$SEED"
 
 # Create Key Vault
 export KV_NAME="kv-deep-agents-$SEED-bmo2"

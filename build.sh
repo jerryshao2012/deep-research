@@ -9,6 +9,8 @@ source "$SCRIPT_DIR/scripts/container_runtime.sh"
 TOTAL_START_TIME=$(date +%s)
 STEP_TIMES=()
 BUILD_CONTEXT_DIR=""
+DOCKER_CREDENTIAL_DIR=""
+DOCKER_PAT_FILE=""
 
 # Function to track step timing
 start_step() {
@@ -44,20 +46,52 @@ cleanup_build_context() {
   if [[ "$BUILD_CONTEXT_DIR" == "$SCRIPT_DIR"/.container-build-context.* ]] && [ -d "$BUILD_CONTEXT_DIR" ]; then
     rm -rf -- "$BUILD_CONTEXT_DIR"
   fi
+  if [[ "$DOCKER_CREDENTIAL_DIR" == "$SCRIPT_DIR"/.docker-credentials.* ]] && [ -d "$DOCKER_CREDENTIAL_DIR" ]; then
+    rm -rf -- "$DOCKER_CREDENTIAL_DIR"
+  fi
 }
 
 # Configuration
-source ./env.sh
-if [ -f "../.env" ]; then
-  set -a
-  source "../.env"
-  set +a
+source "$SCRIPT_DIR/env.sh"
+: "${BACKEND_APP_NAME:?Set BACKEND_APP_NAME in env.sh}"
+: "${UI_APP_NAME:?Set UI_APP_NAME in env.sh}"
+
+trap cleanup_build_context EXIT
+DOCKER_CREDENTIAL_DIR="$(mktemp -d "$SCRIPT_DIR/.docker-credentials.XXXXXX")"
+DOCKER_PAT_FILE="$DOCKER_CREDENTIAL_DIR/pat"
+XTRACE_WAS_ENABLED=false
+case "$-" in
+  *x*) XTRACE_WAS_ENABLED=true; set +x ;;
+esac
+OLD_UMASK=$(umask)
+umask 077
+if [ -n "${DOCKER_HUB_PAT:-}" ]; then
+  printf '%s' "$DOCKER_HUB_PAT" >"$DOCKER_PAT_FILE"
 fi
-if [ -f "./.env" ]; then
-  set -a
-  source "./.env"
-  set +a
+unset DOCKER_HUB_PAT
+umask "$OLD_UMASK"
+if [ -f "$SCRIPT_DIR/.env" ]; then
+  CREDENTIAL_ARGS=()
+  if [ -z "${DOCKER_HUB_USERNAME:-}" ]; then
+    CREDENTIAL_ARGS+=(--username)
+  fi
+  if [ ! -e "$DOCKER_PAT_FILE" ]; then
+    CREDENTIAL_ARGS+=(--pat-file "$DOCKER_PAT_FILE")
+  fi
+  if [ "${#CREDENTIAL_ARGS[@]}" -gt 0 ]; then
+    FALLBACK_USERNAME=$(python3 "$SCRIPT_DIR/scripts/load_docker_credentials.py" --input "$SCRIPT_DIR/.env" "${CREDENTIAL_ARGS[@]}")
+    if [ -z "${DOCKER_HUB_USERNAME:-}" ] && [ -n "$FALLBACK_USERNAME" ]; then
+      DOCKER_HUB_USERNAME="$FALLBACK_USERNAME"
+    fi
+  fi
 fi
+if [ "$XTRACE_WAS_ENABLED" = true ]; then
+  set -x
+fi
+
+python3 "$SCRIPT_DIR/scripts/sanitize_passkey_dotenv.py" --input "$SCRIPT_DIR/.env.docker" --check
+BACKEND_APP_NAME="$BACKEND_APP_NAME" UI_APP_NAME="$UI_APP_NAME" \
+  "$SCRIPT_DIR/scripts/resolve_azure_endpoints.sh" >/dev/null
 
 select_container_runtime
 ensure_container_runtime_ready
@@ -91,15 +125,18 @@ end_step
 
 # 4. Check Docker Hub Username
 start_step "Docker Hub Setup"
-if [ -z "$DOCKER_HUB_USERNAME" ]; then
+if [ -z "${DOCKER_HUB_USERNAME:-}" ]; then
   echo "❌ Error: Please set DOCKER_HUB_USERNAME in .env"
   exit 1
 fi
 echo "✅ Using Docker Hub user: $DOCKER_HUB_USERNAME"
-if [ -n "$DOCKER_HUB_PAT" ]; then
+if [ -s "$DOCKER_PAT_FILE" ]; then
   echo "🔐 Logging into Docker Hub..."
-  printf '%s\n' "$DOCKER_HUB_PAT" | container_runtime_login "$DOCKER_HUB_USERNAME" docker.io
+  container_runtime_login "$DOCKER_HUB_USERNAME" docker.io <"$DOCKER_PAT_FILE"
 fi
+rm -rf -- "$DOCKER_CREDENTIAL_DIR"
+DOCKER_CREDENTIAL_DIR=""
+DOCKER_PAT_FILE=""
 end_step
 
 # 5. Increment API version

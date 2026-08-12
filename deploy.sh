@@ -1,5 +1,8 @@
 #!/bin/bash
 set -e
+set -o pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Timer tracking
 TOTAL_START_TIME=$(date +%s)
@@ -47,13 +50,25 @@ while [[ $# -gt 0 ]]; do
     --help|-h)
       echo "Usage: ./deploy.sh [OPTIONS]"
       echo ""
+      echo "Update existing deployment for managed passkey cutover."
+      echo ""
+      echo "Prerequisites (this script does not bootstrap them):"
+      echo "  - Existing resource group and Container Apps environment"
+      echo "  - Existing backend Container App"
+      echo "  - Existing user-assigned managed identity"
+      echo "  - Existing Key Vault with identity secret get access"
+      echo "  - Pre-created Key Vault secret PASSKEY-PROXY-SECRET"
+      echo "  - Existing provider/runtime secrets referenced by the app configuration"
+      echo "  - Successful build producing .build_version and Docker Hub image"
+      echo "  - Confirmed Google/GitHub OAuth URLs when endpoint metadata changes"
+      echo ""
       echo "Options:"
       echo "  --skip-kv-access Skip Key Vault access policy updates (faster re-deployment)"
       echo "  --help, -h       Show this help message"
       echo ""
       echo "Examples:"
-      echo "  ./deploy.sh                                    # Full deployment using existing image"
-      echo "  ./deploy.sh --skip-kv-access                   # Fast re-deployment (no KV access check)"
+      echo "  OAUTH_REDIRECTS_CONFIRMED=true ./deploy.sh     # Update existing deployment after OAuth confirmation"
+      echo "  ./deploy.sh --skip-kv-access                   # Update with current-user KV policy step skipped"
       echo ""
       echo "Note: For bi-directional file sync with Azure File Share, use:"
       echo "  ./sync-files.sh"
@@ -70,22 +85,197 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Configuration
-source ./env.sh
+source "$SCRIPT_DIR/env.sh"
 : "${KV_NAME:?Set KV_NAME in env.sh}"
 : "${STORAGE_ACCOUNT_NAME:?Set STORAGE_ACCOUNT_NAME in env.sh}"
+: "${BACKEND_APP_NAME:?Set BACKEND_APP_NAME in env.sh}"
+: "${UI_APP_NAME:?Set UI_APP_NAME in env.sh}"
+
+if [ -z "${DOCKER_HUB_USERNAME:-}" ] && [ -f "$SCRIPT_DIR/.env" ]; then
+  DOCKER_HUB_USERNAME=$(python3 "$SCRIPT_DIR/scripts/load_docker_credentials.py" --input "$SCRIPT_DIR/.env" --username)
+fi
+
+python3 "$SCRIPT_DIR/scripts/sanitize_passkey_dotenv.py" --input "$SCRIPT_DIR/.env.docker" --check
+
+RESOLVER_STDOUT="$(mktemp)"
+RESOLVER_STDERR="$(mktemp)"
+set +e
+BACKEND_APP_NAME="$BACKEND_APP_NAME" UI_APP_NAME="$UI_APP_NAME" \
+  "$SCRIPT_DIR/scripts/resolve_azure_endpoints.sh" >"$RESOLVER_STDOUT" 2>"$RESOLVER_STDERR"
+RESOLVER_STATUS=$?
+set -e
+cat "$RESOLVER_STDERR" >&2
+if [ "$RESOLVER_STATUS" -ne 0 ]; then
+  cat "$RESOLVER_STDOUT"
+  rm -f "$RESOLVER_STDOUT" "$RESOLVER_STDERR"
+  exit "$RESOLVER_STATUS"
+fi
+RESOLVER_OUTPUT="$(cat "$RESOLVER_STDOUT")"
+rm -f "$RESOLVER_STDOUT" "$RESOLVER_STDERR"
+
+RESOLVED_AZURE_ENVIRONMENT_ID=""
+RESOLVED_AZURE_ENVIRONMENT_DEFAULT_DOMAIN=""
+RESOLVED_BACKEND_APP_NAME=""
+RESOLVED_UI_APP_NAME=""
+RESOLVED_BACKEND_URL=""
+RESOLVED_AZURE_UI_URL=""
+RESOLVED_FRONTEND_URLS=""
+RESOLVED_GOOGLE_CALLBACK_URL=""
+RESOLVED_GITHUB_CALLBACK_URL=""
+RESOLVED_GITHUB_HOMEPAGE_URL=""
+RESOLVED_CHANGED=""
+SEEN_RESOLVER_KEYS="|"
+while IFS='=' read -r key value; do
+  if [[ "$SEEN_RESOLVER_KEYS" == *"|$key|"* ]]; then
+    echo "Error: duplicate resolver output key: $key" >&2
+    exit 65
+  fi
+  case "$key" in
+    AZURE_ENVIRONMENT_ID) RESOLVED_AZURE_ENVIRONMENT_ID="$value" ;;
+    AZURE_ENVIRONMENT_DEFAULT_DOMAIN) RESOLVED_AZURE_ENVIRONMENT_DEFAULT_DOMAIN="$value" ;;
+    BACKEND_APP_NAME) RESOLVED_BACKEND_APP_NAME="$value" ;;
+    UI_APP_NAME) RESOLVED_UI_APP_NAME="$value" ;;
+    BACKEND_URL) RESOLVED_BACKEND_URL="$value" ;;
+    AZURE_UI_URL) RESOLVED_AZURE_UI_URL="$value" ;;
+    FRONTEND_URLS) RESOLVED_FRONTEND_URLS="$value" ;;
+    GOOGLE_CALLBACK_URL) RESOLVED_GOOGLE_CALLBACK_URL="$value" ;;
+    GITHUB_CALLBACK_URL) RESOLVED_GITHUB_CALLBACK_URL="$value" ;;
+    GITHUB_HOMEPAGE_URL) RESOLVED_GITHUB_HOMEPAGE_URL="$value" ;;
+    CHANGED) RESOLVED_CHANGED="$value" ;;
+    *)
+      echo "Error: unexpected resolver output key: $key" >&2
+      exit 65
+      ;;
+  esac
+  SEEN_RESOLVER_KEYS="${SEEN_RESOLVER_KEYS}${key}|"
+done <<< "$RESOLVER_OUTPUT"
+for key in RESOLVED_AZURE_ENVIRONMENT_ID RESOLVED_AZURE_ENVIRONMENT_DEFAULT_DOMAIN RESOLVED_BACKEND_APP_NAME RESOLVED_UI_APP_NAME RESOLVED_BACKEND_URL RESOLVED_AZURE_UI_URL RESOLVED_FRONTEND_URLS RESOLVED_GOOGLE_CALLBACK_URL RESOLVED_GITHUB_CALLBACK_URL RESOLVED_GITHUB_HOMEPAGE_URL RESOLVED_CHANGED; do
+  if [[ -z "${!key}" ]]; then
+    echo "Error: missing resolver output key: ${key#RESOLVED_}" >&2
+    exit 65
+  fi
+done
+if [[ "$RESOLVED_BACKEND_APP_NAME" != "$BACKEND_APP_NAME" || "$RESOLVED_UI_APP_NAME" != "$UI_APP_NAME" ]]; then
+  echo "Error: resolver app names do not match canonical env.sh names" >&2
+  exit 65
+fi
+if [[ "$RESOLVED_CHANGED" != true && "$RESOLVED_CHANGED" != false ]]; then
+  echo "Error: invalid resolver CHANGED value" >&2
+  exit 65
+fi
+FRONTEND_URLS="$RESOLVED_FRONTEND_URLS"
+if [[ "$RESOLVED_CHANGED" == true && "${OAUTH_REDIRECTS_CONFIRMED:-}" != true ]]; then
+  echo "Deployment blocked: set OAUTH_REDIRECTS_CONFIRMED=true for this process after updating the exact OAuth URLs above." >&2
+  exit 3
+fi
+
+USER_IDENTITY_NAME="${AGENT_NAME}-identity"
+IDENTITY_STDERR=$(mktemp)
+set +e
+IDENTITY_ROW=$(az identity show --subscription "$AZURE_SUBSCRIPTION_ID" --name "$USER_IDENTITY_NAME" --resource-group "$RESOURCE_GROUP" --query '[id,principalId]' -o tsv 2>"$IDENTITY_STDERR")
+IDENTITY_STATUS=$?
+set -e
+rm -f "$IDENTITY_STDERR"
+if [[ "$IDENTITY_STATUS" != 0 ]]; then
+  echo "Error: existing user-assigned managed identity '$USER_IDENTITY_NAME' is required before managed passkey deployment" >&2
+  exit "$IDENTITY_STATUS"
+fi
+if [[ "$IDENTITY_ROW" != *$'\t'* || "$IDENTITY_ROW" == *$'\n'* ]]; then
+  echo "Error: existing backend user-assigned identity returned an invalid response" >&2
+  exit 65
+fi
+USER_IDENTITY_ID="${IDENTITY_ROW%%$'\t'*}"
+USER_IDENTITY_PRINCIPAL_ID="${IDENTITY_ROW#*$'\t'}"
+if [[ -z "$USER_IDENTITY_ID" || -z "$USER_IDENTITY_PRINCIPAL_ID" ]]; then
+  echo "Error: existing backend user-assigned identity is incomplete" >&2
+  exit 65
+fi
+
+EXISTING_CONFIG_JSON=$(mktemp /tmp/existing-config-XXXXXX.json 2>/dev/null || mktemp)
+APP_CONFIG_STDERR=$(mktemp)
+set +e
+az containerapp show --subscription "$AZURE_SUBSCRIPTION_ID" --name "$AGENT_NAME" --resource-group "$RESOURCE_GROUP" --output json >"$EXISTING_CONFIG_JSON" 2>"$APP_CONFIG_STDERR"
+APP_CONFIG_STATUS=$?
+set -e
+if [[ "$APP_CONFIG_STATUS" != 0 ]]; then
+  if [[ "$APP_CONFIG_STATUS" == 3 ]]; then
+    echo "Error: existing Container App '$AGENT_NAME' is required before managed passkey deployment" >&2
+  else
+  echo "Error: Container App configuration query failed (status $APP_CONFIG_STATUS); response suppressed" >&2
+  fi
+  rm -f "$EXISTING_CONFIG_JSON" "$APP_CONFIG_STDERR"
+  exit "$APP_CONFIG_STATUS"
+fi
+rm -f "$APP_CONFIG_STDERR"
+
+if [ -z "$DOCKER_HUB_USERNAME" ]; then
+  echo "❌ Error: Please set DOCKER_HUB_USERNAME before running deploy.sh" >&2
+  rm -f "$EXISTING_CONFIG_JSON"
+  exit 1
+fi
+if [ ! -f "$SCRIPT_DIR/.build_version" ]; then
+  echo "Error: .build_version not found; run ./build.sh first" >&2
+  rm -f "$EXISTING_CONFIG_JSON"
+  exit 1
+fi
+BUILD_VERSION=$(cat "$SCRIPT_DIR/.build_version")
+SQLITE_ENV_STORAGE_NAME="authsqlite"
+RESTART_TRIGGER=$(date +%s)
+REVISION_SUFFIX="passkeys-$(date +%Y%m%d%H%M%S)"
+DESIRED_CONFIG_YAML=$(mktemp /tmp/desired-config-XXXXXX.yaml 2>/dev/null || mktemp)
+UPDATE_YAML=$(mktemp /tmp/update-config-XXXXXX.yaml 2>/dev/null || mktemp)
+python3 "$SCRIPT_DIR/scripts/render_azure_containerapp_config.py" \
+  --docker-username "$DOCKER_HUB_USERNAME" \
+  --build-version "$BUILD_VERSION" \
+  --identity-id "$USER_IDENTITY_ID" \
+  --key-vault-name "$KV_NAME" \
+  --frontend-urls "$FRONTEND_URLS" \
+  --storage-name "$SQLITE_ENV_STORAGE_NAME" \
+  --restart-trigger "$RESTART_TRIGGER" \
+  --revision-suffix "$REVISION_SUFFIX" \
+  --output "$DESIRED_CONFIG_YAML"
+python3 "$SCRIPT_DIR/scripts/merge_azure_containerapp_config.py" \
+  --existing-json "$EXISTING_CONFIG_JSON" \
+  --desired-yaml "$DESIRED_CONFIG_YAML" \
+  --output-yaml "$UPDATE_YAML"
+rm -f "$DESIRED_CONFIG_YAML"
+
+KV_ACCESS_STDERR=$(mktemp)
+set +e
+KV_ACCESS_OBJECT_ID=$(az keyvault show --subscription "$AZURE_SUBSCRIPTION_ID" --name "$KV_NAME" --resource-group "$RESOURCE_GROUP" --query "properties.accessPolicies[?objectId=='$USER_IDENTITY_PRINCIPAL_ID' && contains(permissions.secrets, 'get')].objectId | [0]" -o tsv 2>"$KV_ACCESS_STDERR")
+KV_ACCESS_STATUS=$?
+set -e
+rm -f "$KV_ACCESS_STDERR"
+if [[ "$KV_ACCESS_STATUS" != 0 ]]; then
+  echo "Error: existing Key Vault '$KV_NAME' is required before managed passkey deployment" >&2
+  exit "$KV_ACCESS_STATUS"
+fi
+if [[ "$KV_ACCESS_OBJECT_ID" != "$USER_IDENTITY_PRINCIPAL_ID" ]]; then
+  echo "Error: backend identity lacks Key Vault secret get access" >&2
+  exit 4
+fi
+PASSKEY_SECRET_STDOUT=$(mktemp)
+PASSKEY_SECRET_STDERR=$(mktemp)
+set +e
+az keyvault secret show --subscription "$AZURE_SUBSCRIPTION_ID" --vault-name "$KV_NAME" --name PASSKEY-PROXY-SECRET --query id -o tsv >"$PASSKEY_SECRET_STDOUT" 2>"$PASSKEY_SECRET_STDERR"
+PASSKEY_SECRET_STATUS=$?
+set -e
+if [[ "$PASSKEY_SECRET_STATUS" != 0 ]]; then
+  cat "$PASSKEY_SECRET_STDOUT"
+  cat "$PASSKEY_SECRET_STDERR" >&2
+  rm -f "$PASSKEY_SECRET_STDOUT" "$PASSKEY_SECRET_STDERR" "$EXISTING_CONFIG_JSON"
+  exit "$PASSKEY_SECRET_STATUS"
+fi
+PASSKEY_SECRET_ID=$(cat "$PASSKEY_SECRET_STDOUT")
+rm -f "$PASSKEY_SECRET_STDOUT" "$PASSKEY_SECRET_STDERR"
+if [[ -z "${PASSKEY_SECRET_ID//[[:space:]]/}" ]]; then
+  echo "Error: PASSKEY-PROXY-SECRET id is empty" >&2
+  rm -f "$EXISTING_CONFIG_JSON"
+  exit 65
+fi
 
 echo "🚀 Starting Deep Research Agent deployment (using existing image)..."
 
-if [ -f "./.env" ]; then
-  set -a
-  source "./.env"
-  set +a
-fi
-
-if [ -z "$DOCKER_HUB_USERNAME" ]; then
-  echo "❌ Error: Please set DOCKER_HUB_USERNAME in .env before running deploy.sh"
-  exit 1
-fi
 echo "✅ Using Docker Hub user: $DOCKER_HUB_USERNAME"
 
 # 1. Set Azure Subscription
@@ -107,11 +297,6 @@ end_step
 
 # 2. Verify image exists in ACR
 start_step "Verify Container Image"
-if [ ! -f .build_version ]; then
-    echo "⚠️ .build_version not found. Please run ./build.sh first."
-    exit 1
-fi
-BUILD_VERSION=$(cat .build_version)
 # No direct ACR check for Docker Hub image in bash
 echo "✅ Verified image exists in ACR"
 
@@ -134,11 +319,7 @@ end_step
 
 # 4. Create Key Vault and store secrets
 start_step "Key Vault Setup & Secrets"
-if az keyvault show --name $KV_NAME --resource-group $RESOURCE_GROUP &> /dev/null; then
-  echo "✅ Key Vault '$KV_NAME' already exists. Skipping creation."
-else
-  az keyvault create --name $KV_NAME --resource-group $RESOURCE_GROUP --location $LOCATION --enable-rbac-authorization false
-fi
+echo "✅ Using required existing Key Vault '$KV_NAME'."
 
 if [ "$SKIP_KV_ACCESS" = false ]; then
   echo "🔑 Ensuring Key Vault access configuration uses Access Policies..."
@@ -167,10 +348,6 @@ if [ -f "./secrets.sh" ]; then
   echo "💡 Tip: Create a secrets.sh file to automatically populate API keys."
 fi
 
-if [ -n "$DOCKER_HUB_PAT" ]; then
-  echo "🔐 Storing Docker Hub PAT in Key Vault..."
-  az keyvault secret set --vault-name $KV_NAME --name DOCKER-HUB-PAT --value "$DOCKER_HUB_PAT" > /dev/null
-fi
 end_step
 
 # 5. Setup Persistent Storage (Azure Blob Storage for Free Tier)
@@ -228,41 +405,11 @@ start_step "Container App Deployment"
 echo "🚀 Deploying agent..."
 
 # Unify identity management
-USER_IDENTITY_NAME="${AGENT_NAME}-identity"
-echo "🔐 Ensuring User-Assigned Managed Identity '$USER_IDENTITY_NAME' exists..."
-az identity create --name "$USER_IDENTITY_NAME" --resource-group $RESOURCE_GROUP > /dev/null
-USER_IDENTITY_ID=$(az identity show --name "$USER_IDENTITY_NAME" --resource-group $RESOURCE_GROUP --query id -o tsv)
-USER_IDENTITY_PRINCIPAL_ID=$(az identity show --name "$USER_IDENTITY_NAME" --resource-group $RESOURCE_GROUP --query principalId -o tsv)
-
-echo "🔐 Ensuring Managed Identity has Key Vault access..."
-az keyvault set-policy --name "$KV_NAME" --secret-permissions get list --object-id "$USER_IDENTITY_PRINCIPAL_ID" > /dev/null
+echo "🔐 Using existing User-Assigned Managed Identity '$USER_IDENTITY_NAME'."
 
 echo "✅ Skipping ACR permissions since we use Docker Hub"
 
-if az containerapp show --name $AGENT_NAME --resource-group $RESOURCE_GROUP &> /dev/null; then
-  echo "📝 Container app already exists. Updating..."
-  az containerapp identity assign --name $AGENT_NAME --resource-group $RESOURCE_GROUP --user-assigned "$USER_IDENTITY_ID" > /dev/null || true
-  echo "⏳ Waiting for initial update to settle..."
-  sleep 10
-else
-  echo "✨ Creating new container app..."
-  az containerapp create \
-    --name $AGENT_NAME \
-    --resource-group $RESOURCE_GROUP \
-    --environment $ENV_NAME \
-    --image $DOCKER_HUB_USERNAME/deep-research-agent:$BUILD_VERSION \
-    --registry-server docker.io \
-    --registry-username "$DOCKER_HUB_USERNAME" \
-    --registry-password "$DOCKER_HUB_PAT" \
-    --target-port 2024 \
-    --ingress external \
-    --transport auto \
-    --min-replicas 0 \
-    --max-replicas 1 \
-    --cpu 2.0 \
-    --memory 4Gi \
-    --user-assigned "$USER_IDENTITY_ID"
-fi
+echo "📝 Updating required existing Container App '$AGENT_NAME'."
 
 echo "⏳ Waiting for any active provisioning operations to complete..."
 for i in {1..60}; do
@@ -292,139 +439,25 @@ echo "⚙️  Applying comprehensive configuration update..."
 #            secretRef: azure-openai-deployment
 #          - name: AZURE_OPENAI_API_KEY
 #            secretRef: azure-openai-api-key
-UPDATE_YAML=$(mktemp /tmp/update-config-XXXXXX.yaml 2>/dev/null || mktemp)
-RESTART_TRIGGER=$(date +%s)
-cat > "$UPDATE_YAML" <<EOF
-properties:
-  configuration:
-    ingress:
-      external: true
-      targetPort: 2024
-      transport: auto
-    secrets:
-      - name: tavily-api-key
-        keyVaultUrl: https://${KV_NAME}.vault.azure.net/secrets/TAVILY-API-KEY
-        identity: ${USER_IDENTITY_ID}
-      - name: langchain-api-key
-        keyVaultUrl: https://${KV_NAME}.vault.azure.net/secrets/LANGCHAIN-API-KEY
-        identity: ${USER_IDENTITY_ID}
-      - name: upload-api-key
-        keyVaultUrl: https://${KV_NAME}.vault.azure.net/secrets/UPLOAD-API-KEY
-        identity: ${USER_IDENTITY_ID}
-      - name: storage-account-name
-        keyVaultUrl: https://${KV_NAME}.vault.azure.net/secrets/STORAGE-ACCOUNT-NAME
-        identity: ${USER_IDENTITY_ID}
-      - name: storage-account-key
-        keyVaultUrl: https://${KV_NAME}.vault.azure.net/secrets/STORAGE-ACCOUNT-KEY
-        identity: ${USER_IDENTITY_ID}
-      - name: azure-storage-container-name
-        keyVaultUrl: https://${KV_NAME}.vault.azure.net/secrets/AZURE-STORAGE-CONTAINER-NAME
-        identity: ${USER_IDENTITY_ID}
-      - name: google-api-key
-        keyVaultUrl: https://${KV_NAME}.vault.azure.net/secrets/GOOGLE-API-KEY
-        identity: ${USER_IDENTITY_ID}
-      - name: docker-hub-pat
-        keyVaultUrl: https://${KV_NAME}.vault.azure.net/secrets/DOCKER-HUB-PAT
-        identity: ${USER_IDENTITY_ID}
-    registries:
-      - server: docker.io
-        username: ${DOCKER_HUB_USERNAME}
-        passwordSecretRef: docker-hub-pat
-  template:
-    containers:
-      - name: deep-research-agent
-        image: "${DOCKER_HUB_USERNAME}/deep-research-agent:${BUILD_VERSION}"
-        resources:
-          cpu: 2.0
-          memory: 4Gi
-        env:
-          - name: RESTART_TRIGGER
-            value: "${RESTART_TRIGGER}"
-          - name: VERIFY_SSL
-            value: "false"
-          - name: LOG_LEVEL
-            value: INFO
-          - name: LANGCHAIN_TRACING_V2
-            value: "true"
-          - name: LANGSMITH_ENDPOINT
-            value: https://api.smith.langchain.com
-          - name: LANGCHAIN_PROJECT
-            value: deep-research-production
-          - name: ENABLE_EVAL_TRACKING
-            value: "true"
-          - name: ALLOW_ALL_THREADS
-            value: "false"
-          - name: MODEL_TPM
-            value: "120000"
-          - name: MODEL_RPM
-            value: "500"
-          - name: GRAPH_RECURSION_LIMIT
-            value: "200"
-          - name: MAX_CONCURRENT_RESEARCH_UNITS
-            value: "3"
-          - name: MAX_RESEARCHER_ITERATIONS
-            value: "3"
-          - name: MAX_GLOB_DEPTH
-            value: "3"
-          - name: MAX_FILES_TO_READ
-            value: "20"
-          - name: MAX_TOTAL_SIZE_MB
-            value: "50"
-          - name: MODEL_MAX_RETRIES
-            value: "5"
-          - name: MODEL_INITIAL_BACKOFF
-            value: "1.0"
-          - name: MODEL_MAX_BACKOFF
-            value: "60.0"
-          - name: MODEL_BACKOFF_MULTIPLIER
-            value: "2.0"
-          - name: MODEL_RETRY_JITTER
-            value: "true"
-          - name: DB_TYPE
-            value: sqlite
-          - name: MEMORY_TYPE
-            value: ""
-          - name: REPORTS_OUTPUT_FOLDER
-            value: /deps/deep_research/output
-          - name: EVAL_HISTORY_FILE
-            value: /deps/deep_research/output/eval_history/server_runs.jsonl
-          - name: DOC_FOLDER
-            value: /deps/deep_research/docs
-          - name: WIKI_BASE_DIR
-            value: /deps/deep_research
-          - name: INPUT_FOLDER
-            value: /deps/deep_research/input
-          - name: SQLITE_DB_PATH
-            value: /mnt/auth/auth.db
-          - name: AUTH_SQLITE_JOURNAL_MODE
-            value: DELETE
-          - name: TAVILY_API_KEY
-            secretRef: tavily-api-key
-          - name: LANGCHAIN_API_KEY
-            secretRef: langchain-api-key
-          - name: UPLOAD_API_KEY
-            secretRef: upload-api-key
-          - name: STORAGE_ACCOUNT_NAME
-            secretRef: storage-account-name
-          - name: STORAGE_ACCOUNT_KEY
-            secretRef: storage-account-key
-          - name: AZURE_STORAGE_CONTAINER_NAME
-            secretRef: azure-storage-container-name
-          - name: GOOGLE_API_KEY
-            secretRef: google-api-key
-        volumeMounts:
-          - volumeName: auth-sqlite
-            mountPath: /mnt/auth
-    volumes:
-      - name: auth-sqlite
-        storageType: AzureFile
-        storageName: ${SQLITE_ENV_STORAGE_NAME}
-    scale:
-      minReplicas: 0
-      maxReplicas: 1
-EOF
-az containerapp update --name $AGENT_NAME --resource-group $RESOURCE_GROUP --yaml "$UPDATE_YAML"
+rm -f "$EXISTING_CONFIG_JSON"
+az containerapp update --name "$AGENT_NAME" --resource-group "$RESOURCE_GROUP" --yaml "$UPDATE_YAML"
 rm -f "$UPDATE_YAML"
+REVISION_READY=false
+for i in {1..60}; do
+  REVISION_STATE=$(az containerapp revision list --name "$AGENT_NAME" --resource-group "$RESOURCE_GROUP" --query "[?name=='${AGENT_NAME}--${REVISION_SUFFIX}'] | [0].[properties.runningState,properties.healthState]" -o tsv)
+  if [[ "$REVISION_STATE" == $'Running\tHealthy' ]]; then
+    REVISION_READY=true
+    break
+  fi
+  if [[ "$REVISION_STATE" == Failed* || "$REVISION_STATE" == *$'\tUnhealthy' ]]; then
+    break
+  fi
+  sleep 5
+done
+if [[ "$REVISION_READY" != true ]]; then
+  echo "❌ Revision ${AGENT_NAME}--${REVISION_SUFFIX} did not become Running and Healthy." >&2
+  exit 1
+fi
 echo "✅ Container App configured successfully."
 end_step
 
@@ -435,16 +468,6 @@ echo "════════════════════════�
 
 EXTERNAL_URL=$(az containerapp show --name $AGENT_NAME --resource-group $RESOURCE_GROUP --query properties.configuration.ingress.fqdn -o tsv)
 echo "🌐 Agent URL: https://$EXTERNAL_URL"
-
-echo "📝 Updating DEEP_RESEARCH_AGENT_URL in env.sh..."
-if grep -q "^export DEEP_RESEARCH_AGENT_URL=" ./env.sh; then
-  awk -v url="https://$EXTERNAL_URL" '/^export DEEP_RESEARCH_AGENT_URL=/{print "export DEEP_RESEARCH_AGENT_URL=\"" url "\""; next} 1' ./env.sh > ./env.sh.tmp && mv ./env.sh.tmp ./env.sh
-else
-  echo "" >> ./env.sh
-  echo "# 4. Agent URL" >> ./env.sh
-  echo "export DEEP_RESEARCH_AGENT_URL=\"https://$EXTERNAL_URL\"" >> ./env.sh
-fi
-echo "✅ env.sh updated."
 
 echo "🏥 Health Check: https://$EXTERNAL_URL/health"
 echo ""
@@ -486,11 +509,15 @@ done
 
 if [ "$VERSION_MATCHED" = false ]; then
   echo ""
-  echo "⚠️  WARNING: Container started but version mismatch detected!"
+  echo "❌ Container health/version verification failed." >&2
+  exit 1
 else
   echo ""
   echo "✅ Deployment verified successfully!"
 fi
 end_step
+
+BACKEND_APP_NAME="$BACKEND_APP_NAME" UI_APP_NAME="$UI_APP_NAME" \
+  "$SCRIPT_DIR/scripts/resolve_azure_endpoints.sh" --record >/dev/null
 
 print_timing_summary

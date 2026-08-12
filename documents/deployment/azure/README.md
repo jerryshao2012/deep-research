@@ -1,10 +1,10 @@
 # Deploy to Azure Container Apps
 
-Use this guide to deploy Deep Research Agent to Azure Container Apps with the repository's current scripts. It is for operators who can create Azure resources and publish container images. Review the limitations below before running anything against a subscription.
+Use this guide for the repository's current update-only managed passkey cutover on Azure Container Apps. It assumes bootstrap resources already exist; `deploy.sh` is not a first-deployment or disaster-recovery bootstrap script.
 
 ## Understand the deployed architecture
 
-`build.sh` publishes versioned `linux/amd64` images to Docker Hub. `deploy.sh` creates or updates one externally accessible Container App on port `2024`, backed by Key Vault, a user-assigned managed identity, Azure Blob Storage, and a small Azure Files mount.
+`build.sh` publishes versioned `linux/amd64` images to Docker Hub. `deploy.sh` updates the existing externally accessible backend Container App on port `2024`, backed by Key Vault, a user-assigned managed identity, Azure Blob Storage, and a small Azure Files mount.
 
 ```mermaid
 flowchart LR
@@ -27,9 +27,15 @@ See [Storage and persistence](storage.md) before migrating state or changing rep
 
 ## Check prerequisites
 
-You need:
+Bootstrap these prerequisites separately before using this workflow:
 
-- an Azure subscription and rights to manage resource groups, Container Apps, managed identities, Key Vault access policies, and Storage;
+- the resource group, Container Apps environment, and backend Container App named by `env.sh`;
+- the user-assigned managed identity `${AGENT_NAME}-identity` and its assignment to the backend app;
+- the Key Vault named by `KV_NAME`, with that identity granted secret `get` access;
+- a pre-created, rotated `PASSKEY-PROXY-SECRET` in that Key Vault;
+- all other provider and runtime secrets referenced by the existing Container App configuration;
+- storage prerequisites required by the current deployment, or rights for its existing storage-management steps;
+- an Azure subscription and rights to update Container Apps, Key Vault access policies, and Storage;
 - Azure CLI with the Container Apps extension available;
 - one supported local container runtime: Apple's `container` CLI on an Apple silicon Mac running a macOS release listed in [Apple's current requirements](https://github.com/apple/container#requirements), Podman, or Docker;
 - Python 3 for API-version management inside the build script;
@@ -51,7 +57,7 @@ python3 --version
 Review [configuration](../../guides/configuration.md) and [authentication](../../guides/authentication.md) before exposing the service.
 
 > [!IMPORTANT]
-> `env.sh`, `build.sh`, and `deploy.sh` currently contain repository-specific defaults, including resource names, region, subscription selection, and an existing endpoint. Replace or verify them locally before running the scripts. The scripts are not a portable, parameter-only deployment template. Never commit the resulting credentials or personal deployment values.
+> `env.sh`, `build.sh`, and `deploy.sh` contain repository-specific names, region, and subscription selection. Verify them against already-bootstrapped resources. Historical bootstrap steps must remain a separate operator procedure; the current cutover script fails closed when the backend app, identity, Key Vault, access policy, or passkey proxy secret is missing.
 
 ## Prepare local deployment values
 
@@ -80,17 +86,20 @@ Review [configuration](../../guides/configuration.md) and [authentication](../..
 
 Do not paste subscription IDs, storage keys, or API keys into this guide or terminal history.
 
-## Deploy in order
+## Update in order
 
-### 1. Populate Key Vault inputs
+### 1. Resolve endpoints and confirm OAuth settings
 
-`deploy.sh` creates Key Vault when needed and invokes `secrets.sh` if present. Running the secret helper first is useful when the vault already exists:
+Load canonical resource names, resolve exact Azure URLs, then update Google and GitHub provider settings shown by the resolver:
 
 ```bash
-./secrets.sh
+source ./env.sh
+./scripts/resolve_azure_endpoints.sh
 ```
 
-For identity and secret-reference behavior, see [Security](security.md).
+First deployment through this workflow, or any endpoint change, is blocked until OAuth settings are confirmed process-locally. Do not add the confirmation to `.env`, `env.sh`, or another persisted file. Resolver metadata is recorded in `.resolved-azure-endpoints.json` only after revision readiness and health verification succeed.
+
+Before continuing, verify existing Key Vault inputs, including `PASSKEY-PROXY-SECRET`, and rotate/populate them through the separate approved secret-management procedure. `deploy.sh` does not create the vault, managed identity, backend app, or passkey proxy secret. For identity and secret-reference behavior, see [Security](security.md).
 
 ### 2. Build and publish an image
 
@@ -111,13 +120,13 @@ CONTAINER_RUNTIME=docker ./build.sh
 
 The script increments `API_VERSION`, creates `.build_version`, builds a `linux/amd64` image, and pushes both `latest` and the timestamped version to Docker Hub. Review those source changes before committing; an image build is not read-only.
 
-### 3. Create or update Azure resources
+### 3. Update the existing backend deployment
 
 ```bash
-./deploy.sh
+OAUTH_REDIRECTS_CONFIRMED=true ./deploy.sh
 ```
 
-The deployment reads `.build_version`; it does not build an image. It creates or reuses the resource group, Container Apps environment, Key Vault, storage account, Blob container, Azure Files auth share, and user-assigned identity. It then applies the Container App configuration and waits for `/health` to report the expected API version.
+The confirmation is required only when resolver metadata is new or changed; unchanged endpoints produce a nonblocking reminder. Deployment reads `.build_version`, validates existing app configuration and managed prerequisites, updates supporting storage where configured, applies a named Container App revision, and waits for that exact revision plus `/health` to report the expected API version.
 
 For a repeat deployment where Key Vault access-policy updates are known to be correct:
 
@@ -125,7 +134,7 @@ For a repeat deployment where Key Vault access-policy updates are known to be co
 ./deploy.sh --skip-kv-access
 ```
 
-This flag skips only the current-user Key Vault access update. It does not skip storage, identity, application configuration, or health verification.
+This flag skips only the current-user Key Vault access update. It does not bypass the read-only check that the backend identity already has secret `get` access, nor storage, application configuration, revision readiness, or health verification.
 
 ### 4. Synchronize runtime files when needed
 
@@ -138,10 +147,11 @@ The no-flag form downloads and then uploads. Read the quiescence and overwrite w
 
 ## Verify health
 
-`deploy.sh` writes the resolved HTTPS endpoint back to `env.sh`. Verify the active revision and endpoint without printing secrets:
+`deploy.sh` does not rewrite `env.sh`. After successful revision and health checks it atomically records resolved endpoints in `.resolved-azure-endpoints.json`. Verify active revision and endpoint without printing secrets:
 
 ```bash
 source ./env.sh
+BACKEND_URL="$(python3 -c 'import json; print(json.load(open(".resolved-azure-endpoints.json"))["backend_url"])')"
 
 az containerapp show \
   --name "$AGENT_NAME" \
@@ -155,7 +165,7 @@ az containerapp revision list \
   --query '[?properties.active==`true`].{name:name,state:properties.runningState,active:properties.active}' \
   --output table
 
-curl --fail --silent --show-error "$DEEP_RESEARCH_AGENT_URL/health" \
+curl --fail --silent --show-error "$BACKEND_URL/health" \
   | python3 -m json.tool
 ```
 
