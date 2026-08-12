@@ -2510,6 +2510,80 @@ def test_stale_registration_returns_exact_reauth_payload(passkey_client):
     assert response.json() == {"code": "reauth_required", "provider": "google"}
 
 
+def test_stale_session_can_list_but_cannot_rename_or_delete(passkey_client):
+    client, store, user, token = passkey_client
+    store.create_credential(
+        identity=user["identity"],
+        rp_id="app.example.com",
+        credential_id="stale-session-credential",
+        public_key=b"public-key",
+        sign_count=0,
+        transports=["internal"],
+        device_type="single_device",
+        backed_up=False,
+        label="Phone",
+    )
+    with store._lock:
+        store._connection.execute(
+            "UPDATE auth_sessions SET authenticated_at = ?", (time.time() - 601,)
+        )
+    headers = _proxy_headers(token=token)
+
+    listed = client.get("/auth/passkeys", headers=headers)
+    renamed = client.patch(
+        "/auth/passkeys/stale-session-credential",
+        headers=headers,
+        json={"label": "Pixel"},
+    )
+    deleted = client.delete("/auth/passkeys/stale-session-credential", headers=headers)
+
+    assert listed.status_code == 200
+    assert listed.json()["passkeys"][0]["label"] == "Phone"
+    for response in (renamed, deleted):
+        assert response.status_code == 403
+        assert response.json() == {
+            "code": "reauth_required",
+            "provider": "google",
+        }
+    assert store.get_credential("stale-session-credential").label == "Phone"
+
+
+@pytest.mark.parametrize("session_state", ["missing", "invalid", "expired"])
+@pytest.mark.parametrize(
+    ("http_method", "path", "json_body"),
+    [
+        ("get", "/auth/passkeys", None),
+        ("post", "/auth/passkeys/registration/options", None),
+        (
+            "patch",
+            "/auth/passkeys/session-check-credential",
+            {"label": "Pixel"},
+        ),
+        ("delete", "/auth/passkeys/session-check-credential", None),
+    ],
+)
+def test_protected_passkey_routes_return_exact_invalid_session(
+    passkey_client, session_state, http_method, path, json_body
+):
+    client, store, _user, token = passkey_client
+    if session_state == "missing":
+        request_token = None
+    elif session_state == "invalid":
+        request_token = "not-a-live-session"
+    else:
+        request_token = token
+        with store._lock:
+            store._connection.execute("UPDATE auth_sessions SET expires_at = 0")
+    request_kwargs = {"headers": _proxy_headers(token=request_token)}
+    if json_body is not None:
+        request_kwargs["json"] = json_body
+
+    response = getattr(client, http_method)(path, **request_kwargs)
+
+    assert response.status_code == 401
+    assert response.json() == {"code": "invalid_session"}
+
+
 def test_management_routes_list_rename_and_delete(passkey_client):
     client, store, _user, token = passkey_client
     store.create_credential(

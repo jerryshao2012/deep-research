@@ -580,12 +580,12 @@ class PasskeyService:
     def _live_session(self, session_token: str, *, recent: bool = True):
         detail = self.store.get_session_detail(session_token)
         if detail is None:
-            raise InvalidPasskeyError("Invalid or expired session")
+            raise InvalidPasskeySessionError("Invalid or expired session")
         self._consume_rate(
             "account", detail.identity, self.config.authenticated_rate_limit
         )
         if recent and not self.config.is_recent_auth(
-                detail.authenticated_at, now=self._clock()
+            detail.authenticated_at, now=self._clock()
         ):
             raise ReauthenticationRequired(detail.provider)
         return detail
@@ -889,8 +889,8 @@ class PasskeyService:
         return {"ok": True, "user": user, "session_token": session_token}
 
     def list_credentials(self, session_token: str) -> list[dict[str, Any]]:
-        """List public credential metadata for a recently authenticated account."""
-        detail = self._live_session(session_token)
+        """List public credential metadata for a live authenticated account."""
+        detail = self._live_session(session_token, recent=False)
         return [
             self._credential_json(item)
             for item in self.store.list_credentials(detail.identity)
