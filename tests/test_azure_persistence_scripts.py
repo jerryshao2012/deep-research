@@ -1960,7 +1960,7 @@ elif args[:2] == ["containerapp", "show"] and "--query" in args and args[args.in
     if os.environ.get("FAKE_FINAL_TEMPLATE_MALFORMED"):
         sys.stdout.write('{"secret":"final-template-secret-canary"')
         raise SystemExit(0)
-    template = {"containers": [{
+    template = {"customMetricsSettings": None, "containers": [{
         "name": "renamed-main",
         "imageType": "ContainerImage",
         "env": [{"name": "UNRELATED_ENV", "value": "kept"}],
@@ -1995,7 +1995,7 @@ elif args[:2] == ["containerapp", "show"] and "--output" in args and args[args.i
                 ],
                 "registries": [{"server": "docker.io", "username": "wrong-user" if os.environ.get("FAKE_REGISTRY_DRIFT") else "demo-user", "passwordSecretRef": "docker-hub-pat", "identity": ""}],
             },
-            "template": {"containers": [{
+            "template": {"customMetricsSettings": None, "containers": [{
                 "name": "renamed-main",
                 "imageType": "ContainerImage",
                 "env": [{"name": "UNRELATED_ENV", "value": "kept"}],
@@ -2096,6 +2096,7 @@ sys.stdout.write('{"version":"9.8.7","status":"ok"}\\n')
     assert rendered["location"] == "canadacentral"
     revision_suffix = rendered["properties"]["template"]["revisionSuffix"]
     assert revision_suffix == "passkeys-20260812010101"
+    assert "customMetricsSettings" not in rendered["properties"]["template"]
     container = rendered["properties"]["template"]["containers"][0]
     assert container["name"] == "renamed-main"
     assert "imageType" not in container

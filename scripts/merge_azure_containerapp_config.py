@@ -19,6 +19,7 @@ LIST_IDENTITIES = {
 }
 
 SERVER_GENERATED_CONTAINER_FIELDS = {"imageType"}
+SERVER_GENERATED_TEMPLATE_FIELDS = {"customMetricsSettings"}
 
 
 def _merge(existing: object, desired: object, path: tuple[str, ...] = ()) -> object:
@@ -58,6 +59,8 @@ def _merge(existing: object, desired: object, path: tuple[str, ...] = ()) -> obj
 
 
 def _strip_server_generated_fields(template: dict[str, object]) -> None:
+    for generated_field in SERVER_GENERATED_TEMPLATE_FIELDS:
+        template.pop(generated_field, None)
     for field in ("containers", "initContainers"):
         containers = template.get(field)
         if containers is None:
