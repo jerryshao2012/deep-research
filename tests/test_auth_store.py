@@ -788,6 +788,28 @@ def test_fastapi_auth_helper_checks_session_off_event_loop(monkeypatch):
     assert asyncio.run(authenticate()) is True
 
 
+def test_custom_route_authentication_checks_session_off_event_loop(monkeypatch):
+    from research_agent import server
+
+    def authenticate_credential(credential):
+        with pytest.raises(RuntimeError, match="no running event loop"):
+            asyncio.get_running_loop()
+        assert credential == "session-token"
+        return {
+            "identity": "google:google-subject",
+            "display_name": "Person",
+            "is_authenticated": True,
+        }
+
+    monkeypatch.delenv("ALLOW_ALL_THREADS", raising=False)
+    monkeypatch.setattr(server, "authenticate_credential", authenticate_credential)
+    request = SimpleNamespace(headers={"x-api-key": "session-token"})
+
+    user = asyncio.run(server.get_current_user(request))
+
+    assert user["identity"] == "google:google-subject"
+
+
 @pytest.mark.parametrize(
     ("backend", "message"),
     [

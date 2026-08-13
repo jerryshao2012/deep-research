@@ -2,8 +2,71 @@
 
 from __future__ import annotations
 
+import asyncio
 import tempfile
 from pathlib import Path
+
+import pytest
+
+
+def _assert_off_event_loop() -> None:
+    with pytest.raises(RuntimeError, match="no running event loop"):
+        asyncio.get_running_loop()
+
+
+def test_wiki_tree_checks_storage_off_event_loop(monkeypatch):
+    from thread_wiki import routes
+
+    class WikiDir:
+        def exists(self):
+            _assert_off_event_loop()
+            return True
+
+    wiki_dir = WikiDir()
+    paths = type("Paths", (), {"wiki_dir": wiki_dir})()
+
+    def build_directory_tree(root, current):
+        _assert_off_event_loop()
+        assert root is wiki_dir
+        assert current is wiki_dir
+        return {"type": "directory", "children": []}
+
+    monkeypatch.setattr(routes.ThreadWikiPaths, "resolve", lambda *_: paths)
+    monkeypatch.setattr(routes, "_build_directory_tree", build_directory_tree)
+
+    result = asyncio.run(routes.get_thread_wiki_tree("thread-id", {}))
+
+    assert result["file_count"] == 0
+
+
+def test_wiki_status_checks_storage_off_event_loop(monkeypatch):
+    from thread_wiki import routes
+
+    paths = type("Paths", (), {"wiki_dir": object()})()
+
+    async def get_progress(_thread_id):
+        return None
+
+    def wiki_is_ready(received_paths):
+        _assert_off_event_loop()
+        assert received_paths is paths
+        return True
+
+    def load_summary(wiki_dir):
+        _assert_off_event_loop()
+        assert wiki_dir is paths.wiki_dir
+        return {"detected_files": 1}
+
+    monkeypatch.setattr(routes.ThreadWikiPaths, "resolve", lambda *_: paths)
+    monkeypatch.setattr(routes.progress_tracker, "get_progress", get_progress)
+    monkeypatch.setattr(routes, "_wiki_is_ready", wiki_is_ready)
+    monkeypatch.setattr(routes, "load_code_analysis_summary", load_summary)
+
+    result = asyncio.run(routes.get_wiki_status("thread-id", {}))
+
+    assert result.wiki_ready is True
+    assert result.code_analysis is not None
+    assert result.code_analysis.detected_files == 1
 
 
 def test_resolve_model_does_not_mutate_sys_path(monkeypatch):

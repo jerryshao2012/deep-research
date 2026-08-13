@@ -420,7 +420,7 @@ async def get_current_user(request: Request) -> Auth.types.MinimalUserDict:
             detail="Missing authentication. Please provide 'x-api-key', 'Authorization: Bearer', or OAuth session token."
         )
 
-    return authenticate_credential(api_key)
+    return await asyncio.to_thread(authenticate_credential, api_key)
 
 
 # ── DB helpers ────────────────────────────────────────────────────────────────

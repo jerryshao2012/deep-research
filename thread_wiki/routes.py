@@ -473,8 +473,10 @@ async def get_wiki_status(
 
     if prog is None:
         # No active ingest — check if wiki is already built.
-        ready = _wiki_is_ready(paths)
-        code_analysis = load_code_analysis_summary(paths.wiki_dir)
+        ready = await asyncio.to_thread(_wiki_is_ready, paths)
+        code_analysis = await asyncio.to_thread(
+            load_code_analysis_summary, paths.wiki_dir
+        )
         return WikiStatusResponse(
             thread_id=thread_id,
             phase="ready" if ready else "idle",
@@ -518,7 +520,7 @@ async def get_wiki_status(
         started_at=prog.started_at,
         completed_at=prog.completed_at,
         is_active=prog.is_active(),
-        wiki_ready=_wiki_is_ready(paths),
+        wiki_ready=await asyncio.to_thread(_wiki_is_ready, paths),
         review_report=review_out,
         code_analysis=prog.code_analysis,
     )
@@ -946,7 +948,7 @@ async def get_thread_wiki_tree(
 ) -> dict[str, Any]:
     """Get the full directory tree structure for a thread's wiki workspace."""
     paths = ThreadWikiPaths.resolve(thread_id, _BASE_DIR)
-    if not paths.wiki_dir.exists():
+    if not await asyncio.to_thread(paths.wiki_dir.exists):
         raise HTTPException(
             status_code=404,
             detail=f"Wiki directory does not exist for thread '{thread_id}'. Run ingest first.",
@@ -975,7 +977,7 @@ async def get_thread_wiki_file(
 ) -> dict[str, Any]:
     """Read and return the text content of a specific file in the thread's wiki workspace."""
     paths = ThreadWikiPaths.resolve(thread_id, _BASE_DIR)
-    if not paths.wiki_dir.exists():
+    if not await asyncio.to_thread(paths.wiki_dir.exists):
         raise HTTPException(
             status_code=404,
             detail=f"Wiki directory does not exist for thread '{thread_id}'.",
