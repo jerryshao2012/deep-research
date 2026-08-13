@@ -20,7 +20,11 @@ def test_build_scripts_use_selected_container_runtime_after_environment_loading(
     environment_script: str,
 ) -> None:
     source = (PROJECT_ROOT / script_name).read_text(encoding="utf-8")
-    environment_source = f"source ./{environment_script}"
+    environment_source = (
+        'source "$SCRIPT_DIR/env.sh"'
+        if script_name == "build.sh"
+        else f"source ./{environment_script}"
+    )
 
     assert 'source "$SCRIPT_DIR/scripts/container_runtime.sh"' in source
     assert source.index(environment_source) < source.index("select_container_runtime")

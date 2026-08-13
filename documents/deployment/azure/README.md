@@ -115,7 +115,7 @@ Before continuing, verify existing Key Vault inputs, including `PASSKEY-PROXY-SE
 
 ### 2. Build and publish an image
 
-`build.sh` auto-detects installed runtimes in `container → podman → docker` order. Setting `CONTAINER_RUNTIME` forces one installed supported runtime. Readiness depends on the selected runtime:
+`build.sh` auto-detects installed runtimes in `container → podman → docker` order. Prefer `--container-cli` (or `-c`) to select one installed supported runtime for a single build. `CONTAINER_CLI` provides the cross-repository environment override, while legacy `CONTAINER_RUNTIME` remains compatible. Precedence is command option → `CONTAINER_CLI` → `CONTAINER_RUNTIME` → automatic selection; conflicting environment aliases fail unless the command option resolves the choice. Readiness depends on the selected runtime:
 
 - Apple's runtime can start its system automatically.
 - Native Linux Podman is daemonless and needs no daemon service, but `podman info` must pass.
@@ -126,6 +126,10 @@ If the selected runtime fails its readiness check, the build stops instead of fa
 
 ```bash
 ./build.sh
+./build.sh --container-cli podman
+./build.sh --container-cli=podman
+./build.sh -c podman
+CONTAINER_CLI=podman ./build.sh
 CONTAINER_RUNTIME=podman ./build.sh
 CONTAINER_RUNTIME=docker ./build.sh
 ```

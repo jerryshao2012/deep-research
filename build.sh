@@ -2,6 +2,118 @@
 set -e
 set -o pipefail
 
+print_usage() {
+  echo "Usage: ./build.sh [--container-cli RUNTIME|-c RUNTIME]"
+  echo "       ./build.sh --container-cli=RUNTIME"
+  echo "RUNTIME: container, podman, or docker"
+}
+
+unset CLI_CONTAINER_CLI CLI_CONTAINER_CLI_SEEN
+unset CALLER_CONTAINER_CLI CALLER_CONTAINER_CLI_WAS_SET
+unset CALLER_CONTAINER_RUNTIME CALLER_CONTAINER_RUNTIME_WAS_SET
+unset RESOLVED_CONTAINER_RUNTIME SELECTED_CONTAINER_RUNTIME_PATH
+CLI_CONTAINER_CLI=""
+CLI_CONTAINER_CLI_SEEN=false
+CALLER_CONTAINER_CLI=""
+CALLER_CONTAINER_CLI_WAS_SET=false
+CALLER_CONTAINER_RUNTIME=""
+CALLER_CONTAINER_RUNTIME_WAS_SET=false
+RESOLVED_CONTAINER_RUNTIME=""
+if [ "${CONTAINER_CLI+x}" = x ]; then
+  CALLER_CONTAINER_CLI="$CONTAINER_CLI"
+  CALLER_CONTAINER_CLI_WAS_SET=true
+fi
+if [ "${CONTAINER_RUNTIME+x}" = x ]; then
+  CALLER_CONTAINER_RUNTIME="$CONTAINER_RUNTIME"
+  CALLER_CONTAINER_RUNTIME_WAS_SET=true
+fi
+unset CONTAINER_CLI CONTAINER_RUNTIME
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --help|-h)
+      if [ "$#" -ne 1 ] || [ "$CLI_CONTAINER_CLI_SEEN" = true ]; then
+        echo "Error: --help must be used alone." >&2
+        exit 64
+      fi
+      print_usage
+      exit 0
+      ;;
+    --container-cli|-c)
+      if [ "$CLI_CONTAINER_CLI_SEEN" = true ]; then
+        echo "Error: container runtime option may be supplied only once." >&2
+        exit 64
+      fi
+      if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+        echo "Error: $1 requires a runtime value." >&2
+        exit 64
+      fi
+      CLI_CONTAINER_CLI="$2"
+      CLI_CONTAINER_CLI_SEEN=true
+      shift 2
+      ;;
+    --container-cli=*)
+      if [ "$CLI_CONTAINER_CLI_SEEN" = true ]; then
+        echo "Error: container runtime option may be supplied only once." >&2
+        exit 64
+      fi
+      CLI_CONTAINER_CLI="${1#--container-cli=}"
+      if [ -z "$CLI_CONTAINER_CLI" ]; then
+        echo "Error: --container-cli requires a runtime value." >&2
+        exit 64
+      fi
+      CLI_CONTAINER_CLI_SEEN=true
+      shift
+      ;;
+    *)
+      echo "Error: unknown argument '$1'." >&2
+      exit 64
+      ;;
+  esac
+done
+
+if [ "$CLI_CONTAINER_CLI_SEEN" = true ]; then
+  RESOLVED_CONTAINER_RUNTIME="$CLI_CONTAINER_CLI"
+elif [ "$CALLER_CONTAINER_CLI_WAS_SET" = true ]; then
+  if [ "$CALLER_CONTAINER_RUNTIME_WAS_SET" = true ] \
+    && [ "$CALLER_CONTAINER_CLI" != "$CALLER_CONTAINER_RUNTIME" ]; then
+    echo "Error: CONTAINER_CLI and CONTAINER_RUNTIME disagree." >&2
+    exit 64
+  fi
+  RESOLVED_CONTAINER_RUNTIME="$CALLER_CONTAINER_CLI"
+elif [ "$CALLER_CONTAINER_RUNTIME_WAS_SET" = true ]; then
+  RESOLVED_CONTAINER_RUNTIME="$CALLER_CONTAINER_RUNTIME"
+fi
+
+if [ -n "$RESOLVED_CONTAINER_RUNTIME" ]; then
+  case "$RESOLVED_CONTAINER_RUNTIME" in
+    container|podman|docker) ;;
+    *)
+      echo "Error: container runtime must be one of: container, podman, docker." >&2
+      exit 64
+      ;;
+  esac
+  SELECTED_CONTAINER_RUNTIME_PATH="$(type -P -- "$RESOLVED_CONTAINER_RUNTIME" 2>/dev/null)" || {
+    echo "Error: requested container runtime '$RESOLVED_CONTAINER_RUNTIME' is not on PATH." >&2
+    exit 64
+  }
+  if [ ! -f "$SELECTED_CONTAINER_RUNTIME_PATH" ] || [ ! -x "$SELECTED_CONTAINER_RUNTIME_PATH" ]; then
+    echo "Error: requested container runtime '$RESOLVED_CONTAINER_RUNTIME' is not on PATH." >&2
+    exit 64
+  fi
+  unset SELECTED_CONTAINER_RUNTIME_PATH
+elif [ "$CLI_CONTAINER_CLI_SEEN" = true ] \
+  || [ "$CALLER_CONTAINER_CLI_WAS_SET" = true ] \
+  || [ "$CALLER_CONTAINER_RUNTIME_WAS_SET" = true ]; then
+  echo "Error: container runtime must be one of: container, podman, docker." >&2
+  exit 64
+fi
+
+readonly CLI_CONTAINER_CLI CLI_CONTAINER_CLI_SEEN
+readonly CALLER_CONTAINER_CLI CALLER_CONTAINER_CLI_WAS_SET
+readonly CALLER_CONTAINER_RUNTIME CALLER_CONTAINER_RUNTIME_WAS_SET
+readonly RESOLVED_CONTAINER_RUNTIME
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/scripts/container_runtime.sh"
 
@@ -157,6 +269,10 @@ verify_build_owned_files_unchanged() {
 
 # Configuration
 source "$SCRIPT_DIR/env.sh"
+unset CONTAINER_CLI CONTAINER_RUNTIME
+if [ -n "$RESOLVED_CONTAINER_RUNTIME" ]; then
+  CONTAINER_RUNTIME="$RESOLVED_CONTAINER_RUNTIME"
+fi
 : "${BACKEND_APP_NAME:?Set BACKEND_APP_NAME in env.sh}"
 : "${UI_APP_NAME:?Set UI_APP_NAME in env.sh}"
 

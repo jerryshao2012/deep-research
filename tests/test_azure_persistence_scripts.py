@@ -3050,7 +3050,10 @@ def _prepare_build_rollback_fixture(tmp_path: Path) -> tuple[Path, Path]:
     )
     runtime = fixture / "scripts/container_runtime.sh"
     runtime.write_text(
-        """select_container_runtime() { CONTAINER_RUNTIME=fake; }
+        """select_container_runtime() {
+  printf '%s\n' "${CONTAINER_RUNTIME:-automatic}" > "$FAKE_SELECTED_RUNTIME_FILE"
+  CONTAINER_RUNTIME="${CONTAINER_RUNTIME:-fake}"
+}
 ensure_container_runtime_ready() { :; }
 container_runtime_login() {
   cat >/dev/null
@@ -3131,6 +3134,8 @@ def _run_build_fixture(
     *,
     failure: str = "",
     extra_path: str | None = None,
+    args: tuple[str, ...] = (),
+    environment_update: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     path = f"{fixture / 'bin'}:{env['PATH']}"
@@ -3143,15 +3148,290 @@ def _run_build_fixture(
             "FAKE_ENV_ROW": f"{ENVIRONMENT_ID}\t{DEFAULT_DOMAIN}\tSucceeded\n",
             "FAKE_BUILD_FAILURE": failure,
             "FAKE_PUSH_COUNT_FILE": str(fixture / "push-count"),
+            "FAKE_SELECTED_RUNTIME_FILE": str(fixture / "selected-runtime"),
         }
     )
+    env.pop("CONTAINER_CLI", None)
+    env.pop("CONTAINER_RUNTIME", None)
+    if environment_update:
+        env.update(environment_update)
     return subprocess.run(
-        ["bash", "build.sh"],
+        ["bash", "build.sh", *args],
         cwd=fixture,
         env=env,
         text=True,
         capture_output=True,
         check=False,
+    )
+
+
+def _install_build_fixture_runtime(fixture: Path, name: str) -> None:
+    runtime = fixture / "bin" / name
+    runtime.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    runtime.chmod(0o700)
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("--container-cli", "podman"),
+        ("--container-cli=podman",),
+        ("-c", "podman"),
+    ],
+    ids=("long-separate", "long-equals", "short"),
+)
+def test_backend_build_container_cli_argument_forms_select_runtime(tmp_path, args):
+    fixture, argv_log = _prepare_build_rollback_fixture(tmp_path)
+    _install_build_fixture_runtime(fixture, "podman")
+
+    result = _run_build_fixture(fixture, argv_log, args=args)
+
+    assert result.returncode == 0, result.stderr
+    assert (fixture / "selected-runtime").read_text(encoding="utf-8") == "podman\n"
+
+
+@pytest.mark.parametrize(
+    ("environment_update", "expected"),
+    [
+        ({"CONTAINER_CLI": "container"}, "container"),
+        ({"CONTAINER_RUNTIME": "podman"}, "podman"),
+        (
+            {"CONTAINER_CLI": "docker", "CONTAINER_RUNTIME": "docker"},
+            "docker",
+        ),
+    ],
+    ids=("new-alias", "legacy-alias", "matching-aliases"),
+)
+def test_backend_build_runtime_alias_precedence_without_argument(
+    tmp_path, environment_update, expected
+):
+    fixture, argv_log = _prepare_build_rollback_fixture(tmp_path)
+    _install_build_fixture_runtime(fixture, expected)
+
+    result = _run_build_fixture(
+        fixture, argv_log, environment_update=environment_update
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (fixture / "selected-runtime").read_text(encoding="utf-8") == f"{expected}\n"
+
+
+def test_backend_build_container_cli_argument_overrides_conflicting_runtime_aliases(
+    tmp_path,
+):
+    fixture, argv_log = _prepare_build_rollback_fixture(tmp_path)
+    _install_build_fixture_runtime(fixture, "podman")
+
+    result = _run_build_fixture(
+        fixture,
+        argv_log,
+        args=("--container-cli", "podman"),
+        environment_update={
+            "CONTAINER_CLI": "container",
+            "CONTAINER_RUNTIME": "docker",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (fixture / "selected-runtime").read_text(encoding="utf-8") == "podman\n"
+
+
+def test_backend_build_runtime_alias_from_sourced_config_is_ignored(tmp_path):
+    fixture, argv_log = _prepare_build_rollback_fixture(tmp_path)
+    with (fixture / "env.sh").open("a", encoding="utf-8") as stream:
+        stream.write(
+            "export CONTAINER_CLI=container\nexport CONTAINER_RUNTIME=docker\n"
+        )
+
+    result = _run_build_fixture(fixture, argv_log)
+
+    assert result.returncode == 0, result.stderr
+    assert (fixture / "selected-runtime").read_text(encoding="utf-8") == "automatic\n"
+
+
+def test_backend_build_runtime_alias_parser_state_cannot_be_poisoned_by_env_sh(
+    tmp_path,
+):
+    fixture, argv_log = _prepare_build_rollback_fixture(tmp_path)
+    _install_build_fixture_runtime(fixture, "podman")
+    with (fixture / "env.sh").open("a", encoding="utf-8") as stream:
+        stream.write(
+            "CLI_CONTAINER_CLI=docker\n"
+            "CLI_CONTAINER_CLI_SEEN=false\n"
+            "CALLER_CONTAINER_CLI=container\n"
+            "CALLER_CONTAINER_CLI_WAS_SET=true\n"
+            "CALLER_CONTAINER_RUNTIME=docker\n"
+            "CALLER_CONTAINER_RUNTIME_WAS_SET=true\n"
+            "RESOLVED_CONTAINER_RUNTIME=docker\n"
+        )
+    config_before = (fixture / "webapp/config.py").read_bytes()
+
+    result = _run_build_fixture(
+        fixture, argv_log, args=("--container-cli", "podman")
+    )
+
+    assert result.returncode != 0
+    assert "readonly" in result.stderr.lower()
+    assert (fixture / "webapp/config.py").read_bytes() == config_before
+    assert not (fixture / ".build_version").exists()
+    assert not (fixture / "selected-runtime").exists()
+    assert not (fixture / "push-count").exists()
+    assert not argv_log.exists()
+
+
+def _assert_build_argument_failure_has_no_side_effects(
+    fixture: Path,
+    argv_log: Path,
+    config_before: bytes,
+) -> None:
+    assert (fixture / "webapp/config.py").read_bytes() == config_before
+    assert not (fixture / ".build_version").exists()
+    assert not (fixture / "env-source-marker").exists()
+    assert not (fixture / "selected-runtime").exists()
+    assert not (fixture / "push-count").exists()
+    assert not argv_log.exists()
+    assert not list(fixture.glob(".container-build-context.*"))
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("--container-cli",),
+        ("-c",),
+        ("--container-cli", ""),
+        ("--container-cli=",),
+        ("--container-cli", "nerdctl"),
+        ("--container-cli", "docker", "-c", "docker"),
+        ("--container-cli", "docker", "--container-cli=podman"),
+        ("-cpodman",),
+        ("--unknown",),
+        ("--help", "--container-cli", "docker"),
+        ("--container-cli", "docker", "--help"),
+    ],
+    ids=(
+        "missing-long",
+        "missing-short",
+        "empty-separate",
+        "empty-equals",
+        "unsupported",
+        "duplicate-same",
+        "duplicate-conflict",
+        "combined-short",
+        "unknown",
+        "help-mixed-first",
+        "help-mixed-last",
+    ),
+)
+def test_backend_build_container_cli_argument_rejects_invalid_before_side_effects(
+    tmp_path, args
+):
+    fixture, argv_log = _prepare_build_rollback_fixture(tmp_path)
+    with (fixture / "env.sh").open("a", encoding="utf-8") as stream:
+        stream.write('touch "$SCRIPT_DIR/env-source-marker"\n')
+    config_before = (fixture / "webapp/config.py").read_bytes()
+
+    result = _run_build_fixture(fixture, argv_log, args=args)
+
+    assert result.returncode == 64, result.stderr
+    _assert_build_argument_failure_has_no_side_effects(
+        fixture, argv_log, config_before
+    )
+
+
+def test_backend_build_runtime_alias_conflict_rejected_before_side_effects(tmp_path):
+    fixture, argv_log = _prepare_build_rollback_fixture(tmp_path)
+    with (fixture / "env.sh").open("a", encoding="utf-8") as stream:
+        stream.write('touch "$SCRIPT_DIR/env-source-marker"\n')
+    config_before = (fixture / "webapp/config.py").read_bytes()
+
+    result = _run_build_fixture(
+        fixture,
+        argv_log,
+        environment_update={
+            "CONTAINER_CLI": "podman",
+            "CONTAINER_RUNTIME": "docker",
+        },
+    )
+
+    assert result.returncode == 64, result.stderr
+    assert "CONTAINER_CLI and CONTAINER_RUNTIME disagree" in result.stderr
+    _assert_build_argument_failure_has_no_side_effects(
+        fixture, argv_log, config_before
+    )
+
+
+@pytest.mark.parametrize(
+    "environment_update",
+    [
+        {"CONTAINER_CLI": ""},
+        {"CONTAINER_RUNTIME": "nerdctl"},
+    ],
+    ids=("empty-new-alias", "unsupported-legacy-alias"),
+)
+def test_backend_build_runtime_alias_invalid_rejected_before_side_effects(
+    tmp_path, environment_update
+):
+    fixture, argv_log = _prepare_build_rollback_fixture(tmp_path)
+    with (fixture / "env.sh").open("a", encoding="utf-8") as stream:
+        stream.write('touch "$SCRIPT_DIR/env-source-marker"\n')
+    config_before = (fixture / "webapp/config.py").read_bytes()
+
+    result = _run_build_fixture(
+        fixture, argv_log, environment_update=environment_update
+    )
+
+    assert result.returncode == 64, result.stderr
+    _assert_build_argument_failure_has_no_side_effects(
+        fixture, argv_log, config_before
+    )
+
+
+def test_backend_build_container_runtime_argument_unavailable_before_side_effects(
+    tmp_path,
+):
+    fixture, argv_log = _prepare_build_rollback_fixture(tmp_path)
+    with (fixture / "env.sh").open("a", encoding="utf-8") as stream:
+        stream.write('touch "$SCRIPT_DIR/env-source-marker"\n')
+    config_before = (fixture / "webapp/config.py").read_bytes()
+    restricted_path = f"{fixture / 'bin'}:/usr/bin:/bin"
+
+    result = _run_build_fixture(
+        fixture,
+        argv_log,
+        args=("--container-cli", "podman"),
+        environment_update={"PATH": restricted_path},
+    )
+
+    assert result.returncode == 64, result.stderr
+    assert "podman" in result.stderr
+    assert "PATH" in result.stderr
+    _assert_build_argument_failure_has_no_side_effects(
+        fixture, argv_log, config_before
+    )
+
+
+@pytest.mark.parametrize("help_arg", ["--help", "-h"])
+def test_backend_build_help_is_side_effect_free(tmp_path, help_arg):
+    fixture, argv_log = _prepare_build_rollback_fixture(tmp_path)
+    with (fixture / "env.sh").open("a", encoding="utf-8") as stream:
+        stream.write('touch "$SCRIPT_DIR/env-source-marker"\n')
+    config_before = (fixture / "webapp/config.py").read_bytes()
+
+    result = _run_build_fixture(
+        fixture,
+        argv_log,
+        args=(help_arg,),
+        environment_update={
+            "CONTAINER_CLI": "podman",
+            "CONTAINER_RUNTIME": "docker",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Usage: ./build.sh" in result.stdout
+    assert "container, podman, or docker" in result.stdout
+    _assert_build_argument_failure_has_no_side_effects(
+        fixture, argv_log, config_before
     )
 
 
@@ -3293,9 +3573,10 @@ def test_backend_build_atomic_publication_failure_restores_exact_state(
             "PATH": f"{fixture / 'bin'}:{env['PATH']}",
             "FAKE_AZ_ARGV_LOG": str(argv_log),
             "FAKE_ENV_ROW": f"{ENVIRONMENT_ID}\t{DEFAULT_DOMAIN}\tSucceeded\n",
-            "FAKE_BUILD_FAILURE": "",
-            "FAKE_PUSH_COUNT_FILE": str(fixture / "push-count"),
-        },
+                "FAKE_BUILD_FAILURE": "",
+                "FAKE_PUSH_COUNT_FILE": str(fixture / "push-count"),
+                "FAKE_SELECTED_RUNTIME_FILE": str(fixture / "selected-runtime"),
+            },
         text=True,
         capture_output=True,
         check=False,
