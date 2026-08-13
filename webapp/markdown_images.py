@@ -1,4 +1,4 @@
-"""Thread-independent image assets for synchronized Markdown previews."""
+"""Thread-independent assets for synchronized Markdown previews."""
 
 from __future__ import annotations
 
@@ -9,8 +9,11 @@ import re
 import shutil
 import tempfile
 import uuid
+from io import BytesIO
 from pathlib import Path
 from typing import Any
+from zipfile import BadZipFile, LargeZipFile, ZipFile
+from zlib import error as ZlibError
 
 import filetype
 from fastapi import Header, HTTPException, Request, status
@@ -30,6 +33,23 @@ _ALLOWED_IMAGES: dict[str, tuple[str, frozenset[str]]] = {
     "image/gif": ("gif", frozenset({".gif"})),
     "image/webp": ("webp", frozenset({".webp"})),
 }
+_ALLOWED_ZIP_CONTENT_TYPES = frozenset(
+    {
+        "",
+        "application/octet-stream",
+        "application/x-zip-compressed",
+        "application/zip",
+    }
+)
+_ZIP_CONTENT_TYPE = "application/zip"
+_ZIP_SIGNATURES = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
+_MAX_ZIP_MEMBER_COUNT = 1_000
+_MAX_ZIP_UNCOMPRESSED_BYTES = 100 * 1024 * 1024
+_ZIP_VALIDATION_CHUNK_BYTES = 1024 * 1024
+_DECLARED_ZIP_CONTENT_TYPES = frozenset(
+    {"application/x-zip-compressed", "application/zip"}
+)
+_STORED_CONTENT_TYPES = frozenset((*_ALLOWED_IMAGES, _ZIP_CONTENT_TYPE))
 
 
 def _webapp_module():
@@ -86,6 +106,50 @@ def _validate_image(filename: str, content_type: str | None, data: bytes) -> str
     ):
         raise ValueError("extension, MIME type, and image signature must agree")
     return declared_type
+
+
+def _validate_asset(filename: str, content_type: str | None, data: bytes) -> str:
+    declared_type = (content_type or "").lower()
+    if Path(filename).suffix.lower() == ".zip":
+        if (
+            declared_type not in _ALLOWED_ZIP_CONTENT_TYPES
+            or not data.startswith(_ZIP_SIGNATURES)
+        ):
+            raise ValueError("extension, MIME type, and ZIP signature must agree")
+        try:
+            with ZipFile(BytesIO(data)) as archive:
+                members = archive.infolist()
+                if len(members) > _MAX_ZIP_MEMBER_COUNT:
+                    raise ValueError("ZIP contains too many members")
+                if (
+                    sum(member.file_size for member in members)
+                    > _MAX_ZIP_UNCOMPRESSED_BYTES
+                ):
+                    raise ValueError("ZIP uncompressed size exceeds validation limit")
+                if any(member.flag_bits & 0x1 for member in members):
+                    raise ValueError("encrypted ZIP members cannot be validated")
+                for member in members:
+                    with archive.open(member) as member_file:
+                        while member_file.read(_ZIP_VALIDATION_CHUNK_BYTES):
+                            pass
+        except (
+            BadZipFile,
+            LargeZipFile,
+            NotImplementedError,
+            OSError,
+            RuntimeError,
+            ZlibError,
+        ) as exc:
+            raise ValueError("ZIP structure or member integrity is invalid") from exc
+        return _ZIP_CONTENT_TYPE
+    return _validate_image(filename, content_type, data)
+
+
+def _is_archive_upload(filename: str, content_type: str | None) -> bool:
+    return (
+        Path(filename).suffix.lower() == ".zip"
+        or (content_type or "").lower() in _DECLARED_ZIP_CONTENT_TYPES
+    )
 
 
 def _store_asset(
@@ -145,7 +209,7 @@ def _load_asset(markdown_id: str, asset_id: str) -> tuple[Path, dict[str, Any]]:
         ) from exc
     if (
             not payload.is_file()
-            or metadata.get("content_type") not in _ALLOWED_IMAGES
+            or metadata.get("content_type") not in _STORED_CONTENT_TYPES
             or not isinstance(metadata.get("filename"), str)
             or metadata.get("size") != payload.stat().st_size
     ):
@@ -154,10 +218,15 @@ def _load_asset(markdown_id: str, asset_id: str) -> tuple[Path, dict[str, Any]]:
         )
     try:
         with payload.open("rb") as payload_file:
-            _validate_image(
+            validation_data = (
+                payload_file.read()
+                if metadata["content_type"] == _ZIP_CONTENT_TYPE
+                else payload_file.read(261)
+            )
+            _validate_asset(
                 metadata["filename"],
                 metadata["content_type"],
-                payload_file.read(261),
+                validation_data,
             )
     except (OSError, ValueError) as exc:
         raise HTTPException(
@@ -198,7 +267,7 @@ def register_markdown_image_routes(app) -> None:
         ):
             raise HTTPException(
                 status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                detail="Image upload request is too large",
+                detail="Asset upload request is too large",
             )
 
         assets: list[dict[str, Any]] = []
@@ -213,7 +282,7 @@ def register_markdown_image_routes(app) -> None:
             if not files or any(not isinstance(upload, UploadFile) for upload in files):
                 raise HTTPException(
                     status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                    detail="files must contain uploaded images",
+                    detail="files must contain uploaded assets",
                 )
             for upload in files:
                 raw_filename = upload.filename or ""
@@ -224,7 +293,7 @@ def register_markdown_image_routes(app) -> None:
                         {
                             "filename": raw_filename,
                             "code": "invalid_filename",
-                            "message": "Image filename is invalid",
+                            "message": "Asset filename is invalid",
                         }
                     )
                     continue
@@ -234,12 +303,12 @@ def register_markdown_image_routes(app) -> None:
                         {
                             "filename": display_name,
                             "code": "file_too_large",
-                            "message": "Image exceeds 10 MiB",
+                            "message": "File exceeds 10 MiB",
                         }
                     )
                     continue
                 try:
-                    verified_type = _validate_image(
+                    verified_type = _validate_asset(
                         display_name, upload.content_type, data
                     )
                     asset_id = str(uuid.uuid4())
@@ -252,13 +321,22 @@ def register_markdown_image_routes(app) -> None:
                         data=data,
                     )
                 except ValueError:
-                    errors.append(
-                        {
-                            "filename": display_name,
-                            "code": "unsupported_or_mismatched_image",
-                            "message": "Only valid PNG, JPEG, GIF, and WebP images are supported",
-                        }
-                    )
+                    if _is_archive_upload(display_name, upload.content_type):
+                        errors.append(
+                            {
+                                "filename": display_name,
+                                "code": "unsupported_or_mismatched_archive",
+                                "message": "Only valid ZIP archives are supported",
+                            }
+                        )
+                    else:
+                        errors.append(
+                            {
+                                "filename": display_name,
+                                "code": "unsupported_or_mismatched_image",
+                                "message": "Only valid PNG, JPEG, GIF, and WebP images are supported",
+                            }
+                        )
                     continue
                 except OSError as exc:
                     await asyncio.to_thread(
@@ -266,7 +344,7 @@ def register_markdown_image_routes(app) -> None:
                     )
                     raise HTTPException(
                         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                        detail="Image storage failed",
+                        detail="Asset storage failed",
                     ) from exc
                 stored_asset_ids.append(asset_id)
                 assets.append(
@@ -285,7 +363,11 @@ def register_markdown_image_routes(app) -> None:
             path=payload,
             filename=metadata["filename"],
             media_type=metadata["content_type"],
-            content_disposition_type="attachment" if download else "inline",
+            content_disposition_type=(
+                "attachment"
+                if download or metadata["content_type"] == _ZIP_CONTENT_TYPE
+                else "inline"
+            ),
             headers={"Cache-Control": "private, no-store"},
         )
 
