@@ -436,7 +436,6 @@ BUILD_CONTEXT_DIR="$(mktemp -d "$SCRIPT_DIR/.container-build-context.XXXXXX")"
 git ls-files --cached --others --exclude-standard -z \
   | tar --null -T - -cf - \
   | tar -xf - -C "$BUILD_CONTEXT_DIR"
-cp .env.docker "$BUILD_CONTEXT_DIR/.env.docker"
 # Registry pushes require the full registry host in the image name.
 FULL_IMAGE_NAME="docker.io/$DOCKER_HUB_USERNAME/deep-research-agent:latest"
 

@@ -16,7 +16,10 @@ WORKDIR /deps/deep_research
 
 # Copy the local package
 ADD . /deps/deep_research
-RUN cp /deps/deep_research/.env.docker /deps/deep_research/.env
+# Keep LangGraph's configured env file present but empty. Runtime environment
+# variables supplied by the platform remain authoritative and no private
+# dotenv values are embedded in the image.
+RUN install -m 600 /dev/null /deps/deep_research/.env
 
 # Note: Runtime directories (docs/, output/, input/) are mounted via Azure Files at runtime
 # No need to create them in the Docker image - they will be provided by the volume mount
@@ -39,4 +42,3 @@ ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 
 # Launch using langgraph dev
 CMD ["langgraph", "dev", "--host", "0.0.0.0", "--port", "2024", "--no-reload", "--no-browser"]
-

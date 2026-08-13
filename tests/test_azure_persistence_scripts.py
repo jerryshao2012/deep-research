@@ -899,7 +899,16 @@ def test_azure_build_checks_private_dotenv_before_azure_or_runtime_access():
     assert source.index(check) < source.index(resolver)
     assert source.index(check) < source.index("select_container_runtime")
     assert source.index(check) < source.index("az account set")
-    assert 'cp .env.docker "$BUILD_CONTEXT_DIR/.env.docker"' in source
+    assert 'cp .env.docker "$BUILD_CONTEXT_DIR/.env.docker"' not in source
+
+
+def test_backend_image_uses_runtime_environment_without_embedding_private_dotenv():
+    build_source = (PROJECT_ROOT / "build.sh").read_text(encoding="utf-8")
+    dockerfile = (PROJECT_ROOT / "Dockerfile").read_text(encoding="utf-8")
+
+    assert 'cp .env.docker "$BUILD_CONTEXT_DIR/.env.docker"' not in build_source
+    assert "cp /deps/deep_research/.env.docker /deps/deep_research/.env" not in dockerfile
+    assert "install -m 600 /dev/null /deps/deep_research/.env" in dockerfile
 
 
 def _install_azure_script_fixture(
@@ -2803,7 +2812,7 @@ def test_azure_build_stages_context_without_git_metadata() -> None:
     assert "git ls-files --cached --others --exclude-standard -z" in source
     assert "tar --null -T - -cf -" in source
     assert 'tar -xf - -C "$BUILD_CONTEXT_DIR"' in source
-    assert 'cp .env.docker "$BUILD_CONTEXT_DIR/.env.docker"' in source
+    assert 'cp .env.docker "$BUILD_CONTEXT_DIR/.env.docker"' not in source
     assert (
         'container_runtime_build --platform linux/amd64 -t "$FULL_IMAGE_NAME" '
         '"$BUILD_CONTEXT_DIR"' in source
