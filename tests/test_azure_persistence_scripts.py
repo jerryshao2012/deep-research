@@ -2132,7 +2132,7 @@ sys.stdout.write('{"version":"9.8.7","status":"ok"}\\n')
         "containerApps/demo-api?api-version=2025-07-01"
     )
     assert update_call[update_call.index("--headers") + 1] == (
-        "Content-Type=application/merge-patch+json"
+        "Content-Type=application/json"
     )
     assert not any(argument.startswith("If-Match=") for argument in update_call)
     assert "containerapp update" not in json.dumps(calls)

@@ -780,7 +780,7 @@ fi
 rm -f "$EXISTING_CONFIG_JSON"
 az rest --method patch \
   --uri "${APP_RESOURCE_ID}?api-version=2025-07-01" \
-  --headers Content-Type=application/merge-patch+json \
+  --headers Content-Type=application/json \
   --body "@$UPDATE_PATCH_JSON" \
   --output none
 rm -f "$UPDATE_PATCH_JSON"
