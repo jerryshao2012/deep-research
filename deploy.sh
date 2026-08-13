@@ -57,7 +57,7 @@ print_usage() {
   echo "  - Existing backend Container App"
   echo "  - Existing user-assigned managed identity assigned to the backend app"
   echo "  - Existing Key Vault with identity secret get access"
-  echo "  - Pre-created Key Vault secret PASSKEY-PROXY-SECRET"
+  echo "  - Pre-created Key Vault secrets PASSKEY-PROXY-SECRET, OAUTH-SECRET-KEY, GOOGLE-CLIENT-ID, and GOOGLE-CLIENT-SECRET"
   echo "  - Existing provider/runtime secrets referenced by the app configuration"
   echo "  - Existing storage account, Blob container, Azure Files share, and Container Apps environment storage"
   echo "  - Successful build producing .build_version and Docker Hub image"
@@ -409,6 +409,9 @@ required = {
     "storage-account-key": "STORAGE-ACCOUNT-KEY",
     "azure-storage-container-name": "AZURE-STORAGE-CONTAINER-NAME",
     "google-api-key": "GOOGLE-API-KEY",
+    "google-client-id": "GOOGLE-CLIENT-ID",
+    "google-client-secret": "GOOGLE-CLIENT-SECRET",
+    "oauth-secret-key": "OAUTH-SECRET-KEY",
     "docker-hub-pat": "DOCKER-HUB-PAT",
     "passkey-proxy-secret": "PASSKEY-PROXY-SECRET",
 }
@@ -563,6 +566,9 @@ REQUIRED_KEY_VAULT_SECRETS=(
   STORAGE-ACCOUNT-KEY
   AZURE-STORAGE-CONTAINER-NAME
   GOOGLE-API-KEY
+  GOOGLE-CLIENT-ID
+  GOOGLE-CLIENT-SECRET
+  OAUTH-SECRET-KEY
   DOCKER-HUB-PAT
   PASSKEY-PROXY-SECRET
 )
@@ -795,7 +801,7 @@ for i in {1..60}; do
     REVISION_READY=true
     break
   fi
-  if [[ "$REVISION_STATE" == Failed* || "$REVISION_STATE" == *$'\tUnhealthy' ]]; then
+  if [[ "$REVISION_STATE" == Failed* || "$REVISION_STATE" == ActivationFailed* || "$REVISION_STATE" == *$'\tUnhealthy' ]]; then
     break
   fi
   sleep 5

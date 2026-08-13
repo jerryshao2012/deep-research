@@ -1987,6 +1987,9 @@ elif args[:2] == ["containerapp", "show"] and "--output" in args and args[args.i
         ("storage-account-key", "STORAGE-ACCOUNT-KEY"),
         ("azure-storage-container-name", "AZURE-STORAGE-CONTAINER-NAME"),
         ("google-api-key", "GOOGLE-API-KEY"),
+        ("google-client-id", "GOOGLE-CLIENT-ID"),
+        ("google-client-secret", "GOOGLE-CLIENT-SECRET"),
+        ("oauth-secret-key", "OAUTH-SECRET-KEY"),
         ("docker-hub-pat", "DOCKER-HUB-PAT"),
         ("passkey-proxy-secret", "PASSKEY-PROXY-SECRET"),
     ]
@@ -2021,6 +2024,9 @@ elif args[:3] == ["containerapp", "secret", "list"]:
         ("storage-account-key", "STORAGE-ACCOUNT-KEY"),
         ("azure-storage-container-name", "AZURE-STORAGE-CONTAINER-NAME"),
         ("google-api-key", "GOOGLE-API-KEY"),
+        ("google-client-id", "GOOGLE-CLIENT-ID"),
+        ("google-client-secret", "GOOGLE-CLIENT-SECRET"),
+        ("oauth-secret-key", "OAUTH-SECRET-KEY"),
         ("docker-hub-pat", "DOCKER-HUB-PAT"),
         ("passkey-proxy-secret", "PASSKEY-PROXY-SECRET"),
     ]
@@ -2115,6 +2121,9 @@ sys.stdout.write('{"version":"9.8.7","status":"ok"}\\n')
         f"{UI_URL},https://bmo-deepagent-ui.vercel.app"
     )
     assert runtime_env["PASSKEY_PROXY_SECRET"]["secretRef"] == ("passkey-proxy-secret")
+    assert runtime_env["GOOGLE_CLIENT_ID"]["secretRef"] == "google-client-id"
+    assert runtime_env["GOOGLE_CLIENT_SECRET"]["secretRef"] == "google-client-secret"
+    assert runtime_env["OAUTH_SECRET_KEY"]["secretRef"] == "oauth-secret-key"
     volume_mounts = {item["volumeName"]: item for item in container["volumeMounts"]}
     assert volume_mounts["unrelated-volume"]["mountPath"] == "/kept"
     assert volume_mounts["auth-sqlite"]["mountPath"] == "/mnt/auth"
@@ -2131,6 +2140,9 @@ sys.stdout.write('{"version":"9.8.7","status":"ok"}\\n')
         "STORAGE-ACCOUNT-KEY",
         "AZURE-STORAGE-CONTAINER-NAME",
         "GOOGLE-API-KEY",
+        "GOOGLE-CLIENT-ID",
+        "GOOGLE-CLIENT-SECRET",
+        "OAUTH-SECRET-KEY",
         "DOCKER-HUB-PAT",
         "PASSKEY-PROXY-SECRET",
     }
@@ -2159,7 +2171,7 @@ sys.stdout.write('{"version":"9.8.7","status":"ok"}\\n')
         ["identity", "show"],
         ["containerapp", "show"],
         ["keyvault", "show"],
-        *(["keyvault", "secret"] for _ in range(9)),
+        *(["keyvault", "secret"] for _ in range(12)),
         ["storage", "account"],
         ["storage", "container-rm"],
         ["storage", "share-rm"],
@@ -2558,6 +2570,7 @@ def test_azure_deploy_contains_no_bootstrap_permission_or_secret_mutations():
         assert forbidden not in source
     assert "az storage container-rm show" in source
     assert "--show-values" not in source
+    assert '"$REVISION_STATE" == ActivationFailed*' in source
 
 
 @pytest.mark.parametrize(
@@ -4043,7 +4056,7 @@ def test_azure_metadata_snapshot_capture_is_canonical_metadata_only_and_mode_060
                 if call[:3] == ["keyvault", "secret", "list-versions"]
             ]
         )
-        == 9
+        == 12
     )
     assert not any(call[:3] == ["keyvault", "secret", "show"] for call in calls)
     assert all("--query" in call for call in calls)

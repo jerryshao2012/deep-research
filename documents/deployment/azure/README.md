@@ -32,7 +32,7 @@ Bootstrap these prerequisites separately before using this workflow:
 - the resource group, Container Apps environment, and backend Container App named by `env.sh`;
 - the user-assigned managed identity `${AGENT_NAME}-identity` and its assignment to the backend app;
 - the Key Vault named by `KV_NAME`, with that identity granted secret `get` access;
-- a pre-created, rotated `PASSKEY-PROXY-SECRET` in that Key Vault;
+- pre-created, rotated `PASSKEY-PROXY-SECRET`, `OAUTH-SECRET-KEY`, `GOOGLE-CLIENT-ID`, and `GOOGLE-CLIENT-SECRET` entries in that Key Vault;
 - all other provider and runtime secrets referenced by the existing Container App configuration;
 - the existing storage account, Blob container, Azure Files share, and Container Apps environment storage binding required by the app;
 - an Azure subscription with read-only access to each prerequisite and permission to update the existing backend Container App; existing resource permissions remain unchanged;
@@ -68,7 +68,7 @@ Review [configuration](../../guides/configuration.md) and [authentication](../..
    touch .env.docker
    ```
 
-   Add only non-secret runtime defaults safe to publish. `build.sh` runs strict passkey dotenv check, then copies this file into build context; `Dockerfile` places it at `/deps/deep_research/.env` inside image. Never put OAuth/API secrets, cloud credentials, storage keys, tokens, `FRONTEND_URLS`, or passkey origin/RP/proxy settings in this file. If an older private file contains them, use `scripts/sanitize_passkey_dotenv.py --sanitize` through approved rotation procedure; its optional secret capture is a mode-`0600` recovery artifact and no value is printed.
+   `build.sh` checks this private file but never copies it into build context. `Dockerfile` creates an empty `/deps/deep_research/.env`, so Azure runtime settings remain authoritative and no dotenv secret enters image layers. If an older private file contains deployment-owned passkey settings, use `scripts/sanitize_passkey_dotenv.py --sanitize` through approved rotation procedure; its optional secret capture is a mode-`0600` recovery artifact and no value is printed.
 3. Create a repository-root `.env` with `DOCKER_HUB_USERNAME` and `DOCKER_HUB_PAT`. The build script reads this ignored local file for registry login; it must not be copied into the image.
 4. Copy the secret template, fill it locally, and restrict its permissions:
 
@@ -77,7 +77,7 @@ Review [configuration](../../guides/configuration.md) and [authentication](../..
    chmod 600 secrets.sh
    ```
 
-5. Ensure `secrets.sh` contains only the provider credentials needed by the selected model path. The current generated Container App configuration maps Tavily, LangChain, upload, Google, storage, and Docker Hub secrets at runtime through Key Vault references. Other model providers require corresponding safe secret references before deployment; see [configuration](../../guides/configuration.md).
+5. Ensure all provider credentials are pre-created in Key Vault. Generated Container App configuration maps Tavily, LangChain, upload, Google API, Google OAuth, stable OAuth signing, storage, Docker Hub, and passkey proxy secrets through runtime Key Vault references. Other model providers require corresponding safe secret references before deployment; see [configuration](../../guides/configuration.md).
 6. Confirm the active Azure account and subscription:
 
    ```bash
@@ -111,7 +111,7 @@ New metadata or endpoint change is blocked until provider settings are updated a
 
 Derived runtime config uses `FRONTEND_URLS` as sole multi-origin source with `PASSKEY_DERIVE_FROM_FRONTEND_URLS=true`, `PASSKEY_ENABLED=true`, and proxy ID `web-bff`. It includes Azure UI plus reserved `https://bmo-deepagent-ui.vercel.app`; backend maps each exact origin to its own hostname RP ID. Current rollout does not configure, build, deploy, or verify Vercel. Future activation requires then-current server-only proxy secret, canonical origin/proxy ID, deployment and verification before traffic; never derive canonical origin from ephemeral `VERCEL_URL`, and preserve existing credential RP continuity.
 
-Before continuing, verify existing Key Vault inputs, including `PASSKEY-PROXY-SECRET`, and rotate/populate them through the separate approved secret-management procedure. `deploy.sh` does not create the vault, managed identity, backend app, or passkey proxy secret. For identity and secret-reference behavior, see [Security](security.md).
+Before continuing, verify existing Key Vault inputs, including `PASSKEY-PROXY-SECRET`, `OAUTH-SECRET-KEY`, `GOOGLE-CLIENT-ID`, and `GOOGLE-CLIENT-SECRET`, and rotate/populate them through the separate approved secret-management procedure. `deploy.sh` does not create the vault, managed identity, backend app, or secrets. For identity and secret-reference behavior, see [Security](security.md).
 
 ### 2. Build and publish an image
 

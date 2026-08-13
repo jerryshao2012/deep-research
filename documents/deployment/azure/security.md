@@ -35,7 +35,7 @@ chmod 600 secrets.sh
 
 Keep `secrets.sh`, `.env`, storage keys, Docker Hub tokens, provider keys, OAuth secrets, and exported configuration out of Git and shared logs. Prefer an approved secret-delivery system over interactive command lines. Never pass a real secret in a copied documentation command or screenshot.
 
-`deploy.sh` expects Key Vault entries for secret references it emits, including pre-created `PASSKEY-PROXY-SECRET`; it never reads or writes values. Current generated application configuration includes Tavily, LangChain, upload, Google, storage, Blob-container, Docker Hub, and passkey proxy references. Azure OpenAI secret blocks exist only as commented source and are not injected into live YAML. If Azure OpenAI is selected, administrator must preprovision and test managed-identity or Key Vault configuration before release; see [Configuration](../../guides/configuration.md).
+`deploy.sh` expects Key Vault entries for every secret reference it emits, including pre-created `PASSKEY-PROXY-SECRET`, `OAUTH-SECRET-KEY`, `GOOGLE-CLIENT-ID`, and `GOOGLE-CLIENT-SECRET`; it reads metadata but never secret values and never creates them. Current generated application configuration includes Tavily, LangChain, upload, Google API/OAuth, stable OAuth signing, storage, Blob-container, Docker Hub, and passkey proxy references. Azure OpenAI secret blocks exist only as commented source and are not injected into live YAML. If Azure OpenAI is selected, administrator must preprovision and test managed-identity or Key Vault configuration before release; see [Configuration](../../guides/configuration.md).
 
 List metadata without reading secret values:
 
@@ -141,7 +141,7 @@ Infrastructure identity does not authenticate API callers. Before exposing exter
 - for passkeys, each exact HTTPS origin derives its own hostname RP ID; reserved `bmo-deepagent-ui.vercel.app` is full host RP ID, not public suffix `vercel.app`;
 - keep one replica while SQLite is the auth store.
 
-Current Azure script configures passkey runtime references but does not provision OAuth providers, secrets, or stable OAuth signing key. Treat them as required preprovisioned production configuration. Current rollout activates Azure only; Vercel remains reserved backend mapping until separately configured, deployed, and verified. Follow [Authentication](../../guides/authentication.md).
+Current Azure script configures passkey and Google OAuth runtime references but does not provision OAuth providers or secret values. Treat them as required preprovisioned production configuration. Current rollout activates Azure only; Vercel remains reserved backend mapping until separately configured, deployed, and verified. Follow [Authentication](../../guides/authentication.md).
 
 ## Audit without leaking secrets
 

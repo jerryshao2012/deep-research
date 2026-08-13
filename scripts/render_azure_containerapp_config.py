@@ -131,6 +131,9 @@ def main() -> int:
     )
     references = (
         ("PASSKEY_PROXY_SECRET", "passkey-proxy-secret"),
+        ("GOOGLE_CLIENT_ID", "google-client-id"),
+        ("GOOGLE_CLIENT_SECRET", "google-client-secret"),
+        ("OAUTH_SECRET_KEY", "oauth-secret-key"),
         ("TAVILY_API_KEY", "tavily-api-key"),
         ("LANGCHAIN_API_KEY", "langchain-api-key"),
         ("UPLOAD_API_KEY", "upload-api-key"),
