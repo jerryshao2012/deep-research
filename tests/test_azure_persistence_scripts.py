@@ -1962,6 +1962,7 @@ elif args[:2] == ["containerapp", "show"] and "--query" in args and args[args.in
         raise SystemExit(0)
     template = {"containers": [{
         "name": "renamed-main",
+        "imageType": "ContainerImage",
         "env": [{"name": "UNRELATED_ENV", "value": "kept"}],
         "volumeMounts": [{"volumeName": "unrelated-volume", "mountPath": "/kept"}],
     }]}
@@ -1996,6 +1997,7 @@ elif args[:2] == ["containerapp", "show"] and "--output" in args and args[args.i
             },
             "template": {"containers": [{
                 "name": "renamed-main",
+                "imageType": "ContainerImage",
                 "env": [{"name": "UNRELATED_ENV", "value": "kept"}],
                 "volumeMounts": [{"volumeName": "unrelated-volume", "mountPath": "/kept"}],
             }]},
@@ -2096,6 +2098,7 @@ sys.stdout.write('{"version":"9.8.7","status":"ok"}\\n')
     assert revision_suffix == "passkeys-20260812010101"
     container = rendered["properties"]["template"]["containers"][0]
     assert container["name"] == "renamed-main"
+    assert "imageType" not in container
     runtime_env = {item["name"]: item for item in container["env"]}
     assert runtime_env["UNRELATED_ENV"]["value"] == "kept"
     assert runtime_env["FRONTEND_URLS"]["value"] == (

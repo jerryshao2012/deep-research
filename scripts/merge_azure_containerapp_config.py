@@ -18,6 +18,8 @@ LIST_IDENTITIES = {
     "volumeMounts": "volumeName",
 }
 
+SERVER_GENERATED_CONTAINER_FIELDS = {"imageType"}
+
 
 def _merge(existing: object, desired: object, path: tuple[str, ...] = ()) -> object:
     if isinstance(existing, dict) and isinstance(desired, dict):
@@ -55,6 +57,20 @@ def _merge(existing: object, desired: object, path: tuple[str, ...] = ()) -> obj
     return desired
 
 
+def _strip_server_generated_fields(template: dict[str, object]) -> None:
+    for field in ("containers", "initContainers"):
+        containers = template.get(field)
+        if containers is None:
+            continue
+        if not isinstance(containers, list) or not all(
+            isinstance(container, dict) for container in containers
+        ):
+            raise ValueError(f"Azure Container App {field} must be a list of mappings")
+        for container in containers:
+            for generated_field in SERVER_GENERATED_CONTAINER_FIELDS:
+                container.pop(generated_field, None)
+
+
 def main() -> int:
     """Parse, validate, merge template state, and write a narrow patch."""
     parser = argparse.ArgumentParser()
@@ -84,6 +100,7 @@ def main() -> int:
     ):
         raise ValueError("Azure Container App templates must be mappings")
     merged_template = _merge(existing_template, desired_template, ("template",))
+    _strip_server_generated_fields(merged_template)
     merged = {
         "location": existing_location,
         "properties": {"template": merged_template},
