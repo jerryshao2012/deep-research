@@ -1992,7 +1992,7 @@ elif args[:2] == ["containerapp", "show"] and "--output" in args and args[args.i
                     {"name": name, "keyVaultUrl": f"https://demo-vault.vault.azure.net/secrets/{secret}", "identity": "/subscriptions/demo/identity"}
                     for name, secret in required
                 ],
-                "registries": [{"server": "docker.io", "username": "wrong-user" if os.environ.get("FAKE_REGISTRY_DRIFT") else "demo-user", "passwordSecretRef": "docker-hub-pat"}],
+                "registries": [{"server": "docker.io", "username": "wrong-user" if os.environ.get("FAKE_REGISTRY_DRIFT") else "demo-user", "passwordSecretRef": "docker-hub-pat", "identity": ""}],
             },
             "template": {"containers": [{
                 "name": "renamed-main",

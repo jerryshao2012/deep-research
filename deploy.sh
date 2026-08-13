@@ -442,6 +442,7 @@ expected_registry = {
     "server": "docker.io",
     "username": username,
     "passwordSecretRef": "docker-hub-pat",
+    "identity": "",
 }
 if len(matching) != 1 or matching[0] != expected_registry:
     raise SystemExit(4)
