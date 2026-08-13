@@ -122,7 +122,7 @@ def main() -> int:
         ("DOC_FOLDER", "/deps/deep_research/docs"),
         ("WIKI_BASE_DIR", "/deps/deep_research"),
         ("INPUT_FOLDER", "/deps/deep_research/input"),
-        ("SQLITE_DB_PATH", "/mnt/auth/auth.db"),
+        ("SQLITE_DB_PATH", "/mnt/auth/auth-v2.db"),
         ("AUTH_SQLITE_JOURNAL_MODE", "DELETE"),
         ("FRONTEND_URLS", frontend_urls),
         ("PASSKEY_DERIVE_FROM_FRONTEND_URLS", "true"),

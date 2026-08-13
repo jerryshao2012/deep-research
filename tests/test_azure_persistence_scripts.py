@@ -2872,7 +2872,7 @@ def test_passkey_sqlite_deployment_is_single_replica_on_persistent_azure_file(tm
             "storageName": "authsqlite",
         }
     ]
-    assert environment["SQLITE_DB_PATH"]["value"] == "/mnt/auth/auth.db"
+    assert environment["SQLITE_DB_PATH"]["value"] == "/mnt/auth/auth-v2.db"
     assert environment["AUTH_SQLITE_JOURNAL_MODE"]["value"] == "DELETE"
     assert template["scale"]["maxReplicas"] == 1
 
