@@ -107,7 +107,7 @@ GitHub authorization callback URL: https://<backend-app>.<environment-default-do
 GitHub homepage / frontend origin: https://<ui-app>.<environment-default-domain>
 ```
 
-New metadata or endpoint change is blocked until provider settings are updated and process-local `OAUTH_REDIRECTS_CONFIRMED=true` is supplied. Do not persist confirmation in `.env`, `env.sh`, or another file. Recreating Container Apps environment can change `defaultDomain`; update both providers before traffic. Resolver metadata is recorded atomically in `.resolved-azure-endpoints.json` only after exact revision readiness and health verification.
+New metadata or endpoint change is blocked until provider settings are updated and process-local `--oauth-redirects-confirmed` is supplied. Existing `OAUTH_REDIRECTS_CONFIRMED=true` commands remain compatible. Do not persist confirmation in `.env`, `env.sh`, or another file. Recreating Container Apps environment can change `defaultDomain`; update both providers before traffic. Resolver metadata is recorded atomically in `.resolved-azure-endpoints.json` only after exact revision readiness and health verification.
 
 Derived runtime config uses `FRONTEND_URLS` as sole multi-origin source with `PASSKEY_DERIVE_FROM_FRONTEND_URLS=true`, `PASSKEY_ENABLED=true`, and proxy ID `web-bff`. It includes Azure UI plus reserved `https://bmo-deepagent-ui.vercel.app`; backend maps each exact origin to its own hostname RP ID. Current rollout does not configure, build, deploy, or verify Vercel. Future activation requires then-current server-only proxy secret, canonical origin/proxy ID, deployment and verification before traffic; never derive canonical origin from ephemeral `VERCEL_URL`, and preserve existing credential RP continuity.
 
@@ -139,10 +139,11 @@ The script increments `API_VERSION`, creates `.build_version`, builds a `linux/a
 ### 3. Update the existing backend deployment
 
 ```bash
+./deploy.sh --oauth-redirects-confirmed
 OAUTH_REDIRECTS_CONFIRMED=true ./deploy.sh
 ```
 
-The confirmation is required only when resolver metadata is new or changed; unchanged endpoints produce a nonblocking reminder. Deployment reads `.build_version`, validates existing app configuration and managed prerequisites without changing permissions, identities, storage, or secret values, applies a named Container App revision, and waits for that exact revision plus `/health` to report the expected API version.
+The dedicated flag is preferred; it accepts no value and has no short form. The environment-variable form remains available for compatibility. Confirmation is required only when resolver metadata is new or changed; unchanged endpoints produce a nonblocking reminder. Deployment reads `.build_version`, validates existing app configuration and managed prerequisites without changing permissions, identities, storage, or secret values, applies a named Container App revision, and waits for that exact revision plus `/health` to report the expected API version.
 
 Deployment performs read-only prerequisite checks. It does not change Key Vault
 permissions, identities, storage resources, or secret values. Provision or rotate

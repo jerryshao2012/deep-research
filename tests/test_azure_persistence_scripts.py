@@ -1253,6 +1253,184 @@ def test_azure_deploy_first_resolution_blocks_before_any_mutation(tmp_path):
 
 
 @pytest.mark.parametrize(
+    ("args", "expected_message"),
+    [
+        (
+            ("--oauth-redirects-confirmed", "--oauth-redirects-confirmed"),
+            "may be supplied only once",
+        ),
+        (("--oauth-redirects-confirmed=false",), "unknown argument"),
+        (("--unknown",), "unknown argument"),
+        (("--help", "--oauth-redirects-confirmed"), "--help must be used alone"),
+        (("-h", "--oauth-redirects-confirmed"), "--help must be used alone"),
+    ],
+)
+def test_azure_deploy_oauth_confirmation_argument_rejects_invalid_input_before_side_effects(
+    tmp_path, args, expected_message
+):
+    fixture, argv_log = _install_azure_script_fixture(tmp_path, "deploy.sh")
+    env_marker = fixture / "env-sourced"
+    sanitizer_marker = fixture / "sanitizer-called"
+    resolver_marker = fixture / "resolver-called"
+    (fixture / "env.sh").write_text(
+        f"touch '{env_marker}'\n", encoding="utf-8"
+    )
+    (fixture / "scripts/sanitize_passkey_dotenv.py").write_text(
+        f"#!/bin/sh\ntouch '{sanitizer_marker}'\n", encoding="utf-8"
+    )
+    (fixture / "scripts/resolve_azure_endpoints.sh").write_text(
+        f"#!/bin/sh\ntouch '{resolver_marker}'\n", encoding="utf-8"
+    )
+
+    result = subprocess.run(
+        ["bash", "deploy.sh", *args],
+        cwd=fixture,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 64
+    assert expected_message in result.stderr
+    assert not env_marker.exists()
+    assert not sanitizer_marker.exists()
+    assert not resolver_marker.exists()
+    assert _read_az_calls(argv_log) == []
+
+
+@pytest.mark.parametrize("help_arg", ["--help", "-h"])
+def test_azure_deploy_help_is_side_effect_free(tmp_path, help_arg):
+    fixture, argv_log = _install_azure_script_fixture(tmp_path, "deploy.sh")
+    env_marker = fixture / "env-sourced"
+    (fixture / "env.sh").write_text(
+        f"touch '{env_marker}'\n", encoding="utf-8"
+    )
+
+    result = subprocess.run(
+        ["bash", "deploy.sh", help_arg],
+        cwd=fixture,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert (
+        "Usage: ./deploy.sh [--oauth-redirects-confirmed] [--help]"
+        in result.stdout
+    )
+    assert not env_marker.exists()
+    assert _read_az_calls(argv_log) == []
+
+
+def _run_deploy_confirmation_probe(
+    tmp_path: Path,
+    *,
+    args: tuple[str, ...] = (),
+    confirmation: str | None = None,
+    changed: bool = True,
+    env_sh_tail: str = "",
+) -> tuple[subprocess.CompletedProcess[str], list[list[str]]]:
+    fixture, argv_log = _install_azure_script_fixture(tmp_path, "deploy.sh")
+    (fixture / ".env.docker").write_text("OTHER=value\n", encoding="utf-8")
+    if not changed:
+        (fixture / METADATA_NAME).write_text(
+            json.dumps(_expected_metadata()), encoding="utf-8"
+        )
+    if env_sh_tail:
+        with (fixture / "env.sh").open("a", encoding="utf-8") as stream:
+            stream.write(env_sh_tail)
+    env = os.environ.copy()
+    env.pop("OAUTH_REDIRECTS_CONFIRMED", None)
+    env.update(
+        {
+            "PATH": f"{fixture / 'bin'}:{env['PATH']}",
+            "FAKE_AZ_ARGV_LOG": str(argv_log),
+            "FAKE_ENV_ROW": f"{ENVIRONMENT_ID}\t{DEFAULT_DOMAIN}\tSucceeded\n",
+            "DOCKER_HUB_USERNAME": "demo-user",
+        }
+    )
+    if confirmation is not None:
+        env["OAUTH_REDIRECTS_CONFIRMED"] = confirmation
+    result = subprocess.run(
+        ["bash", "deploy.sh", *args],
+        cwd=fixture,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    return result, _read_az_calls(argv_log)
+
+
+@pytest.mark.parametrize(
+    ("args", "confirmation", "changed"),
+    [
+        (("--oauth-redirects-confirmed",), None, True),
+        (("--oauth-redirects-confirmed",), "false", True),
+        ((), "true", True),
+        ((), None, False),
+        (("--oauth-redirects-confirmed",), None, False),
+    ],
+)
+def test_azure_deploy_oauth_confirmation_argument_reaches_read_only_preflight(
+    tmp_path, args, confirmation, changed
+):
+    result, calls = _run_deploy_confirmation_probe(
+        tmp_path, args=args, confirmation=confirmation, changed=changed
+    )
+
+    assert result.returncode == 91
+    assert [call[:2] for call in calls] == [
+        ["containerapp", "env"],
+        ["group", "show"],
+    ]
+
+
+def test_azure_deploy_env_sh_cannot_forge_oauth_confirmation(tmp_path):
+    result, calls = _run_deploy_confirmation_probe(
+        tmp_path,
+        env_sh_tail=(
+            "export OAUTH_REDIRECTS_CONFIRMED=true\n"
+            "CLI_OAUTH_REDIRECTS_CONFIRMED=true\n"
+            "CLI_OAUTH_REDIRECTS_CONFIRMED_SEEN=true\n"
+        ),
+    )
+
+    assert result.returncode == 3
+    assert "Deployment blocked" in result.stderr
+    assert [call[:2] for call in calls] == [["containerapp", "env"]]
+
+
+@pytest.mark.parametrize(
+    ("args", "confirmation"),
+    [
+        ((), "true"),
+        (("--oauth-redirects-confirmed",), "false"),
+    ],
+)
+def test_azure_deploy_env_sh_cannot_clear_oauth_confirmation(
+    tmp_path, args, confirmation
+):
+    result, calls = _run_deploy_confirmation_probe(
+        tmp_path,
+        args=args,
+        confirmation=confirmation,
+        env_sh_tail=(
+            "unset OAUTH_REDIRECTS_CONFIRMED\n"
+            "CLI_OAUTH_REDIRECTS_CONFIRMED=false\n"
+            "CLI_OAUTH_REDIRECTS_CONFIRMED_SEEN=false\n"
+        ),
+    )
+
+    assert result.returncode == 91
+    assert [call[:2] for call in calls] == [
+        ["containerapp", "env"],
+        ["group", "show"],
+    ]
+
+
+@pytest.mark.parametrize(
     ("resolver_output", "message"),
     [
         ("CHANGED=true\n", "malformed resolver output assignment"),

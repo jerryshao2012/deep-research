@@ -47,47 +47,141 @@ normalize_azure_tsv_array() {
   printf '%s' "$row"
 }
 
+print_usage() {
+  echo "Usage: ./deploy.sh [--oauth-redirects-confirmed] [--help]"
+  echo ""
+  echo "Update existing deployment for managed passkey cutover."
+  echo ""
+  echo "Prerequisites (this script does not bootstrap them):"
+  echo "  - Existing resource group and Container Apps environment"
+  echo "  - Existing backend Container App"
+  echo "  - Existing user-assigned managed identity assigned to the backend app"
+  echo "  - Existing Key Vault with identity secret get access"
+  echo "  - Pre-created Key Vault secret PASSKEY-PROXY-SECRET"
+  echo "  - Existing provider/runtime secrets referenced by the app configuration"
+  echo "  - Existing storage account, Blob container, Azure Files share, and Container Apps environment storage"
+  echo "  - Successful build producing .build_version and Docker Hub image"
+  echo "  - Confirmed Google/GitHub OAuth URLs when endpoint metadata changes"
+  echo ""
+  echo "Options:"
+  echo "  --oauth-redirects-confirmed  Confirm provider URLs for changed endpoints"
+  echo "  --help, -h                   Show this help message"
+  echo ""
+  echo "Examples:"
+  echo "  ./deploy.sh --oauth-redirects-confirmed"
+  echo "  OAUTH_REDIRECTS_CONFIRMED=true ./deploy.sh"
+  echo ""
+  echo "Note: For bi-directional file sync with Azure File Share, use:"
+  echo "  ./sync-files.sh"
+  echo "Note: To build the image, run:"
+  echo "  ./build.sh"
+}
+
 # Parse command-line arguments
+unset CLI_OAUTH_REDIRECTS_CONFIRMED CLI_OAUTH_REDIRECTS_CONFIRMED_SEEN \
+  DEPLOY_ORIGINAL_ARGUMENT_COUNT
+CLI_OAUTH_REDIRECTS_CONFIRMED=false
+CLI_OAUTH_REDIRECTS_CONFIRMED_SEEN=false
+DEPLOY_ORIGINAL_ARGUMENT_COUNT="$#"
 while [[ $# -gt 0 ]]; do
   case $1 in
     --help|-h)
-      echo "Usage: ./deploy.sh [--help]"
-      echo ""
-      echo "Update existing deployment for managed passkey cutover."
-      echo ""
-      echo "Prerequisites (this script does not bootstrap them):"
-      echo "  - Existing resource group and Container Apps environment"
-      echo "  - Existing backend Container App"
-      echo "  - Existing user-assigned managed identity assigned to the backend app"
-      echo "  - Existing Key Vault with identity secret get access"
-      echo "  - Pre-created Key Vault secret PASSKEY-PROXY-SECRET"
-      echo "  - Existing provider/runtime secrets referenced by the app configuration"
-      echo "  - Existing storage account, Blob container, Azure Files share, and Container Apps environment storage"
-      echo "  - Successful build producing .build_version and Docker Hub image"
-      echo "  - Confirmed Google/GitHub OAuth URLs when endpoint metadata changes"
-      echo ""
-      echo "Options:"
-      echo "  --help, -h       Show this help message"
-      echo ""
-      echo "Examples:"
-      echo "  OAUTH_REDIRECTS_CONFIRMED=true ./deploy.sh     # Update existing deployment after OAuth confirmation"
-      echo ""
-      echo "Note: For bi-directional file sync with Azure File Share, use:"
-      echo "  ./sync-files.sh"
-      echo "Note: To build the image, run:"
-      echo "  ./build.sh"
+      if [[ "$DEPLOY_ORIGINAL_ARGUMENT_COUNT" -ne 1 ]]; then
+        echo "Error: --help must be used alone." >&2
+        exit 64
+      fi
+      print_usage
       exit 0
       ;;
+    --oauth-redirects-confirmed)
+      if [[ "$CLI_OAUTH_REDIRECTS_CONFIRMED_SEEN" == true ]]; then
+        echo "Error: --oauth-redirects-confirmed may be supplied only once." >&2
+        exit 64
+      fi
+      CLI_OAUTH_REDIRECTS_CONFIRMED=true
+      CLI_OAUTH_REDIRECTS_CONFIRMED_SEEN=true
+      shift
+      ;;
     *)
-      echo "❌ Unknown option: $1"
-      echo "Use --help for usage information"
-      exit 1
+      echo "Error: unknown argument '$1'." >&2
+      exit 64
       ;;
   esac
 done
 
 # Configuration
-source "$SCRIPT_DIR/env.sh"
+unset CALLER_OAUTH_REDIRECTS_CONFIRMED
+CALLER_OAUTH_REDIRECTS_CONFIRMED="${OAUTH_REDIRECTS_CONFIRMED-}"
+unset OAUTH_REDIRECTS_CONFIRMED
+
+unset ENV_CONFIG_OUTPUT CONFIG_LINE_COUNT config_line
+if ENV_CONFIG_OUTPUT=$(BASH_ENV=/dev/null ENV=/dev/null \
+  OAUTH_REDIRECTS_CONFIRMED= CALLER_OAUTH_REDIRECTS_CONFIRMED= \
+  CLI_OAUTH_REDIRECTS_CONFIRMED= CLI_OAUTH_REDIRECTS_CONFIRMED_SEEN= \
+  DEPLOY_ORIGINAL_ARGUMENT_COUNT= \
+  /bin/bash --noprofile --norc -c '
+set +x
+if source "$1" >/dev/null 2>/dev/null; then
+  :
+else
+  exit $?
+fi
+set +x
+builtin trap - EXIT ERR DEBUG RETURN
+builtin printf "SEED=%s\n" "${SEED-}"
+builtin printf "AZURE_SUBSCRIPTION_ID=%s\n" "${AZURE_SUBSCRIPTION_ID-}"
+builtin printf "RESOURCE_GROUP=%s\n" "${RESOURCE_GROUP-}"
+builtin printf "LOCATION=%s\n" "${LOCATION-}"
+builtin printf "ENV_NAME=%s\n" "${ENV_NAME-}"
+builtin printf "AGENT_NAME=%s\n" "${AGENT_NAME-}"
+builtin printf "BACKEND_APP_NAME=%s\n" "${BACKEND_APP_NAME-}"
+builtin printf "UI_APP_NAME=%s\n" "${UI_APP_NAME-}"
+builtin printf "KV_NAME=%s\n" "${KV_NAME-}"
+builtin printf "STORAGE_ACCOUNT_NAME=%s\n" "${STORAGE_ACCOUNT_NAME-}"
+' deploy-env "$SCRIPT_DIR/env.sh" 2>/dev/null); then
+  :
+else
+  status=$?
+  echo "Error: env.sh configuration failed." >&2
+  exit "$status"
+fi
+
+CONFIG_LINE_COUNT=0
+while IFS= read -r config_line || [[ -n "$config_line" ]]; do
+  CONFIG_LINE_COUNT=$((CONFIG_LINE_COUNT + 1))
+  case "$CONFIG_LINE_COUNT:$config_line" in
+    1:SEED=*) SEED="${config_line#SEED=}" ;;
+    2:AZURE_SUBSCRIPTION_ID=*) AZURE_SUBSCRIPTION_ID="${config_line#AZURE_SUBSCRIPTION_ID=}" ;;
+    3:RESOURCE_GROUP=*) RESOURCE_GROUP="${config_line#RESOURCE_GROUP=}" ;;
+    4:LOCATION=*) LOCATION="${config_line#LOCATION=}" ;;
+    5:ENV_NAME=*) ENV_NAME="${config_line#ENV_NAME=}" ;;
+    6:AGENT_NAME=*) AGENT_NAME="${config_line#AGENT_NAME=}" ;;
+    7:BACKEND_APP_NAME=*) BACKEND_APP_NAME="${config_line#BACKEND_APP_NAME=}" ;;
+    8:UI_APP_NAME=*) UI_APP_NAME="${config_line#UI_APP_NAME=}" ;;
+    9:KV_NAME=*) KV_NAME="${config_line#KV_NAME=}" ;;
+    10:STORAGE_ACCOUNT_NAME=*) STORAGE_ACCOUNT_NAME="${config_line#STORAGE_ACCOUNT_NAME=}" ;;
+    *)
+      echo "Error: env.sh returned invalid configuration." >&2
+      exit 65
+      ;;
+  esac
+done <<< "$ENV_CONFIG_OUTPUT"
+if [[ "$CONFIG_LINE_COUNT" -ne 10 ]]; then
+  echo "Error: env.sh returned incomplete configuration." >&2
+  exit 65
+fi
+export SEED AZURE_SUBSCRIPTION_ID RESOURCE_GROUP LOCATION ENV_NAME AGENT_NAME \
+  BACKEND_APP_NAME UI_APP_NAME KV_NAME STORAGE_ACCOUNT_NAME
+unset ENV_CONFIG_OUTPUT CONFIG_LINE_COUNT config_line
+
+if [[ "$CLI_OAUTH_REDIRECTS_CONFIRMED_SEEN" == true ]]; then
+  OAUTH_REDIRECTS_CONFIRMED="$CLI_OAUTH_REDIRECTS_CONFIRMED"
+else
+  OAUTH_REDIRECTS_CONFIRMED="$CALLER_OAUTH_REDIRECTS_CONFIRMED"
+fi
+unset CALLER_OAUTH_REDIRECTS_CONFIRMED CLI_OAUTH_REDIRECTS_CONFIRMED \
+  CLI_OAUTH_REDIRECTS_CONFIRMED_SEEN DEPLOY_ORIGINAL_ARGUMENT_COUNT
+
 : "${KV_NAME:?Set KV_NAME in env.sh}"
 : "${STORAGE_ACCOUNT_NAME:?Set STORAGE_ACCOUNT_NAME in env.sh}"
 : "${BACKEND_APP_NAME:?Set BACKEND_APP_NAME in env.sh}"
