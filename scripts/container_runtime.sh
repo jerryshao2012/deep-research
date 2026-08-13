@@ -69,8 +69,22 @@ ensure_container_runtime_ready() {
         podman)
             if ! "$CONTAINER_RUNTIME_COMMAND" info >/dev/null 2>&1; then
                 printf '%s\n' \
-                    'Error: podman info failed; daemonless Podman is not ready. Check the Podman installation and configuration.' >&2
-                return 1
+                    'Podman is unavailable; starting the default Podman machine.' >&2
+                if "$CONTAINER_RUNTIME_COMMAND" machine start; then
+                    :
+                else
+                    local start_status=$?
+                    printf '%s\n' 'Error: failed to start the default Podman machine.' >&2
+                    return "$start_status"
+                fi
+                if "$CONTAINER_RUNTIME_COMMAND" info >/dev/null 2>&1; then
+                    :
+                else
+                    local info_status=$?
+                    printf '%s\n' \
+                        'Error: Podman machine started but podman info still fails.' >&2
+                    return "$info_status"
+                fi
             fi
             ;;
         docker)

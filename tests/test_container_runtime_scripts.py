@@ -851,9 +851,72 @@ def test_podman_readiness_failure_does_not_fall_back_to_docker(
     )
 
     assert result.returncode != 0
-    assert invocation_log.read_text(encoding="utf-8") == "podman info\n"
-    assert "podman info" in result.stderr
-    assert "daemonless Podman" in result.stderr
+    assert invocation_log.read_text(encoding="utf-8") == (
+        "podman info\n"
+        "podman machine start\n"
+    )
+    assert "failed to start" in result.stderr
+
+
+def test_podman_readiness_starts_machine_then_retries_info(tmp_path: Path) -> None:
+    invocation_log = tmp_path / "invocations.log"
+    state_file = tmp_path / "podman-ready"
+    _install_runtime(
+        tmp_path,
+        "podman",
+        """printf "podman %s\\n" "$*" >> "$INVOCATION_LOG"
+if [[ "$*" == "info" && ! -f "$PODMAN_STATE_FILE" ]]; then
+    exit 1
+fi
+if [[ "$*" == "machine start" ]]; then
+    : > "$PODMAN_STATE_FILE"
+    exit 0
+fi
+if [[ "$*" == "info" ]]; then
+    exit 0
+fi
+exit 99""",
+    )
+
+    result = _run_adapter(
+        tmp_path,
+        "select_container_runtime && ensure_container_runtime_ready",
+        extra_env={
+            "INVOCATION_LOG": str(invocation_log),
+            "PODMAN_STATE_FILE": str(state_file),
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert invocation_log.read_text(encoding="utf-8") == (
+        "podman info\n"
+        "podman machine start\n"
+        "podman info\n"
+    )
+
+
+def test_podman_readiness_preserves_machine_start_failure(tmp_path: Path) -> None:
+    invocation_log = tmp_path / "invocations.log"
+    _install_runtime(
+        tmp_path,
+        "podman",
+        """printf "podman %s\\n" "$*" >> "$INVOCATION_LOG"
+if [[ "$*" == "info" ]]; then exit 1; fi
+if [[ "$*" == "machine start" ]]; then exit 17; fi
+exit 99""",
+    )
+
+    result = _run_adapter(
+        tmp_path,
+        "select_container_runtime && ensure_container_runtime_ready",
+        extra_env={"INVOCATION_LOG": str(invocation_log)},
+    )
+
+    assert result.returncode == 17
+    assert invocation_log.read_text(encoding="utf-8") == (
+        "podman info\n"
+        "podman machine start\n"
+    )
 
 
 def test_docker_readiness_failure_tells_user_to_start_daemon(
