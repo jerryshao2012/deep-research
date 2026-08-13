@@ -1,10 +1,27 @@
-# Operate model rate limits and retries
+# Reliability & Rate Limiting
 
 Use this guide to shape model traffic before quota exhaustion and recover from recognized rate-limit failures. It separates provider quotas, agent concurrency, retry timing, observable failure messages, and practical tuning.
 
 ## Check prerequisites
 
 Configure a working model provider first, then obtain that deployment's current TPM and RPM quotas. Treat the profiles below as starting points and validate them under representative load; shared provider usage and provider-side burst rules can reduce capacity available to this process.
+
+## Reliability strategy
+
+Treat each model deployment as finite-capacity system. Deep Research uses two complementary layers:
+
+1. **Proactive shaping** estimates request tokens and spaces asynchronous calls before local process exceeds configured TPM/RPM safety budget.
+2. **Reactive retries** recognize provider rate-limit failures after call, then wait with exponential backoff and jitter before trying again.
+
+Use both layers for cloud models. Shaping reduces avoidable `429` responses; retries cover shared-capacity drops and timing races shaping cannot predict. Neither layer creates provider capacity or replaces deployment monitoring.
+
+Operational order matters:
+
+1. configure actual deployment quotas rather than account-wide guesses;
+2. keep one request below safe TPM admission capacity;
+3. reduce delegated concurrency when aggregate load is high;
+4. use retries only when waiting can restore capacity;
+5. inspect logs and provider metrics before increasing limits or retry count.
 
 ## Shape traffic proactively
 

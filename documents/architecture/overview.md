@@ -34,6 +34,20 @@ Control flows from an entry surface into an owning application capability. `rese
 | Persistence and state | Store uploaded sources, generated wiki workspaces, auth/session data, thread/run state, checkpoints, progress, and evaluation history. | Filesystem plus SQLite, PostgreSQL, Cosmos, or configured platform adapters. |
 | Output skills | Discover, validate, and apply pluggable output contracts such as golden datasets and interview preparation. | Skill registry searches `.deepagents/skills/` and the supported `docs/.deepagents/skills/` extension root. This repository currently supplies the former; the latter need not exist. |
 
+## Tool behavior and runtime ownership
+
+| Tool or group | Runtime owner | Current behavior and caveats |
+| --- | --- | --- |
+| `tavily_search` | Delegated researcher | Uses Tavily to discover URLs, then returns fetched page content as Markdown. Result count and `general`/`news`/`finance` topic are injected runtime controls; `--no-web` disables external retrieval. |
+| `fetch_webpage_content` | Delegated researcher | Fetches one known URL and converts readable content to Markdown. Use after URL discovery or when caller already knows source; network, timeout, and extraction failures remain evidence gaps. |
+| `think_tool` | Orchestrator and delegated researcher | Records strategic reflection in `OUTPUT_FOLDER/research_reflection.log` and attempts to publish `/research_reflection.md` to graph state. Reflection should compare findings, contradictions, gaps, source quality, and search budget; it is not evidence by itself. |
+| `ls`, `glob`, `read_file` | Orchestrator | Prefer virtual graph filesystem, then use constrained local fallback. Markdown reads accept a case-insensitive exact-heading selector such as `guide.md#Installation`; file access still follows configured containment and context limits. |
+| `read_docs_folder` | Orchestrator | Extracts PDF, text, Markdown, Word, PowerPoint, and Excel input. It prefers ready wiki content, caches extracts, summarizes oversized folders, and supports targeted `specific_files` reads internally. |
+| `llm_wiki_query` | Orchestrator | Explicitly queries current thread wiki and persists cited findings as `/cited_response*.md`. Result is research material that must be checked, combined with other evidence, and written into final report. |
+| `write_file` | Orchestrator | Writes state/output artifacts and overwrites same path. Final-report handling normalizes known document source paths; callers still own synthesis, citation numbering, and safe destination selection. |
+
+Skill registry helpers and bundled renderer scripts are application utilities, not a promise that every helper is exposed as agent-callable tool. Add or expose one only through registration path described in [Extend the research agent](../development/extending-the-agent.md#add-a-custom-tool).
+
 ## Research control and data flow
 
 1. Caller submits research question through CLI or LangGraph surface; custom web clients may first create thread state or upload documents through FastAPI.
@@ -41,6 +55,16 @@ Control flows from an entry surface into an owning application capability. `rese
 3. Tools acquire web or local evidence. Thread knowledge enters research only through an explicit `llm_wiki_query` call; it is not injected automatically.
 4. Evidence and intermediate state remain attached to graph/thread execution. Long-lived sources and wiki artifacts remain under their owning persistence boundaries.
 5. Synthesis produces report, then verification may request revision. Selected output skill transforms final research into its requested artifact shape.
+
+### Research mechanics
+
+- **Planning:** orchestrator decomposes complex request into bounded research units and tracks unfinished work; plan representation is runtime detail, not stable public API.
+- **Local context:** when document folder is supplied, application-owned file tools read normalized, bounded source set before delegating external research. Delegated researcher cannot read filesystem.
+- **Web evidence:** delegated `research-agent` uses Tavily URL discovery, page fetch, and `think_tool`; it returns evidence to orchestrator rather than writing final application files.
+- **Reflection:** `think_tool` pauses search loop to summarize findings, test source quality, identify contradictions/gaps, and choose next query or stopping point.
+- **Synthesis:** orchestrator consolidates delegated findings, local/wiki evidence, and citations. Sub-agent output is input evidence, not final answer by itself.
+- **Skills:** selected skill instructions shape final artifact. Application rendering validates and writes skill output under thread output folder; installed skills and schema requirements vary by skill.
+- **Verification:** citation grounding, sufficiency judging, and adversarial gap analysis can request bounded revision after report generation.
 
 ## Document and wiki data flow
 

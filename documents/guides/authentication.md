@@ -52,19 +52,48 @@ It does not generate a fallback. A request may send a valid API key or OAuth ses
 
 OAuth routes are served by the custom FastAPI app attached to `langgraph dev` and by the standalone Uvicorn app. When Authlib dependencies import successfully, OAuth route capability is enabled even if provider credentials are blank; configure credentials before login, because blank or invalid values fail during the OAuth flow.
 
-### Register Google
+### Choose provider URLs
 
-Create a web OAuth client with:
+Register browser and callback URLs before copying credentials. Replace example domains with externally visible origins; callback scheme, hostname, port, path, case, and trailing slash must match provider configuration.
 
-- the frontend origin as an authorized JavaScript origin;
-- the exact backend callback `https://<backend-origin>/auth/callback/google` as an authorized redirect URI;
-- `openid email profile` consent scopes.
+| Surface | Frontend origin or homepage | Google callback | GitHub callback |
+| --- | --- | --- | --- |
+| Local `langgraph dev` | `http://localhost:3000` | `http://localhost:2024/auth/callback/google` | `http://localhost:2024/auth/callback/github` |
+| Local standalone Uvicorn | `http://localhost:3000` | `http://localhost:8000/auth/callback/google` | `http://localhost:8000/auth/callback/github` |
+| Production | `https://ui.example.com` | `https://api.example.com/auth/callback/google` | `https://api.example.com/auth/callback/github` |
 
-Set `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`. Local LangGraph development normally uses callback `http://localhost:2024/auth/callback/google`; `localhost` and `127.0.0.1` are different registered URIs.
+Do not interchange `localhost` and `127.0.0.1`; providers treat them as different registered values. Behind a proxy, register public HTTPS callback and make proxy overwrite `X-Forwarded-Host` and `X-Forwarded-Proto` with trusted values.
 
-### Register GitHub
+### Register a Google OAuth client
 
-Create a GitHub OAuth app for each environment with the frontend as Homepage URL and `https://<backend-origin>/auth/callback/github` as Authorization callback URL. Set `GITHUB_CLIENT_ID` and `GITHUB_CLIENT_SECRET`; a GitHub OAuth client secret is not a personal access token.
+Use Google's current [web-server OAuth instructions](https://developers.google.com/identity/protocols/oauth2/web-server) as provider source of truth:
+
+1. Open [Google Cloud Console](https://console.cloud.google.com/), create or select project, then open Google Auth Platform or **APIs & Services**.
+2. Configure OAuth consent screen/branding and audience. Supply app name, support email, and developer contact; for external testing, add intended test users. Request only `openid email profile` scopes used by this application.
+3. Open **Clients** or **Credentials**, select **Create client**, and choose **Web application**.
+4. Give client environment-specific name such as `Deep Research Local` or `Deep Research Production`.
+5. Under **Authorized JavaScript origins**, add frontend origin when companion UI uses Google browser APIs, for example `http://localhost:3000` or `https://ui.example.com`. Origins contain scheme, host, and optional port but no path or wildcard.
+6. Under **Authorized redirect URIs**, add exact backend callback from table, for example `http://localhost:2024/auth/callback/google`.
+7. Create client and copy Client ID and Client Secret into secret store. Never commit downloaded client-secret file or generated value.
+
+Google redirect URI must match authorization request exactly. `http://localhost:2024/auth/callback/google` and `http://127.0.0.1:2024/auth/callback/google` are different. Production callbacks use HTTPS. If consent screen remains in testing, only configured test users may be able to sign in.
+
+Set copied values as `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`.
+
+### Register a GitHub OAuth app
+
+Follow current [GitHub OAuth app registration](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/creating-an-oauth-app):
+
+1. Open [GitHub Developer Settings](https://github.com/settings/developers), select **OAuth Apps**, then **New OAuth App** or **Register a new application**.
+2. Enter environment-specific application name such as `Deep Research Local`.
+3. Set **Homepage URL** to frontend URL, for example `http://localhost:3000`.
+4. Set **Authorization callback URL** to exact backend callback, for example `http://localhost:2024/auth/callback/github`.
+5. Leave **Enable Device Flow** off unless separate device authorization workflow is intentionally implemented; browser login uses web application flow.
+6. Select **Register application**, copy Client ID, then select **Generate a new client secret** and copy secret immediately.
+
+GitHub OAuth app has one configured callback URL. Create separate app for local development and each production callback domain, or use repository's domain-keyed multi-client configuration below. Client secret is not personal access token. Runtime requests `user:email` so account with private primary email can be resolved through email API.
+
+Set default app values as `GITHUB_CLIENT_ID` and `GITHUB_CLIENT_SECRET`.
 
 For multiple frontend domains, the runtime also accepts paired comma-separated mappings:
 
@@ -75,11 +104,84 @@ GITHUB_CLIENT_SECRETS=domain-one.example:<client-secret>,domain-two.example:<cli
 
 The domain keys present in both variables select the matching OAuth client. Keep a default `GITHUB_CLIENT_ID` and `GITHUB_CLIENT_SECRET` when a fallback client is required.
 
+### Configure backend OAuth environment
+
+For one Google client, one GitHub client, and local frontend:
+
+```dotenv
+GOOGLE_CLIENT_ID=your-google-client-id
+GOOGLE_CLIENT_SECRET=your-google-client-secret
+GITHUB_CLIENT_ID=your-github-client-id
+GITHUB_CLIENT_SECRET=your-github-client-secret
+OAUTH_SECRET_KEY=
+FRONTEND_URLS=http://localhost:3000
+```
+
+Generate independent signing value and inject at runtime rather than checking it in:
+
+```bash
+uv run python -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+Keep `OAUTH_SECRET_KEY` stable across replicas and restarts so signed OAuth state cookie remains valid during callback. Restart server after changing provider credentials; route existence alone does not prove configuration ready.
+
+### Follow the end-to-end OAuth flow
+
+```mermaid
+sequenceDiagram
+    participant B as Browser or UI
+    participant A as Deep Research backend
+    participant P as Google or GitHub
+    participant S as Configured auth store
+    B->>A: GET /auth/login/{provider}
+    A-->>B: Redirect with signed OAuth state
+    B->>P: Authenticate and consent
+    P-->>A: GET /auth/callback/{provider}?code=...&state=...
+    A->>P: Exchange code and request profile
+    P-->>A: Provider tokens and profile
+    A->>S: Upsert immutable identity and create session
+    S-->>A: Opaque session token
+    A-->>B: Redirect to allowed /login/success?token=...
+    B->>A: Protected request with bearer or X-API-Key session token
+    A->>S: Validate expiry and load sanitized identity
+    S-->>A: Active user or rejection
+```
+
+Provider access tokens remain server-side. Application session token is opaque credential, not provider JWT; frontend must treat it as secret. Session record uses immutable provider subject (`google:<sub>` or `github:<numeric-id>`) plus sanitized profile fields. Validation refreshes eligible near-expiry sessions, explicit logout revokes token, and configured auth store—not request-local memory—owns lifecycle.
+
 ### Allow frontend redirects
 
 Set `FRONTEND_URLS` to a comma-separated list of exact frontend origins. `/auth/login/{provider}` accepts `redirect_url` only when it matches the configured origin allowlist, stores the selected frontend and safe return path in the signed session cookie, and constructs its callback from the request or forwarded host and protocol.
 
 Register callback URLs that exactly match the externally visible scheme, host, port, and path. Configure the reverse proxy to overwrite untrusted forwarded headers rather than passing arbitrary client values.
+
+### Validate the OAuth login flow
+
+1. Start `uv run langgraph dev` for port `2024`, or standalone `uv run python -m uvicorn webapp:app --host 127.0.0.1 --port 8000`.
+2. Open `/auth/login/google` or `/auth/login/github` on same backend origin used in registered callback.
+3. Complete provider authorization. Backend callback creates session and redirects to `<frontend>/login/success?token=...`.
+4. Frontend must capture token, remove it from browser history immediately, and prevent query strings from entering analytics, logs, or referrer data.
+5. Validate token against same backend:
+
+```bash
+curl http://localhost:2024/auth/session/validate \
+  -H "Authorization: Bearer $SESSION_TOKEN"
+```
+
+Successful response contains normalized `user` with `identity`, `email`, `name`, `provider`, and `avatar_url`, plus sanitized `metadata`. It excludes raw provider tokens and session token.
+
+Use `POST /auth/session/refresh` to extend active session or `POST /auth/logout` to revoke it, supplying same bearer or `X-API-Key` session credential.
+
+### Compare provider registration fields
+
+| Requirement | Google | GitHub |
+| --- | --- | --- |
+| Consent configuration | Required; audience and test users may restrict access | No separate consent screen |
+| Frontend field | Authorized JavaScript origins when browser SDK uses client | Homepage URL |
+| Backend field | Authorized redirect URI | Authorization callback URL |
+| Application scopes | `openid email profile` | `user:email` |
+| Stable identity | `sub` | Numeric `id` |
+| Private email behavior | Email and verification claims come from OpenID profile | Runtime requests email list when public email absent |
 
 ### Use OAuth sessions
 

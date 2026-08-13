@@ -49,3 +49,5 @@ This index is the canonical handbook navigation for installing, using, extending
 
 - [Implementation plans](history/plans/) preserve approved execution plans for completed and ongoing work.
 - [Design specifications](history/specs/) preserve architecture and feature-design decisions.
+- [README `e0ae106` content audit](history/audits/README-e0ae10676b7cf892bbf567adab79e17cc3ab7c8a-content-audit.md) traces every historical line to current documentation or an evidence-backed exclusion.
+- [README `e0ae106` snapshot](history/snapshots/README-e0ae10676b7cf892bbf567adab79e17cc3ab7c8a.md) is byte-preserved historical evidence. It contains obsolete commands, paths, URLs, and runtime claims; do not use it as current operating guidance.

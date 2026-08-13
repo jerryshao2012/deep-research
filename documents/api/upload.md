@@ -38,6 +38,39 @@ curl -H "X-API-Key: ${DEEP_RESEARCH_API_KEY}" \
 
 Upload returns HTTP `201` with saved-file results, a saved-file count, remaining free-space data, and Thread Wiki trigger flags.
 
+Representative response for ordinary folder:
+
+```json
+{
+  "folder": "policy",
+  "count": 2,
+  "saved": [
+    {"filename": "source-1.pdf", "path": "docs/policy/source-1.pdf", "size": 642000},
+    {"filename": "source-2.docx", "path": "docs/policy/source-2.docx", "size": 523000}
+  ],
+  "total_uploaded_bytes": 1165000,
+  "free_space_bytes": 98765432100,
+  "free_space_human": "92.00 GB",
+  "wiki_ingest_started": false,
+  "wiki_ingest_thread_id": null
+}
+```
+
+For `folder=threads/<thread-id>`, successful response sets `wiki_ingest_started` to `true` and returns extracted thread ID. Ingest starts asynchronously; poll Thread Wiki status instead of treating upload response as wiki-ready signal.
+
+Representative list response:
+
+```json
+{
+  "folder": "policy",
+  "count": 2,
+  "items": [
+    {"name": "archive", "type": "folder", "size": null},
+    {"name": "source-1.pdf", "type": "file", "size": 642000}
+  ]
+}
+```
+
 ## Endpoints
 
 | Method and path | Input | Result |

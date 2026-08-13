@@ -77,6 +77,23 @@ curl -N -H "x-api-key: ${DEEP_RESEARCH_API_KEY}" \
 
 Query responses contain an answer, optional filed wiki path, and structured source citations. `file_results: true` lets durable answers be filed under the wiki query area.
 
+## Supported inputs and extraction
+
+Thread Wiki stages ordinary documents and source code through different safe paths:
+
+| Input | Recognized forms | Extraction or analysis |
+| --- | --- | --- |
+| PDF | `.pdf` | PyMuPDF4LLM-to-Markdown path with PDF fallback when needed; citations retain original page numbers. |
+| Word | `.docx` | Paragraphs and tables through `python-docx`. |
+| PowerPoint | `.pptx` | Slide text and speaker notes through `python-pptx`. |
+| Excel | `.xlsx` | Worksheet values through `openpyxl`. |
+| Markdown and text | `.md`, `.txt` | Direct text staging with source boundaries retained. |
+| Structured text | `.json`, `.yaml`, `.yml`, `.csv` | Text normalization and chunking; no source execution. |
+| Whole source files | Supported language extensions listed below | Tree-sitter AST units, symbol/import relationships, semantic chunks, and safe text fallback. |
+| Embedded code | Explicitly supported fenced-language tags | Semantic code chunk attached to containing document; excluded from repository-wide symbol resolution. |
+
+Unsupported, undecodable, oversized, or parser-failing code degrades to ordinary text when safe rather than executing content. Extraction limits and code-language coverage are documented in [Configuration](../guides/configuration.md) and [AST-aware code ingestion](../architecture/code-ingestion.md).
+
 ## Workflows
 
 Upload documents to `docs/threads/<id>` through the [Document upload API](upload.md). A successful thread-folder upload launches background ingest. Deleting a thread source cancels conflicting work, removes source-derived references, and launches lint reconciliation.

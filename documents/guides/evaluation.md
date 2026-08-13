@@ -1,4 +1,4 @@
-# Evaluate research quality and regressions
+# Multi-Agent Complex Workflows Evaluation & Regression Tracking
 
 Use this guide to score golden datasets, compare like-for-like runs, inspect operational trends, and understand report verification. It distinguishes the executable scoring pipeline from programmatic agent-run comparisons and best-effort server metrics so their artifacts and verdicts are not mixed.
 
@@ -7,6 +7,20 @@ Use this guide to score golden datasets, compare like-for-like runs, inspect ope
 Install development dependencies with `uv sync --extra dev`. Golden-dataset scoring requires an input CSV accepted by the golden-dataset metrics scripts plus a configured model for LLM judging and optional humanization; operational metrics require a run that writes `/final_report.md`.
 
 Hold non-experimental factors such as input, model, and relevant configuration stable while changing the factor under evaluation. Record both baseline and candidate code revisions so a code-change evaluation remains attributable; a comparison is meaningful only when its manifest represents the same test case.
+
+## Why trace-based evaluation matters
+
+Multi-agent research can fail even when final response appears plausible. Long-running workflows add failure modes such as non-termination, role drift, duplicated actions, context loss during handoff, unsupported claims propagating between agents, and external side effects from tool calls or shared state. One output score cannot locate where those failures began.
+
+Evaluation therefore combines output artifacts with execution facts:
+
+- manifest identifies exact test case and prevents unrelated comparisons;
+- tool-call outcomes expose failed or redundant actions;
+- parameter checks flag structurally incomplete calls;
+- token, latency, retry, and correction metrics show efficiency and recovery behavior;
+- citation and adversarial checks examine final report independently of execution trace.
+
+Historical README referenced [A Trace-Based Assurance Framework for Agentic AI Orchestration](https://arxiv.org/abs/2603.18096) as design context for contracts, bounded stress testing, fault injection, and runtime governance. This repository implements only mechanisms documented below. Deterministic replay, structured service/retrieval/memory fault injection, action mediation, and several coordination metrics remain future work rather than current guarantees.
 
 ## Choose the evaluation layer
 
@@ -77,7 +91,33 @@ The supported sequence is:
 5. find `latest_baseline(records, record["manifest_hash"])`;
 6. call `compare_records(baseline=..., candidate=...)`.
 
+### Comparison identity and manifest rules
+
 The canonical SHA-256 manifest hash prevents comparisons such as “generate 5 pairs” against “generate 10 pairs.” No matching baseline or a hash mismatch returns `non-comparable` rather than a pass.
+
+Comparison identity includes subject text, selected skill, document folder, web-search mode, model, and relevant flags. Difference in any identity field intentionally produces different hash. This prevents false regression verdict when candidate changes task itself.
+
+Representative record shape:
+
+```json
+{
+  "timestamp_utc": "2026-08-13T18:00:00+00:00",
+  "run_type": "candidate",
+  "manifest": {
+    "subject": "Generate 10 grounded question-answer pairs",
+    "skill": "golden-dataset",
+    "doc_folder": "./docs/policy",
+    "no_web": false,
+    "model": "configured-model"
+  },
+  "manifest_hash": "<sha256>",
+  "metrics": {
+    "completeness": {"pass": true},
+    "tool_execution": {"total_tool_calls": 12, "success_rate": 0.92},
+    "latency": {"runtime_seconds": 45.2}
+  }
+}
+```
 
 ### Understand collected metrics
 
@@ -92,6 +132,8 @@ The canonical SHA-256 manifest hash prevents comparisons such as “generate 5 p
 | Latency | End-to-end runtime in seconds. |
 
 Tool output is treated as failed when empty or beginning with a known error prefix such as invalid JSON, schema validation failure, unknown skill, invocation error, or `ERROR:`. Parameter quality is a lightweight structural heuristic, not semantic proof that a tool argument is correct.
+
+Parameter analysis recognizes common argument families: file operations look for `path` or `file_path`; search operations look for `query` or `search_query`; reflection calls look for non-empty reflection content; task delegation looks for description/prompt content. Unknown tools can contribute tool counts without receiving meaningful parameter-quality score. Treat aggregate as triage signal and inspect trace before diagnosing root cause.
 
 ### Apply regression thresholds
 
@@ -108,6 +150,8 @@ Tool output is treated as failed when empty or beginning with a known error pref
 | Self-correction | Correction rate decreases; any increase is better. |
 
 Any `worse` metric makes the overall verdict worse. Otherwise, any `better` metric makes it better; all equal metrics produce same. Token efficiency is `unavailable` unless both records captured usage metadata.
+
+### Verify evaluation behavior
 
 Run focused contract tests with:
 
@@ -126,6 +170,8 @@ EVAL_LOG_QUESTIONS=false
 ```
 
 On the first middleware observation of `/final_report.md`, `_eval_logged` is set and the current state snapshot supplies tool execution, parameter quality, self-correction, token usage, latency, model, selected skill, document folder, web mode, and output file names. This snapshot can occur in the same middleware pass that requests a verification revision, so later revision messages, tokens, and latency may be omitted; no second record is written after `_eval_logged` becomes true.
+
+Operational JSONL records describe diverse production-like runs and are not automatically comparable baselines. A typical record contains timestamp, model, redacted or recorded context, runtime, aggregate metrics, output files, experiment labels, and optional Git metadata. Keep this history separate from `golden_dataset_runs.jsonl`, whose records require matching manifests and explicit baseline/candidate intent.
 
 Persistence differs by middleware path. Synchronous `after_model` schedules `log_server_metrics()` as a background task and does not await its file write, so the process must remain alive to flush it; asynchronous `aafter_model` awaits `log_server_metrics()` and its offloaded file write before returning. The logging function catches its own failures in either path, making this best-effort telemetry rather than a research-response gate; monitor logging errors.
 

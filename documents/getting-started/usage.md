@@ -54,6 +54,14 @@ Generate a golden dataset grounded in supplied documents:
 uv run python -m research_agent.cli "Generate 20 question-answer pairs from the provided documents" --doc-folder /path/to/policy_documents --skill golden-dataset
 ```
 
+### Understand document-grounded research
+
+`--doc-folder` keeps local evidence with the application orchestrator. When a ready Thread Wiki exists, the orchestrator can query it for cited findings; otherwise, or when a query is incomplete, application-owned file tools read a bounded set of supported documents. The delegated `research-agent` is intentionally web-only and cannot open local files, so relevant local excerpts are included in its task prompt when outside research is needed.
+
+For a document-grounded task, treat supplied files as source of truth for claims about their contents. With web search enabled, the orchestrator may delegate targeted searches to fill explicit gaps, check current external facts, or add context; those web findings do not silently replace local evidence. Use `--no-web` when every claim must come from supplied material.
+
+The `golden-dataset` skill maps generated questions and ideal answers back to localized document evidence. Use a focused subject such as the desired item count and domain, then inspect generated sources and metrics rather than assuming that a completed run is fully grounded. Large folders are subject to configured file-count, depth, inline-size, and extraction limits; narrow the folder or split the run when previews indicate material was omitted.
+
 Generate code from a subject file:
 
 ```bash

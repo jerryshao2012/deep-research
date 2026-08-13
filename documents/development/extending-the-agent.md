@@ -35,6 +35,8 @@ For each prompt change:
 3. run the focused prompt suite and any affected `tests/test_agent_contracts.py` nodes;
 4. update [Validate prompt changes](prompt-validation.md) when the validation contract changes.
 
+When changing reflection guidance, keep `think_tool` strategic rather than ceremonial. Instructions should require researcher to state what was learned, whether sources agree, what evidence is still missing, whether another search can close gap, and whether budget warrants stopping. Add concrete prompt-validation assertions for any new required reflection behavior.
+
 ## Add a custom tool
 
 Define the LangChain `@tool` wrapper in `research_agent/research_subagent/tools.py`. Put substantial I/O or reusable logic in a focused module under `research_agent/research_subagent/utils/`, keep state-only parameters injected with `InjectedState` or `InjectedToolArg`, and document purpose, when to call the tool, arguments, return value, and failure behavior in its docstring.
@@ -83,6 +85,8 @@ Runtime discovery order is explicit:
 `research_agent/agent.py` passes all three roots to Deep Agents in the order shown. `research_agent/research_subagent/utils/skill_registry.py` scans the built-in root before the custom root, while `webapp/routes.py` installs uploaded skills into `docs/.deepagents/skills/`.
 
 `research_agent/skills/` is not an active source and does not exist in the current tree; references to it in older material describe a pre-migration layout. Structured skills may additionally define the schema, render spec, defaults, quality guidelines, and scripts consumed by `SkillRegistry`, but plain instructional skills do not need those sections.
+
+At runtime, registry discovers skill metadata, selected instructions are injected into research prompt, and `render_skill_output` applies configured render/validation path before artifact is written under active output directory. Golden-dataset workflow may also run bundled metrics and scoring helpers; frontend-slides and other presentation skills own their assets/scripts inside skill directory. Do not register these legacy helper names as general agent tools unless current graph explicitly exposes them.
 
 Run both discovery contracts after adding a skill:
 
