@@ -168,6 +168,7 @@ def main() -> int:
                         "name": "auth-sqlite",
                         "storageType": "AzureFile",
                         "storageName": storage_name,
+                        "mountOptions": "nobrl",
                     }
                 ],
                 "scale": {"minReplicas": 0, "maxReplicas": 1},

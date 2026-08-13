@@ -2870,6 +2870,7 @@ def test_passkey_sqlite_deployment_is_single_replica_on_persistent_azure_file(tm
             "name": "auth-sqlite",
             "storageType": "AzureFile",
             "storageName": "authsqlite",
+            "mountOptions": "nobrl",
         }
     ]
     assert environment["SQLITE_DB_PATH"]["value"] == "/mnt/auth/auth-v2.db"
