@@ -24,6 +24,9 @@ DOCKER_CREDENTIALS = PROJECT_ROOT / "scripts/load_docker_credentials.py"
 KEY_VAULT_RBAC = PROJECT_ROOT / "scripts/evaluate_keyvault_rbac.py"
 AZURE_METADATA_SNAPSHOT = PROJECT_ROOT / "scripts/snapshot_azure_passkey_metadata.py"
 BUILD_CONFIG_PUBLISHER = PROJECT_ROOT / "scripts/publish_build_config.py"
+KEY_VAULT_SECRET_VALIDATOR = (
+    PROJECT_ROOT / "scripts/validate_keyvault_secret_versions.py"
+)
 METADATA_NAME = ".resolved-azure-endpoints.json"
 RESOLVER_ENV = {
     "AZURE_SUBSCRIPTION_ID": "00000000-1111-2222-3333-444444444444",
@@ -915,6 +918,10 @@ def _install_azure_script_fixture(
     shutil.copy2(DOCKER_CREDENTIALS, scripts_dir / DOCKER_CREDENTIALS.name)
     if KEY_VAULT_RBAC.exists():
         shutil.copy2(KEY_VAULT_RBAC, scripts_dir / KEY_VAULT_RBAC.name)
+    if KEY_VAULT_SECRET_VALIDATOR.exists():
+        shutil.copy2(
+            KEY_VAULT_SECRET_VALIDATOR, scripts_dir / KEY_VAULT_SECRET_VALIDATOR.name
+        )
     (fixture / "env.sh").write_text(
         "\n".join(
             [
@@ -1428,9 +1435,22 @@ sys.exit(0)
     assert [call[:2] for call in _read_az_calls(argv_log)] == expected_calls
 
 
-@pytest.mark.parametrize("secret_id", ["", "   \n"])
-def test_azure_deploy_rejects_empty_passkey_secret_id_before_mutation(
-    tmp_path, secret_id
+@pytest.mark.parametrize(
+    "secret_versions",
+    [
+        [],
+        [
+            {
+                "id": "https://demo-vault.vault.azure.net/secrets/PASSKEY-PROXY-SECRET/v1",
+                "name": "PASSKEY-PROXY-SECRET",
+                "version": None,
+                "enabled": False,
+            }
+        ],
+    ],
+)
+def test_azure_deploy_rejects_missing_enabled_passkey_secret_before_mutation(
+    tmp_path, secret_versions
 ):
     fixture, argv_log = _prepare_deploy_preflight_fixture(tmp_path)
     fake_az = fixture / "bin/az"
@@ -1452,12 +1472,13 @@ elif args[:2] == ["containerapp", "show"] and "--output" in args:
     sys.stdout.write(json.dumps({"identity": {"userAssignedIdentities": {"/subscriptions/demo/identity": {}}}, "properties": {"configuration": {}, "template": {"containers": [{"name": "deep-research-agent"}]}}}))
 elif args[:2] == ["keyvault", "show"]:
     sys.stdout.write("/subscriptions/demo/vaults/demo-vault|false|1\\n")
-elif args[:3] == ["keyvault", "secret", "show"]:
+elif args[:3] == ["keyvault", "secret", "list-versions"]:
     name = args[args.index("--name") + 1]
     if name == "PASSKEY-PROXY-SECRET":
-        sys.stdout.write(os.environ["FAKE_SECRET_ID"])
+        payload = json.loads(os.environ["FAKE_SECRET_VERSIONS"])
     else:
-        sys.stdout.write(f"https://demo-vault.vault.azure.net/secrets/{name}\\n")
+        payload = [{"id": f"https://demo-vault.vault.azure.net/secrets/{name}/v1", "name": name, "version": None, "enabled": True}]
+    json.dump(payload, sys.stdout)
 sys.exit(0)
 """,
         encoding="utf-8",
@@ -1469,7 +1490,7 @@ sys.exit(0)
             "PATH": f"{fixture / 'bin'}:{env['PATH']}",
             "FAKE_AZ_ARGV_LOG": str(argv_log),
             "FAKE_ENV_ROW": f"{ENVIRONMENT_ID}\t{DEFAULT_DOMAIN}\tSucceeded\n",
-            "FAKE_SECRET_ID": secret_id,
+            "FAKE_SECRET_VERSIONS": json.dumps(secret_versions),
             "DOCKER_HUB_USERNAME": "demo-user",
             "OAUTH_REDIRECTS_CONFIRMED": "true",
         }
@@ -1480,14 +1501,16 @@ sys.exit(0)
     )
 
     assert result.returncode != 0
-    assert "PASSKEY-PROXY-SECRET id" in result.stderr
+    assert result.returncode == 65
+    assert "PASSKEY-PROXY-SECRET" in result.stderr
+    assert "enabled" in result.stderr
     calls = _read_az_calls(argv_log)
     assert not any(call[:2] == ["account", "set"] for call in calls)
     assert not any(call[:2] == ["keyvault", "set-policy"] for call in calls)
     assert not any(call[:2] == ["containerapp", "update"] for call in calls)
 
 
-def test_azure_deploy_preserves_passkey_secret_query_failure_bytes_and_status(tmp_path):
+def test_azure_deploy_preserves_passkey_secret_query_status_without_bytes(tmp_path):
     fixture, argv_log = _prepare_deploy_preflight_fixture(tmp_path)
     fake_az = fixture / "bin/az"
     fake_az.write_text(
@@ -1508,13 +1531,13 @@ elif args[:2] == ["containerapp", "show"] and "--output" in args:
     sys.stdout.write(json.dumps({"identity": {"userAssignedIdentities": {"/subscriptions/demo/identity": {}}}, "properties": {"configuration": {}, "template": {"containers": [{"name": "deep-research-agent"}]}}}))
 elif args[:2] == ["keyvault", "show"]:
     sys.stdout.write("/subscriptions/demo/vaults/demo-vault|false|1\\n")
-elif args[:3] == ["keyvault", "secret", "show"]:
+elif args[:3] == ["keyvault", "secret", "list-versions"]:
     name = args[args.index("--name") + 1]
     if name == "PASSKEY-PROXY-SECRET":
         sys.stdout.write("secret query stdout bytes\\n")
         sys.stderr.write("secret query stderr bytes\\n")
         raise SystemExit(47)
-    sys.stdout.write(f"https://demo-vault.vault.azure.net/secrets/{name}\\n")
+    json.dump([{"id": f"https://demo-vault.vault.azure.net/secrets/{name}/v1", "name": name, "version": None, "enabled": True}], sys.stdout)
 sys.exit(0)
 """,
         encoding="utf-8",
@@ -1536,8 +1559,9 @@ sys.exit(0)
     )
 
     assert result.returncode == 47
-    assert result.stdout == "secret query stdout bytes\n"
-    assert result.stderr.endswith("secret query stderr bytes\n")
+    assert "secret query stdout bytes" not in result.stdout + result.stderr
+    assert "secret query stderr bytes" not in result.stdout + result.stderr
+    assert "missing or unreadable" in result.stderr
     assert not any(call[:2] == ["account", "set"] for call in _read_az_calls(argv_log))
 
 
@@ -1737,9 +1761,9 @@ elif args[:2] == ["identity", "show"]:
     sys.stdout.write("/subscriptions/demo/identity\\nprincipal-123\\n")
 elif args[:2] == ["keyvault", "show"] and "accessPolicies" in " ".join(args):
     sys.stdout.write("/subscriptions/demo/vaults/demo-vault|false|1\\n")
-elif args[:3] == ["keyvault", "secret", "show"]:
+elif args[:3] == ["keyvault", "secret", "list-versions"]:
     name = args[args.index("--name") + 1]
-    sys.stdout.write(f"https://demo-vault.vault.azure.net/secrets/{name}\\n")
+    json.dump([{"id": f"https://demo-vault.vault.azure.net/secrets/{name}/v1", "name": name, "version": None, "enabled": True}], sys.stdout)
 elif args[:3] == ["storage", "account", "show"]:
     sys.stdout.write("/subscriptions/demo/storageAccounts/demostorage\\n")
 elif args[:3] == ["storage", "container-rm", "show"]:
@@ -1906,7 +1930,7 @@ sys.stdout.write('{"version":"9.8.7","status":"ok"}\\n')
     calls = _read_az_calls(argv_log)
     assert deploy_pat_canary not in json.dumps(calls)
     secret_calls = [
-        call for call in calls if call[:3] == ["keyvault", "secret", "show"]
+        call for call in calls if call[:3] == ["keyvault", "secret", "list-versions"]
     ]
     assert {call[call.index("--name") + 1] for call in secret_calls} == {
         "TAVILY-API-KEY",
@@ -1919,7 +1943,10 @@ sys.stdout.write('{"version":"9.8.7","status":"ok"}\\n')
         "DOCKER-HUB-PAT",
         "PASSKEY-PROXY-SECRET",
     }
-    assert all(call[call.index("--query") + 1] == "id" for call in secret_calls)
+    assert all(
+        "value" not in call[call.index("--query") + 1].casefold()
+        for call in secret_calls
+    )
     update_call = next(call for call in calls if call[:1] == ["rest"])
     assert update_call[:3] == ["rest", "--method", "patch"]
     assert update_call[update_call.index("--uri") + 1] == (
@@ -2126,8 +2153,140 @@ def test_azure_deploy_uses_managed_passkey_runtime_configuration(tmp_path):
         'resolve_azure_endpoints.sh" --record-if-current'
     )
     assert source.count('"$SCRIPT_DIR/scripts/resolve_azure_endpoints.sh"') >= 3
-    assert "az keyvault secret show" in source
+    assert "az keyvault secret list-versions" in source
+    assert "az keyvault secret show" not in source
     assert "--query value" not in source
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        ([], "enabled"),
+        (
+            [
+                {
+                    "id": "https://demo-vault.vault.azure.net/secrets/TAVILY-API-KEY/v1",
+                    "name": "TAVILY-API-KEY",
+                    "version": None,
+                    "enabled": False,
+                }
+            ],
+            "enabled",
+        ),
+        ({"value": "secret-canary"}, "array"),
+        (
+            [
+                {
+                    "id": "https://wrong.vault.azure.net/secrets/TAVILY-API-KEY/v1",
+                    "name": "TAVILY-API-KEY",
+                    "version": None,
+                    "enabled": True,
+                }
+            ],
+            "vault",
+        ),
+        (
+            [
+                {
+                    "id": "https://demo-vault.vault.azure.net:bad/secrets/TAVILY-API-KEY/v1",
+                    "name": "TAVILY-API-KEY",
+                    "version": None,
+                    "enabled": True,
+                }
+            ],
+            "binding",
+        ),
+        (
+            [
+                {
+                    "id": "https://demo-vault.vault.azure.net/secrets/TAVILY-API-KEY/v1",
+                    "name": "TAVILY-API-KEY",
+                    "version": None,
+                    "enabled": True,
+                },
+                {
+                    "id": "https://demo-vault.vault.azure.net/secrets/TAVILY-API-KEY/v1",
+                    "name": "TAVILY-API-KEY",
+                    "version": "v1",
+                    "enabled": True,
+                },
+            ],
+            "duplicate",
+        ),
+        (
+            [
+                {
+                    "id": "https://demo-vault.vault.azure.net/secrets/TAVILY-API-KEY/v1",
+                    "name": "TAVILY-API-KEY",
+                    "version": None,
+                    "enabled": True,
+                    "value": "secret-canary",
+                }
+            ],
+            "schema",
+        ),
+    ],
+)
+def test_key_vault_secret_version_validator_fails_closed(tmp_path, payload, message):
+    source = tmp_path / "versions.json"
+    source.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(KEY_VAULT_SECRET_VALIDATOR),
+            str(source),
+            "demo-vault",
+            "TAVILY-API-KEY",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 65
+    assert message in result.stderr.lower()
+    assert result.stdout == ""
+    assert "secret-canary" not in result.stderr
+
+
+def test_key_vault_secret_version_validator_accepts_real_null_version_shape(tmp_path):
+    source = tmp_path / "versions.json"
+    source.write_text(
+        json.dumps(
+            [
+                {
+                    "id": "https://demo-vault.vault.azure.net/secrets/TAVILY-API-KEY/v1",
+                    "name": "TAVILY-API-KEY",
+                    "version": None,
+                    "enabled": False,
+                },
+                {
+                    "id": "https://demo-vault.vault.azure.net/secrets/TAVILY-API-KEY/v2",
+                    "name": "TAVILY-API-KEY",
+                    "version": None,
+                    "enabled": True,
+                },
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(KEY_VAULT_SECRET_VALIDATOR),
+            str(source),
+            "demo-vault",
+            "TAVILY-API-KEY",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == ""
 
 
 def test_azure_deploy_runs_yaml_helpers_in_project_environment():
@@ -2257,11 +2416,11 @@ elif args[:2] == ["containerapp", "show"] and "--output" in args:
 elif args[:2] == ["keyvault", "show"]:
     policy_matches = "0" if missing == "vault_access" else "1"
     sys.stdout.write(f"/subscriptions/demo/vaults/demo-vault|false|{policy_matches}\\n")
-elif args[:3] == ["keyvault", "secret", "show"]:
+elif args[:3] == ["keyvault", "secret", "list-versions"]:
     name = args[args.index("--name") + 1]
     if missing == "required_secret" and name == "TAVILY-API-KEY":
         raise SystemExit(3)
-    sys.stdout.write(f"https://demo-vault.vault.azure.net/secrets/{name}\\n")
+    json.dump([{"id": f"https://demo-vault.vault.azure.net/secrets/{name}/v1", "name": name, "version": None, "enabled": True}], sys.stdout)
 elif args[:3] == ["storage", "account", "show"]:
     if missing == "storage_account":
         raise SystemExit(3)
@@ -2336,9 +2495,9 @@ elif args[:2] == ["containerapp", "show"] and "--output" in args:
     sys.stdout.write(json.dumps({{"identity": {{"userAssignedIdentities": {{"/subscriptions/demo/identity": {{}}}}}}, "properties": {{"configuration": {{}}, "template": {{"containers": [{{"name": "deep-research-agent"}}]}}}}}}))
 elif args[:2] == ["keyvault", "show"]:
     sys.stdout.write("/subscriptions/demo/vaults/demo-vault|false|1\\n")
-elif args[:3] == ["keyvault", "secret", "show"]:
+elif args[:3] == ["keyvault", "secret", "list-versions"]:
     name = args[args.index("--name") + 1]
-    sys.stdout.write(f"https://demo-vault.vault.azure.net/secrets/{{name}}\\n")
+    json.dump([{{"id": f"https://demo-vault.vault.azure.net/secrets/{{name}}/v1", "name": name, "version": None, "enabled": True}}], sys.stdout)
 elif args[:3] == ["storage", "account", "show"]:
     sys.stdout.write("/subscriptions/demo/storageAccounts/demostorage\\n")
 elif args[:3] == ["storage", "container-rm", "show"]:

@@ -472,28 +472,30 @@ REQUIRED_KEY_VAULT_SECRETS=(
   PASSKEY-PROXY-SECRET
 )
 for REQUIRED_SECRET_NAME in "${REQUIRED_KEY_VAULT_SECRETS[@]}"; do
-  SECRET_ID_STDOUT=$(mktemp)
-  SECRET_ID_STDERR=$(mktemp)
+  SECRET_VERSIONS_JSON=$(mktemp)
+  SECRET_VERSIONS_STDERR=$(mktemp)
   set +e
-  az keyvault secret show --subscription "$AZURE_SUBSCRIPTION_ID" --vault-name "$KV_NAME" --name "$REQUIRED_SECRET_NAME" --query id -o tsv >"$SECRET_ID_STDOUT" 2>"$SECRET_ID_STDERR"
-  SECRET_ID_STATUS=$?
+  az keyvault secret list-versions --subscription "$AZURE_SUBSCRIPTION_ID" --vault-name "$KV_NAME" --name "$REQUIRED_SECRET_NAME" --query '[].{id:id,name:name,version:version,enabled:attributes.enabled}' --output json >"$SECRET_VERSIONS_JSON" 2>"$SECRET_VERSIONS_STDERR"
+  SECRET_VERSIONS_STATUS=$?
   set -e
-  if [[ "$SECRET_ID_STATUS" != 0 ]]; then
+  rm -f "$SECRET_VERSIONS_STDERR"
+  if [[ "$SECRET_VERSIONS_STATUS" != 0 ]]; then
     echo "Error: required pre-created Key Vault secret '$REQUIRED_SECRET_NAME' is missing or unreadable" >&2
-    cat "$SECRET_ID_STDOUT"
-    cat "$SECRET_ID_STDERR" >&2
-    rm -f "$SECRET_ID_STDOUT" "$SECRET_ID_STDERR" "$EXISTING_CONFIG_JSON" "$UPDATE_PATCH_JSON"
-    exit "$SECRET_ID_STATUS"
+    rm -f "$SECRET_VERSIONS_JSON" "$EXISTING_CONFIG_JSON" "$UPDATE_PATCH_JSON"
+    exit "$SECRET_VERSIONS_STATUS"
   fi
-  SECRET_ID=$(cat "$SECRET_ID_STDOUT")
-  rm -f "$SECRET_ID_STDOUT" "$SECRET_ID_STDERR"
-  if [[ -z "${SECRET_ID//[[:space:]]/}" ]]; then
-    echo "Error: $REQUIRED_SECRET_NAME id is empty" >&2
+  set +e
+  python3 "$SCRIPT_DIR/scripts/validate_keyvault_secret_versions.py" "$SECRET_VERSIONS_JSON" "$KV_NAME" "$REQUIRED_SECRET_NAME"
+  SECRET_VERSIONS_VALIDATION_STATUS=$?
+  set -e
+  rm -f "$SECRET_VERSIONS_JSON"
+  if [[ "$SECRET_VERSIONS_VALIDATION_STATUS" != 0 ]]; then
+    echo "Error: required pre-created Key Vault secret '$REQUIRED_SECRET_NAME' has invalid version metadata" >&2
     rm -f "$EXISTING_CONFIG_JSON" "$UPDATE_PATCH_JSON"
-    exit 65
+    exit "$SECRET_VERSIONS_VALIDATION_STATUS"
   fi
 done
-unset REQUIRED_SECRET_NAME SECRET_ID SECRET_ID_STATUS
+unset REQUIRED_SECRET_NAME SECRET_VERSIONS_STATUS SECRET_VERSIONS_VALIDATION_STATUS
 
 BLOB_CONTAINER_NAME="deep-research-blobs"
 STORAGE_FILE_SHARE_NAME="deep-research-auth"
