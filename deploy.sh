@@ -138,6 +138,7 @@ builtin printf "BACKEND_APP_NAME=%s\n" "${BACKEND_APP_NAME-}"
 builtin printf "UI_APP_NAME=%s\n" "${UI_APP_NAME-}"
 builtin printf "KV_NAME=%s\n" "${KV_NAME-}"
 builtin printf "STORAGE_ACCOUNT_NAME=%s\n" "${STORAGE_ACCOUNT_NAME-}"
+builtin printf "MODEL_NAME=%s\n" "${MODEL_NAME-}"
 ' deploy-env "$SCRIPT_DIR/env.sh" 2>/dev/null); then
   :
 else
@@ -160,18 +161,20 @@ while IFS= read -r config_line || [[ -n "$config_line" ]]; do
     8:UI_APP_NAME=*) UI_APP_NAME="${config_line#UI_APP_NAME=}" ;;
     9:KV_NAME=*) KV_NAME="${config_line#KV_NAME=}" ;;
     10:STORAGE_ACCOUNT_NAME=*) STORAGE_ACCOUNT_NAME="${config_line#STORAGE_ACCOUNT_NAME=}" ;;
+    11:MODEL_NAME=*) MODEL_NAME="${config_line#MODEL_NAME=}" ;;
     *)
       echo "Error: env.sh returned invalid configuration." >&2
       exit 65
       ;;
   esac
 done <<< "$ENV_CONFIG_OUTPUT"
-if [[ "$CONFIG_LINE_COUNT" -ne 10 ]]; then
+if [[ "$CONFIG_LINE_COUNT" -ne 11 ]]; then
   echo "Error: env.sh returned incomplete configuration." >&2
   exit 65
 fi
 export SEED AZURE_SUBSCRIPTION_ID RESOURCE_GROUP LOCATION ENV_NAME AGENT_NAME \
   BACKEND_APP_NAME UI_APP_NAME KV_NAME STORAGE_ACCOUNT_NAME
+export MODEL_NAME
 unset ENV_CONFIG_OUTPUT CONFIG_LINE_COUNT config_line
 
 if [[ "$CLI_OAUTH_REDIRECTS_CONFIRMED_SEEN" == true ]]; then
@@ -186,6 +189,7 @@ unset CALLER_OAUTH_REDIRECTS_CONFIRMED CLI_OAUTH_REDIRECTS_CONFIRMED \
 : "${STORAGE_ACCOUNT_NAME:?Set STORAGE_ACCOUNT_NAME in env.sh}"
 : "${BACKEND_APP_NAME:?Set BACKEND_APP_NAME in env.sh}"
 : "${UI_APP_NAME:?Set UI_APP_NAME in env.sh}"
+: "${MODEL_NAME:?Set MODEL_NAME in env.sh}"
 
 if [ -z "${DOCKER_HUB_USERNAME:-}" ] && [ -f "$SCRIPT_DIR/.env" ]; then
   DOCKER_HUB_USERNAME=$(python3 "$SCRIPT_DIR/scripts/load_docker_credentials.py" --input "$SCRIPT_DIR/.env" --username)
@@ -484,6 +488,7 @@ uv run python "$SCRIPT_DIR/scripts/render_azure_containerapp_config.py" \
   --key-vault-name "$KV_NAME" \
   --frontend-urls "$FRONTEND_URLS" \
   --storage-name "$SQLITE_ENV_STORAGE_NAME" \
+  --model-name "$MODEL_NAME" \
   --restart-trigger "$RESTART_TRIGGER" \
   --revision-suffix "$REVISION_SUFFIX" \
   --output "$DESIRED_CONFIG_YAML"

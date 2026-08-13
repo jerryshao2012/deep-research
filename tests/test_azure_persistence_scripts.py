@@ -2279,6 +2279,8 @@ def _render_desired_config(tmp_path: Path) -> dict:
             f"{UI_URL},https://bmo-deepagent-ui.vercel.app",
             "--storage-name",
             "authsqlite",
+            "--model-name",
+            "gemini-3.5-flash",
             "--restart-trigger",
             "1234567890",
             "--revision-suffix",
@@ -2314,6 +2316,8 @@ def test_azure_config_renderer_rejects_invalid_revision_suffix(tmp_path):
             UI_URL,
             "--storage-name",
             "authsqlite",
+            "--model-name",
+            "gemini-3.5-flash",
             "--restart-trigger",
             "1234567890",
             "--revision-suffix",
@@ -2849,6 +2853,7 @@ def test_azure_deploy_uses_sqlite_without_cosmos(tmp_path) -> None:
     }
 
     assert environment["DB_TYPE"]["value"] == "sqlite"
+    assert environment["MODEL_NAME"]["value"] == "gemini-3.5-flash"
     for forbidden in ("az cosmosdb", "COSMOSDB_", "cosmosdb-", "value: cosmosdb"):
         assert forbidden not in source
 
@@ -3037,6 +3042,8 @@ def test_backend_config_renderer_targets_existing_container_name(tmp_path):
         f"{UI_URL},https://bmo-deepagent-ui.vercel.app",
         "--storage-name",
         "authsqlite",
+        "--model-name",
+        "gemini-3.5-flash",
         "--restart-trigger",
         "1234567890",
         "--revision-suffix",

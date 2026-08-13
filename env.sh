@@ -20,5 +20,8 @@ export KV_NAME="kv-deep-agents-$SEED-bmo2"
 # Create Storage Account (globally unique; lowercase letters and numbers only)
 export STORAGE_ACCOUNT_NAME="stdeepagents${SEED}bmo2"
 
+# Public model selection; provider credential remains a Key Vault reference.
+export MODEL_NAME="gemini-3.5-flash"
+
 # 4. Agent URL
 export DEEP_RESEARCH_AGENT_URL="https://deep-research-agent-0312.wonderfuldesert-92e45542.canadacentral.azurecontainerapps.io"

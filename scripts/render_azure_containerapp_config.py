@@ -51,6 +51,7 @@ def main() -> int:
     parser.add_argument("--key-vault-name", required=True)
     parser.add_argument("--frontend-urls", required=True)
     parser.add_argument("--storage-name", required=True)
+    parser.add_argument("--model-name", required=True)
     parser.add_argument("--restart-trigger", required=True)
     parser.add_argument("--revision-suffix", required=True)
     parser.add_argument("--output", required=True, type=Path)
@@ -78,6 +79,9 @@ def main() -> int:
         "Container Apps storage name",
         arguments.storage_name,
         r"[A-Za-z0-9][A-Za-z0-9_-]{0,62}",
+    )
+    model_name = _require_match(
+        "model name", arguments.model_name, r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,254}"
     )
     restart_trigger = _require_match(
         "restart trigger", arguments.restart_trigger, r"[0-9]{1,20}"
@@ -113,6 +117,7 @@ def main() -> int:
         ("MODEL_BACKOFF_MULTIPLIER", "2.0"),
         ("MODEL_RETRY_JITTER", "true"),
         ("DB_TYPE", "sqlite"),
+        ("MODEL_NAME", model_name),
         ("MEMORY_TYPE", ""),
         ("REPORTS_OUTPUT_FOLDER", "/deps/deep_research/output"),
         (
