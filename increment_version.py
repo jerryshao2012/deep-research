@@ -33,6 +33,32 @@ def increment_version(file_path: Path) -> str:
     # Write back
     file_path.write_text(new_content)
 
+    # Try to find and update contracts/custom-api.openapi.json
+    openapi_paths = [
+        file_path.parent.parent / "contracts" / "custom-api.openapi.json",
+        Path(__file__).parent / "contracts" / "custom-api.openapi.json",
+    ]
+    openapi_file = None
+    for p in openapi_paths:
+        if p.exists() and p.is_file():
+            openapi_file = p
+            break
+
+    if openapi_file:
+        openapi_content = openapi_file.read_text(encoding="utf-8")
+        openapi_match = re.search(
+            r'"version"\s*:\s*"(\d+)\.(\d+)\.(\d+)"', openapi_content
+        )
+        if not openapi_match:
+            raise ValueError(f"Could not find version string in {openapi_file}")
+
+        old_version_str = f'"{openapi_match.group(1)}.{openapi_match.group(2)}.{openapi_match.group(3)}"'
+        new_version_str = f'"{new_version}"'
+        old_match_str = openapi_match.group(0)
+        new_match_str = old_match_str.replace(old_version_str, new_version_str)
+        new_openapi_content = openapi_content.replace(old_match_str, new_match_str)
+        openapi_file.write_text(new_openapi_content, encoding="utf-8")
+
     return new_version
 
 

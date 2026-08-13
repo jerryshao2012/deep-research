@@ -958,7 +958,7 @@
   "info": {
     "description": "Upload documents to the deep research agent docs folder",
     "title": "Document Upload API",
-    "version": "1.8.130"
+    "version": "1.8.131"
   },
   "openapi": "3.1.0",
   "paths": {
