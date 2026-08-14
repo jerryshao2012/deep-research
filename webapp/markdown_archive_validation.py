@@ -285,6 +285,7 @@ def _scan_tar_framing(data: bytes) -> bytes | bytearray:
     metadata_payload_bytes = 0
     global_pax_size: int | None = None
     local_pax_size: int | None = None
+    local_pax_active = False
     semantic_data: bytearray | None = None
 
     while offset < len(data):
@@ -326,13 +327,20 @@ def _scan_tar_framing(data: bytes) -> bytes | bytearray:
                 )
             if type_flag in {b"x", b"X", b"g"}:
                 pax_size = _parse_pax_size_override(data[header_end:payload_end])
-                if type_flag in {b"x", b"X"} and local_pax_size is None:
-                    local_pax_size = pax_size
+                if type_flag in {b"x", b"X"}:
+                    if not local_pax_active:
+                        local_pax_active = True
+                        local_pax_size = (
+                            pax_size if pax_size is not None else global_pax_size
+                        )
+                    elif local_pax_size is None and pax_size is not None:
+                        local_pax_size = pax_size
                 elif type_flag == b"g" and pax_size is not None:
                     global_pax_size = pax_size
         else:
             member_count += 1
             declared_payload_bytes += size
+            local_pax_active = False
             local_pax_size = None
             if member_count > MAX_MEMBER_COUNT:
                 raise ArchiveValidationError("TAR contains too many members")

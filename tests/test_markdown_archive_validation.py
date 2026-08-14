@@ -485,6 +485,69 @@ def test_validate_archive_clears_local_pax_size_after_global_override() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("outer_type", "nested_type"),
+    [(b"x", b"X"), (b"X", b"x")],
+    ids=("pax-then-solaris", "solaris-then-pax"),
+)
+def test_validate_archive_outer_local_pax_captures_global_size(
+    outer_type: bytes,
+    nested_type: bytes,
+) -> None:
+    data = _raw_tar(
+        _tar_record("global", _pax_record("size", "513"), type_flag=b"g"),
+        _tar_record(
+            "outer-local",
+            _pax_record("comment", "outer"),
+            type_flag=outer_type,
+        ),
+        _tar_record(
+            "nested-local",
+            _pax_record("size", "1"),
+            type_flag=nested_type,
+        ),
+        _tar_record("report.txt", b"a" * 513, declared_size=1),
+    )
+
+    assert validate_archive("pax.tar", "application/x-tar", data) == (
+        "application/x-tar"
+    )
+
+
+def test_validate_archive_outer_local_pax_survives_nested_global_update() -> None:
+    data = _raw_tar(
+        _tar_record("global-large", _pax_record("size", "513"), type_flag=b"g"),
+        _tar_record(
+            "outer-local",
+            _pax_record("comment", "outer"),
+            type_flag=b"x",
+        ),
+        _tar_record("global-small", _pax_record("size", "1"), type_flag=b"g"),
+        _tar_record("captured.txt", b"a" * 513, declared_size=1),
+        _tar_record("updated.txt", b"b", declared_size=513),
+    )
+
+    assert validate_archive("pax.tar", "application/x-tar", data) == (
+        "application/x-tar"
+    )
+
+
+def test_validate_archive_nested_local_size_applies_without_global_size() -> None:
+    data = _raw_tar(
+        _tar_record(
+            "outer-local",
+            _pax_record("comment", "outer"),
+            type_flag=b"x",
+        ),
+        _tar_record("nested-local", _pax_record("size", "1"), type_flag=b"X"),
+        _tar_record("report.txt", b"a", declared_size=513),
+    )
+
+    assert validate_archive("pax.tar", "application/x-tar", data) == (
+        "application/x-tar"
+    )
+
+
 def test_validate_archive_caps_semantic_tar_member_iteration_independently(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
