@@ -22,6 +22,7 @@ from starlette.datastructures import UploadFile
 
 from webapp.auth_helpers import is_authenticated
 from webapp.markdown_archive_validation import (
+    ARCHIVE_CONTENT_TYPES,
     is_archive_upload,
     is_extended_archive_filename,
     is_stored_archive_content_type,
@@ -44,7 +45,9 @@ _ALLOWED_IMAGES: dict[str, tuple[str, frozenset[str]]] = {
 _ALLOWED_IMAGE_EXTENSIONS = frozenset(
     suffix for _, suffixes in _ALLOWED_IMAGES.values() for suffix in suffixes
 )
-_STORED_NON_ARCHIVE_CONTENT_TYPES = frozenset((*_ALLOWED_IMAGES, OFFICE_CONTENT_TYPE))
+_STORED_CONTENT_TYPES = frozenset(
+    (*_ALLOWED_IMAGES, *ARCHIVE_CONTENT_TYPES, OFFICE_CONTENT_TYPE)
+)
 _ARCHIVE_ERROR_MESSAGE = (
     "Only valid ZIP, 7Z, TAR, TAR.GZ, and TGZ archives are supported"
 )
@@ -227,7 +230,7 @@ def _store_asset(
         raise
 
 
-def _load_asset(markdown_id: str, asset_id: str) -> tuple[Path, dict[str, Any]]:
+async def _load_asset(markdown_id: str, asset_id: str) -> tuple[Path, dict[str, Any]]:
     asset_path = _images_root(markdown_id) / _validated_asset_id(asset_id)
     payload = asset_path / "payload"
     metadata_path = asset_path / "metadata.json"
@@ -237,33 +240,82 @@ def _load_asset(markdown_id: str, asset_id: str) -> tuple[Path, dict[str, Any]]:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Image not found"
         ) from exc
-    stored_content_type = metadata.get("content_type")
-    if (
-        not payload.is_file()
-        or not isinstance(stored_content_type, str)
-        or (
-            stored_content_type not in _STORED_NON_ARCHIVE_CONTENT_TYPES
-            and not is_stored_archive_content_type(stored_content_type)
-        )
-        or not isinstance(metadata.get("filename"), str)
-        or metadata.get("size") != payload.stat().st_size
-    ):
+    if not isinstance(metadata, dict):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Image not found"
         )
+    stored_content_type = metadata.get("content_type")
     try:
-        with payload.open("rb") as payload_file:
-            validation_data = (
-                payload_file.read()
-                if is_stored_archive_content_type(metadata["content_type"])
-                else payload_file.read(261)
+        invalid_metadata = (
+            not payload.is_file()
+            or not isinstance(stored_content_type, str)
+            or stored_content_type not in _STORED_CONTENT_TYPES
+            or not isinstance(metadata.get("filename"), str)
+            or type(metadata.get("size")) is not int
+            or metadata["size"] < 0
+            or metadata["size"] != payload.stat().st_size
+        )
+    except OSError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Image not found"
+        ) from exc
+    if invalid_metadata:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Image not found"
+        )
+
+    filename = metadata["filename"]
+    if stored_content_type == OFFICE_CONTENT_TYPE:
+        if not is_office_upload(filename):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="Image not found"
             )
-            verified_type = _validate_asset(
-                metadata["filename"],
-                metadata["content_type"],
+        return payload, metadata
+
+    if is_stored_archive_content_type(stored_content_type):
+        archive_slot_acquired = False
+        try:
+            try:
+                await asyncio.wait_for(
+                    _ARCHIVE_BATCH_LIMITER.acquire(),
+                    timeout=_ARCHIVE_BATCH_WAIT_SECONDS,
+                )
+            except TimeoutError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Archive validation is busy",
+                    headers={"Retry-After": "2"},
+                ) from exc
+            archive_slot_acquired = True
+            validation_data = await _run_worker_to_completion(payload.read_bytes)
+            verified_type = await _run_worker_to_completion(
+                validate_archive,
+                filename,
+                stored_content_type,
                 validation_data,
             )
-            if verified_type != metadata["content_type"]:
+            if verified_type != stored_content_type:
+                raise ValueError("stored content type does not match asset")
+        except HTTPException:
+            raise
+        except (OSError, ValueError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="Image not found"
+            ) from exc
+        finally:
+            if archive_slot_acquired:
+                _ARCHIVE_BATCH_LIMITER.release()
+        return payload, metadata
+
+    try:
+        with payload.open("rb") as payload_file:
+            validation_data = payload_file.read(261)
+            verified_type = _validate_image(
+                filename,
+                stored_content_type,
+                validation_data,
+            )
+            if verified_type != stored_content_type:
                 raise ValueError("stored content type does not match asset")
     except (OSError, ValueError) as exc:
         raise HTTPException(
@@ -455,8 +507,12 @@ def register_markdown_image_routes(app) -> None:
                 _ARCHIVE_BATCH_LIMITER.release()
         return {"assets": assets, "errors": errors}
 
-    def image_response(markdown_id: str, asset_id: str, *, download: bool):
-        payload, metadata = _load_asset(markdown_id, asset_id)
+    async def image_response(markdown_id: str, asset_id: str, *, download: bool):
+        payload, metadata = await _load_asset(markdown_id, asset_id)
+        is_office = metadata["content_type"] == OFFICE_CONTENT_TYPE
+        headers = {"Cache-Control": "private, no-store"}
+        if is_office:
+            headers["X-Content-Type-Options"] = "nosniff"
         return FileResponse(
             path=payload,
             filename=metadata["filename"],
@@ -465,10 +521,10 @@ def register_markdown_image_routes(app) -> None:
                 "attachment"
                 if download
                 or is_stored_archive_content_type(metadata["content_type"])
-                or metadata["content_type"] == OFFICE_CONTENT_TYPE
+                or is_office
                 else "inline"
             ),
-            headers={"Cache-Control": "private, no-store"},
+            headers=headers,
         )
 
     @app.get("/markdown-threads/{markdown_id}/images/{asset_id}")
@@ -483,7 +539,7 @@ def register_markdown_image_routes(app) -> None:
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid or missing API key",
             )
-        return image_response(markdown_id, asset_id, download=False)
+        return await image_response(markdown_id, asset_id, download=False)
 
     @app.get("/markdown-threads/{markdown_id}/images/{asset_id}/download")
     async def download_markdown_image(
@@ -497,7 +553,7 @@ def register_markdown_image_routes(app) -> None:
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid or missing API key",
             )
-        return image_response(markdown_id, asset_id, download=True)
+        return await image_response(markdown_id, asset_id, download=True)
 
     @app.delete("/markdown-threads/{markdown_id}/images")
     async def delete_markdown_images(

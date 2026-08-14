@@ -103,6 +103,25 @@ _ZIP = _zip_bytes()
 _SEVEN_ZIP = _seven_zip_bytes()
 _TAR = _tar_bytes()
 _TAR_GZ = _tar_bytes(compressed=True)
+_ARCHIVE_ASSETS = (
+    ("audit résumé.zip", _ZIP, "application/zip"),
+    ("evidence.7z", _SEVEN_ZIP, "application/x-7z-compressed"),
+    ("evidence.tar", _TAR, "application/x-tar"),
+    ("evidence.tar.gz", _TAR_GZ, "application/gzip"),
+    ("evidence.tgz", _TAR_GZ, "application/gzip"),
+)
+_OFFICE_ASSETS = (
+    ("word", "report résumé.docx"),
+    ("excel", "ledger.xlsx"),
+    ("powerpoint", "slides.pptx"),
+    ("access", "database.accdb"),
+    ("visio", "diagram.vsdx"),
+    ("onenote", "notes.one"),
+    ("project", "schedule.mpp"),
+    ("outlook", "mail.msg"),
+    ("publisher", "layout.pub"),
+    ("infopath", "form.xsn"),
+)
 
 
 def _upload(client: TestClient, markdown_id: str, files):
@@ -1096,7 +1115,7 @@ def test_extended_invalid_errors_are_classified_and_ordered_before_later_success
     ]
 
 
-def test_feature_gate_never_blocks_reads_of_stored_extended_assets(
+def test_feature_gate_never_blocks_view_or_download_of_stored_extended_assets(
     tmp_path, monkeypatch
 ):
     monkeypatch.setattr(webapp, "DOCS_ROOT", tmp_path / "docs")
@@ -1105,18 +1124,22 @@ def test_feature_gate_never_blocks_reads_of_stored_extended_assets(
     uploaded = _upload(
         client,
         "123456",
-        [("report.docx", b"office", "application/vnd.ms-word")],
+        [
+            ("evidence.tar", _TAR, "application/x-tar"),
+            ("report.docx", b"office", "application/vnd.ms-word"),
+        ],
     ).json()
     monkeypatch.setenv("MARKDOWN_EXTENDED_ATTACHMENT_UPLOADS_ENABLED", " false ")
 
-    response = client.get(
-        f"/markdown-threads/123456/images/{uploaded['assets'][0]['id']}",
-        headers=_AUTH_HEADERS,
-    )
+    for asset, expected in zip(uploaded["assets"], (_TAR, b"office"), strict=True):
+        for suffix in ("", "/download"):
+            response = client.get(
+                f"/markdown-threads/123456/images/{asset['id']}{suffix}",
+                headers=_AUTH_HEADERS,
+            )
 
-    assert response.status_code == 200
-    assert response.content == b"office"
-    assert response.headers["content-type"].startswith("application/octet-stream")
+            assert response.status_code == 200
+            assert response.content == expected
 
 
 def test_inline_and_download_return_exact_bytes_and_original_filename(
@@ -1145,15 +1168,18 @@ def test_inline_and_download_return_exact_bytes_and_original_filename(
     assert "my%20chart.png" in download.headers["content-disposition"]
 
 
+@pytest.mark.parametrize(
+    ("filename", "payload", "normalized_content_type"), _ARCHIVE_ASSETS
+)
 def test_archive_routes_return_exact_opaque_bytes_as_safe_download(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, filename, payload, normalized_content_type
 ):
     monkeypatch.setattr(webapp, "DOCS_ROOT", tmp_path / "docs")
     client = TestClient(webapp.app)
     uploaded = _upload(
         client,
         "123456",
-        [("audit résumé.zip", _ZIP, "application/zip")],
+        [(filename, payload, normalized_content_type)],
     ).json()
     asset_id = uploaded["assets"][0]["id"]
 
@@ -1167,12 +1193,208 @@ def test_archive_routes_return_exact_opaque_bytes_as_safe_download(
 
     for response in (view, download):
         assert response.status_code == 200
-        assert response.content == _ZIP
-        assert response.headers["content-type"].startswith("application/zip")
+        assert response.content == payload
+        assert response.headers["content-type"] == normalized_content_type
         assert response.headers["content-disposition"].startswith("attachment")
-        assert "audit%20r%C3%A9sum%C3%A9.zip" in response.headers["content-disposition"]
+        if filename == "audit résumé.zip":
+            assert (
+                "audit%20r%C3%A9sum%C3%A9.zip"
+                in response.headers["content-disposition"]
+            )
         assert "\r" not in response.headers["content-disposition"]
         assert "\n" not in response.headers["content-disposition"]
+        assert response.headers["cache-control"] == "private, no-store"
+
+
+@pytest.mark.parametrize(("family", "filename"), _OFFICE_ASSETS)
+def test_office_routes_serve_arbitrary_bytes_as_safe_download(
+    tmp_path, monkeypatch, family, filename
+):
+    docs_root = tmp_path / "docs"
+    monkeypatch.setattr(webapp, "DOCS_ROOT", docs_root)
+    client = TestClient(webapp.app)
+    payload = f"{family}\x00arbitrary-office-bytes".encode()
+    uploaded = _upload(client, "123456", [(filename, payload, "text/plain")]).json()
+    asset_id = uploaded["assets"][0]["id"]
+
+    for suffix in ("", "/download"):
+        response = client.get(
+            f"/markdown-threads/123456/images/{asset_id}{suffix}",
+            headers=_AUTH_HEADERS,
+        )
+
+        assert response.status_code == 200
+        assert response.content == payload
+        assert response.headers["content-type"] == "application/octet-stream"
+        assert response.headers["content-disposition"].startswith("attachment")
+        assert response.headers["cache-control"] == "private, no-store"
+        assert response.headers["x-content-type-options"] == "nosniff"
+        assert "\r" not in response.headers["content-disposition"]
+        assert "\n" not in response.headers["content-disposition"]
+        if family == "word":
+            assert (
+                "report%20r%C3%A9sum%C3%A9.docx"
+                in response.headers["content-disposition"]
+            )
+
+    mutated_payload = b"x" * len(payload)
+    stored_payload = (
+        docs_root / "markdown-threads" / "123456" / "images" / asset_id / "payload"
+    )
+    stored_payload.write_bytes(mutated_payload)
+    for suffix in ("", "/download"):
+        response = client.get(
+            f"/markdown-threads/123456/images/{asset_id}{suffix}",
+            headers=_AUTH_HEADERS,
+        )
+        assert response.status_code == 200
+        assert response.content == mutated_payload
+
+
+@pytest.mark.parametrize(
+    "stored_metadata",
+    [
+        [],
+        {
+            "filename": "report.txt",
+            "content_type": "application/octet-stream",
+            "size": 1,
+        },
+        {
+            "filename": "report.docx",
+            "content_type": "application/octet-stream",
+            "size": True,
+        },
+        {"filename": "report.docx", "content_type": "text/plain", "size": 1},
+    ],
+)
+def test_office_routes_reject_malformed_metadata_shape(
+    tmp_path, monkeypatch, stored_metadata
+):
+    docs_root = tmp_path / "docs"
+    monkeypatch.setattr(webapp, "DOCS_ROOT", docs_root)
+    client = TestClient(webapp.app, raise_server_exceptions=False)
+    uploaded = _upload(
+        client,
+        "123456",
+        [("report.docx", b"x", "application/octet-stream")],
+    ).json()
+    asset_id = uploaded["assets"][0]["id"]
+    metadata_path = (
+        docs_root
+        / "markdown-threads"
+        / "123456"
+        / "images"
+        / asset_id
+        / "metadata.json"
+    )
+    metadata_path.write_text(json.dumps(stored_metadata))
+
+    for suffix in ("", "/download"):
+        response = client.get(
+            f"/markdown-threads/123456/images/{asset_id}{suffix}",
+            headers=_AUTH_HEADERS,
+        )
+        assert response.status_code == 404
+
+
+def test_retrieval_overload_limits_archives_but_office_bypasses_limiter(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(webapp, "DOCS_ROOT", tmp_path / "docs")
+    client = TestClient(webapp.app)
+    uploaded = _upload(
+        client,
+        "123456",
+        [
+            ("evidence.tar", _TAR, "application/x-tar"),
+            ("report.docx", b"office", "application/octet-stream"),
+        ],
+    ).json()
+    archive_id, office_id = (asset["id"] for asset in uploaded["assets"])
+    monkeypatch.setattr(
+        markdown_images,
+        "_ARCHIVE_BATCH_LIMITER",
+        markdown_images._LoopLocalArchiveBatchLimiter(0),
+    )
+    monkeypatch.setattr(markdown_images, "_ARCHIVE_BATCH_WAIT_SECONDS", 0.001)
+
+    for suffix in ("", "/download"):
+        overloaded = client.get(
+            f"/markdown-threads/123456/images/{archive_id}{suffix}",
+            headers=_AUTH_HEADERS,
+        )
+        office = client.get(
+            f"/markdown-threads/123456/images/{office_id}{suffix}",
+            headers=_AUTH_HEADERS,
+        )
+
+        assert overloaded.status_code == 503
+        assert overloaded.json() == {"detail": "Archive validation is busy"}
+        assert overloaded.headers["retry-after"] == "2"
+        assert office.status_code == 200
+        assert office.content == b"office"
+
+
+def test_archive_routes_revalidate_off_loop_and_hold_slot_until_cancelled_worker_finishes(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(webapp, "DOCS_ROOT", tmp_path / "docs")
+    client = TestClient(webapp.app)
+    uploaded = _upload(
+        client, "123456", [("evidence.tar", _TAR, "application/x-tar")]
+    ).json()
+    asset_id = uploaded["assets"][0]["id"]
+    limiter = asyncio.Semaphore(1)
+    monkeypatch.setattr(markdown_images, "_ARCHIVE_BATCH_LIMITER", limiter)
+    original_validate = markdown_images.validate_archive
+    worker_started = threading.Event()
+    worker_finish = threading.Event()
+    validation_threads: list[bool] = []
+
+    def blocking_validate(filename, content_type, data):
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            validation_threads.append(True)
+        else:
+            validation_threads.append(False)
+        worker_started.set()
+        if not validation_threads[-1]:
+            raise AssertionError("retrieval validation ran on event loop")
+        if not worker_finish.wait(5):
+            raise AssertionError("retrieval validation worker was not released")
+        return original_validate(filename, content_type, data)
+
+    monkeypatch.setattr(markdown_images, "validate_archive", blocking_validate)
+
+    async def scenario() -> None:
+        async with AsyncClient(
+            transport=ASGITransport(app=webapp.app), base_url="http://test"
+        ) as async_client:
+            request = asyncio.create_task(
+                async_client.get(
+                    f"/markdown-threads/123456/images/{asset_id}",
+                    headers=_AUTH_HEADERS,
+                )
+            )
+            assert await asyncio.to_thread(worker_started.wait, 2)
+            assert validation_threads == [True]
+            request.cancel()
+            await asyncio.sleep(0.02)
+            try:
+                assert not request.done()
+                assert limiter.locked()
+                request.cancel()
+                await asyncio.sleep(0.02)
+                assert not request.done()
+            finally:
+                worker_finish.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(request, 2)
+            assert not limiter.locked()
+
+    asyncio.run(scenario())
 
 
 def test_missing_or_corrupt_assets_are_not_served(tmp_path, monkeypatch):
@@ -1234,25 +1456,31 @@ def test_same_size_corrupt_payload_is_not_served(tmp_path, monkeypatch):
     assert response.status_code == 404
 
 
-def test_same_size_corrupt_archive_payload_is_not_served(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    ("filename", "payload", "normalized_content_type"), _ARCHIVE_ASSETS
+)
+def test_same_size_corrupt_archive_payload_is_not_served(
+    tmp_path, monkeypatch, filename, payload, normalized_content_type
+):
     docs_root = tmp_path / "docs"
     monkeypatch.setattr(webapp, "DOCS_ROOT", docs_root)
     client = TestClient(webapp.app)
     uploaded = _upload(
-        client, "123456", [("evidence.zip", _ZIP, "application/zip")]
+        client, "123456", [(filename, payload, normalized_content_type)]
     ).json()
     asset_id = uploaded["assets"][0]["id"]
-    payload = (
+    stored_payload = (
         docs_root / "markdown-threads" / "123456" / "images" / asset_id / "payload"
     )
-    payload.write_bytes(b"x" * len(_ZIP))
+    stored_payload.write_bytes(b"x" * len(payload))
 
-    response = client.get(
-        f"/markdown-threads/123456/images/{asset_id}/download",
-        headers=_AUTH_HEADERS,
-    )
+    for suffix in ("", "/download"):
+        response = client.get(
+            f"/markdown-threads/123456/images/{asset_id}{suffix}",
+            headers=_AUTH_HEADERS,
+        )
 
-    assert response.status_code == 404
+        assert response.status_code == 404
 
 
 @pytest.mark.parametrize("markdown_id", ["12345", "1234567", "12a456", "１２３４５６"])
@@ -1267,24 +1495,30 @@ def test_markdown_id_requires_exactly_six_ascii_digits(
     assert response.status_code == 422
 
 
-def test_delete_namespace_is_idempotent(tmp_path, monkeypatch):
+def test_cleanup_deletes_combined_image_archive_and_all_office_families(
+    tmp_path, monkeypatch
+):
     docs_root = tmp_path / "docs"
     monkeypatch.setattr(webapp, "DOCS_ROOT", docs_root)
     client = TestClient(webapp.app)
-    _upload(
-        client,
-        "123456",
-        [
-            ("one.png", _PNG, "image/png"),
-            ("evidence.zip", _ZIP, "application/zip"),
+    assets = [
+        ("one.png", _PNG, "image/png"),
+        *_ARCHIVE_ASSETS,
+        *[
+            (filename, f"{family}-office".encode(), "application/octet-stream")
+            for family, filename in _OFFICE_ASSETS
         ],
-    )
+    ]
+    for start in range(0, len(assets), 5):
+        response = _upload(client, "123456", assets[start : start + 5])
+        assert response.status_code == 200
+        assert response.json()["errors"] == []
 
     first = client.delete("/markdown-threads/123456/images", headers=_AUTH_HEADERS)
     second = client.delete("/markdown-threads/123456/images", headers=_AUTH_HEADERS)
 
     assert first.status_code == 200
-    assert first.json()["deleted_count"] == 2
+    assert first.json()["deleted_count"] == len(assets)
     assert second.status_code == 200
     assert second.json()["deleted_count"] == 0
     assert not (docs_root / "markdown-threads" / "123456" / "images").exists()
