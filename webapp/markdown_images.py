@@ -9,11 +9,8 @@ import re
 import shutil
 import tempfile
 import uuid
-from io import BytesIO
 from pathlib import Path
 from typing import Any
-from zipfile import BadZipFile, LargeZipFile, ZipFile
-from zlib import error as ZlibError
 
 import filetype
 from fastapi import Header, HTTPException, Request, status
@@ -21,6 +18,11 @@ from fastapi.responses import FileResponse
 from starlette.datastructures import UploadFile
 
 from webapp.auth_helpers import is_authenticated
+from webapp.markdown_archive_validation import (
+    archive_format_for_filename,
+    is_archive_upload,
+    validate_archive,
+)
 from webapp.utils import safe_filename
 
 _MARKDOWN_ID_RE = re.compile(r"^[0-9]{6}$")
@@ -33,22 +35,7 @@ _ALLOWED_IMAGES: dict[str, tuple[str, frozenset[str]]] = {
     "image/gif": ("gif", frozenset({".gif"})),
     "image/webp": ("webp", frozenset({".webp"})),
 }
-_ALLOWED_ZIP_CONTENT_TYPES = frozenset(
-    {
-        "",
-        "application/octet-stream",
-        "application/x-zip-compressed",
-        "application/zip",
-    }
-)
 _ZIP_CONTENT_TYPE = "application/zip"
-_ZIP_SIGNATURES = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
-_MAX_ZIP_MEMBER_COUNT = 1_000
-_MAX_ZIP_UNCOMPRESSED_BYTES = 100 * 1024 * 1024
-_ZIP_VALIDATION_CHUNK_BYTES = 1024 * 1024
-_DECLARED_ZIP_CONTENT_TYPES = frozenset(
-    {"application/x-zip-compressed", "application/zip"}
-)
 _STORED_CONTENT_TYPES = frozenset((*_ALLOWED_IMAGES, _ZIP_CONTENT_TYPE))
 
 
@@ -109,47 +96,9 @@ def _validate_image(filename: str, content_type: str | None, data: bytes) -> str
 
 
 def _validate_asset(filename: str, content_type: str | None, data: bytes) -> str:
-    declared_type = (content_type or "").lower()
-    if Path(filename).suffix.lower() == ".zip":
-        if (
-            declared_type not in _ALLOWED_ZIP_CONTENT_TYPES
-            or not data.startswith(_ZIP_SIGNATURES)
-        ):
-            raise ValueError("extension, MIME type, and ZIP signature must agree")
-        try:
-            with ZipFile(BytesIO(data)) as archive:
-                members = archive.infolist()
-                if len(members) > _MAX_ZIP_MEMBER_COUNT:
-                    raise ValueError("ZIP contains too many members")
-                if (
-                    sum(member.file_size for member in members)
-                    > _MAX_ZIP_UNCOMPRESSED_BYTES
-                ):
-                    raise ValueError("ZIP uncompressed size exceeds validation limit")
-                if any(member.flag_bits & 0x1 for member in members):
-                    raise ValueError("encrypted ZIP members cannot be validated")
-                for member in members:
-                    with archive.open(member) as member_file:
-                        while member_file.read(_ZIP_VALIDATION_CHUNK_BYTES):
-                            pass
-        except (
-            BadZipFile,
-            LargeZipFile,
-            NotImplementedError,
-            OSError,
-            RuntimeError,
-            ZlibError,
-        ) as exc:
-            raise ValueError("ZIP structure or member integrity is invalid") from exc
-        return _ZIP_CONTENT_TYPE
+    if archive_format_for_filename(filename) is not None:
+        return validate_archive(filename, content_type, data)
     return _validate_image(filename, content_type, data)
-
-
-def _is_archive_upload(filename: str, content_type: str | None) -> bool:
-    return (
-        Path(filename).suffix.lower() == ".zip"
-        or (content_type or "").lower() in _DECLARED_ZIP_CONTENT_TYPES
-    )
 
 
 def _store_asset(
@@ -321,7 +270,7 @@ def register_markdown_image_routes(app) -> None:
                         data=data,
                     )
                 except ValueError:
-                    if _is_archive_upload(display_name, upload.content_type):
+                    if is_archive_upload(display_name, upload.content_type):
                         errors.append(
                             {
                                 "filename": display_name,
