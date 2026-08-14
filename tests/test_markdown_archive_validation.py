@@ -409,16 +409,25 @@ def test_validate_archive_rejects_excess_declared_7z_output(
         validate_archive("oversized.7z", "application/x-7z-compressed", data)
 
 
-def test_validate_archive_caps_actual_7z_decoded_output(
+def test_validate_archive_caps_cumulative_actual_7z_decoded_output(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    data = _seven_zip_bytes([("report.txt", b"decoded")])
+    member_content = b"12345"
+    decoded_limit = 8
+    assert len(member_content) < decoded_limit < (2 * len(member_content))
+    data = _seven_zip_bytes(
+        [("first.txt", member_content), ("second.txt", member_content)]
+    )
     original_list = py7zr.SevenZipFile.list
 
     def underreport_sizes(archive: py7zr.SevenZipFile) -> list[py7zr.FileInfo]:
         return [replace(member, uncompressed=0) for member in original_list(archive)]
 
-    monkeypatch.setattr(archive_validation, "MAX_TOTAL_UNCOMPRESSED_BYTES", 6)
+    monkeypatch.setattr(
+        archive_validation,
+        "MAX_TOTAL_UNCOMPRESSED_BYTES",
+        decoded_limit,
+    )
     monkeypatch.setattr(py7zr.SevenZipFile, "list", underreport_sizes)
 
     with pytest.raises(
