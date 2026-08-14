@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import tarfile
+import threading
 from io import BytesIO
 from zipfile import ZIP_DEFLATED, ZipFile
 
@@ -12,6 +13,7 @@ import py7zr
 import pytest
 from conftest import TEST_API_KEY
 from fastapi.testclient import TestClient
+from httpx import ASGITransport, AsyncClient
 
 import webapp
 from webapp import markdown_images
@@ -730,6 +732,189 @@ def test_archive_specific_mime_mismatch_participates_in_overload_limit(
     )
 
     assert response.status_code == 503
+    assert not (docs_root / "markdown-threads" / "123456" / "images").exists()
+
+
+def test_archive_limiter_supports_contention_across_two_event_loops():
+    limiter = markdown_images._ARCHIVE_BATCH_LIMITER
+
+    async def contend() -> None:
+        await limiter.acquire()
+        await limiter.acquire()
+        waiter = asyncio.create_task(limiter.acquire())
+        await asyncio.sleep(0)
+        try:
+            assert not waiter.done()
+            waiter.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await waiter
+        finally:
+            if not waiter.done():
+                waiter.cancel()
+            try:
+                await waiter
+            except BaseException:
+                pass
+            limiter.release()
+            limiter.release()
+
+    asyncio.run(contend())
+    asyncio.run(contend())
+
+
+def test_cancelled_archive_validation_holds_slot_until_worker_finishes(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(webapp, "DOCS_ROOT", tmp_path / "docs")
+    limiter = asyncio.Semaphore(1)
+    monkeypatch.setattr(markdown_images, "_ARCHIVE_BATCH_LIMITER", limiter)
+    original_validate = markdown_images.validate_archive
+    worker_started = threading.Event()
+    worker_finish = threading.Event()
+
+    def blocking_validate(filename, content_type, data):
+        worker_started.set()
+        if not worker_finish.wait(5):
+            raise AssertionError("validation worker was not released")
+        return original_validate(filename, content_type, data)
+
+    monkeypatch.setattr(markdown_images, "validate_archive", blocking_validate)
+
+    async def scenario() -> None:
+        async with AsyncClient(
+            transport=ASGITransport(app=webapp.app), base_url="http://test"
+        ) as client:
+            request = asyncio.create_task(
+                client.post(
+                    "/markdown-threads/123456/images",
+                    headers=_AUTH_HEADERS,
+                    files={"files": ("evidence.tar", _TAR, "application/x-tar")},
+                )
+            )
+            assert await asyncio.to_thread(worker_started.wait, 2)
+            request.cancel()
+            await asyncio.sleep(0.02)
+            try:
+                assert not request.done()
+                assert limiter.locked()
+                request.cancel()
+                await asyncio.sleep(0.02)
+                assert not request.done()
+                assert limiter.locked()
+            finally:
+                worker_finish.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(request, 2)
+            assert not limiter.locked()
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_storage_waits_then_rolls_back_completed_and_current_assets(
+    tmp_path, monkeypatch
+):
+    docs_root = tmp_path / "docs"
+    monkeypatch.setattr(webapp, "DOCS_ROOT", docs_root)
+    original_store = markdown_images._store_asset
+    worker_started = threading.Event()
+    worker_finish = threading.Event()
+
+    def blocking_second_store(*args, filename, **kwargs):
+        if filename == "two.png":
+            worker_started.set()
+            if not worker_finish.wait(5):
+                raise AssertionError("storage worker was not released")
+        return original_store(*args, filename=filename, **kwargs)
+
+    monkeypatch.setattr(markdown_images, "_store_asset", blocking_second_store)
+
+    async def scenario() -> None:
+        async with AsyncClient(
+            transport=ASGITransport(app=webapp.app), base_url="http://test"
+        ) as client:
+            request = asyncio.create_task(
+                client.post(
+                    "/markdown-threads/123456/images",
+                    headers=_AUTH_HEADERS,
+                    files=[
+                        ("files", ("one.png", _PNG, "image/png")),
+                        ("files", ("two.png", _PNG, "image/png")),
+                    ],
+                )
+            )
+            assert await asyncio.to_thread(worker_started.wait, 2)
+            request.cancel()
+            await asyncio.sleep(0.02)
+            try:
+                assert not request.done()
+                request.cancel()
+                await asyncio.sleep(0.02)
+                assert not request.done()
+            finally:
+                worker_finish.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(request, 2)
+
+    asyncio.run(scenario())
+    images_root = docs_root / "markdown-threads" / "123456" / "images"
+    assert not images_root.exists() or not any(images_root.iterdir())
+
+
+def test_feature_gate_disabled_candidates_skip_saturated_archive_limiter(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(webapp, "DOCS_ROOT", tmp_path / "docs")
+    monkeypatch.setenv("MARKDOWN_EXTENDED_ATTACHMENT_UPLOADS_ENABLED", "false")
+    monkeypatch.setattr(markdown_images, "_ARCHIVE_BATCH_LIMITER", asyncio.Semaphore(0))
+    monkeypatch.setattr(markdown_images, "_ARCHIVE_BATCH_WAIT_SECONDS", 0.001)
+    client = TestClient(webapp.app)
+
+    response = _upload(
+        client,
+        "123456",
+        [
+            ("evidence.7z", _SEVEN_ZIP, "application/x-7z-compressed"),
+            ("evidence.tar", _TAR, "application/x-tar"),
+            ("evidence.tgz", _TAR_GZ, "application/gzip"),
+            ("report.docx", b"office", "application/x-tar"),
+        ],
+    )
+
+    assert response.status_code == 200
+    assert response.json()["assets"] == []
+    assert [error["filename"] for error in response.json()["errors"]] == [
+        "evidence.7z",
+        "evidence.tar",
+        "evidence.tgz",
+        "report.docx",
+    ]
+    assert all(
+        error["code"] == "extended_attachment_upload_disabled"
+        for error in response.json()["errors"]
+    )
+
+
+def test_feature_gate_disabled_batch_with_zip_still_waits_for_archive_limiter(
+    tmp_path, monkeypatch
+):
+    docs_root = tmp_path / "docs"
+    monkeypatch.setattr(webapp, "DOCS_ROOT", docs_root)
+    monkeypatch.setenv("MARKDOWN_EXTENDED_ATTACHMENT_UPLOADS_ENABLED", "false")
+    monkeypatch.setattr(markdown_images, "_ARCHIVE_BATCH_LIMITER", asyncio.Semaphore(0))
+    monkeypatch.setattr(markdown_images, "_ARCHIVE_BATCH_WAIT_SECONDS", 0.001)
+    client = TestClient(webapp.app)
+
+    response = _upload(
+        client,
+        "123456",
+        [
+            ("evidence.tar", _TAR, "application/x-tar"),
+            ("evidence.zip", _ZIP, "application/zip"),
+        ],
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Archive validation is busy"}
     assert not (docs_root / "markdown-threads" / "123456" / "images").exists()
 
 

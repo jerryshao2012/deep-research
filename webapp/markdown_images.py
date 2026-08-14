@@ -9,8 +9,11 @@ import re
 import shutil
 import tempfile
 import uuid
+from collections.abc import Callable
 from pathlib import Path
+from threading import Lock
 from typing import Any
+from weakref import WeakKeyDictionary
 
 import filetype
 from fastapi import Header, HTTPException, Request, status
@@ -31,7 +34,6 @@ _MARKDOWN_ID_RE = re.compile(r"^[0-9]{6}$")
 _MAX_IMAGE_BYTES = 10 * 1024 * 1024
 _MAX_IMAGE_COUNT = 5
 _MAX_REQUEST_BYTES = (_MAX_IMAGE_BYTES * _MAX_IMAGE_COUNT) + (1024 * 1024)
-_ARCHIVE_BATCH_LIMITER = asyncio.Semaphore(2)
 _ARCHIVE_BATCH_WAIT_SECONDS = 2.0
 _ALLOWED_IMAGES: dict[str, tuple[str, frozenset[str]]] = {
     "image/png": ("png", frozenset({".png"})),
@@ -46,6 +48,33 @@ _STORED_NON_ARCHIVE_CONTENT_TYPES = frozenset((*_ALLOWED_IMAGES, OFFICE_CONTENT_
 _ARCHIVE_ERROR_MESSAGE = (
     "Only valid ZIP, 7Z, TAR, TAR.GZ, and TGZ archives are supported"
 )
+
+
+class _LoopLocalArchiveBatchLimiter:
+    def __init__(self, capacity: int) -> None:
+        self._capacity = capacity
+        self._lock = Lock()
+        self._semaphores: WeakKeyDictionary[
+            asyncio.AbstractEventLoop, asyncio.Semaphore
+        ] = WeakKeyDictionary()
+
+    def _semaphore_for_running_loop(self) -> asyncio.Semaphore:
+        loop = asyncio.get_running_loop()
+        with self._lock:
+            semaphore = self._semaphores.get(loop)
+            if semaphore is None:
+                semaphore = asyncio.Semaphore(self._capacity)
+                self._semaphores[loop] = semaphore
+            return semaphore
+
+    async def acquire(self) -> None:
+        await self._semaphore_for_running_loop().acquire()
+
+    def release(self) -> None:
+        self._semaphore_for_running_loop().release()
+
+
+_ARCHIVE_BATCH_LIMITER = _LoopLocalArchiveBatchLimiter(2)
 
 
 def _webapp_module():
@@ -128,6 +157,40 @@ def _extended_attachment_uploads_enabled() -> bool:
 
 def _is_archive_candidate(filename: str, content_type: str | None) -> bool:
     return not is_office_upload(filename) and is_archive_upload(filename, content_type)
+
+
+def _archive_candidate_needs_slot(
+    filename: str,
+    content_type: str | None,
+    *,
+    extended_uploads_enabled: bool,
+) -> bool:
+    if not _is_archive_candidate(filename, content_type):
+        return False
+    return extended_uploads_enabled or not is_extended_archive_filename(filename)
+
+
+async def _run_worker_to_completion[T](
+    function: Callable[..., T], /, *args: Any, **kwargs: Any
+) -> T:
+    worker = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            result = await asyncio.shield(worker)
+        except asyncio.CancelledError as exc:
+            if worker.cancelled():
+                raise
+            if cancellation is None:
+                cancellation = exc
+            continue
+        except BaseException:
+            if cancellation is not None:
+                raise cancellation
+            raise
+        if cancellation is not None:
+            raise cancellation
+        return result
 
 
 def _store_asset(
@@ -270,8 +333,13 @@ def register_markdown_image_routes(app) -> None:
                     detail="files must contain uploaded assets",
                 )
             archive_slot_acquired = False
+            extended_uploads_enabled = _extended_attachment_uploads_enabled()
             needs_archive_slot = any(
-                _is_archive_candidate(upload.filename or "", upload.content_type)
+                _archive_candidate_needs_slot(
+                    upload.filename or "",
+                    upload.content_type,
+                    extended_uploads_enabled=extended_uploads_enabled,
+                )
                 for upload in files
             )
             if needs_archive_slot:
@@ -288,7 +356,6 @@ def register_markdown_image_routes(app) -> None:
                     ) from exc
                 archive_slot_acquired = True
             try:
-                extended_uploads_enabled = _extended_attachment_uploads_enabled()
                 for upload in files:
                     raw_filename = upload.filename or ""
                     try:
@@ -331,7 +398,7 @@ def register_markdown_image_routes(app) -> None:
                         if office_candidate:
                             verified_type = OFFICE_CONTENT_TYPE
                         elif archive_candidate:
-                            verified_type = await asyncio.to_thread(
+                            verified_type = await _run_worker_to_completion(
                                 validate_archive,
                                 display_name,
                                 upload.content_type,
@@ -342,7 +409,8 @@ def register_markdown_image_routes(app) -> None:
                                 display_name, upload.content_type, data
                             )
                         asset_id = str(uuid.uuid4())
-                        await asyncio.to_thread(
+                        stored_asset_ids.append(asset_id)
+                        await _run_worker_to_completion(
                             _store_asset,
                             images_root,
                             asset_id=asset_id,
@@ -377,14 +445,13 @@ def register_markdown_image_routes(app) -> None:
                             )
                         continue
                     except OSError as exc:
-                        await asyncio.to_thread(
+                        await _run_worker_to_completion(
                             _rollback_request_assets, images_root, stored_asset_ids
                         )
                         raise HTTPException(
                             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                             detail="Asset storage failed",
                         ) from exc
-                    stored_asset_ids.append(asset_id)
                     assets.append(
                         {
                             "id": asset_id,
@@ -393,6 +460,11 @@ def register_markdown_image_routes(app) -> None:
                             "size": len(data),
                         }
                     )
+            except asyncio.CancelledError:
+                await _run_worker_to_completion(
+                    _rollback_request_assets, images_root, stored_asset_ids
+                )
+                raise
             finally:
                 if archive_slot_acquired:
                     _ARCHIVE_BATCH_LIMITER.release()
