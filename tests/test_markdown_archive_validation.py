@@ -8,10 +8,13 @@ from contextlib import nullcontext
 from dataclasses import replace
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 from zipfile import ZIP_DEFLATED, ZipFile
 
 import py7zr
 import pytest
+from py7zr.archiveinfo import Folder
+from py7zr.properties import COMPRESSION_METHOD
 
 import webapp.markdown_archive_validation as archive_validation
 from webapp.markdown_archive_validation import (
@@ -305,6 +308,44 @@ def test_validate_archive_accepts_valid_empty_7z_in_memory() -> None:
     assert validate_archive("empty.7z", "application/x-7z-compressed", data) == (
         "application/x-7z-compressed"
     )
+
+
+def test_validate_archive_rejects_unsupported_7z_coder_before_empty_early_return(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data = _seven_zip_bytes()
+    original_open = archive_validation.SevenZipFile
+
+    def open_with_unsupported_coder(
+        *args: object, **kwargs: object
+    ) -> py7zr.SevenZipFile:
+        archive = original_open(*args, **kwargs)
+        folder = Folder()
+        folder.coders = [
+            {
+                "method": COMPRESSION_METHOD.MISC_LZ4,
+                "numinstreams": 1,
+                "numoutstreams": 1,
+                "properties": None,
+            }
+        ]
+        folder.unpacksizes = [0]
+        archive.header.main_streams = SimpleNamespace(
+            unpackinfo=SimpleNamespace(folders=[folder])
+        )
+        return archive
+
+    monkeypatch.setattr(
+        archive_validation,
+        "SevenZipFile",
+        open_with_unsupported_coder,
+    )
+
+    with pytest.raises(
+        ArchiveValidationError,
+        match="^7z compression method is unsupported$",
+    ):
+        validate_archive("empty.7z", "application/x-7z-compressed", data)
 
 
 @pytest.mark.parametrize("header_encryption", [False, True])

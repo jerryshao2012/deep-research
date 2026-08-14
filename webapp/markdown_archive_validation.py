@@ -10,7 +10,7 @@ from tarfile import TarError
 from zipfile import BadZipFile, LargeZipFile, ZipFile
 from zlib import error as ZlibError
 
-from py7zr import SevenZipFile
+from py7zr import SevenZipFile, UnsupportedCompressionMethodError
 from py7zr.exceptions import PasswordRequired
 from py7zr.io import Py7zIO, WriterFactory
 
@@ -259,6 +259,14 @@ def _validate_zip(data: bytes) -> None:
         ) from None
 
 
+def _validate_7z_coder_chains(archive: SevenZipFile) -> None:
+    main_streams = archive.header.main_streams
+    if main_streams is None:
+        return
+    for folder in main_streams.unpackinfo.folders:
+        folder.get_decompressor(0, reset=True)
+
+
 def _validate_7z(data: bytes) -> None:
     try:
         with SevenZipFile(BytesIO(data), mode="r") as archive:
@@ -266,6 +274,7 @@ def _validate_7z(data: bytes) -> None:
                 raise ArchiveValidationError(
                     "encrypted 7z archives cannot be validated"
                 )
+            _validate_7z_coder_chains(archive)
             members = [member for member in archive.list() if not member.is_directory]
             if len(members) > MAX_MEMBER_COUNT:
                 raise ArchiveValidationError("7z contains too many members")
@@ -303,6 +312,8 @@ def _validate_7z(data: bytes) -> None:
         raise ArchiveValidationError(
             "encrypted 7z archives cannot be validated"
         ) from None
+    except UnsupportedCompressionMethodError:
+        raise ArchiveValidationError("7z compression method is unsupported") from None
     except Exception:
         raise ArchiveValidationError(
             "7z structure or member integrity is invalid"
