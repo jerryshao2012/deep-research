@@ -13,7 +13,8 @@ import py7zr
 import pytest
 from conftest import TEST_API_KEY
 from fastapi.testclient import TestClient
-from httpx import ASGITransport, AsyncClient
+from httpx import ASGITransport, AsyncByteStream, AsyncClient
+from starlette import formparsers as starlette_formparsers
 
 import webapp
 from webapp import markdown_images
@@ -132,6 +133,17 @@ def _upload(client: TestClient, markdown_id: str, files):
     )
 
 
+class _CountingAsyncStream(AsyncByteStream):
+    def __init__(self, chunks) -> None:
+        self._chunks = chunks
+        self.consumed = 0
+
+    async def __aiter__(self):
+        for chunk in self._chunks:
+            self.consumed += len(chunk)
+            yield chunk
+
+
 def test_upload_requires_authentication(tmp_path, monkeypatch):
     monkeypatch.setattr(webapp, "DOCS_ROOT", tmp_path / "docs")
     client = TestClient(webapp.app)
@@ -177,6 +189,119 @@ def test_upload_validates_markdown_id_and_batch_count(tmp_path, monkeypatch):
 
     assert invalid_id.status_code in {404, 422}
     assert too_many.status_code == 400
+    assert not (tmp_path / "docs" / "markdown-threads").exists()
+
+
+def test_chunked_upload_without_content_length_stops_at_total_request_limit(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(webapp, "DOCS_ROOT", tmp_path / "docs")
+    boundary = "markdown-assets-boundary"
+    chunk_size = 64 * 1024
+    chunks = []
+    for index in range(markdown_images._MAX_IMAGE_COUNT):
+        chunks.append(
+            (
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="files"; filename="{index}.png"\r\n'
+                "Content-Type: image/png\r\n\r\n"
+            ).encode()
+        )
+        chunks.extend(
+            [b"x" * chunk_size] * (markdown_images._MAX_IMAGE_BYTES // chunk_size)
+        )
+        chunks.append(b"\r\n")
+    chunks.append(f"--{boundary}--\r\n".encode())
+    chunks.extend([b"x" * chunk_size] * 20)
+    stream = _CountingAsyncStream(chunks)
+
+    async def scenario():
+        async with AsyncClient(
+            transport=ASGITransport(app=webapp.app, raise_app_exceptions=False),
+            base_url="http://test",
+        ) as client:
+            return await client.post(
+                "/markdown-threads/123456/images",
+                headers={
+                    **_AUTH_HEADERS,
+                    "Content-Type": f"multipart/form-data; boundary={boundary}",
+                },
+                content=stream,
+            )
+
+    response = asyncio.run(scenario())
+
+    assert response.status_code == 413
+    assert response.json() == {"detail": "Asset upload request is too large"}
+    assert stream.consumed <= markdown_images._MAX_REQUEST_BYTES + chunk_size
+    assert not (tmp_path / "docs" / "markdown-threads").exists()
+
+
+def test_multipart_parser_stops_oversized_file_before_validation_or_storage(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(webapp, "DOCS_ROOT", tmp_path / "docs")
+    validation_called = False
+    storage_called = False
+    spooled_files = []
+    original_spooled_file = starlette_formparsers.SpooledTemporaryFile
+
+    def fail_validation(*args, **kwargs):
+        nonlocal validation_called
+        validation_called = True
+        raise AssertionError("oversized file reached validation")
+
+    def fail_storage(*args, **kwargs):
+        nonlocal storage_called
+        storage_called = True
+        raise AssertionError("oversized file reached storage")
+
+    def tracking_spooled_file(*args, **kwargs):
+        temporary = original_spooled_file(*args, **kwargs)
+        spooled_files.append(temporary)
+        return temporary
+
+    monkeypatch.setattr(markdown_images, "_validate_asset", fail_validation)
+    monkeypatch.setattr(markdown_images, "_validate_image", fail_validation)
+    monkeypatch.setattr(markdown_images, "_store_asset", fail_storage)
+    monkeypatch.setattr(
+        starlette_formparsers, "SpooledTemporaryFile", tracking_spooled_file
+    )
+    boundary = "markdown-assets-boundary"
+    prefix = (
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="files"; filename="large.png"\r\n'
+        "Content-Type: image/png\r\n\r\n"
+    ).encode()
+    chunk_size = 64 * 1024
+    stream = _CountingAsyncStream(
+        [prefix, _PNG]
+        + [b"x" * chunk_size] * ((markdown_images._MAX_IMAGE_BYTES // chunk_size) + 4)
+        + [f"\r\n--{boundary}--\r\n".encode()]
+    )
+
+    async def scenario():
+        async with AsyncClient(
+            transport=ASGITransport(app=webapp.app, raise_app_exceptions=False),
+            base_url="http://test",
+        ) as client:
+            return await client.post(
+                "/markdown-threads/123456/images",
+                headers={
+                    **_AUTH_HEADERS,
+                    "Content-Type": f"multipart/form-data; boundary={boundary}",
+                },
+                content=stream,
+            )
+
+    response = asyncio.run(scenario())
+
+    assert response.status_code == 413
+    assert response.json() == {"detail": "File exceeds 10 MiB"}
+    assert not validation_called
+    assert not storage_called
+    assert spooled_files and all(temporary.closed for temporary in spooled_files)
+    assert stream.consumed <= len(prefix) + len(_PNG) + 10 * 1024 * 1024 + chunk_size
     assert not (tmp_path / "docs" / "markdown-threads").exists()
 
 
@@ -504,7 +629,7 @@ def test_storage_failure_rolls_back_assets_written_by_request(tmp_path, monkeypa
     assert not images_root.exists() or not any(images_root.iterdir())
 
 
-def test_upload_rejects_oversized_file_per_item(tmp_path, monkeypatch):
+def test_upload_rejects_oversized_file_during_multipart_parsing(tmp_path, monkeypatch):
     monkeypatch.setattr(webapp, "DOCS_ROOT", tmp_path / "docs")
     client = TestClient(webapp.app)
 
@@ -514,12 +639,13 @@ def test_upload_rejects_oversized_file_per_item(tmp_path, monkeypatch):
         [("large.png", _PNG + b"x" * (10 * 1024 * 1024), "image/png")],
     )
 
-    assert response.status_code == 200
-    assert response.json()["assets"] == []
-    assert response.json()["errors"][0]["code"] == "file_too_large"
+    assert response.status_code == 413
+    assert response.json() == {"detail": "File exceeds 10 MiB"}
 
 
-def test_upload_rejects_oversized_archive_per_item(tmp_path, monkeypatch):
+def test_upload_rejects_oversized_archive_during_multipart_parsing(
+    tmp_path, monkeypatch
+):
     monkeypatch.setattr(webapp, "DOCS_ROOT", tmp_path / "docs")
     client = TestClient(webapp.app)
 
@@ -529,13 +655,8 @@ def test_upload_rejects_oversized_archive_per_item(tmp_path, monkeypatch):
         [("large.zip", _ZIP + b"x" * (10 * 1024 * 1024), "application/zip")],
     )
 
-    assert response.status_code == 200
-    assert response.json()["assets"] == []
-    assert response.json()["errors"][0] == {
-        "filename": "large.zip",
-        "code": "file_too_large",
-        "message": "File exceeds 10 MiB",
-    }
+    assert response.status_code == 413
+    assert response.json() == {"detail": "File exceeds 10 MiB"}
 
 
 def test_extended_uploads_accept_mixed_max_five_batches_in_input_order(
@@ -1650,6 +1771,109 @@ def test_cleanup_concurrent_deletes_claim_namespace_once_without_residue(
     namespace_root = docs_root / "markdown-threads" / "123456"
     assert not (namespace_root / "images").exists()
     assert list(namespace_root.glob(".images-delete-*")) == []
+
+
+def test_cleanup_waits_for_entire_upload_batch_then_deletes_it(tmp_path, monkeypatch):
+    docs_root = tmp_path / "docs"
+    monkeypatch.setattr(webapp, "DOCS_ROOT", docs_root)
+    original_store = markdown_images._store_asset
+    first_stored = threading.Event()
+    finish_upload = threading.Event()
+
+    def pause_after_first_store(*args, filename, **kwargs):
+        original_store(*args, filename=filename, **kwargs)
+        if filename == "one.png":
+            first_stored.set()
+            if not finish_upload.wait(5):
+                raise AssertionError("upload was not released")
+
+    monkeypatch.setattr(markdown_images, "_store_asset", pause_after_first_store)
+
+    async def scenario():
+        async with AsyncClient(
+            transport=ASGITransport(app=webapp.app), base_url="http://test"
+        ) as client:
+            upload = asyncio.create_task(
+                client.post(
+                    "/markdown-threads/123456/images",
+                    headers=_AUTH_HEADERS,
+                    files=[
+                        ("files", ("one.png", _PNG, "image/png")),
+                        ("files", ("two.png", _PNG, "image/png")),
+                    ],
+                )
+            )
+            assert await asyncio.to_thread(first_stored.wait, 2)
+            delete = asyncio.create_task(
+                client.delete("/markdown-threads/123456/images", headers=_AUTH_HEADERS)
+            )
+            await asyncio.sleep(0.05)
+            try:
+                assert not delete.done()
+            finally:
+                finish_upload.set()
+            return await asyncio.wait_for(upload, 2), await asyncio.wait_for(delete, 2)
+
+    uploaded, deleted = asyncio.run(scenario())
+
+    assert uploaded.status_code == 200
+    assert [asset["filename"] for asset in uploaded.json()["assets"]] == [
+        "one.png",
+        "two.png",
+    ]
+    assert deleted.status_code == 200
+    assert deleted.json()["deleted_count"] == 2
+    images_root = docs_root / "markdown-threads" / "123456" / "images"
+    assert not images_root.exists()
+
+
+def test_upload_waits_for_delete_fence_then_creates_new_namespace(
+    tmp_path, monkeypatch
+):
+    docs_root = tmp_path / "docs"
+    monkeypatch.setattr(webapp, "DOCS_ROOT", docs_root)
+    original_delete = markdown_images._delete_images_namespace
+    delete_started = threading.Event()
+    finish_delete = threading.Event()
+
+    def blocking_delete(images_root):
+        delete_started.set()
+        if not finish_delete.wait(5):
+            raise AssertionError("delete was not released")
+        return original_delete(images_root)
+
+    monkeypatch.setattr(markdown_images, "_delete_images_namespace", blocking_delete)
+
+    async def scenario():
+        async with AsyncClient(
+            transport=ASGITransport(app=webapp.app), base_url="http://test"
+        ) as client:
+            delete = asyncio.create_task(
+                client.delete("/markdown-threads/123456/images", headers=_AUTH_HEADERS)
+            )
+            assert await asyncio.to_thread(delete_started.wait, 2)
+            upload = asyncio.create_task(
+                client.post(
+                    "/markdown-threads/123456/images",
+                    headers=_AUTH_HEADERS,
+                    files={"files": ("one.png", _PNG, "image/png")},
+                )
+            )
+            await asyncio.sleep(0.05)
+            try:
+                assert not upload.done()
+            finally:
+                finish_delete.set()
+            return await asyncio.wait_for(delete, 2), await asyncio.wait_for(upload, 2)
+
+    deleted, uploaded = asyncio.run(scenario())
+
+    assert deleted.status_code == 200
+    assert deleted.json()["deleted_count"] == 0
+    assert uploaded.status_code == 200
+    assert [asset["filename"] for asset in uploaded.json()["assets"]] == ["one.png"]
+    images_root = docs_root / "markdown-threads" / "123456" / "images"
+    assert len([child for child in images_root.iterdir() if child.is_dir()]) == 1
 
 
 def test_cleanup_counts_only_supported_metadata_and_removes_whole_namespace(

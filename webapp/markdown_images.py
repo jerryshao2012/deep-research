@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import json
 import os
 import re
 import shutil
 import tempfile
 import uuid
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from pathlib import Path
 from threading import Lock
 from typing import Any
@@ -19,7 +21,12 @@ from weakref import WeakKeyDictionary
 import filetype
 from fastapi import Header, HTTPException, Request, status
 from fastapi.responses import FileResponse, Response
-from starlette.datastructures import UploadFile
+from starlette.datastructures import FormData, UploadFile
+from starlette.formparsers import (
+    MultiPartException,
+    MultiPartParser,
+    parse_options_header,
+)
 
 from webapp.auth_helpers import is_authenticated
 from webapp.markdown_archive_validation import (
@@ -81,6 +88,53 @@ class _LoopLocalArchiveBatchLimiter:
 _ARCHIVE_BATCH_LIMITER = _LoopLocalArchiveBatchLimiter(2)
 
 
+class _RequestBodyTooLarge(MultiPartException):
+    pass
+
+
+class _UploadFileTooLarge(MultiPartException):
+    pass
+
+
+class _BoundedUploadMultiPartParser(MultiPartParser):
+    def __init__(self, *args: Any, max_file_size: int, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._max_file_size = max_file_size
+        self._current_file_size = 0
+
+    def on_part_begin(self) -> None:
+        super().on_part_begin()
+        self._current_file_size = 0
+
+    def on_part_data(self, data: bytes, start: int, end: int) -> None:
+        if self._current_part.file is not None:
+            self._current_file_size += end - start
+            if self._current_file_size > self._max_file_size:
+                raise _UploadFileTooLarge("File exceeds 10 MiB")
+        super().on_part_data(data, start, end)
+
+
+class _LoopLocalNamespaceMutationLocks:
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._locks: WeakKeyDictionary[
+            asyncio.AbstractEventLoop, dict[str, asyncio.Lock]
+        ] = WeakKeyDictionary()
+
+    def lock_for_running_loop(self, key: str) -> asyncio.Lock:
+        loop = asyncio.get_running_loop()
+        with self._lock:
+            loop_locks = self._locks.setdefault(loop, {})
+            mutation_lock = loop_locks.get(key)
+            if mutation_lock is None:
+                mutation_lock = asyncio.Lock()
+                loop_locks[key] = mutation_lock
+            return mutation_lock
+
+
+_NAMESPACE_MUTATION_LOCKS = _LoopLocalNamespaceMutationLocks()
+
+
 def _webapp_module():
     import sys
 
@@ -119,6 +173,70 @@ def _images_root(markdown_id: str) -> Path:
         / _validated_markdown_id(markdown_id)
         / "images"
     )
+
+
+def _namespace_lock_path(markdown_id: str) -> Path:
+    return (
+        _webapp_module().DOCS_ROOT
+        / ".markdown-asset-locks"
+        / f"{_validated_markdown_id(markdown_id)}.lock"
+    )
+
+
+def _acquire_namespace_file_lock(lock_path: Path, holder: list[int]) -> None:
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+    except BaseException:
+        os.close(descriptor)
+        raise
+    holder.append(descriptor)
+
+
+def _release_namespace_file_lock(descriptor: int) -> None:
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
+
+
+class _NamespaceMutationFence:
+    def __init__(self, markdown_id: str) -> None:
+        self._lock_path = _namespace_lock_path(markdown_id)
+        self._async_lock: asyncio.Lock | None = None
+        self._descriptor: int | None = None
+
+    async def acquire(self) -> None:
+        async_lock = _NAMESPACE_MUTATION_LOCKS.lock_for_running_loop(
+            str(self._lock_path)
+        )
+        await async_lock.acquire()
+        self._async_lock = async_lock
+        holder: list[int] = []
+        try:
+            await _run_worker_to_completion(
+                _acquire_namespace_file_lock, self._lock_path, holder
+            )
+        except BaseException:
+            try:
+                if holder:
+                    _release_namespace_file_lock(holder.pop())
+            finally:
+                self._async_lock.release()
+                self._async_lock = None
+            raise
+        self._descriptor = holder.pop()
+
+    def release(self) -> None:
+        try:
+            if self._descriptor is not None:
+                _release_namespace_file_lock(self._descriptor)
+                self._descriptor = None
+        finally:
+            if self._async_lock is not None:
+                self._async_lock.release()
+                self._async_lock = None
 
 
 def _validate_image(filename: str, content_type: str | None, data: bytes) -> str:
@@ -184,6 +302,49 @@ async def _run_worker_to_completion[T](
         if cancellation is not None:
             raise cancellation
         return result
+
+
+async def _bounded_request_stream(request: Request) -> AsyncIterator[bytes]:
+    received = 0
+    async for chunk in request.stream():
+        received += len(chunk)
+        if received > _MAX_REQUEST_BYTES:
+            raise _RequestBodyTooLarge("Asset upload request is too large")
+        yield chunk
+
+
+async def _parse_upload_form(request: Request) -> FormData:
+    content_type, _ = parse_options_header(request.headers.get("content-type"))
+    if content_type != b"multipart/form-data":
+        return FormData()
+    parser = _BoundedUploadMultiPartParser(
+        request.headers,
+        _bounded_request_stream(request),
+        max_files=_MAX_IMAGE_COUNT,
+        max_fields=0,
+        max_part_size=_MAX_IMAGE_BYTES,
+        max_file_size=_MAX_IMAGE_BYTES,
+    )
+    try:
+        return await parser.parse()
+    except (_RequestBodyTooLarge, _UploadFileTooLarge) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+            detail=exc.message,
+        ) from exc
+    except MultiPartException as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=exc.message,
+        ) from exc
+
+
+@asynccontextmanager
+async def _closing_form(form: FormData) -> AsyncIterator[FormData]:
+    try:
+        yield form
+    finally:
+        await form.close()
 
 
 def _store_asset(
@@ -426,7 +587,7 @@ def register_markdown_image_routes(app) -> None:
             and int(content_length) > _MAX_REQUEST_BYTES
         ):
             raise HTTPException(
-                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                status_code=status.HTTP_413_CONTENT_TOO_LARGE,
                 detail="Asset upload request is too large",
             )
 
@@ -434,12 +595,10 @@ def register_markdown_image_routes(app) -> None:
         errors: list[dict[str, str]] = []
         stored_asset_ids: list[str] = []
         archive_slot_acquired = False
+        mutation_fence = _NamespaceMutationFence(markdown_id)
+        mutation_fence_acquired = False
         try:
-            async with request.form(
-                max_files=_MAX_IMAGE_COUNT,
-                max_fields=0,
-                max_part_size=_MAX_IMAGE_BYTES,
-            ) as form:
+            async with _closing_form(await _parse_upload_form(request)) as form:
                 files = form.getlist("files")
                 if not files or any(
                     not isinstance(upload, UploadFile) for upload in files
@@ -518,6 +677,9 @@ def register_markdown_image_routes(app) -> None:
                             verified_type = _validate_image(
                                 display_name, upload.content_type, data
                             )
+                        if not mutation_fence_acquired:
+                            await mutation_fence.acquire()
+                            mutation_fence_acquired = True
                         asset_id = str(uuid.uuid4())
                         stored_asset_ids.append(asset_id)
                         await _run_worker_to_completion(
@@ -574,6 +736,8 @@ def register_markdown_image_routes(app) -> None:
                 )
             raise
         finally:
+            if mutation_fence_acquired:
+                mutation_fence.release()
             if archive_slot_acquired:
                 _ARCHIVE_BATCH_LIMITER.release()
         return {"assets": assets, "errors": errors}
@@ -649,7 +813,12 @@ def register_markdown_image_routes(app) -> None:
                 detail="Invalid or missing API key",
             )
         images_root = _images_root(markdown_id)
-        deleted_count = await _run_worker_to_completion(
-            _delete_images_namespace, images_root
-        )
+        mutation_fence = _NamespaceMutationFence(markdown_id)
+        await mutation_fence.acquire()
+        try:
+            deleted_count = await _run_worker_to_completion(
+                _delete_images_namespace, images_root
+            )
+        finally:
+            mutation_fence.release()
         return {"markdown_id": markdown_id, "deleted_count": deleted_count}
