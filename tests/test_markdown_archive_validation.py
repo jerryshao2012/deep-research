@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import gzip
 from io import BytesIO
 from zipfile import ZIP_DEFLATED, ZipFile
 
 import pytest
 
+import webapp.markdown_archive_validation as archive_validation
 from webapp.markdown_archive_validation import (
     ARCHIVE_CONTENT_TYPES,
     ArchiveValidationError,
@@ -17,6 +19,94 @@ from webapp.markdown_archive_validation import (
     normalized_archive_content_type,
     validate_archive,
 )
+
+_TAR_BLOCK_BYTES = 512
+
+
+def _tar_size_field(size: int, *, base_256: bool = False) -> bytes:
+    if base_256:
+        return ((1 << 95) | size).to_bytes(12, "big")
+    return f"{size:011o}\0".encode("ascii")
+
+
+def _tar_header(
+    filename: str,
+    size: int,
+    *,
+    type_flag: bytes = b"0",
+    base_256_size: bool = False,
+) -> bytes:
+    header = bytearray(_TAR_BLOCK_BYTES)
+    header[0:100] = filename.encode("ascii").ljust(100, b"\0")
+    header[100:108] = b"0000644\0"
+    header[108:116] = b"0000000\0"
+    header[116:124] = b"0000000\0"
+    header[124:136] = _tar_size_field(size, base_256=base_256_size)
+    header[136:148] = b"00000000000\0"
+    header[148:156] = b"        "
+    header[156:157] = type_flag
+    header[257:263] = b"ustar\0"
+    header[263:265] = b"00"
+    checksum = sum(header)
+    header[148:156] = f"{checksum:06o}\0 ".encode("ascii")
+    return bytes(header)
+
+
+def _tar_record(
+    filename: str,
+    content: bytes = b"",
+    *,
+    type_flag: bytes = b"0",
+    declared_size: int | None = None,
+    base_256_size: bool = False,
+    padding_byte: bytes = b"\0",
+) -> bytes:
+    size = len(content) if declared_size is None else declared_size
+    padding_size = (-len(content)) % _TAR_BLOCK_BYTES
+    return (
+        _tar_header(
+            filename,
+            size,
+            type_flag=type_flag,
+            base_256_size=base_256_size,
+        )
+        + content
+        + (padding_byte * padding_size)
+    )
+
+
+def _raw_tar(*records: bytes, zero_blocks: int = 2, trailing: bytes = b"") -> bytes:
+    return b"".join(records) + (b"\0" * _TAR_BLOCK_BYTES * zero_blocks) + trailing
+
+
+def _pax_record(key: str, value: str) -> bytes:
+    body = f"{key}={value}\n".encode("ascii")
+    length = len(body) + 2
+    while True:
+        candidate = len(body) + len(str(length)) + 1
+        if candidate == length:
+            return f"{length} ".encode("ascii") + body
+        length = candidate
+
+
+def _tar_with_pax_sizes(*sizes: int) -> bytes:
+    records: list[bytes] = []
+    for index, size in enumerate(sizes):
+        records.append(
+            _tar_record(
+                f"pax-{index}",
+                _pax_record("size", str(size)),
+                type_flag=b"x",
+            )
+        )
+        records.append(
+            _tar_record(
+                f"file-{index}.txt",
+                b"a",
+                declared_size=1,
+            )
+        )
+    return _raw_tar(*records)
 
 
 def _zip_bytes(filename: str = "report.txt", content: bytes = b"report") -> bytes:
@@ -41,9 +131,7 @@ def _zip_with_negative_member_offset() -> bytes:
     data = bytearray(_zip_bytes())
     end_header = data.index(b"PK\x05\x06")
     central_offset = int.from_bytes(data[end_header + 16 : end_header + 20], "little")
-    data[end_header + 16 : end_header + 20] = (central_offset + 1).to_bytes(
-        4, "little"
-    )
+    data[end_header + 16 : end_header + 20] = (central_offset + 1).to_bytes(4, "little")
     return bytes(data)
 
 
@@ -205,3 +293,199 @@ def test_validate_archive_normalizes_zip_library_error_text() -> None:
         validate_archive("broken.zip", "application/zip", b"PK\x03\x04broken")
 
     assert str(caught.value) == "ZIP structure or member integrity is invalid"
+
+
+@pytest.mark.parametrize(
+    ("filename", "content_type", "compress"),
+    [
+        ("evidence.tar", "application/x-tar", False),
+        ("evidence.tar.gz", "application/gzip", True),
+        ("evidence.tgz", "application/x-tgz", True),
+    ],
+)
+def test_validate_archive_accepts_valid_tar_variants(
+    filename: str, content_type: str, compress: bool
+) -> None:
+    raw_tar = _raw_tar(
+        _tar_record("first.txt", b"first"),
+        _tar_record("second.txt", b"second"),
+    )
+    data = gzip.compress(raw_tar) if compress else raw_tar
+
+    assert validate_archive(filename, content_type, data) == (
+        "application/gzip" if compress else "application/x-tar"
+    )
+
+
+def test_validate_archive_accepts_nonnegative_base_256_tar_size() -> None:
+    data = _raw_tar(_tar_record("report.txt", b"report", base_256_size=True))
+
+    assert validate_archive("evidence.tar", "application/tar", data) == (
+        "application/x-tar"
+    )
+
+
+def test_validate_archive_rejects_tar_with_bad_header_checksum() -> None:
+    data = bytearray(_raw_tar(_tar_record("report.txt", b"report")))
+    data[0] ^= 0x01
+
+    with pytest.raises(ArchiveValidationError) as caught:
+        validate_archive("broken.tar", "application/x-tar", bytes(data))
+
+    assert str(caught.value) == "TAR structure or member integrity is invalid"
+
+
+def test_validate_archive_rejects_tar_declared_expansion_over_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(archive_validation, "MAX_EXPANDED_BYTES", 1)
+    data = _raw_tar(_tar_record("oversized.txt", b"ab"))
+
+    with pytest.raises(
+        ArchiveValidationError,
+        match="^TAR declared payload exceeds validation limit$",
+    ):
+        validate_archive("oversized.tar", "application/x-tar", data)
+
+
+def test_validate_archive_drains_every_regular_tar_member_with_actual_byte_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(archive_validation, "MAX_EXPANDED_BYTES", 5)
+    data = _tar_with_pax_sizes(3, 3)
+
+    with pytest.raises(
+        ArchiveValidationError,
+        match="^TAR expanded payload exceeds validation limit$",
+    ):
+        validate_archive("oversized.tar", "application/x-tar", data)
+
+
+def test_validate_archive_rejects_nonzero_tar_record_padding() -> None:
+    data = _raw_tar(
+        _tar_record("report.txt", b"report", padding_byte=b"x"),
+    )
+
+    with pytest.raises(
+        ArchiveValidationError,
+        match="^TAR record padding is invalid$",
+    ):
+        validate_archive("broken.tar", "application/x-tar", data)
+
+
+@pytest.mark.parametrize("zero_blocks", [0, 1])
+def test_validate_archive_requires_two_tar_end_blocks(zero_blocks: int) -> None:
+    data = _raw_tar(_tar_record("report.txt", b"report"), zero_blocks=zero_blocks)
+
+    with pytest.raises(
+        ArchiveValidationError,
+        match="^TAR end marker is invalid$",
+    ):
+        validate_archive("broken.tar", "application/x-tar", data)
+
+
+@pytest.mark.parametrize("trailing", [b"x", b"\0"])
+def test_validate_archive_rejects_nonzero_or_partial_tar_trailing_junk(
+    trailing: bytes,
+) -> None:
+    data = _raw_tar(_tar_record("report.txt", b"report"), trailing=trailing)
+
+    with pytest.raises(
+        ArchiveValidationError,
+        match="^TAR trailing data is invalid$",
+    ):
+        validate_archive("broken.tar", "application/x-tar", data)
+
+
+def test_validate_archive_rejects_excess_tar_zero_blocks() -> None:
+    data = _raw_tar(_tar_record("report.txt", b"report"), zero_blocks=21)
+
+    with pytest.raises(
+        ArchiveValidationError,
+        match="^TAR end marker is invalid$",
+    ):
+        validate_archive("broken.tar", "application/x-tar", data)
+
+
+def test_validate_archive_rejects_excess_tar_metadata_records() -> None:
+    metadata = _tar_header("metadata", 0, type_flag=b"x")
+    data = _raw_tar(
+        *(metadata for _ in range(archive_validation.MAX_TAR_METADATA_RECORDS + 1))
+    )
+
+    with pytest.raises(
+        ArchiveValidationError,
+        match="^TAR contains too many metadata records$",
+    ):
+        validate_archive("metadata.tar", "application/x-tar", data)
+
+
+def test_validate_archive_rejects_excess_tar_metadata_payload() -> None:
+    payload = b"x" * (archive_validation.MAX_TAR_METADATA_BYTES + 1)
+    data = _raw_tar(_tar_record("metadata", payload, type_flag=b"g"))
+
+    with pytest.raises(
+        ArchiveValidationError,
+        match="^TAR metadata payload exceeds validation limit$",
+    ):
+        validate_archive("metadata.tar", "application/x-tar", data)
+
+
+def test_validate_archive_rejects_excess_tar_logical_members() -> None:
+    member = _tar_header("empty.txt", 0)
+    data = _raw_tar(*(member for _ in range(archive_validation.MAX_MEMBER_COUNT + 1)))
+
+    with pytest.raises(
+        ArchiveValidationError,
+        match="^TAR contains too many members$",
+    ):
+        validate_archive("members.tar", "application/x-tar", data)
+
+
+def test_validate_archive_rejects_gzip_tar_crc_corruption() -> None:
+    data = bytearray(gzip.compress(_raw_tar(_tar_record("report.txt", b"report"))))
+    data[-8] ^= 0x01
+
+    with pytest.raises(ArchiveValidationError) as caught:
+        validate_archive("broken.tar.gz", "application/gzip", bytes(data))
+
+    assert str(caught.value) == "gzip TAR structure or integrity is invalid"
+
+
+def test_validate_archive_caps_actual_gzip_decompressed_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(archive_validation, "MAX_TAR_STREAM_BYTES", 1024)
+    data = gzip.compress(b"x" * 1025)
+
+    with pytest.raises(
+        ArchiveValidationError,
+        match="^gzip TAR stream exceeds validation limit$",
+    ):
+        validate_archive("oversized.tgz", "application/gzip", data)
+
+
+@pytest.mark.parametrize(
+    ("filename", "content_type", "data", "message"),
+    [
+        (
+            "broken.tar",
+            "application/x-tar",
+            b"not a tar stream",
+            "TAR structure or member integrity is invalid",
+        ),
+        (
+            "broken.tgz",
+            "application/gzip",
+            b"\x1f\x8bnot a gzip stream",
+            "gzip TAR structure or integrity is invalid",
+        ),
+    ],
+)
+def test_validate_archive_normalizes_tar_parser_errors(
+    filename: str, content_type: str, data: bytes, message: str
+) -> None:
+    with pytest.raises(ArchiveValidationError) as caught:
+        validate_archive(filename, content_type, data)
+
+    assert str(caught.value) == message

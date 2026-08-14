@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import tarfile
 from dataclasses import dataclass
+from gzip import BadGzipFile, GzipFile
 from io import BytesIO
+from tarfile import TarError
 from zipfile import BadZipFile, LargeZipFile, ZipFile
 from zlib import error as ZlibError
 
@@ -98,13 +101,28 @@ _SPECIFIC_ARCHIVE_CONTENT_TYPES = frozenset(
     if content_type not in _GENERIC_CONTENT_TYPES
 )
 
-ARCHIVE_CONTENT_TYPES = frozenset(
-    spec.normalized_content_type for spec in _FORMATS
-)
+ARCHIVE_CONTENT_TYPES = frozenset(spec.normalized_content_type for spec in _FORMATS)
 
 _MAX_ZIP_MEMBER_COUNT = 1_000
 _MAX_ZIP_UNCOMPRESSED_BYTES = 100 * 1024 * 1024
 _ZIP_VALIDATION_CHUNK_BYTES = 1024 * 1024
+
+MAX_MEMBER_COUNT = 1_000
+MAX_EXPANDED_BYTES = 100 * 1024 * 1024
+MAX_TAR_METADATA_RECORDS = (2 * MAX_MEMBER_COUNT) + 1
+MAX_TAR_METADATA_BYTES = 1024 * 1024
+MAX_TAR_ZERO_BLOCKS = 20
+MAX_TAR_STREAM_BYTES = (
+    MAX_EXPANDED_BYTES
+    + MAX_TAR_METADATA_BYTES
+    + ((MAX_MEMBER_COUNT + MAX_TAR_METADATA_RECORDS) * 512)
+    + ((MAX_MEMBER_COUNT + MAX_TAR_METADATA_RECORDS) * 511)
+    + (MAX_TAR_ZERO_BLOCKS * 512)
+)
+
+_TAR_BLOCK_BYTES = 512
+_TAR_METADATA_TYPE_FLAGS = frozenset({b"x", b"g", b"L", b"K"})
+_TAR_VALIDATION_CHUNK_BYTES = 1024 * 1024
 
 
 def archive_format_for_filename(filename: str) -> str | None:
@@ -181,6 +199,142 @@ def _validate_zip(data: bytes) -> None:
         ) from None
 
 
+def _parse_tar_size(field: bytes) -> int:
+    if field[0] & 0x80:
+        if field[0] & 0x40:
+            raise ArchiveValidationError("TAR structure or member integrity is invalid")
+        return int.from_bytes(bytes((field[0] & 0x7F,)) + field[1:], "big")
+
+    stripped = field.rstrip(b"\0 ").lstrip(b" ")
+    if not stripped:
+        return 0
+    if any(byte < ord("0") or byte > ord("7") for byte in stripped):
+        raise ArchiveValidationError("TAR structure or member integrity is invalid")
+    return int(stripped, 8)
+
+
+def _scan_tar_framing(data: bytes) -> None:
+    offset = 0
+    member_count = 0
+    declared_payload_bytes = 0
+    metadata_count = 0
+    metadata_payload_bytes = 0
+
+    while offset < len(data):
+        header_end = offset + _TAR_BLOCK_BYTES
+        if header_end > len(data):
+            raise ArchiveValidationError("TAR structure or member integrity is invalid")
+        header = data[offset:header_end]
+        if not any(header):
+            break
+
+        size = _parse_tar_size(header[124:136])
+        payload_end = header_end + size
+        record_end = payload_end + (-size % _TAR_BLOCK_BYTES)
+        if payload_end > len(data) or record_end > len(data):
+            raise ArchiveValidationError("TAR structure or member integrity is invalid")
+        if any(data[payload_end:record_end]):
+            raise ArchiveValidationError("TAR record padding is invalid")
+
+        if header[156:157] in _TAR_METADATA_TYPE_FLAGS:
+            metadata_count += 1
+            metadata_payload_bytes += size
+            if metadata_count > MAX_TAR_METADATA_RECORDS:
+                raise ArchiveValidationError("TAR contains too many metadata records")
+            if metadata_payload_bytes > MAX_TAR_METADATA_BYTES:
+                raise ArchiveValidationError(
+                    "TAR metadata payload exceeds validation limit"
+                )
+        else:
+            member_count += 1
+            declared_payload_bytes += size
+            if member_count > MAX_MEMBER_COUNT:
+                raise ArchiveValidationError("TAR contains too many members")
+            if declared_payload_bytes > MAX_EXPANDED_BYTES:
+                raise ArchiveValidationError(
+                    "TAR declared payload exceeds validation limit"
+                )
+
+        offset = record_end
+
+    if offset == len(data):
+        raise ArchiveValidationError("TAR end marker is invalid")
+
+    trailing = data[offset:]
+    full_blocks, partial_bytes = divmod(len(trailing), _TAR_BLOCK_BYTES)
+    if partial_bytes:
+        raise ArchiveValidationError("TAR trailing data is invalid")
+    if any(trailing):
+        raise ArchiveValidationError("TAR trailing data is invalid")
+    if full_blocks < 2 or full_blocks > MAX_TAR_ZERO_BLOCKS:
+        raise ArchiveValidationError("TAR end marker is invalid")
+
+
+def _validate_raw_tar(data: bytes) -> None:
+    _scan_tar_framing(data)
+    try:
+        expanded_bytes = 0
+        with tarfile.open(fileobj=BytesIO(data), mode="r:") as archive:
+            for member in archive:
+                if not member.isreg():
+                    continue
+                member_file = archive.extractfile(member)
+                if member_file is None:
+                    raise ArchiveValidationError(
+                        "TAR structure or member integrity is invalid"
+                    )
+                with member_file:
+                    while chunk := member_file.read(_TAR_VALIDATION_CHUNK_BYTES):
+                        expanded_bytes += len(chunk)
+                        if expanded_bytes > MAX_EXPANDED_BYTES:
+                            raise ArchiveValidationError(
+                                "TAR expanded payload exceeds validation limit"
+                            )
+    except ArchiveValidationError:
+        raise
+    except (
+        TarError,
+        EOFError,
+        OSError,
+        ValueError,
+        UnicodeError,
+        ZlibError,
+    ):
+        raise ArchiveValidationError(
+            "TAR structure or member integrity is invalid"
+        ) from None
+
+
+def _decompress_gzip_tar(data: bytes) -> bytes:
+    try:
+        output = BytesIO()
+        with GzipFile(fileobj=BytesIO(data), mode="rb") as compressed:
+            while True:
+                remaining = MAX_TAR_STREAM_BYTES - output.tell()
+                chunk = compressed.read(min(_TAR_VALIDATION_CHUNK_BYTES, remaining + 1))
+                if not chunk:
+                    break
+                if len(chunk) > remaining:
+                    raise ArchiveValidationError(
+                        "gzip TAR stream exceeds validation limit"
+                    )
+                output.write(chunk)
+        return output.getvalue()
+    except ArchiveValidationError:
+        raise
+    except (
+        BadGzipFile,
+        EOFError,
+        OSError,
+        ValueError,
+        UnicodeError,
+        ZlibError,
+    ):
+        raise ArchiveValidationError(
+            "gzip TAR structure or integrity is invalid"
+        ) from None
+
+
 def validate_archive(filename: str, content_type: str | None, data: bytes) -> str:
     """Validate archive agreement and return its normalized storage MIME."""
     archive_format = archive_format_for_filename(filename)
@@ -198,6 +352,14 @@ def validate_archive(filename: str, content_type: str | None, data: bytes) -> st
 
     if archive_format == ".zip":
         _validate_zip(data)
+        return spec.normalized_content_type
+
+    if archive_format == ".tar":
+        _validate_raw_tar(data)
+        return spec.normalized_content_type
+
+    if archive_format in {".tar.gz", ".tgz"}:
+        _validate_raw_tar(_decompress_gzip_tar(data))
         return spec.normalized_content_type
 
     raise ArchiveValidationError("archive format validation is not yet supported")
