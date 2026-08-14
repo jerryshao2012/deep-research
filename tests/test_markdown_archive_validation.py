@@ -91,12 +91,17 @@ def _pax_record(key: str, value: str) -> bytes:
         length = candidate
 
 
-def _tar_with_local_pax_size(raw_size: int, content: bytes) -> bytes:
+def _tar_with_local_pax_size(
+    raw_size: int,
+    content: bytes,
+    *,
+    type_flag: bytes = b"x",
+) -> bytes:
     return _raw_tar(
         _tar_record(
             "local-pax",
             _pax_record("size", str(len(content))),
-            type_flag=b"x",
+            type_flag=type_flag,
         ),
         _tar_record("pax-sized.txt", content, declared_size=raw_size),
         _tar_record("tail.txt", b"tail"),
@@ -390,6 +395,24 @@ def test_validate_archive_applies_local_pax_size_to_physical_record_boundary(
     )
 
 
+@pytest.mark.parametrize(
+    ("raw_size", "content"),
+    [
+        (1, b"a" * 513),
+        (513, b"a"),
+    ],
+    ids=("larger-solaris-pax-boundary", "smaller-solaris-pax-boundary"),
+)
+def test_validate_archive_applies_solaris_pax_size_to_physical_record_boundary(
+    raw_size: int, content: bytes
+) -> None:
+    data = _tar_with_local_pax_size(raw_size, content, type_flag=b"X")
+
+    assert validate_archive("pax.tar", "application/x-tar", data) == (
+        "application/x-tar"
+    )
+
+
 def test_validate_archive_rejects_global_pax_size_boundary_disagreement() -> None:
     data = _raw_tar(
         _tar_record(
@@ -476,8 +499,11 @@ def test_validate_archive_rejects_excess_tar_zero_blocks() -> None:
         validate_archive("broken.tar", "application/x-tar", data)
 
 
-def test_validate_archive_rejects_excess_tar_metadata_records() -> None:
-    metadata = _tar_header("metadata", 0, type_flag=b"x")
+@pytest.mark.parametrize("type_flag", [b"x", b"X"], ids=("pax", "solaris-pax"))
+def test_validate_archive_rejects_excess_tar_metadata_records(
+    type_flag: bytes,
+) -> None:
+    metadata = _tar_header("metadata", 0, type_flag=type_flag)
     member = _tar_header("empty.txt", 0)
     records: list[bytes] = []
     for _ in range(archive_validation.MAX_MEMBER_COUNT):
@@ -492,8 +518,9 @@ def test_validate_archive_rejects_excess_tar_metadata_records() -> None:
         validate_archive("metadata.tar", "application/x-tar", data)
 
 
-def test_validate_archive_caps_recursive_tar_metadata_chain() -> None:
-    metadata = _tar_header("metadata", 0, type_flag=b"x")
+@pytest.mark.parametrize("type_flag", [b"x", b"X"], ids=("pax", "solaris-pax"))
+def test_validate_archive_caps_recursive_tar_metadata_chain(type_flag: bytes) -> None:
+    metadata = _tar_header("metadata", 0, type_flag=type_flag)
     data = _raw_tar(
         *(metadata for _ in range(1_100)),
         _tar_record("report.txt", b"report"),

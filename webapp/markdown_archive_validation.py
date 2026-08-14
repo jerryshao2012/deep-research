@@ -122,7 +122,7 @@ MAX_TAR_STREAM_BYTES = (
 )
 
 _TAR_BLOCK_BYTES = 512
-_TAR_METADATA_TYPE_FLAGS = frozenset({b"x", b"g", b"L", b"K"})
+_TAR_METADATA_TYPE_FLAGS = frozenset({b"x", b"X", b"g", b"L", b"K"})
 _TAR_VALIDATION_CHUNK_BYTES = 1024 * 1024
 
 
@@ -328,9 +328,9 @@ def _scan_tar_framing(data: bytes) -> None:
                     "TAR metadata nesting exceeds validation limit"
                 )
 
-            if type_flag in {b"x", b"g"}:
+            if type_flag in {b"x", b"X", b"g"}:
                 pax_size = _parse_pax_size_override(data[header_end:payload_end])
-                if type_flag == b"x" and local_pax_size is None:
+                if type_flag in {b"x", b"X"} and local_pax_size is None:
                     local_pax_size = pax_size
                 elif type_flag == b"g" and pax_size is not None:
                     global_pax_size = pax_size
