@@ -1265,6 +1265,16 @@ def test_office_routes_serve_arbitrary_bytes_as_safe_download(
             "content_type": "application/octet-stream",
             "size": True,
         },
+        {
+            "filename": "report.docx",
+            "content_type": "application/octet-stream",
+            "size": -1,
+        },
+        {
+            "filename": "report.docx",
+            "content_type": "application/octet-stream",
+            "size": "1",
+        },
         {"filename": "report.docx", "content_type": "text/plain", "size": 1},
     ],
 )
@@ -1289,6 +1299,43 @@ def test_office_routes_reject_malformed_metadata_shape(
         / "metadata.json"
     )
     metadata_path.write_text(json.dumps(stored_metadata))
+
+    for suffix in ("", "/download"):
+        response = client.get(
+            f"/markdown-threads/123456/images/{asset_id}{suffix}",
+            headers=_AUTH_HEADERS,
+        )
+        assert response.status_code == 404
+
+
+@pytest.mark.parametrize(
+    ("metadata_size", "file_size"),
+    [
+        (markdown_images._MAX_IMAGE_BYTES + 1, markdown_images._MAX_IMAGE_BYTES + 1),
+        (markdown_images._MAX_IMAGE_BYTES, markdown_images._MAX_IMAGE_BYTES + 1),
+    ],
+)
+def test_stored_attachment_oversized_metadata_or_file_returns_404_without_response_read(
+    tmp_path, monkeypatch, metadata_size, file_size
+):
+    docs_root = tmp_path / "docs"
+    monkeypatch.setattr(webapp, "DOCS_ROOT", docs_root)
+    client = TestClient(webapp.app, raise_server_exceptions=False)
+    uploaded = _upload(
+        client,
+        "123456",
+        [("report.docx", b"x", "application/octet-stream")],
+    ).json()
+    asset_id = uploaded["assets"][0]["id"]
+    asset_root = docs_root / "markdown-threads" / "123456" / "images" / asset_id
+    payload_path = asset_root / "payload"
+    with payload_path.open("r+b") as payload_file:
+        payload_file.truncate(file_size)
+    metadata_path = asset_root / "metadata.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata["size"] = metadata_size
+    metadata_path.write_text(json.dumps(metadata))
+    monkeypatch.setattr(markdown_images, "FileResponse", lambda *args, **kwargs: None)
 
     for suffix in ("", "/download"):
         response = client.get(
@@ -1395,6 +1442,43 @@ def test_archive_routes_revalidate_off_loop_and_hold_slot_until_cancelled_worker
             assert not limiter.locked()
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("suffix", ["", "/download"])
+def test_archive_routes_serve_validated_snapshot_when_backing_file_changes(
+    tmp_path, monkeypatch, suffix
+):
+    docs_root = tmp_path / "docs"
+    monkeypatch.setattr(webapp, "DOCS_ROOT", docs_root)
+    client = TestClient(webapp.app)
+    uploaded = _upload(
+        client, "123456", [("evidence.zip", _ZIP, "application/zip")]
+    ).json()
+    asset_id = uploaded["assets"][0]["id"]
+    payload_path = (
+        docs_root / "markdown-threads" / "123456" / "images" / asset_id / "payload"
+    )
+    replacement = b"x" * len(_ZIP)
+    original_validate = markdown_images.validate_archive
+
+    def validate_then_replace(filename, content_type, data):
+        verified_type = original_validate(filename, content_type, data)
+        payload_path.write_bytes(replacement)
+        return verified_type
+
+    monkeypatch.setattr(markdown_images, "validate_archive", validate_then_replace)
+
+    response = client.get(
+        f"/markdown-threads/123456/images/{asset_id}{suffix}",
+        headers=_AUTH_HEADERS,
+    )
+
+    assert response.status_code == 200
+    assert response.content == _ZIP
+    assert payload_path.read_bytes() == replacement
+    assert response.headers["content-type"] == "application/zip"
+    assert response.headers["content-disposition"].startswith("attachment")
+    assert response.headers["cache-control"] == "private, no-store"
 
 
 def test_missing_or_corrupt_assets_are_not_served(tmp_path, monkeypatch):
@@ -1522,3 +1606,70 @@ def test_cleanup_deletes_combined_image_archive_and_all_office_families(
     assert second.status_code == 200
     assert second.json()["deleted_count"] == 0
     assert not (docs_root / "markdown-threads" / "123456" / "images").exists()
+
+
+def test_cleanup_concurrent_deletes_claim_namespace_once_without_residue(
+    tmp_path, monkeypatch
+):
+    docs_root = tmp_path / "docs"
+    monkeypatch.setattr(webapp, "DOCS_ROOT", docs_root)
+    client = TestClient(webapp.app)
+    uploaded = _upload(
+        client,
+        "123456",
+        [
+            ("one.png", _PNG, "image/png"),
+            ("evidence.zip", _ZIP, "application/zip"),
+            ("report.docx", b"office", "application/octet-stream"),
+        ],
+    )
+    assert uploaded.status_code == 200
+    assert uploaded.json()["errors"] == []
+
+    async def scenario():
+        async with AsyncClient(
+            transport=ASGITransport(app=webapp.app, raise_app_exceptions=False),
+            base_url="http://test",
+        ) as async_client:
+            return await asyncio.gather(
+                async_client.delete(
+                    "/markdown-threads/123456/images", headers=_AUTH_HEADERS
+                ),
+                async_client.delete(
+                    "/markdown-threads/123456/images", headers=_AUTH_HEADERS
+                ),
+            )
+
+    responses = asyncio.run(scenario())
+
+    assert [response.status_code for response in responses] == [200, 200]
+    assert sorted(response.json()["deleted_count"] for response in responses) == [
+        0,
+        3,
+    ]
+    namespace_root = docs_root / "markdown-threads" / "123456"
+    assert not (namespace_root / "images").exists()
+    assert list(namespace_root.glob(".images-delete-*")) == []
+
+
+def test_cleanup_counts_only_supported_metadata_and_removes_whole_namespace(
+    tmp_path, monkeypatch
+):
+    docs_root = tmp_path / "docs"
+    monkeypatch.setattr(webapp, "DOCS_ROOT", docs_root)
+    client = TestClient(webapp.app, raise_server_exceptions=False)
+    uploaded = _upload(client, "123456", [("one.png", _PNG, "image/png")])
+    assert uploaded.status_code == 200
+    images_root = docs_root / "markdown-threads" / "123456" / "images"
+    unsupported = images_root / "unsupported"
+    unsupported.mkdir()
+    (unsupported / "payload").write_bytes(b"x")
+    (unsupported / "metadata.json").write_text(
+        json.dumps({"filename": "bad.bin", "content_type": [], "size": 1})
+    )
+
+    response = client.delete("/markdown-threads/123456/images", headers=_AUTH_HEADERS)
+
+    assert response.status_code == 200
+    assert response.json()["deleted_count"] == 1
+    assert not images_root.exists()

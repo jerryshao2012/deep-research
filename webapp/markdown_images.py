@@ -13,11 +13,12 @@ from collections.abc import Callable
 from pathlib import Path
 from threading import Lock
 from typing import Any
+from urllib.parse import quote
 from weakref import WeakKeyDictionary
 
 import filetype
 from fastapi import Header, HTTPException, Request, status
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from starlette.datastructures import UploadFile
 
 from webapp.auth_helpers import is_authenticated
@@ -230,7 +231,17 @@ def _store_asset(
         raise
 
 
-async def _load_asset(markdown_id: str, asset_id: str) -> tuple[Path, dict[str, Any]]:
+def _read_stored_attachment(payload: Path, expected_size: int) -> bytes:
+    with payload.open("rb") as payload_file:
+        data = payload_file.read(min(expected_size, _MAX_IMAGE_BYTES) + 1)
+    if len(data) != expected_size:
+        raise ValueError("stored attachment size changed while reading")
+    return data
+
+
+async def _load_asset(
+    markdown_id: str, asset_id: str
+) -> tuple[Path, dict[str, Any], bytes | None]:
     asset_path = _images_root(markdown_id) / _validated_asset_id(asset_id)
     payload = asset_path / "payload"
     metadata_path = asset_path / "metadata.json"
@@ -253,6 +264,13 @@ async def _load_asset(markdown_id: str, asset_id: str) -> tuple[Path, dict[str, 
             or not isinstance(metadata.get("filename"), str)
             or type(metadata.get("size")) is not int
             or metadata["size"] < 0
+            or (
+                metadata["size"] > _MAX_IMAGE_BYTES
+                and (
+                    stored_content_type == OFFICE_CONTENT_TYPE
+                    or is_stored_archive_content_type(stored_content_type)
+                )
+            )
             or metadata["size"] != payload.stat().st_size
         )
     except OSError as exc:
@@ -270,7 +288,15 @@ async def _load_asset(markdown_id: str, asset_id: str) -> tuple[Path, dict[str, 
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail="Image not found"
             )
-        return payload, metadata
+        try:
+            snapshot = await _run_worker_to_completion(
+                _read_stored_attachment, payload, metadata["size"]
+            )
+        except (OSError, ValueError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="Image not found"
+            ) from exc
+        return payload, metadata, snapshot
 
     if is_stored_archive_content_type(stored_content_type):
         archive_slot_acquired = False
@@ -287,7 +313,9 @@ async def _load_asset(markdown_id: str, asset_id: str) -> tuple[Path, dict[str, 
                     headers={"Retry-After": "2"},
                 ) from exc
             archive_slot_acquired = True
-            validation_data = await _run_worker_to_completion(payload.read_bytes)
+            validation_data = await _run_worker_to_completion(
+                _read_stored_attachment, payload, metadata["size"]
+            )
             verified_type = await _run_worker_to_completion(
                 validate_archive,
                 filename,
@@ -305,7 +333,7 @@ async def _load_asset(markdown_id: str, asset_id: str) -> tuple[Path, dict[str, 
         finally:
             if archive_slot_acquired:
                 _ARCHIVE_BATCH_LIMITER.release()
-        return payload, metadata
+        return payload, metadata, validation_data
 
     try:
         with payload.open("rb") as payload_file:
@@ -321,7 +349,50 @@ async def _load_asset(markdown_id: str, asset_id: str) -> tuple[Path, dict[str, 
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Image not found"
         ) from exc
-    return payload, metadata
+    return payload, metadata, None
+
+
+def _attachment_content_disposition(filename: str) -> str:
+    encoded_filename = quote(filename)
+    if encoded_filename != filename:
+        return f"attachment; filename*=utf-8''{encoded_filename}"
+    return f'attachment; filename="{filename}"'
+
+
+def _count_supported_assets(images_root: Path) -> int:
+    count = 0
+    for child in images_root.iterdir():
+        if not child.is_dir() or child.name.startswith("."):
+            continue
+        try:
+            metadata = json.loads((child / "metadata.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            continue
+        content_type = (
+            metadata.get("content_type") if isinstance(metadata, dict) else None
+        )
+        if isinstance(content_type, str) and content_type in _STORED_CONTENT_TYPES:
+            count += 1
+    return count
+
+
+def _delete_images_namespace(images_root: Path) -> int:
+    while True:
+        tombstone = images_root.with_name(f".{images_root.name}-delete-{uuid.uuid4()}")
+        if tombstone.exists():
+            continue
+        try:
+            images_root.rename(tombstone)
+        except FileNotFoundError:
+            return 0
+        except FileExistsError:
+            continue
+        break
+
+    try:
+        return _count_supported_assets(tombstone)
+    finally:
+        shutil.rmtree(tombstone)
 
 
 def _rollback_request_assets(images_root: Path, asset_ids: list[str]) -> None:
@@ -508,11 +579,22 @@ def register_markdown_image_routes(app) -> None:
         return {"assets": assets, "errors": errors}
 
     async def image_response(markdown_id: str, asset_id: str, *, download: bool):
-        payload, metadata = await _load_asset(markdown_id, asset_id)
+        payload, metadata, attachment_snapshot = await _load_asset(
+            markdown_id, asset_id
+        )
         is_office = metadata["content_type"] == OFFICE_CONTENT_TYPE
         headers = {"Cache-Control": "private, no-store"}
         if is_office:
             headers["X-Content-Type-Options"] = "nosniff"
+        if attachment_snapshot is not None:
+            headers["Content-Disposition"] = _attachment_content_disposition(
+                metadata["filename"]
+            )
+            return Response(
+                content=attachment_snapshot,
+                media_type=metadata["content_type"],
+                headers=headers,
+            )
         return FileResponse(
             path=payload,
             filename=metadata["filename"],
@@ -567,12 +649,7 @@ def register_markdown_image_routes(app) -> None:
                 detail="Invalid or missing API key",
             )
         images_root = _images_root(markdown_id)
-        deleted_count = 0
-        if images_root.is_dir():
-            deleted_count = sum(
-                1
-                for child in images_root.iterdir()
-                if child.is_dir() and not child.name.startswith(".")
-            )
-            await asyncio.to_thread(shutil.rmtree, images_root)
+        deleted_count = await _run_worker_to_completion(
+            _delete_images_namespace, images_root
+        )
         return {"markdown_id": markdown_id, "deleted_count": deleted_count}
