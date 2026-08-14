@@ -3,6 +3,8 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.so
+.container-build-context*/
+.worktrees/
 
 # Virtual environments
 .venv/
@@ -19,7 +21,7 @@ sync-aws/
 .deepeval/
 tests/
 *.ipynb
-documents/
+docs/
 output/
 input/
 deep_research_example.egg-info/
@@ -51,6 +53,7 @@ current_config.json
 
 # Deployment scripts
 .build_version
+all.sh
 build*.sh
 deploy*.sh
 env*.sh
@@ -61,11 +64,13 @@ documents/
 README.md
 AGENTS.md
 CLAUDE.md
+.claude/
 .codex/
 .cce/
-.claude/
 .kun-canvas/
 .kunsdd/
+.superpowers/
+graphify-out/
 
 # Azure deployment configs
 

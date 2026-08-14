@@ -281,33 +281,33 @@ OLD_UMASK=$(umask)
 umask 077
 DOCKER_CREDENTIAL_DIR="$(mktemp -d "/tmp/deep-research-docker-credentials.XXXXXX")"
 umask "$OLD_UMASK"
-DOCKER_PAT_FILE="$DOCKER_CREDENTIAL_DIR/pat"
+# DOCKER_PAT_FILE="$DOCKER_CREDENTIAL_DIR/pat"
 XTRACE_WAS_ENABLED=false
 case "$-" in
   *x*) XTRACE_WAS_ENABLED=true; set +x ;;
 esac
 OLD_UMASK=$(umask)
 umask 077
-if [ -n "${DOCKER_HUB_PAT:-}" ]; then
-  printf '%s' "$DOCKER_HUB_PAT" >"$DOCKER_PAT_FILE"
-fi
-unset DOCKER_HUB_PAT
+# if [ -n "${DOCKER_HUB_PAT:-}" ]; then
+#   printf '%s' "$DOCKER_HUB_PAT" >"$DOCKER_PAT_FILE"
+# fi
+# unset DOCKER_HUB_PAT
 umask "$OLD_UMASK"
-if [ -f "$SCRIPT_DIR/.env" ]; then
-  CREDENTIAL_ARGS=()
-  if [ -z "${DOCKER_HUB_USERNAME:-}" ]; then
-    CREDENTIAL_ARGS+=(--username)
-  fi
-  if [ ! -e "$DOCKER_PAT_FILE" ]; then
-    CREDENTIAL_ARGS+=(--pat-file "$DOCKER_PAT_FILE")
-  fi
-  if [ "${#CREDENTIAL_ARGS[@]}" -gt 0 ]; then
-    FALLBACK_USERNAME=$(python3 "$SCRIPT_DIR/scripts/load_docker_credentials.py" --input "$SCRIPT_DIR/.env" "${CREDENTIAL_ARGS[@]}")
-    if [ -z "${DOCKER_HUB_USERNAME:-}" ] && [ -n "$FALLBACK_USERNAME" ]; then
-      DOCKER_HUB_USERNAME="$FALLBACK_USERNAME"
-    fi
-  fi
-fi
+# if [ -f "$SCRIPT_DIR/.env" ]; then
+#   CREDENTIAL_ARGS=()
+#   if [ -z "${DOCKER_HUB_USERNAME:-}" ]; then
+#     CREDENTIAL_ARGS+=(--username)
+#   fi
+#   if [ ! -e "$DOCKER_PAT_FILE" ]; then
+#     CREDENTIAL_ARGS+=(--pat-file "$DOCKER_PAT_FILE")
+#   fi
+#   if [ "${#CREDENTIAL_ARGS[@]}" -gt 0 ]; then
+#     FALLBACK_USERNAME=$(python3 "$SCRIPT_DIR/scripts/load_docker_credentials.py" --input "$SCRIPT_DIR/.env" "${CREDENTIAL_ARGS[@]}")
+#     if [ -z "${DOCKER_HUB_USERNAME:-}" ] && [ -n "$FALLBACK_USERNAME" ]; then
+#       DOCKER_HUB_USERNAME="$FALLBACK_USERNAME"
+#     fi
+#   fi
+# fi
 if [ "$XTRACE_WAS_ENABLED" = true ]; then
   set -x
 fi
@@ -402,13 +402,14 @@ if [ -z "${DOCKER_HUB_USERNAME:-}" ]; then
   exit 1
 fi
 echo "✅ Using Docker Hub user: $DOCKER_HUB_USERNAME"
-if [ -s "$DOCKER_PAT_FILE" ]; then
-  echo "🔐 Logging into Docker Hub..."
-  container_runtime_login "$DOCKER_HUB_USERNAME" docker.io <"$DOCKER_PAT_FILE"
-fi
-rm -rf -- "$DOCKER_CREDENTIAL_DIR"
-DOCKER_CREDENTIAL_DIR=""
-DOCKER_PAT_FILE=""
+echo "Relying on ambient Docker credentials."
+# if [ -s "$DOCKER_PAT_FILE" ]; then
+#   echo "🔐 Logging into Docker Hub..."
+#   container_runtime_login "$DOCKER_HUB_USERNAME" docker.io <"$DOCKER_PAT_FILE"
+# fi
+# rm -rf -- "$DOCKER_CREDENTIAL_DIR"
+# DOCKER_CREDENTIAL_DIR=""
+# DOCKER_PAT_FILE=""
 end_step
 
 # 5. Increment API version

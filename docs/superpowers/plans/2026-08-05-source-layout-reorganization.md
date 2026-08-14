@@ -621,7 +621,7 @@ Omit generated metadata path from `git add` when it did not change.
 **Files:**
 - Modify: `tests/test_source_layout.py`
 - Modify: every remaining `.py` file reported by failing contract
-- Modify: `research_agent.ipynb`
+- Modify: `../../../documents/research_agent.ipynb`
 
 - [ ] **Step 1: Add failing AST import contract**
 
@@ -707,7 +707,7 @@ modules, or root wrappers.
 
 - [ ] **Step 4: Update notebook code cells**
 
-In `research_agent.ipynb`, change only code-cell source strings:
+In `../../../documents/research_agent.ipynb`, change only code-cell source strings:
 
 ```python
 from research_agent.research_subagent.tools import tavily_search, think_tool
