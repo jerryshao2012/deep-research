@@ -5,9 +5,12 @@ from __future__ import annotations
 import gzip
 import tarfile
 from contextlib import nullcontext
+from dataclasses import replace
 from io import BytesIO
+from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
 
+import py7zr
 import pytest
 
 import webapp.markdown_archive_validation as archive_validation
@@ -124,6 +127,24 @@ def _zip_bytes(filename: str = "report.txt", content: bytes = b"report") -> byte
     buffer = BytesIO()
     with ZipFile(buffer, "w", compression=ZIP_DEFLATED) as archive:
         archive.writestr(filename, content)
+    return buffer.getvalue()
+
+
+def _seven_zip_bytes(
+    entries: list[tuple[str, bytes]] | None = None,
+    *,
+    password: str | None = None,
+    header_encryption: bool = False,
+) -> bytes:
+    buffer = BytesIO()
+    with py7zr.SevenZipFile(
+        buffer,
+        "w",
+        password=password,
+        header_encryption=header_encryption,
+    ) as archive:
+        for filename, content in entries or []:
+            archive.writestr(content, filename)
     return buffer.getvalue()
 
 
@@ -268,6 +289,148 @@ def test_validate_archive_fails_closed_for_recognized_extended_archives(
 ) -> None:
     with pytest.raises(ArchiveValidationError):
         validate_archive(filename, content_type, data)
+
+
+def test_validate_archive_accepts_valid_7z_in_memory() -> None:
+    data = _seven_zip_bytes([("first.txt", b"first"), ("nested/second.txt", b"second")])
+
+    assert validate_archive("evidence.7z", "application/vnd.7zip", data) == (
+        "application/x-7z-compressed"
+    )
+
+
+def test_validate_archive_accepts_valid_empty_7z_in_memory() -> None:
+    data = _seven_zip_bytes()
+
+    assert validate_archive("empty.7z", "application/x-7z-compressed", data) == (
+        "application/x-7z-compressed"
+    )
+
+
+@pytest.mark.parametrize("header_encryption", [False, True])
+def test_validate_archive_rejects_password_protected_7z(
+    header_encryption: bool,
+) -> None:
+    data = _seven_zip_bytes(
+        [("secret.txt", b"secret")],
+        password="password",
+        header_encryption=header_encryption,
+    )
+
+    with pytest.raises(
+        ArchiveValidationError,
+        match="^encrypted 7z archives cannot be validated$",
+    ):
+        validate_archive("secret.7z", "application/x-7z-compressed", data)
+
+
+@pytest.mark.parametrize("damage", ["truncated", "corrupt-header", "corrupt-payload"])
+def test_validate_archive_normalizes_corrupt_7z_errors(damage: str) -> None:
+    valid = _seven_zip_bytes([("report.txt", b"report")])
+    if damage == "truncated":
+        data = valid[:12]
+    else:
+        corrupted = bytearray(valid)
+        corrupted[8 if damage == "corrupt-header" else 32] ^= 0x01
+        data = bytes(corrupted)
+
+    with pytest.raises(ArchiveValidationError) as caught:
+        validate_archive("broken.7z", "application/x-7z-compressed", data)
+
+    assert str(caught.value) == "7z structure or member integrity is invalid"
+
+
+def test_validate_archive_rejects_excess_7z_logical_files() -> None:
+    data = _seven_zip_bytes(
+        [
+            (f"member-{index}.txt", b"")
+            for index in range(archive_validation.MAX_MEMBER_COUNT + 1)
+        ]
+    )
+
+    with pytest.raises(
+        ArchiveValidationError,
+        match="^7z contains too many members$",
+    ):
+        validate_archive("members.7z", "application/x-7z-compressed", data)
+
+
+def test_validate_archive_rejects_excess_declared_7z_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data = _seven_zip_bytes([("report.txt", b"declared")])
+    monkeypatch.setattr(archive_validation, "MAX_TOTAL_UNCOMPRESSED_BYTES", 7)
+
+    with pytest.raises(
+        ArchiveValidationError,
+        match="^7z uncompressed size exceeds validation limit$",
+    ):
+        validate_archive("oversized.7z", "application/x-7z-compressed", data)
+
+
+def test_validate_archive_caps_actual_7z_decoded_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data = _seven_zip_bytes([("report.txt", b"decoded")])
+    original_list = py7zr.SevenZipFile.list
+
+    def underreport_sizes(archive: py7zr.SevenZipFile) -> list[py7zr.FileInfo]:
+        return [replace(member, uncompressed=0) for member in original_list(archive)]
+
+    monkeypatch.setattr(archive_validation, "MAX_TOTAL_UNCOMPRESSED_BYTES", 6)
+    monkeypatch.setattr(py7zr.SevenZipFile, "list", underreport_sizes)
+
+    with pytest.raises(
+        ArchiveValidationError,
+        match="^7z decoded output exceeds validation limit$",
+    ):
+        validate_archive("oversized.7z", "application/x-7z-compressed", data)
+
+
+def test_validate_archive_excludes_7z_directories_from_limits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data = _seven_zip_bytes([("report.txt", b"report")])
+    original_list = py7zr.SevenZipFile.list
+
+    def include_directory(archive: py7zr.SevenZipFile) -> list[py7zr.FileInfo]:
+        members = original_list(archive)
+        directory = replace(
+            members[0],
+            filename="nested",
+            uncompressed=10_000,
+            is_directory=True,
+            is_file=False,
+        )
+        return [directory, *members]
+
+    monkeypatch.setattr(archive_validation, "MAX_MEMBER_COUNT", 1)
+    monkeypatch.setattr(archive_validation, "MAX_TOTAL_UNCOMPRESSED_BYTES", 6)
+    monkeypatch.setattr(py7zr.SevenZipFile, "list", include_directory)
+
+    assert validate_archive("evidence.7z", "application/x-7z-compressed", data) == (
+        "application/x-7z-compressed"
+    )
+
+
+def test_validate_archive_never_uses_filesystem_7z_extraction_methods(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data = _seven_zip_bytes([("nested/report.txt", b"report")])
+
+    def fail_if_called(*args: object, **kwargs: object) -> None:
+        pytest.fail("filesystem API called during 7z validation")
+
+    monkeypatch.setattr("builtins.open", fail_if_called)
+    monkeypatch.setattr("tempfile.NamedTemporaryFile", fail_if_called)
+    monkeypatch.setattr("tempfile.TemporaryDirectory", fail_if_called)
+    monkeypatch.setattr(Path, "mkdir", fail_if_called)
+    monkeypatch.setattr(Path, "open", fail_if_called)
+    monkeypatch.setattr(Path, "touch", fail_if_called)
+    monkeypatch.setattr(Path, "write_bytes", fail_if_called)
+    monkeypatch.setattr(Path, "write_text", fail_if_called)
+
+    validate_archive("evidence.7z", "application/x-7z-compressed", data)
 
 
 def test_validate_archive_rejects_zip_declared_expansion_over_limit() -> None:

@@ -10,6 +10,10 @@ from tarfile import TarError
 from zipfile import BadZipFile, LargeZipFile, ZipFile
 from zlib import error as ZlibError
 
+from py7zr import SevenZipFile
+from py7zr.exceptions import PasswordRequired
+from py7zr.io import Py7zIO, WriterFactory
+
 
 class ArchiveValidationError(ValueError):
     """Raised when an uploaded archive cannot be safely validated."""
@@ -109,6 +113,7 @@ _ZIP_VALIDATION_CHUNK_BYTES = 1024 * 1024
 
 MAX_MEMBER_COUNT = 1_000
 MAX_EXPANDED_BYTES = 100 * 1024 * 1024
+MAX_TOTAL_UNCOMPRESSED_BYTES = 100 * 1024 * 1024
 MAX_TAR_METADATA_RECORDS = (2 * MAX_MEMBER_COUNT) + 1
 MAX_TAR_METADATA_BYTES = 1024 * 1024
 MAX_TAR_ZERO_BLOCKS = 20
@@ -123,6 +128,61 @@ MAX_TAR_STREAM_BYTES = (
 _TAR_BLOCK_BYTES = 512
 _TAR_METADATA_TYPE_FLAGS = frozenset({b"x", b"X", b"g", b"L", b"K"})
 _TAR_VALIDATION_CHUNK_BYTES = 1024 * 1024
+
+
+@dataclass
+class _SevenZipDecodedBudget:
+    decoded_bytes: int = 0
+
+    def consume(self, size: int) -> None:
+        self.decoded_bytes += size
+        if self.decoded_bytes > MAX_TOTAL_UNCOMPRESSED_BYTES:
+            raise ArchiveValidationError("7z decoded output exceeds validation limit")
+
+
+class _SevenZipDiscardIO(Py7zIO):
+    def __init__(self, budget: _SevenZipDecodedBudget) -> None:
+        self._budget = budget
+        self._position = 0
+        self._size = 0
+
+    def write(self, data: bytes | bytearray) -> int:
+        size = len(data)
+        self._budget.consume(size)
+        self._position += size
+        self._size = max(self._size, self._position)
+        return size
+
+    def read(self, size: int | None = None) -> bytes:
+        return b""
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        if whence == 0:
+            position = offset
+        elif whence == 1:
+            position = self._position + offset
+        elif whence == 2:
+            position = self._size + offset
+        else:
+            raise ValueError("invalid whence")
+        if position < 0:
+            raise ValueError("negative seek position")
+        self._position = position
+        return position
+
+    def flush(self) -> None:
+        return None
+
+    def size(self) -> int:
+        return self._size
+
+
+class _SevenZipDiscardFactory(WriterFactory):
+    def __init__(self, budget: _SevenZipDecodedBudget) -> None:
+        self._budget = budget
+
+    def create(self, filename: str) -> Py7zIO:
+        return _SevenZipDiscardIO(self._budget)
 
 
 def archive_format_for_filename(filename: str) -> str | None:
@@ -196,6 +256,56 @@ def _validate_zip(data: bytes) -> None:
     ):
         raise ArchiveValidationError(
             "ZIP structure or member integrity is invalid"
+        ) from None
+
+
+def _validate_7z(data: bytes) -> None:
+    try:
+        with SevenZipFile(BytesIO(data), mode="r") as archive:
+            if archive.needs_password():
+                raise ArchiveValidationError(
+                    "encrypted 7z archives cannot be validated"
+                )
+            members = [member for member in archive.list() if not member.is_directory]
+            if len(members) > MAX_MEMBER_COUNT:
+                raise ArchiveValidationError("7z contains too many members")
+
+            declared_bytes = 0
+            for member in members:
+                if member.uncompressed < 0:
+                    raise ArchiveValidationError(
+                        "7z structure or member integrity is invalid"
+                    )
+                declared_bytes += member.uncompressed
+                if declared_bytes > MAX_TOTAL_UNCOMPRESSED_BYTES:
+                    raise ArchiveValidationError(
+                        "7z uncompressed size exceeds validation limit"
+                    )
+
+            if members and archive.test() is False:
+                raise ArchiveValidationError(
+                    "7z structure or member integrity is invalid"
+                )
+
+        if not members:
+            return
+
+        budget = _SevenZipDecodedBudget()
+        with SevenZipFile(BytesIO(data), mode="r") as archive:
+            if archive.needs_password():
+                raise ArchiveValidationError(
+                    "encrypted 7z archives cannot be validated"
+                )
+            archive.extractall(factory=_SevenZipDiscardFactory(budget))
+    except ArchiveValidationError:
+        raise
+    except PasswordRequired:
+        raise ArchiveValidationError(
+            "encrypted 7z archives cannot be validated"
+        ) from None
+    except Exception:
+        raise ArchiveValidationError(
+            "7z structure or member integrity is invalid"
         ) from None
 
 
@@ -457,6 +567,10 @@ def validate_archive(filename: str, content_type: str | None, data: bytes) -> st
 
     if archive_format == ".zip":
         _validate_zip(data)
+        return spec.normalized_content_type
+
+    if archive_format == ".7z":
+        _validate_7z(data)
         return spec.normalized_content_type
 
     if archive_format == ".tar":
