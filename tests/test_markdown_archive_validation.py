@@ -9,7 +9,8 @@ from dataclasses import replace
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
-from zipfile import ZIP_DEFLATED, ZipFile
+from zipfile import ZIP_BZIP2, ZIP_DEFLATED, ZIP_LZMA, ZIP_STORED, ZipFile
+from zlib import crc32
 
 import py7zr
 import pytest
@@ -131,6 +132,57 @@ def _zip_bytes(filename: str = "report.txt", content: bytes = b"report") -> byte
     with ZipFile(buffer, "w", compression=ZIP_DEFLATED) as archive:
         archive.writestr(filename, content)
     return buffer.getvalue()
+
+
+def _zip_bytes_with_compression(content: bytes, compression: int) -> bytes:
+    buffer = BytesIO()
+    with ZipFile(buffer, "w", compression=compression) as archive:
+        archive.writestr("report.txt", content)
+    return buffer.getvalue()
+
+
+def _forge_zip_metadata(
+    data: bytes,
+    *,
+    file_size: int | None = None,
+    checksum: int | None = None,
+) -> bytes:
+    forged = bytearray(data)
+    central_header = forged.index(b"PK\x01\x02")
+    if file_size is not None:
+        forged[22:26] = file_size.to_bytes(4, "little")
+        forged[central_header + 24 : central_header + 28] = file_size.to_bytes(
+            4, "little"
+        )
+    if checksum is not None:
+        forged[14:18] = checksum.to_bytes(4, "little")
+        forged[central_header + 16 : central_header + 20] = checksum.to_bytes(
+            4, "little"
+        )
+    return bytes(forged)
+
+
+def _zip_with_trailing_compressed_byte(compression: int = ZIP_DEFLATED) -> bytes:
+    forged = bytearray(
+        _zip_bytes_with_compression(b"payload" * 100, compression=compression)
+    )
+    central_header = forged.index(b"PK\x01\x02")
+    end_header = forged.index(b"PK\x05\x06")
+    compressed_size = int.from_bytes(
+        forged[central_header + 20 : central_header + 24], "little"
+    )
+    filename_size = int.from_bytes(forged[26:28], "little")
+    extra_size = int.from_bytes(forged[28:30], "little")
+    compressed_end = 30 + filename_size + extra_size + compressed_size
+    forged[compressed_end:compressed_end] = b"x"
+    central_header += 1
+    end_header += 1
+    forged[18:22] = (compressed_size + 1).to_bytes(4, "little")
+    forged[central_header + 20 : central_header + 24] = (compressed_size + 1).to_bytes(
+        4, "little"
+    )
+    forged[end_header + 16 : end_header + 20] = central_header.to_bytes(4, "little")
+    return bytes(forged)
 
 
 def _seven_zip_bytes(
@@ -437,7 +489,7 @@ def test_validate_archive_caps_cumulative_actual_7z_decoded_output(
         validate_archive("oversized.7z", "application/x-7z-compressed", data)
 
 
-def test_validate_archive_excludes_7z_directories_from_limits(
+def test_validate_archive_counts_7z_directories_toward_entry_limit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     data = _seven_zip_bytes([("report.txt", b"report")])
@@ -458,9 +510,75 @@ def test_validate_archive_excludes_7z_directories_from_limits(
     monkeypatch.setattr(archive_validation, "MAX_TOTAL_UNCOMPRESSED_BYTES", 6)
     monkeypatch.setattr(py7zr.SevenZipFile, "list", include_directory)
 
-    assert validate_archive("evidence.7z", "application/x-7z-compressed", data) == (
-        "application/x-7z-compressed"
-    )
+    with pytest.raises(
+        ArchiveValidationError,
+        match="^7z contains too many members$",
+    ):
+        validate_archive("evidence.7z", "application/x-7z-compressed", data)
+
+
+@pytest.mark.parametrize(
+    ("method", "properties"),
+    [
+        (
+            COMPRESSION_METHOD.LZMA,
+            b"\x5d" + (100 * 1024 * 1024 + 1).to_bytes(4, "little"),
+        ),
+        (COMPRESSION_METHOD.LZMA2, b"\x1e"),
+        (
+            COMPRESSION_METHOD.PPMD,
+            b"\x06" + (100 * 1024 * 1024 + 1).to_bytes(4, "little"),
+        ),
+    ],
+    ids=("lzma1", "lzma2", "ppmd"),
+)
+def test_validate_archive_rejects_7z_decoder_memory_before_construction(
+    monkeypatch: pytest.MonkeyPatch,
+    method: bytes,
+    properties: bytes,
+) -> None:
+    data = _seven_zip_bytes()
+    original_open = archive_validation.SevenZipFile
+    original_get_decompressor = Folder.get_decompressor
+    oversized_folder: Folder | None = None
+
+    def open_with_oversized_decoder(
+        *args: object, **kwargs: object
+    ) -> py7zr.SevenZipFile:
+        nonlocal oversized_folder
+        archive = original_open(*args, **kwargs)
+        oversized_folder = Folder()
+        oversized_folder.coders = [
+            {
+                "method": method,
+                "numinstreams": 1,
+                "numoutstreams": 1,
+                "properties": properties,
+            }
+        ]
+        oversized_folder.unpacksizes = [0]
+        archive.header.main_streams = SimpleNamespace(
+            unpackinfo=SimpleNamespace(folders=[oversized_folder])
+        )
+        return archive
+
+    def fail_if_decoder_created(
+        folder: Folder, *args: object, **kwargs: object
+    ) -> object:
+        if folder is oversized_folder:
+            raise AssertionError(
+                "decoder created before memory properties were bounded"
+            )
+        return original_get_decompressor(folder, *args, **kwargs)
+
+    monkeypatch.setattr(archive_validation, "SevenZipFile", open_with_oversized_decoder)
+    monkeypatch.setattr(Folder, "get_decompressor", fail_if_decoder_created)
+
+    with pytest.raises(
+        ArchiveValidationError,
+        match="^7z decoder memory exceeds validation limit$",
+    ):
+        validate_archive("oversized.7z", "application/x-7z-compressed", data)
 
 
 def test_validate_archive_never_uses_filesystem_7z_extraction_methods(
@@ -495,6 +613,94 @@ def test_validate_archive_rejects_zip_declared_expansion_over_limit() -> None:
         match="^ZIP uncompressed size exceeds validation limit$",
     ):
         validate_archive("oversized.zip", "application/zip", bytes(data))
+
+
+def test_validate_archive_counts_actual_zip_output_not_forged_file_size(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    content = b"a" * (1024 * 1024)
+    data = _forge_zip_metadata(
+        _zip_bytes(content=content),
+        file_size=1,
+        checksum=crc32(content[:1]),
+    )
+    monkeypatch.setattr(archive_validation, "MAX_TOTAL_UNCOMPRESSED_BYTES", 512)
+
+    with pytest.raises(
+        ArchiveValidationError,
+        match="^ZIP expanded payload exceeds validation limit$",
+    ):
+        validate_archive("forged.zip", "application/zip", data)
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"file_size": len(b"payload") - 1},
+        {"checksum": crc32(b"different")},
+    ],
+    ids=("byte-count", "crc"),
+)
+def test_validate_archive_requires_exact_zip_member_metadata(
+    metadata: dict[str, int],
+) -> None:
+    data = _forge_zip_metadata(_zip_bytes(content=b"payload"), **metadata)
+
+    with pytest.raises(
+        ArchiveValidationError,
+        match="^ZIP structure or member integrity is invalid$",
+    ):
+        validate_archive("forged.zip", "application/zip", data)
+
+
+@pytest.mark.parametrize(
+    "compression",
+    [ZIP_DEFLATED, ZIP_BZIP2, ZIP_LZMA],
+    ids=("deflate", "bzip2", "lzma"),
+)
+def test_validate_archive_rejects_trailing_bytes_in_zip_compressed_stream(
+    compression: int,
+) -> None:
+    with pytest.raises(
+        ArchiveValidationError,
+        match="^ZIP structure or member integrity is invalid$",
+    ):
+        validate_archive(
+            "trailing.zip",
+            "application/zip",
+            _zip_with_trailing_compressed_byte(compression),
+        )
+
+
+@pytest.mark.parametrize(
+    "compression",
+    [ZIP_STORED, ZIP_DEFLATED, ZIP_BZIP2, ZIP_LZMA],
+    ids=("stored", "deflate", "bzip2", "lzma"),
+)
+def test_validate_archive_physically_validates_python_zip_methods(
+    compression: int,
+) -> None:
+    data = _zip_bytes_with_compression(b"validated" * 10_000, compression)
+
+    assert validate_archive("methods.zip", "application/zip", data) == (
+        "application/zip"
+    )
+
+
+def test_validate_archive_caps_cumulative_actual_zip_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    buffer = BytesIO()
+    with ZipFile(buffer, "w", compression=ZIP_DEFLATED) as archive:
+        archive.writestr("first.txt", b"12345")
+        archive.writestr("second.txt", b"67890")
+    monkeypatch.setattr(archive_validation, "MAX_TOTAL_UNCOMPRESSED_BYTES", 8)
+
+    with pytest.raises(
+        ArchiveValidationError,
+        match="^ZIP expanded payload exceeds validation limit$",
+    ):
+        validate_archive("cumulative.zip", "application/zip", buffer.getvalue())
 
 
 @pytest.mark.parametrize(

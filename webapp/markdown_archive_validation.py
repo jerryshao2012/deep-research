@@ -2,17 +2,30 @@
 
 from __future__ import annotations
 
+import bz2
+import lzma
 import tarfile
+import zlib
 from dataclasses import dataclass
 from gzip import BadGzipFile, GzipFile
 from io import BytesIO
 from tarfile import TarError
-from zipfile import BadZipFile, LargeZipFile, ZipFile
+from zipfile import (
+    ZIP_BZIP2,
+    ZIP_DEFLATED,
+    ZIP_LZMA,
+    ZIP_STORED,
+    BadZipFile,
+    LargeZipFile,
+    ZipFile,
+    ZipInfo,
+)
 from zlib import error as ZlibError
 
 from py7zr import SevenZipFile, UnsupportedCompressionMethodError
 from py7zr.exceptions import PasswordRequired
 from py7zr.io import Py7zIO, WriterFactory
+from py7zr.properties import COMPRESSION_METHOD
 
 
 class ArchiveValidationError(ValueError):
@@ -110,10 +123,12 @@ ARCHIVE_CONTENT_TYPES = frozenset(spec.normalized_content_type for spec in _FORM
 _MAX_ZIP_MEMBER_COUNT = 1_000
 _MAX_ZIP_UNCOMPRESSED_BYTES = 100 * 1024 * 1024
 _ZIP_VALIDATION_CHUNK_BYTES = 1024 * 1024
+_ZIP_LOCAL_HEADER_BYTES = 30
 
 MAX_MEMBER_COUNT = 1_000
 MAX_EXPANDED_BYTES = 100 * 1024 * 1024
 MAX_TOTAL_UNCOMPRESSED_BYTES = 100 * 1024 * 1024
+_MAX_7Z_DECODER_MEMORY_BYTES = 100 * 1024 * 1024
 MAX_TAR_METADATA_RECORDS = (2 * MAX_MEMBER_COUNT) + 1
 MAX_TAR_METADATA_BYTES = 1024 * 1024
 MAX_TAR_ZERO_BLOCKS = 20
@@ -222,6 +237,130 @@ def is_extended_archive_filename(filename: str) -> bool:
     return archive_format is not None and archive_format != ".zip"
 
 
+def _zip_compressed_payload(data: bytes, member: ZipInfo) -> memoryview:
+    header_offset = member.header_offset
+    if header_offset < 0 or header_offset + _ZIP_LOCAL_HEADER_BYTES > len(data):
+        raise BadZipFile("truncated local header")
+    if data[header_offset : header_offset + 4] != b"PK\x03\x04":
+        raise BadZipFile("invalid local header")
+
+    name_bytes = int.from_bytes(data[header_offset + 26 : header_offset + 28], "little")
+    extra_bytes = int.from_bytes(
+        data[header_offset + 28 : header_offset + 30], "little"
+    )
+    payload_start = header_offset + _ZIP_LOCAL_HEADER_BYTES + name_bytes + extra_bytes
+    payload_end = payload_start + member.compress_size
+    if payload_end < payload_start or payload_end > len(data):
+        raise BadZipFile("truncated compressed payload")
+    return memoryview(data)[payload_start:payload_end]
+
+
+def _zip_lzma_decompressor(payload: memoryview) -> tuple[lzma.LZMADecompressor, int]:
+    if len(payload) < 4:
+        raise BadZipFile("truncated LZMA properties")
+    properties_size = int.from_bytes(payload[2:4], "little")
+    properties_end = 4 + properties_size
+    if properties_size != 5 or properties_end > len(payload):
+        raise BadZipFile("invalid LZMA properties")
+
+    properties = payload[4:properties_end]
+    property_byte = properties[0]
+    if property_byte >= 9 * 5 * 5:
+        raise BadZipFile("invalid LZMA properties")
+    lc = property_byte % 9
+    remainder = property_byte // 9
+    lp = remainder % 5
+    pb = remainder // 5
+    dictionary_size = int.from_bytes(properties[1:5], "little")
+    if dictionary_size > MAX_TOTAL_UNCOMPRESSED_BYTES:
+        raise BadZipFile("LZMA dictionary exceeds validation limit")
+    return (
+        lzma.LZMADecompressor(
+            format=lzma.FORMAT_RAW,
+            filters=[
+                {
+                    "id": lzma.FILTER_LZMA1,
+                    "dict_size": dictionary_size,
+                    "lc": lc,
+                    "lp": lp,
+                    "pb": pb,
+                }
+            ],
+        ),
+        properties_end,
+    )
+
+
+def _validate_zip_member_payload(
+    data: bytes, member: ZipInfo, expanded_bytes: int
+) -> int:
+    payload = _zip_compressed_payload(data, member)
+    member_bytes = 0
+    checksum = 0
+
+    def consume(output: bytes) -> None:
+        nonlocal checksum, expanded_bytes, member_bytes
+        member_bytes += len(output)
+        expanded_bytes += len(output)
+        if expanded_bytes > MAX_TOTAL_UNCOMPRESSED_BYTES:
+            raise ArchiveValidationError(
+                "ZIP expanded payload exceeds validation limit"
+            )
+        checksum = zlib.crc32(output, checksum)
+
+    if member.compress_type == ZIP_STORED:
+        for offset in range(0, len(payload), _ZIP_VALIDATION_CHUNK_BYTES):
+            consume(bytes(payload[offset : offset + _ZIP_VALIDATION_CHUNK_BYTES]))
+    elif member.compress_type == ZIP_DEFLATED:
+        decompressor = zlib.decompressobj(-15)
+        for offset in range(0, len(payload), _ZIP_VALIDATION_CHUNK_BYTES):
+            pending = payload[offset : offset + _ZIP_VALIDATION_CHUNK_BYTES]
+            while pending:
+                output = decompressor.decompress(
+                    pending, MAX_TOTAL_UNCOMPRESSED_BYTES - expanded_bytes + 1
+                )
+                consume(output)
+                pending = decompressor.unconsumed_tail
+        if not decompressor.eof or decompressor.unused_data:
+            raise BadZipFile("incomplete or trailing DEFLATE stream")
+    elif member.compress_type == ZIP_BZIP2:
+        decompressor = bz2.BZ2Decompressor()
+        for offset in range(0, len(payload), _ZIP_VALIDATION_CHUNK_BYTES):
+            chunk_end = min(offset + _ZIP_VALIDATION_CHUNK_BYTES, len(payload))
+            pending = payload[offset:chunk_end]
+            while not decompressor.eof and (pending or not decompressor.needs_input):
+                output = decompressor.decompress(
+                    pending, MAX_TOTAL_UNCOMPRESSED_BYTES - expanded_bytes + 1
+                )
+                consume(output)
+                pending = b""
+            if decompressor.eof and chunk_end != len(payload):
+                raise BadZipFile("trailing BZIP2 stream data")
+        if not decompressor.eof or decompressor.unused_data:
+            raise BadZipFile("incomplete or trailing BZIP2 stream")
+    elif member.compress_type == ZIP_LZMA:
+        decompressor, payload_offset = _zip_lzma_decompressor(payload)
+        for offset in range(payload_offset, len(payload), _ZIP_VALIDATION_CHUNK_BYTES):
+            chunk_end = min(offset + _ZIP_VALIDATION_CHUNK_BYTES, len(payload))
+            pending = payload[offset:chunk_end]
+            while not decompressor.eof and (pending or not decompressor.needs_input):
+                output = decompressor.decompress(
+                    pending, MAX_TOTAL_UNCOMPRESSED_BYTES - expanded_bytes + 1
+                )
+                consume(output)
+                pending = b""
+            if decompressor.eof and chunk_end != len(payload):
+                raise BadZipFile("trailing LZMA stream data")
+        if not decompressor.eof or decompressor.unused_data:
+            raise BadZipFile("incomplete or trailing LZMA stream")
+    else:
+        raise NotImplementedError("unsupported ZIP compression method")
+
+    if member_bytes != member.file_size or checksum != member.CRC:
+        raise BadZipFile("ZIP member metadata does not match decoded payload")
+    return expanded_bytes
+
+
 def _validate_zip(data: bytes) -> None:
     try:
         with ZipFile(BytesIO(data)) as archive:
@@ -239,14 +378,18 @@ def _validate_zip(data: bytes) -> None:
                 raise ArchiveValidationError(
                     "encrypted ZIP members cannot be validated"
                 )
+            expanded_bytes = 0
             for member in members:
-                with archive.open(member) as member_file:
-                    while member_file.read(_ZIP_VALIDATION_CHUNK_BYTES):
-                        pass
+                expanded_bytes = _validate_zip_member_payload(
+                    data, member, expanded_bytes
+                )
+                with archive.open(member):
+                    pass
     except ArchiveValidationError:
         raise
     except (
         BadZipFile,
+        lzma.LZMAError,
         LargeZipFile,
         NotImplementedError,
         OSError,
@@ -259,12 +402,51 @@ def _validate_zip(data: bytes) -> None:
         ) from None
 
 
-def _validate_7z_coder_chains(archive: SevenZipFile) -> None:
+def _validate_7z_coder_chains(
+    archive: SevenZipFile, *, construct_decoders: bool = True
+) -> None:
     main_streams = archive.header.main_streams
     if main_streams is None:
         return
     for folder in main_streams.unpackinfo.folders:
-        folder.get_decompressor(0, reset=True)
+        for coder in folder.coders:
+            method = coder.get("method")
+            properties = coder.get("properties")
+            decoder_memory = 0
+            if method == COMPRESSION_METHOD.LZMA:
+                if not isinstance(properties, bytes) or len(properties) != 5:
+                    raise ArchiveValidationError(
+                        "7z structure or member integrity is invalid"
+                    )
+                decoder_memory = int.from_bytes(properties[1:5], "little")
+            elif method == COMPRESSION_METHOD.LZMA2:
+                if not isinstance(properties, bytes) or len(properties) != 1:
+                    raise ArchiveValidationError(
+                        "7z structure or member integrity is invalid"
+                    )
+                property_byte = properties[0]
+                if property_byte > 40:
+                    raise ArchiveValidationError(
+                        "7z structure or member integrity is invalid"
+                    )
+                decoder_memory = (
+                    0xFFFFFFFF
+                    if property_byte == 40
+                    else (2 | (property_byte & 1)) << (property_byte // 2 + 11)
+                )
+            elif method == COMPRESSION_METHOD.PPMD:
+                if not isinstance(properties, bytes) or len(properties) not in {5, 7}:
+                    raise ArchiveValidationError(
+                        "7z structure or member integrity is invalid"
+                    )
+                decoder_memory = int.from_bytes(properties[1:5], "little")
+
+            if decoder_memory > _MAX_7Z_DECODER_MEMORY_BYTES:
+                raise ArchiveValidationError(
+                    "7z decoder memory exceeds validation limit"
+                )
+        if construct_decoders:
+            folder.get_decompressor(0, reset=True)
 
 
 def _validate_7z(data: bytes) -> None:
@@ -275,9 +457,10 @@ def _validate_7z(data: bytes) -> None:
                     "encrypted 7z archives cannot be validated"
                 )
             _validate_7z_coder_chains(archive)
-            members = [member for member in archive.list() if not member.is_directory]
-            if len(members) > MAX_MEMBER_COUNT:
+            entries = archive.list()
+            if len(entries) > MAX_MEMBER_COUNT:
                 raise ArchiveValidationError("7z contains too many members")
+            members = [member for member in entries if not member.is_directory]
 
             declared_bytes = 0
             for member in members:
@@ -305,6 +488,7 @@ def _validate_7z(data: bytes) -> None:
                 raise ArchiveValidationError(
                     "encrypted 7z archives cannot be validated"
                 )
+            _validate_7z_coder_chains(archive, construct_decoders=False)
             archive.extractall(factory=_SevenZipDiscardFactory(budget))
     except ArchiveValidationError:
         raise
