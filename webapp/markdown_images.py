@@ -159,17 +159,6 @@ def _is_archive_candidate(filename: str, content_type: str | None) -> bool:
     return not is_office_upload(filename) and is_archive_upload(filename, content_type)
 
 
-def _archive_candidate_needs_slot(
-    filename: str,
-    content_type: str | None,
-    *,
-    extended_uploads_enabled: bool,
-) -> bool:
-    if not _is_archive_candidate(filename, content_type):
-        return False
-    return extended_uploads_enabled or not is_extended_archive_filename(filename)
-
-
 async def _run_worker_to_completion[T](
     function: Callable[..., T], /, *args: Any, **kwargs: Any
 ) -> T:
@@ -333,13 +322,8 @@ def register_markdown_image_routes(app) -> None:
                     detail="files must contain uploaded assets",
                 )
             archive_slot_acquired = False
-            extended_uploads_enabled = _extended_attachment_uploads_enabled()
             needs_archive_slot = any(
-                _archive_candidate_needs_slot(
-                    upload.filename or "",
-                    upload.content_type,
-                    extended_uploads_enabled=extended_uploads_enabled,
-                )
+                _is_archive_candidate(upload.filename or "", upload.content_type)
                 for upload in files
             )
             if needs_archive_slot:
@@ -356,6 +340,7 @@ def register_markdown_image_routes(app) -> None:
                     ) from exc
                 archive_slot_acquired = True
             try:
+                extended_uploads_enabled = _extended_attachment_uploads_enabled()
                 for upload in files:
                     raw_filename = upload.filename or ""
                     try:

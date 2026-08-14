@@ -860,10 +860,11 @@ def test_cancelled_storage_waits_then_rolls_back_completed_and_current_assets(
     assert not images_root.exists() or not any(images_root.iterdir())
 
 
-def test_feature_gate_disabled_candidates_skip_saturated_archive_limiter(
+def test_feature_gate_disabled_archive_candidates_wait_on_saturated_limiter(
     tmp_path, monkeypatch
 ):
-    monkeypatch.setattr(webapp, "DOCS_ROOT", tmp_path / "docs")
+    docs_root = tmp_path / "docs"
+    monkeypatch.setattr(webapp, "DOCS_ROOT", docs_root)
     monkeypatch.setenv("MARKDOWN_EXTENDED_ATTACHMENT_UPLOADS_ENABLED", "false")
     monkeypatch.setattr(markdown_images, "_ARCHIVE_BATCH_LIMITER", asyncio.Semaphore(0))
     monkeypatch.setattr(markdown_images, "_ARCHIVE_BATCH_WAIT_SECONDS", 0.001)
@@ -880,18 +881,39 @@ def test_feature_gate_disabled_candidates_skip_saturated_archive_limiter(
         ],
     )
 
-    assert response.status_code == 200
-    assert response.json()["assets"] == []
-    assert [error["filename"] for error in response.json()["errors"]] == [
-        "evidence.7z",
-        "evidence.tar",
-        "evidence.tgz",
-        "report.docx",
-    ]
-    assert all(
-        error["code"] == "extended_attachment_upload_disabled"
-        for error in response.json()["errors"]
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Archive validation is busy"}
+    assert response.headers["retry-after"] == "2"
+    assert not (docs_root / "markdown-threads" / "123456" / "images").exists()
+
+
+def test_feature_gate_disabled_office_only_batch_skips_saturated_archive_limiter(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(webapp, "DOCS_ROOT", tmp_path / "docs")
+    monkeypatch.setenv("MARKDOWN_EXTENDED_ATTACHMENT_UPLOADS_ENABLED", "false")
+    monkeypatch.setattr(markdown_images, "_ARCHIVE_BATCH_LIMITER", asyncio.Semaphore(0))
+    monkeypatch.setattr(markdown_images, "_ARCHIVE_BATCH_WAIT_SECONDS", 0.001)
+    client = TestClient(webapp.app)
+
+    response = _upload(
+        client,
+        "123456",
+        [
+            ("chart.png", _PNG, "image/png"),
+            ("report.docx", b"office", "application/x-tar"),
+        ],
     )
+
+    assert response.status_code == 200
+    assert [asset["filename"] for asset in response.json()["assets"]] == ["chart.png"]
+    assert response.json()["errors"] == [
+        {
+            "filename": "report.docx",
+            "code": "extended_attachment_upload_disabled",
+            "message": "Extended archive and Microsoft Office uploads are disabled",
+        }
+    ]
 
 
 def test_feature_gate_disabled_batch_with_zip_still_waits_for_archive_limiter(
