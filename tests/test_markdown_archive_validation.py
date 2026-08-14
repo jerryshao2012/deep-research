@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gzip
+import tarfile
 from io import BytesIO
 from zipfile import ZIP_DEFLATED, ZipFile
 
@@ -335,6 +336,19 @@ def test_validate_archive_rejects_tar_with_bad_header_checksum() -> None:
     assert str(caught.value) == "TAR structure or member integrity is invalid"
 
 
+def test_validate_archive_rejects_bad_checksum_in_middle_tar_header() -> None:
+    first = _tar_record("first.txt", b"first")
+    second = _tar_record("second.txt", b"second")
+    third = _tar_record("third.txt", b"third")
+    data = bytearray(_raw_tar(first, second, third))
+    data[len(first)] ^= 0x01
+
+    with pytest.raises(ArchiveValidationError) as caught:
+        validate_archive("broken.tar", "application/x-tar", bytes(data))
+
+    assert str(caught.value) == "TAR structure or member integrity is invalid"
+
+
 def test_validate_archive_rejects_tar_declared_expansion_over_limit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -450,6 +464,39 @@ def test_validate_archive_rejects_gzip_tar_crc_corruption() -> None:
         validate_archive("broken.tar.gz", "application/gzip", bytes(data))
 
     assert str(caught.value) == "gzip TAR structure or integrity is invalid"
+
+
+def test_validate_archive_rejects_gzip_tar_truncated_in_valid_stream_trailer() -> None:
+    valid_gzip = gzip.compress(_raw_tar(_tar_record("report.txt", b"report")))
+
+    with pytest.raises(ArchiveValidationError) as caught:
+        validate_archive("broken.tar.gz", "application/gzip", valid_gzip[:-4])
+
+    assert str(caught.value) == "gzip TAR structure or integrity is invalid"
+
+
+@pytest.mark.parametrize(
+    ("filename", "content_type", "compress"),
+    [
+        ("evidence.tar", "application/x-tar", False),
+        ("evidence.tgz", "application/gzip", True),
+    ],
+)
+def test_validate_archive_never_uses_filesystem_tar_extraction_methods(
+    filename: str,
+    content_type: str,
+    compress: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_if_called(*args: object, **kwargs: object) -> None:
+        pytest.fail("filesystem TAR extraction method called")
+
+    monkeypatch.setattr(tarfile.TarFile, "extract", fail_if_called)
+    monkeypatch.setattr(tarfile.TarFile, "extractall", fail_if_called)
+    raw_tar = _raw_tar(_tar_record("report.txt", b"report"))
+    data = gzip.compress(raw_tar) if compress else raw_tar
+
+    validate_archive(filename, content_type, data)
 
 
 def test_validate_archive_caps_actual_gzip_decompressed_stream(

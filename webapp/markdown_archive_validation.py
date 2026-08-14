@@ -199,7 +199,7 @@ def _validate_zip(data: bytes) -> None:
         ) from None
 
 
-def _parse_tar_size(field: bytes) -> int:
+def _parse_tar_number(field: bytes) -> int:
     if field[0] & 0x80:
         if field[0] & 0x40:
             raise ArchiveValidationError("TAR structure or member integrity is invalid")
@@ -211,6 +211,17 @@ def _parse_tar_size(field: bytes) -> int:
     if any(byte < ord("0") or byte > ord("7") for byte in stripped):
         raise ArchiveValidationError("TAR structure or member integrity is invalid")
     return int(stripped, 8)
+
+
+def _validate_tar_header_checksum(header: bytes) -> None:
+    stored_checksum = _parse_tar_number(header[148:156])
+    checksum_header = header[:148] + (b" " * 8) + header[156:]
+    unsigned_checksum = sum(checksum_header)
+    signed_checksum = sum(
+        byte if byte < 128 else byte - 256 for byte in checksum_header
+    )
+    if stored_checksum not in {unsigned_checksum, signed_checksum}:
+        raise ArchiveValidationError("TAR structure or member integrity is invalid")
 
 
 def _scan_tar_framing(data: bytes) -> None:
@@ -228,7 +239,8 @@ def _scan_tar_framing(data: bytes) -> None:
         if not any(header):
             break
 
-        size = _parse_tar_size(header[124:136])
+        _validate_tar_header_checksum(header)
+        size = _parse_tar_number(header[124:136])
         payload_end = header_end + size
         record_end = payload_end + (-size % _TAR_BLOCK_BYTES)
         if payload_end > len(data) or record_end > len(data):
