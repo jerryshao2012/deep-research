@@ -165,12 +165,15 @@ def _validate_zip(data: bytes) -> None:
                 with archive.open(member) as member_file:
                     while member_file.read(_ZIP_VALIDATION_CHUNK_BYTES):
                         pass
+    except ArchiveValidationError:
+        raise
     except (
         BadZipFile,
         LargeZipFile,
         NotImplementedError,
         OSError,
         RuntimeError,
+        ValueError,
         ZlibError,
     ):
         raise ArchiveValidationError(

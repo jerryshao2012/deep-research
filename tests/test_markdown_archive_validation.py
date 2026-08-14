@@ -26,6 +26,27 @@ def _zip_bytes(filename: str = "report.txt", content: bytes = b"report") -> byte
     return buffer.getvalue()
 
 
+def _zip_with_invalid_utf8_filename() -> bytes:
+    data = bytearray(_zip_bytes(filename="a.txt"))
+    central_header = data.index(b"PK\x01\x02")
+    flag_bits = int.from_bytes(data[central_header + 8 : central_header + 10], "little")
+    data[central_header + 8 : central_header + 10] = (flag_bits | 0x800).to_bytes(
+        2, "little"
+    )
+    data[central_header + 46] = 0xFF
+    return bytes(data)
+
+
+def _zip_with_negative_member_offset() -> bytes:
+    data = bytearray(_zip_bytes())
+    end_header = data.index(b"PK\x05\x06")
+    central_offset = int.from_bytes(data[end_header + 16 : end_header + 20], "little")
+    data[end_header + 16 : end_header + 20] = (central_offset + 1).to_bytes(
+        4, "little"
+    )
+    return bytes(data)
+
+
 @pytest.mark.parametrize(
     ("filename", "expected"),
     [
@@ -157,8 +178,26 @@ def test_validate_archive_rejects_zip_declared_expansion_over_limit() -> None:
         4, "little"
     )
 
-    with pytest.raises(ArchiveValidationError):
+    with pytest.raises(
+        ArchiveValidationError,
+        match="^ZIP uncompressed size exceeds validation limit$",
+    ):
         validate_archive("oversized.zip", "application/zip", bytes(data))
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        _zip_with_negative_member_offset(),
+        _zip_with_invalid_utf8_filename(),
+    ],
+    ids=("value-error", "unicode-decode-error"),
+)
+def test_validate_archive_normalizes_zip_parser_errors(data: bytes) -> None:
+    with pytest.raises(ArchiveValidationError) as caught:
+        validate_archive("broken.zip", "application/zip", data)
+
+    assert str(caught.value) == "ZIP structure or member integrity is invalid"
 
 
 def test_validate_archive_normalizes_zip_library_error_text() -> None:
