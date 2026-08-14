@@ -111,6 +111,7 @@ MAX_MEMBER_COUNT = 1_000
 MAX_EXPANDED_BYTES = 100 * 1024 * 1024
 MAX_TAR_METADATA_RECORDS = (2 * MAX_MEMBER_COUNT) + 1
 MAX_TAR_METADATA_BYTES = 1024 * 1024
+MAX_TAR_CONSECUTIVE_METADATA_RECORDS = 32
 MAX_TAR_ZERO_BLOCKS = 20
 MAX_TAR_STREAM_BYTES = (
     MAX_EXPANDED_BYTES
@@ -224,12 +225,61 @@ def _validate_tar_header_checksum(header: bytes) -> None:
         raise ArchiveValidationError("TAR structure or member integrity is invalid")
 
 
+def _parse_pax_size_override(payload: bytes) -> int | None:
+    offset = 0
+    size_override = None
+    while offset < len(payload):
+        if payload[offset] == 0:
+            if any(payload[offset:]):
+                raise ArchiveValidationError(
+                    "TAR structure or member integrity is invalid"
+                )
+            break
+
+        prefix_end = payload.find(b" ", offset)
+        length_field = payload[offset:prefix_end]
+        if (
+            prefix_end < 0
+            or not length_field
+            or len(length_field) > 20
+            or not length_field.isdigit()
+        ):
+            raise ArchiveValidationError("TAR structure or member integrity is invalid")
+        record_length = int(length_field)
+        record_end = offset + record_length
+        if (
+            record_length < 5
+            or prefix_end >= record_end
+            or record_end > len(payload)
+            or payload[record_end - 1] != ord("\n")
+        ):
+            raise ArchiveValidationError("TAR structure or member integrity is invalid")
+
+        keyword, separator, value = payload[prefix_end + 1 : record_end - 1].partition(
+            b"="
+        )
+        if not keyword or not separator:
+            raise ArchiveValidationError("TAR structure or member integrity is invalid")
+        if keyword == b"size":
+            if not value or len(value) > 20 or not value.isdigit():
+                raise ArchiveValidationError(
+                    "TAR structure or member integrity is invalid"
+                )
+            size_override = int(value)
+        offset = record_end
+
+    return size_override
+
+
 def _scan_tar_framing(data: bytes) -> None:
     offset = 0
     member_count = 0
     declared_payload_bytes = 0
     metadata_count = 0
     metadata_payload_bytes = 0
+    consecutive_metadata_count = 0
+    global_pax_size: int | None = None
+    local_pax_size: int | None = None
 
     while offset < len(data):
         header_end = offset + _TAR_BLOCK_BYTES
@@ -240,7 +290,22 @@ def _scan_tar_framing(data: bytes) -> None:
             break
 
         _validate_tar_header_checksum(header)
-        size = _parse_tar_number(header[124:136])
+        raw_size = _parse_tar_number(header[124:136])
+        type_flag = header[156:157]
+        is_metadata = type_flag in _TAR_METADATA_TYPE_FLAGS
+        if is_metadata:
+            size = raw_size
+        elif local_pax_size is not None:
+            size = local_pax_size
+        elif global_pax_size is not None:
+            if global_pax_size != raw_size:
+                raise ArchiveValidationError(
+                    "global PAX size override disagrees with TAR member header"
+                )
+            size = raw_size
+        else:
+            size = raw_size
+
         payload_end = header_end + size
         record_end = payload_end + (-size % _TAR_BLOCK_BYTES)
         if payload_end > len(data) or record_end > len(data):
@@ -248,18 +313,32 @@ def _scan_tar_framing(data: bytes) -> None:
         if any(data[payload_end:record_end]):
             raise ArchiveValidationError("TAR record padding is invalid")
 
-        if header[156:157] in _TAR_METADATA_TYPE_FLAGS:
+        if is_metadata:
             metadata_count += 1
             metadata_payload_bytes += size
+            consecutive_metadata_count += 1
             if metadata_count > MAX_TAR_METADATA_RECORDS:
                 raise ArchiveValidationError("TAR contains too many metadata records")
             if metadata_payload_bytes > MAX_TAR_METADATA_BYTES:
                 raise ArchiveValidationError(
                     "TAR metadata payload exceeds validation limit"
                 )
+            if consecutive_metadata_count > MAX_TAR_CONSECUTIVE_METADATA_RECORDS:
+                raise ArchiveValidationError(
+                    "TAR metadata nesting exceeds validation limit"
+                )
+
+            if type_flag in {b"x", b"g"}:
+                pax_size = _parse_pax_size_override(data[header_end:payload_end])
+                if type_flag == b"x" and local_pax_size is None:
+                    local_pax_size = pax_size
+                elif type_flag == b"g" and pax_size is not None:
+                    global_pax_size = pax_size
         else:
             member_count += 1
             declared_payload_bytes += size
+            consecutive_metadata_count = 0
+            local_pax_size = None
             if member_count > MAX_MEMBER_COUNT:
                 raise ArchiveValidationError("TAR contains too many members")
             if declared_payload_bytes > MAX_EXPANDED_BYTES:
@@ -286,8 +365,12 @@ def _validate_raw_tar(data: bytes) -> None:
     _scan_tar_framing(data)
     try:
         expanded_bytes = 0
+        semantic_member_count = 0
         with tarfile.open(fileobj=BytesIO(data), mode="r:") as archive:
             for member in archive:
+                semantic_member_count += 1
+                if semantic_member_count > MAX_MEMBER_COUNT:
+                    raise ArchiveValidationError("TAR contains too many members")
                 if not member.isreg():
                     continue
                 member_file = archive.extractfile(member)
@@ -311,6 +394,7 @@ def _validate_raw_tar(data: bytes) -> None:
         ValueError,
         UnicodeError,
         ZlibError,
+        RuntimeError,
     ):
         raise ArchiveValidationError(
             "TAR structure or member integrity is invalid"
