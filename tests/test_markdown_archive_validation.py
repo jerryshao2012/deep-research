@@ -14,7 +14,7 @@ from zlib import crc32
 
 import py7zr
 import pytest
-from py7zr.archiveinfo import Folder
+from py7zr.archiveinfo import Folder, write_uint64
 from py7zr.properties import COMPRESSION_METHOD
 
 import webapp.markdown_archive_validation as archive_validation
@@ -190,6 +190,7 @@ def _seven_zip_bytes(
     *,
     password: str | None = None,
     header_encryption: bool = False,
+    encoded_header: bool = True,
 ) -> bytes:
     buffer = BytesIO()
     with py7zr.SevenZipFile(
@@ -198,9 +199,49 @@ def _seven_zip_bytes(
         password=password,
         header_encryption=header_encryption,
     ) as archive:
+        archive.set_encoded_header_mode(encoded_header)
         for filename, content in entries or []:
             archive.writestr(content, filename)
     return buffer.getvalue()
+
+
+def _seven_zip_next_header_bounds(data: bytes) -> tuple[int, int]:
+    start = 32 + int.from_bytes(data[12:20], "little")
+    return start, start + int.from_bytes(data[20:28], "little")
+
+
+def _update_seven_zip_next_header_checksums(data: bytearray) -> bytes:
+    start, end = _seven_zip_next_header_bounds(data)
+    data[28:32] = crc32(data[start:end]).to_bytes(4, "little")
+    data[8:12] = crc32(data[12:32]).to_bytes(4, "little")
+    return bytes(data)
+
+
+def _seven_zip_with_oversized_encoded_header_decoder() -> bytes:
+    data = bytearray(_seven_zip_bytes([("report.txt", b"report")]))
+    start, end = _seven_zip_next_header_bounds(data)
+    coder = b"\x21\x21\x01\x18"
+    assert data[start:end].count(coder) == 1
+    property_offset = data.index(coder, start, end) + len(coder) - 1
+    data[property_offset] = 40
+    return _update_seven_zip_next_header_checksums(data)
+
+
+def _seven_zip_with_oversized_encoded_header_output() -> bytes:
+    data = bytearray(_seven_zip_bytes([("report.txt", b"report")]))
+    start, end = _seven_zip_next_header_bounds(data)
+    coder = b"\x21\x21\x01\x18"
+    assert data[start:end].count(coder) == 1
+    unpack_size_offset = data.index(coder, start, end) + len(coder)
+    assert data[unpack_size_offset] == 0x0C
+
+    old_size_offset = unpack_size_offset + 1
+    assert data[old_size_offset] < 0x80
+    encoded_size = BytesIO()
+    write_uint64(encoded_size, 100 * 1024 * 1024 + 1)
+    data[old_size_offset : old_size_offset + 1] = encoded_size.getvalue()
+    data[20:28] = (end - start - 1 + len(encoded_size.getvalue())).to_bytes(8, "little")
+    return _update_seven_zip_next_header_checksums(data)
 
 
 def _zip_with_invalid_utf8_filename() -> bytes:
@@ -362,6 +403,45 @@ def test_validate_archive_accepts_valid_empty_7z_in_memory() -> None:
     )
 
 
+def test_validate_archive_preserves_valid_raw_7z_header() -> None:
+    data = _seven_zip_bytes(
+        [("report.txt", b"report")],
+        encoded_header=False,
+    )
+
+    assert validate_archive("raw-header.7z", "application/x-7z-compressed", data) == (
+        "application/x-7z-compressed"
+    )
+
+
+@pytest.mark.parametrize(
+    ("data", "message"),
+    [
+        (
+            _seven_zip_with_oversized_encoded_header_decoder(),
+            "7z decoder memory exceeds validation limit",
+        ),
+        (
+            _seven_zip_with_oversized_encoded_header_output(),
+            "7z encoded header expansion exceeds validation limit",
+        ),
+    ],
+    ids=("decoder-memory", "declared-output"),
+)
+def test_validate_archive_preflights_real_encoded_header_before_constructor(
+    monkeypatch: pytest.MonkeyPatch,
+    data: bytes,
+    message: str,
+) -> None:
+    def fail_if_opened(*args: object, **kwargs: object) -> None:
+        pytest.fail("SevenZipFile constructed before encoded header preflight")
+
+    monkeypatch.setattr(archive_validation, "SevenZipFile", fail_if_opened)
+
+    with pytest.raises(ArchiveValidationError, match=f"^{message}$"):
+        validate_archive("oversized.7z", "application/x-7z-compressed", data)
+
+
 def test_validate_archive_rejects_unsupported_7z_coder_before_empty_early_return(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -515,6 +595,101 @@ def test_validate_archive_counts_7z_directories_toward_entry_limit(
         match="^7z contains too many members$",
     ):
         validate_archive("evidence.7z", "application/x-7z-compressed", data)
+
+
+def test_validate_archive_applies_entry_cap_before_main_decoder_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data = _seven_zip_bytes([("report.txt", b"report")])
+    original_open = archive_validation.SevenZipFile
+    original_list = py7zr.SevenZipFile.list
+    oversized_folder: Folder | None = None
+
+    def open_with_oversized_decoder(
+        *args: object, **kwargs: object
+    ) -> py7zr.SevenZipFile:
+        nonlocal oversized_folder
+        archive = original_open(*args, **kwargs)
+        oversized_folder = Folder()
+        oversized_folder.coders = [
+            {
+                "method": COMPRESSION_METHOD.LZMA2,
+                "numinstreams": 1,
+                "numoutstreams": 1,
+                "properties": b"\x28",
+            }
+        ]
+        oversized_folder.unpacksizes = [0]
+        archive.header.main_streams = SimpleNamespace(
+            unpackinfo=SimpleNamespace(folders=[oversized_folder])
+        )
+        return archive
+
+    def over_limit(archive: py7zr.SevenZipFile) -> list[py7zr.FileInfo]:
+        member = original_list(archive)[0]
+        return [member] * (archive_validation.MAX_MEMBER_COUNT + 1)
+
+    monkeypatch.setattr(archive_validation, "SevenZipFile", open_with_oversized_decoder)
+    monkeypatch.setattr(py7zr.SevenZipFile, "list", over_limit)
+
+    with pytest.raises(
+        ArchiveValidationError,
+        match="^7z contains too many members$",
+    ):
+        validate_archive("members.7z", "application/x-7z-compressed", data)
+
+
+def test_validate_archive_sums_all_main_decoder_memory_before_construction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data = _seven_zip_bytes()
+    original_open = archive_validation.SevenZipFile
+    original_get_decompressor = Folder.get_decompressor
+    folders: list[Folder] = []
+    constructed: list[Folder] = []
+
+    def open_with_cumulative_decoders(
+        *args: object, **kwargs: object
+    ) -> py7zr.SevenZipFile:
+        archive = original_open(*args, **kwargs)
+        folders.clear()
+        for _ in range(2):
+            folder = Folder()
+            folder.coders = [
+                {
+                    "method": COMPRESSION_METHOD.LZMA,
+                    "numinstreams": 1,
+                    "numoutstreams": 1,
+                    "properties": b"\x5d" + (60 * 1024 * 1024).to_bytes(4, "little"),
+                }
+            ]
+            folder.unpacksizes = [0]
+            folders.append(folder)
+        archive.header.main_streams = SimpleNamespace(
+            unpackinfo=SimpleNamespace(folders=folders)
+        )
+        return archive
+
+    def track_decoder_construction(
+        folder: Folder, *args: object, **kwargs: object
+    ) -> object:
+        if folder in folders:
+            constructed.append(folder)
+            raise AssertionError("decoder constructed before complete resource scan")
+        return original_get_decompressor(folder, *args, **kwargs)
+
+    monkeypatch.setattr(
+        archive_validation, "SevenZipFile", open_with_cumulative_decoders
+    )
+    monkeypatch.setattr(Folder, "get_decompressor", track_decoder_construction)
+
+    with pytest.raises(
+        ArchiveValidationError,
+        match="^7z decoder memory exceeds validation limit$",
+    ):
+        validate_archive("cumulative.7z", "application/x-7z-compressed", data)
+
+    assert constructed == []
 
 
 @pytest.mark.parametrize(

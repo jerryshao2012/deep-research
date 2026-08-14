@@ -6,6 +6,7 @@ import bz2
 import lzma
 import tarfile
 import zlib
+from collections.abc import Iterable
 from dataclasses import dataclass
 from gzip import BadGzipFile, GzipFile
 from io import BytesIO
@@ -129,6 +130,10 @@ MAX_MEMBER_COUNT = 1_000
 MAX_EXPANDED_BYTES = 100 * 1024 * 1024
 MAX_TOTAL_UNCOMPRESSED_BYTES = 100 * 1024 * 1024
 _MAX_7Z_DECODER_MEMORY_BYTES = 100 * 1024 * 1024
+_MAX_7Z_ENCODED_HEADER_BYTES = 100 * 1024 * 1024
+_MAX_7Z_HEADER_FOLDERS = 1_000
+_MAX_7Z_HEADER_CODERS = 1_000
+_MAX_7Z_HEADER_STREAMS = 1_000
 MAX_TAR_METADATA_RECORDS = (2 * MAX_MEMBER_COUNT) + 1
 MAX_TAR_METADATA_BYTES = 1024 * 1024
 MAX_TAR_ZERO_BLOCKS = 20
@@ -198,6 +203,46 @@ class _SevenZipDiscardFactory(WriterFactory):
 
     def create(self, filename: str) -> Py7zIO:
         return _SevenZipDiscardIO(self._budget)
+
+
+@dataclass
+class _SevenZipEncodedFolder:
+    coders: list[dict[str, object]]
+    input_streams: int
+    output_streams: int
+    unpacksizes: list[int]
+    digestdefined: bool = False
+
+
+@dataclass
+class _SevenZipHeaderReader:
+    data: memoryview
+    offset: int = 0
+    furthest_offset: int = 0
+
+    def read(self, size: int) -> memoryview:
+        end = self.offset + size
+        if size < 0 or end < self.offset or end > len(self.data):
+            raise ValueError("truncated 7z encoded header")
+        value = self.data[self.offset : end]
+        self.offset = end
+        self.furthest_offset = max(self.furthest_offset, end)
+        return value
+
+    def read_byte(self) -> int:
+        return self.read(1)[0]
+
+    def read_uint64(self) -> int:
+        first = self.read_byte()
+        mask = 0x80
+        extra_bytes = 0
+        while extra_bytes < 8 and first & mask:
+            extra_bytes += 1
+            mask >>= 1
+        if extra_bytes == 8:
+            return int.from_bytes(self.read(8), "little")
+        low = int.from_bytes(self.read(extra_bytes), "little")
+        return low + ((first & (mask - 1)) << (8 * extra_bytes))
 
 
 def archive_format_for_filename(filename: str) -> str | None:
@@ -402,61 +447,303 @@ def _validate_zip(data: bytes) -> None:
         ) from None
 
 
+def _read_seven_zip_defined_flags(
+    reader: _SevenZipHeaderReader, count: int, *, check_all: bool
+) -> list[bool]:
+    if check_all and reader.read_byte() != 0:
+        return [True] * count
+    bits = reader.read((count + 7) // 8)
+    return [bool(bits[index // 8] & (0x80 >> (index % 8))) for index in range(count)]
+
+
+def _skip_seven_zip_crcs(
+    reader: _SevenZipHeaderReader, count: int, *, check_all: bool
+) -> list[bool]:
+    defined = _read_seven_zip_defined_flags(reader, count, check_all=check_all)
+    reader.read(4 * sum(defined))
+    return defined
+
+
+def _read_seven_zip_encoded_folder(
+    reader: _SevenZipHeaderReader,
+    *,
+    coder_budget: int,
+    input_stream_budget: int,
+    output_stream_budget: int,
+) -> _SevenZipEncodedFolder:
+    coder_count = reader.read_uint64()
+    if coder_count == 0 or coder_count > coder_budget:
+        raise ValueError("invalid 7z encoded header coder count")
+
+    coders: list[dict[str, object]] = []
+    total_input_streams = 0
+    total_output_streams = 0
+    for _ in range(coder_count):
+        flags = reader.read_byte()
+        if flags & 0xC0:
+            raise ValueError("invalid 7z encoded header coder flags")
+        method_size = flags & 0x0F
+        if method_size == 0:
+            method = b"\x00"
+        else:
+            method = bytes(reader.read(method_size))
+
+        if flags & 0x10:
+            input_streams = reader.read_uint64()
+            output_streams = reader.read_uint64()
+        else:
+            input_streams = 1
+            output_streams = 1
+        if input_streams == 0 or output_streams == 0:
+            raise ValueError("invalid 7z encoded header stream count")
+        total_input_streams += input_streams
+        total_output_streams += output_streams
+        if (
+            total_input_streams > input_stream_budget
+            or total_output_streams > output_stream_budget
+        ):
+            raise ValueError("7z encoded header has too many streams")
+
+        properties: bytes | None = None
+        if flags & 0x20:
+            property_size = reader.read_uint64()
+            if property_size > len(reader.data) - reader.offset:
+                raise ValueError("invalid 7z encoded header coder properties")
+            properties = bytes(reader.read(property_size))
+        coders.append(
+            {
+                "method": method,
+                "numinstreams": input_streams,
+                "numoutstreams": output_streams,
+                "properties": properties,
+            }
+        )
+
+    bind_pair_count = total_output_streams - 1
+    for _ in range(bind_pair_count):
+        reader.read_uint64()
+        reader.read_uint64()
+    packed_stream_count = total_input_streams - bind_pair_count
+    if packed_stream_count <= 0 or packed_stream_count > _MAX_7Z_HEADER_STREAMS:
+        raise ValueError("invalid 7z encoded header packed stream count")
+    if packed_stream_count != 1:
+        for _ in range(packed_stream_count):
+            reader.read_uint64()
+
+    return _SevenZipEncodedFolder(
+        coders=coders,
+        input_streams=total_input_streams,
+        output_streams=total_output_streams,
+        unpacksizes=[],
+    )
+
+
+def _read_seven_zip_encoded_streams(
+    encoded_header: memoryview,
+) -> tuple[int, list[int], list[_SevenZipEncodedFolder]]:
+    reader = _SevenZipHeaderReader(encoded_header)
+    pack_position = 0
+    packed_sizes: list[int] = []
+    folders: list[_SevenZipEncodedFolder] = []
+
+    property_id = reader.read_byte()
+    if property_id == 0x06:
+        pack_position = reader.read_uint64()
+        packed_stream_count = reader.read_uint64()
+        if packed_stream_count > _MAX_7Z_HEADER_STREAMS:
+            raise ValueError("7z encoded header has too many packed streams")
+        if reader.read_byte() != 0x09:
+            raise ValueError("missing 7z encoded header packed sizes")
+        packed_sizes = [reader.read_uint64() for _ in range(packed_stream_count)]
+        property_id = reader.read_byte()
+        if property_id == 0x0A:
+            _skip_seven_zip_crcs(reader, packed_stream_count, check_all=True)
+            property_id = reader.read_byte()
+        if property_id != 0x00:
+            raise ValueError("invalid 7z encoded header pack info")
+        property_id = reader.read_byte()
+
+    if property_id != 0x07 or reader.read_byte() != 0x0B:
+        raise ValueError("missing 7z encoded header unpack info")
+    folder_count = reader.read_uint64()
+    if folder_count == 0 or folder_count > _MAX_7Z_HEADER_FOLDERS:
+        raise ValueError("invalid 7z encoded header folder count")
+    external = reader.read_byte()
+    coder_budget = _MAX_7Z_HEADER_CODERS
+    input_stream_budget = _MAX_7Z_HEADER_STREAMS
+    output_stream_budget = _MAX_7Z_HEADER_STREAMS
+
+    def read_folders() -> list[_SevenZipEncodedFolder]:
+        nonlocal coder_budget, input_stream_budget, output_stream_budget
+        parsed: list[_SevenZipEncodedFolder] = []
+        for _ in range(folder_count):
+            folder = _read_seven_zip_encoded_folder(
+                reader,
+                coder_budget=coder_budget,
+                input_stream_budget=input_stream_budget,
+                output_stream_budget=output_stream_budget,
+            )
+            coder_budget -= len(folder.coders)
+            input_stream_budget -= folder.input_streams
+            output_stream_budget -= folder.output_streams
+            parsed.append(folder)
+        return parsed
+
+    if external == 0:
+        folders = read_folders()
+    else:
+        external_offset = reader.read_uint64()
+        current_offset = reader.offset
+        if external_offset > len(reader.data):
+            raise ValueError("invalid external 7z encoded header folder offset")
+        reader.offset = external_offset
+        folders = read_folders()
+        reader.offset = current_offset
+
+    if reader.read_byte() != 0x0C:
+        raise ValueError("missing 7z encoded header unpack sizes")
+    total_output_streams = sum(folder.output_streams for folder in folders)
+    if total_output_streams > _MAX_7Z_HEADER_STREAMS:
+        raise ValueError("7z encoded header has too many output streams")
+    for folder in folders:
+        folder.unpacksizes = [
+            reader.read_uint64() for _ in range(folder.output_streams)
+        ]
+
+    property_id = reader.read_byte()
+    if property_id == 0x0A:
+        defined = _skip_seven_zip_crcs(reader, folder_count, check_all=True)
+        for folder, digestdefined in zip(folders, defined, strict=True):
+            folder.digestdefined = digestdefined
+        property_id = reader.read_byte()
+    if property_id != 0x00:
+        raise ValueError("invalid 7z encoded header unpack info")
+
+    property_id = reader.read_byte()
+    if property_id == 0x08:
+        substream_counts = [1] * folder_count
+        property_id = reader.read_byte()
+        if property_id == 0x0D:
+            substream_counts = [reader.read_uint64() for _ in range(folder_count)]
+            if sum(substream_counts) > _MAX_7Z_HEADER_STREAMS:
+                raise ValueError("7z encoded header has too many substreams")
+            property_id = reader.read_byte()
+        if property_id == 0x09:
+            for substream_count in substream_counts:
+                for _ in range(max(0, substream_count - 1)):
+                    reader.read_uint64()
+            property_id = reader.read_byte()
+        digest_count = sum(
+            count if count != 1 or not folder.digestdefined else 0
+            for count, folder in zip(substream_counts, folders, strict=True)
+        )
+        if property_id == 0x0A:
+            _skip_seven_zip_crcs(reader, digest_count, check_all=True)
+            property_id = reader.read_byte()
+        if property_id != 0x00:
+            raise ValueError("invalid 7z encoded header substreams")
+        property_id = reader.read_byte()
+
+    if property_id != 0x00 or reader.furthest_offset != len(reader.data):
+        raise ValueError("invalid trailing 7z encoded header data")
+    return pack_position, packed_sizes, folders
+
+
+def _seven_zip_decoder_memory(coder: dict[str, object]) -> int:
+    method = coder.get("method")
+    properties = coder.get("properties")
+    if method == COMPRESSION_METHOD.LZMA:
+        if not isinstance(properties, bytes) or len(properties) != 5:
+            raise ArchiveValidationError("7z structure or member integrity is invalid")
+        return int.from_bytes(properties[1:5], "little")
+    if method == COMPRESSION_METHOD.LZMA2:
+        if not isinstance(properties, bytes) or len(properties) != 1:
+            raise ArchiveValidationError("7z structure or member integrity is invalid")
+        property_byte = properties[0]
+        if property_byte > 40:
+            raise ArchiveValidationError("7z structure or member integrity is invalid")
+        return (
+            0xFFFFFFFF
+            if property_byte == 40
+            else (2 | (property_byte & 1)) << (property_byte // 2 + 11)
+        )
+    if method == COMPRESSION_METHOD.PPMD:
+        if not isinstance(properties, bytes) or len(properties) not in {5, 7}:
+            raise ArchiveValidationError("7z structure or member integrity is invalid")
+        return int.from_bytes(properties[1:5], "little")
+    return 0
+
+
+def _validate_7z_folder_resources(folders: Iterable[object]) -> None:
+    decoder_memory = 0
+    for folder in folders:
+        for coder in folder.coders:
+            decoder_memory += _seven_zip_decoder_memory(coder)
+            if decoder_memory > _MAX_7Z_DECODER_MEMORY_BYTES:
+                raise ArchiveValidationError(
+                    "7z decoder memory exceeds validation limit"
+                )
+
+
+def _preflight_7z_encoded_header(data: bytes) -> None:
+    if len(data) < 32 or zlib.crc32(data[12:32]) != int.from_bytes(
+        data[8:12], "little"
+    ):
+        raise ValueError("invalid 7z signature header")
+    next_header_start = 32 + int.from_bytes(data[12:20], "little")
+    next_header_size = int.from_bytes(data[20:28], "little")
+    next_header_end = next_header_start + next_header_size
+    if (
+        next_header_start < 32
+        or next_header_end < next_header_start
+        or next_header_end > len(data)
+    ):
+        raise ValueError("invalid 7z next header bounds")
+    next_header = memoryview(data)[next_header_start:next_header_end]
+    if zlib.crc32(next_header) != int.from_bytes(data[28:32], "little"):
+        raise ValueError("invalid 7z next header checksum")
+    if not next_header or next_header[0] != 0x17:
+        return
+
+    pack_position, packed_sizes, folders = _read_seven_zip_encoded_streams(
+        next_header[1:]
+    )
+    packed_start = 32 + pack_position
+    packed_end = packed_start + sum(packed_sizes)
+    if packed_start < 32 or packed_end < packed_start or packed_end > next_header_start:
+        raise ValueError("invalid 7z encoded header stream bounds")
+
+    _validate_7z_folder_resources(folders)
+    declared_output = sum(
+        unpack_size for folder in folders for unpack_size in folder.unpacksizes
+    )
+    if declared_output > _MAX_7Z_ENCODED_HEADER_BYTES:
+        raise ArchiveValidationError(
+            "7z encoded header expansion exceeds validation limit"
+        )
+
+
 def _validate_7z_coder_chains(
     archive: SevenZipFile, *, construct_decoders: bool = True
 ) -> None:
     main_streams = archive.header.main_streams
     if main_streams is None:
         return
-    for folder in main_streams.unpackinfo.folders:
-        for coder in folder.coders:
-            method = coder.get("method")
-            properties = coder.get("properties")
-            decoder_memory = 0
-            if method == COMPRESSION_METHOD.LZMA:
-                if not isinstance(properties, bytes) or len(properties) != 5:
-                    raise ArchiveValidationError(
-                        "7z structure or member integrity is invalid"
-                    )
-                decoder_memory = int.from_bytes(properties[1:5], "little")
-            elif method == COMPRESSION_METHOD.LZMA2:
-                if not isinstance(properties, bytes) or len(properties) != 1:
-                    raise ArchiveValidationError(
-                        "7z structure or member integrity is invalid"
-                    )
-                property_byte = properties[0]
-                if property_byte > 40:
-                    raise ArchiveValidationError(
-                        "7z structure or member integrity is invalid"
-                    )
-                decoder_memory = (
-                    0xFFFFFFFF
-                    if property_byte == 40
-                    else (2 | (property_byte & 1)) << (property_byte // 2 + 11)
-                )
-            elif method == COMPRESSION_METHOD.PPMD:
-                if not isinstance(properties, bytes) or len(properties) not in {5, 7}:
-                    raise ArchiveValidationError(
-                        "7z structure or member integrity is invalid"
-                    )
-                decoder_memory = int.from_bytes(properties[1:5], "little")
-
-            if decoder_memory > _MAX_7Z_DECODER_MEMORY_BYTES:
-                raise ArchiveValidationError(
-                    "7z decoder memory exceeds validation limit"
-                )
-        if construct_decoders:
+    folders = main_streams.unpackinfo.folders
+    _validate_7z_folder_resources(folders)
+    if construct_decoders:
+        for folder in folders:
             folder.get_decompressor(0, reset=True)
 
 
 def _validate_7z(data: bytes) -> None:
     try:
+        _preflight_7z_encoded_header(data)
         with SevenZipFile(BytesIO(data), mode="r") as archive:
             if archive.needs_password():
                 raise ArchiveValidationError(
                     "encrypted 7z archives cannot be validated"
                 )
-            _validate_7z_coder_chains(archive)
             entries = archive.list()
             if len(entries) > MAX_MEMBER_COUNT:
                 raise ArchiveValidationError("7z contains too many members")
@@ -474,6 +761,7 @@ def _validate_7z(data: bytes) -> None:
                         "7z uncompressed size exceeds validation limit"
                     )
 
+            _validate_7z_coder_chains(archive)
             if members and archive.test() is False:
                 raise ArchiveValidationError(
                     "7z structure or member integrity is invalid"
