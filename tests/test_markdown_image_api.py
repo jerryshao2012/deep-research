@@ -1876,6 +1876,150 @@ def test_upload_waits_for_delete_fence_then_creates_new_namespace(
     assert len([child for child in images_root.iterdir() if child.is_dir()]) == 1
 
 
+def test_namespace_mutation_locks_use_at_most_64_fixed_stripes(tmp_path, monkeypatch):
+    docs_root = tmp_path / "docs"
+    monkeypatch.setattr(webapp, "DOCS_ROOT", docs_root)
+
+    async def scenario() -> int:
+        async with AsyncClient(
+            transport=ASGITransport(app=webapp.app), base_url="http://test"
+        ) as client:
+            for value in range(64 * 3):
+                response = await client.delete(
+                    f"/markdown-threads/{value:06d}/images", headers=_AUTH_HEADERS
+                )
+                assert response.status_code == 200
+                assert response.json()["deleted_count"] == 0
+        loop_locks = markdown_images._NAMESPACE_MUTATION_LOCKS._locks[
+            asyncio.get_running_loop()
+        ]
+        return len(loop_locks)
+
+    allocated_lock_count = asyncio.run(scenario())
+    lock_files = sorted((docs_root / ".markdown-asset-locks").glob("*.lock"))
+
+    assert allocated_lock_count <= 64
+    assert len(lock_files) == 64
+    assert {path.name for path in lock_files} == {
+        f"stripe-{stripe:02d}.lock" for stripe in range(64)
+    }
+
+
+def test_same_stripe_ids_serialize_while_unrelated_stripe_proceeds(
+    tmp_path, monkeypatch
+):
+    docs_root = tmp_path / "docs"
+    monkeypatch.setattr(webapp, "DOCS_ROOT", docs_root)
+    held_markdown_id = "123456"
+    colliding_markdown_id = "123520"
+    unrelated_markdown_id = "123457"
+    original_store = markdown_images._store_asset
+    stored = threading.Event()
+    finish_upload = threading.Event()
+
+    def blocking_store(images_root, **kwargs):
+        original_store(images_root, **kwargs)
+        if images_root.parent.name == held_markdown_id:
+            stored.set()
+            if not finish_upload.wait(5):
+                raise AssertionError("upload was not released")
+
+    monkeypatch.setattr(markdown_images, "_store_asset", blocking_store)
+
+    async def scenario():
+        async with AsyncClient(
+            transport=ASGITransport(app=webapp.app), base_url="http://test"
+        ) as client:
+            upload = asyncio.create_task(
+                client.post(
+                    f"/markdown-threads/{held_markdown_id}/images",
+                    headers=_AUTH_HEADERS,
+                    files={"files": ("one.png", _PNG, "image/png")},
+                )
+            )
+            assert await asyncio.to_thread(stored.wait, 2)
+            colliding_delete = asyncio.create_task(
+                client.delete(
+                    f"/markdown-threads/{colliding_markdown_id}/images",
+                    headers=_AUTH_HEADERS,
+                )
+            )
+            unrelated_delete = asyncio.create_task(
+                client.delete(
+                    f"/markdown-threads/{unrelated_markdown_id}/images",
+                    headers=_AUTH_HEADERS,
+                )
+            )
+            unrelated_response = await asyncio.wait_for(unrelated_delete, 1)
+            try:
+                assert unrelated_response.status_code == 200
+                assert not colliding_delete.done()
+            finally:
+                finish_upload.set()
+            return (
+                await asyncio.wait_for(upload, 2),
+                await asyncio.wait_for(colliding_delete, 2),
+            )
+
+    uploaded, colliding_deleted = asyncio.run(scenario())
+
+    assert uploaded.status_code == 200
+    assert colliding_deleted.status_code == 200
+    assert colliding_deleted.json()["deleted_count"] == 0
+
+
+def test_cancelled_cross_loop_file_lock_wait_does_not_leak_lock(tmp_path, monkeypatch):
+    monkeypatch.setattr(webapp, "DOCS_ROOT", tmp_path / "docs")
+    holder_ready = threading.Event()
+    release_holder = threading.Event()
+    holder_errors: list[BaseException] = []
+
+    def hold_fence() -> None:
+        async def scenario() -> None:
+            fence = markdown_images._NamespaceMutationFence("123456")
+            await fence.acquire()
+            holder_ready.set()
+            try:
+                if not release_holder.wait(5):
+                    raise AssertionError("holder was not released")
+            finally:
+                fence.release()
+
+        try:
+            asyncio.run(scenario())
+        except BaseException as exc:
+            holder_errors.append(exc)
+
+    holder = threading.Thread(target=hold_fence)
+    holder.start()
+    assert holder_ready.wait(2)
+
+    async def contend() -> None:
+        contender_fence = markdown_images._NamespaceMutationFence("123456")
+        contender = asyncio.create_task(contender_fence.acquire())
+        await asyncio.sleep(0.05)
+        assert not contender.done()
+        contender.cancel()
+        await asyncio.sleep(0.05)
+        assert not contender.done()
+        release_holder.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(contender, 2)
+
+        subsequent_fence = markdown_images._NamespaceMutationFence("123456")
+        await asyncio.wait_for(subsequent_fence.acquire(), 1)
+        subsequent_fence.release()
+
+    try:
+        asyncio.run(contend())
+    finally:
+        release_holder.set()
+        holder.join(2)
+
+    assert not holder.is_alive()
+    assert holder_errors == []
+
+
 def test_cleanup_counts_only_supported_metadata_and_removes_whole_namespace(
     tmp_path, monkeypatch
 ):

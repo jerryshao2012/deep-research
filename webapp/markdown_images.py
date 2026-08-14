@@ -44,6 +44,7 @@ _MAX_IMAGE_BYTES = 10 * 1024 * 1024
 _MAX_IMAGE_COUNT = 5
 _MAX_REQUEST_BYTES = (_MAX_IMAGE_BYTES * _MAX_IMAGE_COUNT) + (1024 * 1024)
 _ARCHIVE_BATCH_WAIT_SECONDS = 2.0
+_NAMESPACE_LOCK_STRIPE_COUNT = 64
 _ALLOWED_IMAGES: dict[str, tuple[str, frozenset[str]]] = {
     "image/png": ("png", frozenset({".png"})),
     "image/jpeg": ("jpg", frozenset({".jpg", ".jpeg"})),
@@ -115,24 +116,26 @@ class _BoundedUploadMultiPartParser(MultiPartParser):
 
 
 class _LoopLocalNamespaceMutationLocks:
-    def __init__(self) -> None:
+    def __init__(self, stripe_count: int) -> None:
+        self._stripe_count = stripe_count
         self._lock = Lock()
         self._locks: WeakKeyDictionary[
-            asyncio.AbstractEventLoop, dict[str, asyncio.Lock]
+            asyncio.AbstractEventLoop, tuple[asyncio.Lock, ...]
         ] = WeakKeyDictionary()
 
-    def lock_for_running_loop(self, key: str) -> asyncio.Lock:
+    def lock_for_running_loop(self, stripe: int) -> asyncio.Lock:
         loop = asyncio.get_running_loop()
         with self._lock:
-            loop_locks = self._locks.setdefault(loop, {})
-            mutation_lock = loop_locks.get(key)
-            if mutation_lock is None:
-                mutation_lock = asyncio.Lock()
-                loop_locks[key] = mutation_lock
-            return mutation_lock
+            loop_locks = self._locks.get(loop)
+            if loop_locks is None:
+                loop_locks = tuple(asyncio.Lock() for _ in range(self._stripe_count))
+                self._locks[loop] = loop_locks
+            return loop_locks[stripe]
 
 
-_NAMESPACE_MUTATION_LOCKS = _LoopLocalNamespaceMutationLocks()
+_NAMESPACE_MUTATION_LOCKS = _LoopLocalNamespaceMutationLocks(
+    _NAMESPACE_LOCK_STRIPE_COUNT
+)
 
 
 def _webapp_module():
@@ -175,11 +178,15 @@ def _images_root(markdown_id: str) -> Path:
     )
 
 
-def _namespace_lock_path(markdown_id: str) -> Path:
+def _namespace_lock_stripe(markdown_id: str) -> int:
+    return int(_validated_markdown_id(markdown_id)) % _NAMESPACE_LOCK_STRIPE_COUNT
+
+
+def _namespace_lock_path(stripe: int) -> Path:
     return (
         _webapp_module().DOCS_ROOT
         / ".markdown-asset-locks"
-        / f"{_validated_markdown_id(markdown_id)}.lock"
+        / f"stripe-{stripe:02d}.lock"
     )
 
 
@@ -203,14 +210,13 @@ def _release_namespace_file_lock(descriptor: int) -> None:
 
 class _NamespaceMutationFence:
     def __init__(self, markdown_id: str) -> None:
-        self._lock_path = _namespace_lock_path(markdown_id)
+        self._stripe = _namespace_lock_stripe(markdown_id)
+        self._lock_path = _namespace_lock_path(self._stripe)
         self._async_lock: asyncio.Lock | None = None
         self._descriptor: int | None = None
 
     async def acquire(self) -> None:
-        async_lock = _NAMESPACE_MUTATION_LOCKS.lock_for_running_loop(
-            str(self._lock_path)
-        )
+        async_lock = _NAMESPACE_MUTATION_LOCKS.lock_for_running_loop(self._stripe)
         await async_lock.acquire()
         self._async_lock = async_lock
         holder: list[int] = []
