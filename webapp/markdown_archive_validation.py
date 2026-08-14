@@ -111,7 +111,6 @@ MAX_MEMBER_COUNT = 1_000
 MAX_EXPANDED_BYTES = 100 * 1024 * 1024
 MAX_TAR_METADATA_RECORDS = (2 * MAX_MEMBER_COUNT) + 1
 MAX_TAR_METADATA_BYTES = 1024 * 1024
-MAX_TAR_CONSECUTIVE_METADATA_RECORDS = 32
 MAX_TAR_ZERO_BLOCKS = 20
 MAX_TAR_STREAM_BYTES = (
     MAX_EXPANDED_BYTES
@@ -271,15 +270,22 @@ def _parse_pax_size_override(payload: bytes) -> int | None:
     return size_override
 
 
-def _scan_tar_framing(data: bytes) -> None:
+def _rewrite_tar_header_size(data: bytearray, offset: int, size: int) -> None:
+    data[offset + 124 : offset + 136] = f"{size:011o}\0".encode("ascii")
+    data[offset + 148 : offset + 156] = b"        "
+    checksum = sum(data[offset : offset + _TAR_BLOCK_BYTES])
+    data[offset + 148 : offset + 156] = f"{checksum:06o}\0 ".encode("ascii")
+
+
+def _scan_tar_framing(data: bytes) -> bytes | bytearray:
     offset = 0
     member_count = 0
     declared_payload_bytes = 0
     metadata_count = 0
     metadata_payload_bytes = 0
-    consecutive_metadata_count = 0
     global_pax_size: int | None = None
     local_pax_size: int | None = None
+    semantic_data: bytearray | None = None
 
     while offset < len(data):
         header_end = offset + _TAR_BLOCK_BYTES
@@ -298,11 +304,7 @@ def _scan_tar_framing(data: bytes) -> None:
         elif local_pax_size is not None:
             size = local_pax_size
         elif global_pax_size is not None:
-            if global_pax_size != raw_size:
-                raise ArchiveValidationError(
-                    "global PAX size override disagrees with TAR member header"
-                )
-            size = raw_size
+            size = global_pax_size
         else:
             size = raw_size
 
@@ -316,18 +318,12 @@ def _scan_tar_framing(data: bytes) -> None:
         if is_metadata:
             metadata_count += 1
             metadata_payload_bytes += size
-            consecutive_metadata_count += 1
             if metadata_count > MAX_TAR_METADATA_RECORDS:
                 raise ArchiveValidationError("TAR contains too many metadata records")
             if metadata_payload_bytes > MAX_TAR_METADATA_BYTES:
                 raise ArchiveValidationError(
                     "TAR metadata payload exceeds validation limit"
                 )
-            if consecutive_metadata_count > MAX_TAR_CONSECUTIVE_METADATA_RECORDS:
-                raise ArchiveValidationError(
-                    "TAR metadata nesting exceeds validation limit"
-                )
-
             if type_flag in {b"x", b"X", b"g"}:
                 pax_size = _parse_pax_size_override(data[header_end:payload_end])
                 if type_flag in {b"x", b"X"} and local_pax_size is None:
@@ -337,7 +333,6 @@ def _scan_tar_framing(data: bytes) -> None:
         else:
             member_count += 1
             declared_payload_bytes += size
-            consecutive_metadata_count = 0
             local_pax_size = None
             if member_count > MAX_MEMBER_COUNT:
                 raise ArchiveValidationError("TAR contains too many members")
@@ -345,6 +340,10 @@ def _scan_tar_framing(data: bytes) -> None:
                 raise ArchiveValidationError(
                     "TAR declared payload exceeds validation limit"
                 )
+            if size != raw_size:
+                if semantic_data is None:
+                    semantic_data = bytearray(data)
+                _rewrite_tar_header_size(semantic_data, offset, size)
 
         offset = record_end
 
@@ -360,13 +359,15 @@ def _scan_tar_framing(data: bytes) -> None:
     if full_blocks < 2 or full_blocks > MAX_TAR_ZERO_BLOCKS:
         raise ArchiveValidationError("TAR end marker is invalid")
 
+    return semantic_data if semantic_data is not None else data
+
 
 def _validate_raw_tar(data: bytes) -> None:
-    _scan_tar_framing(data)
+    semantic_data = _scan_tar_framing(data)
     try:
         expanded_bytes = 0
         semantic_member_count = 0
-        with tarfile.open(fileobj=BytesIO(data), mode="r:") as archive:
+        with tarfile.open(fileobj=BytesIO(semantic_data), mode="r:") as archive:
             for member in archive:
                 semantic_member_count += 1
                 if semantic_member_count > MAX_MEMBER_COUNT:

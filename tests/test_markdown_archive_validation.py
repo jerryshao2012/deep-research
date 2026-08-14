@@ -108,6 +108,18 @@ def _tar_with_local_pax_size(
     )
 
 
+def _tar_with_global_pax_size(raw_size: int, content: bytes) -> bytes:
+    return _raw_tar(
+        _tar_record(
+            "global-pax",
+            _pax_record("size", str(len(content))),
+            type_flag=b"g",
+        ),
+        _tar_record("global-one.txt", content, declared_size=raw_size),
+        _tar_record("global-two.txt", content, declared_size=raw_size),
+    )
+
+
 def _zip_bytes(filename: str = "report.txt", content: bytes = b"report") -> bytes:
     buffer = BytesIO()
     with ZipFile(buffer, "w", compression=ZIP_DEFLATED) as archive:
@@ -364,7 +376,7 @@ def test_validate_archive_drains_every_regular_tar_member_with_actual_byte_cap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(archive_validation, "MAX_EXPANDED_BYTES", 5)
-    monkeypatch.setattr(archive_validation, "_scan_tar_framing", lambda data: None)
+    monkeypatch.setattr(archive_validation, "_scan_tar_framing", lambda data: data)
     data = _raw_tar(
         _tar_record("first.txt", b"aaa"),
         _tar_record("second.txt", b"bbb"),
@@ -413,21 +425,64 @@ def test_validate_archive_applies_solaris_pax_size_to_physical_record_boundary(
     )
 
 
-def test_validate_archive_rejects_global_pax_size_boundary_disagreement() -> None:
+@pytest.mark.parametrize(
+    ("raw_size", "content"),
+    [
+        (1, b"a" * 513),
+        (513, b"a"),
+    ],
+    ids=("larger-global-pax-boundary", "smaller-global-pax-boundary"),
+)
+def test_validate_archive_applies_global_pax_size_to_multiple_members(
+    raw_size: int,
+    content: bytes,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    extracted: list[tuple[str, int]] = []
+    original_extractfile = tarfile.TarFile.extractfile
+
+    def record_extractfile(
+        archive: tarfile.TarFile, member: tarfile.TarInfo
+    ) -> BytesIO | tarfile.ExFileObject | None:
+        extracted.append((member.name, member.size))
+        return original_extractfile(archive, member)
+
+    monkeypatch.setattr(tarfile.TarFile, "extractfile", record_extractfile)
+    data = _tar_with_global_pax_size(raw_size, content)
+
+    assert validate_archive("pax.tar", "application/x-tar", data) == (
+        "application/x-tar"
+    )
+    assert extracted == [
+        ("global-one.txt", len(content)),
+        ("global-two.txt", len(content)),
+    ]
+
+
+def test_validate_archive_updates_global_pax_size_between_members() -> None:
     data = _raw_tar(
-        _tar_record(
-            "global-pax",
-            _pax_record("size", "513"),
-            type_flag=b"g",
-        ),
-        _tar_record("report.txt", b"a" * 513, declared_size=1),
+        _tar_record("global-large", _pax_record("size", "513"), type_flag=b"g"),
+        _tar_record("large.txt", b"a" * 513, declared_size=1),
+        _tar_record("global-small", _pax_record("size", "1"), type_flag=b"g"),
+        _tar_record("small.txt", b"b", declared_size=513),
     )
 
-    with pytest.raises(
-        ArchiveValidationError,
-        match="^global PAX size override disagrees with TAR member header$",
-    ):
-        validate_archive("pax.tar", "application/x-tar", data)
+    assert validate_archive("pax.tar", "application/x-tar", data) == (
+        "application/x-tar"
+    )
+
+
+def test_validate_archive_clears_local_pax_size_after_global_override() -> None:
+    data = _raw_tar(
+        _tar_record("global-pax", _pax_record("size", "513"), type_flag=b"g"),
+        _tar_record("local-pax", _pax_record("size", "1"), type_flag=b"x"),
+        _tar_record("local.txt", b"a", declared_size=513),
+        _tar_record("global.txt", b"b" * 513, declared_size=1),
+    )
+
+    assert validate_archive("pax.tar", "application/x-tar", data) == (
+        "application/x-tar"
+    )
 
 
 def test_validate_archive_caps_semantic_tar_member_iteration_independently(
@@ -439,7 +494,7 @@ def test_validate_archive_caps_semantic_tar_member_iteration_independently(
     ]
     for member in members:
         member.type = tarfile.DIRTYPE
-    monkeypatch.setattr(archive_validation, "_scan_tar_framing", lambda data: None)
+    monkeypatch.setattr(archive_validation, "_scan_tar_framing", lambda data: data)
     monkeypatch.setattr(
         archive_validation.tarfile,
         "open",
@@ -519,7 +574,30 @@ def test_validate_archive_rejects_excess_tar_metadata_records(
 
 
 @pytest.mark.parametrize("type_flag", [b"x", b"X"], ids=("pax", "solaris-pax"))
-def test_validate_archive_caps_recursive_tar_metadata_chain(type_flag: bytes) -> None:
+def test_validate_archive_accepts_33_valid_local_pax_records(
+    type_flag: bytes,
+) -> None:
+    data = _raw_tar(
+        *(
+            _tar_record(
+                f"metadata-{index}",
+                _pax_record("comment", str(index)),
+                type_flag=type_flag,
+            )
+            for index in range(33)
+        ),
+        _tar_record("report.txt", b"report"),
+    )
+
+    assert validate_archive("metadata.tar", "application/x-tar", data) == (
+        "application/x-tar"
+    )
+
+
+@pytest.mark.parametrize("type_flag", [b"x", b"X"], ids=("pax", "solaris-pax"))
+def test_validate_archive_normalizes_recursive_tar_metadata_chain(
+    type_flag: bytes,
+) -> None:
     metadata = _tar_header("metadata", 0, type_flag=type_flag)
     data = _raw_tar(
         *(metadata for _ in range(1_100)),
@@ -528,7 +606,7 @@ def test_validate_archive_caps_recursive_tar_metadata_chain(type_flag: bytes) ->
 
     with pytest.raises(
         ArchiveValidationError,
-        match="^TAR metadata nesting exceeds validation limit$",
+        match="^TAR structure or member integrity is invalid$",
     ):
         validate_archive("metadata.tar", "application/x-tar", data)
 
