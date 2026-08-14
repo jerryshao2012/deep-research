@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import tarfile
 from io import BytesIO
 from zipfile import ZIP_DEFLATED, ZipFile
 
+import py7zr
 import pytest
 from conftest import TEST_API_KEY
 from fastapi.testclient import TestClient
 
 import webapp
+from webapp import markdown_images
 
 _AUTH_HEADERS = {"X-API-Key": TEST_API_KEY}
 _PNG = b"\x89PNG\r\n\x1a\n" + b"png-payload"
@@ -23,6 +27,23 @@ def _zip_bytes(filename: str = "report.txt", content: bytes = b"report") -> byte
     buffer = BytesIO()
     with ZipFile(buffer, "w", compression=ZIP_DEFLATED) as archive:
         archive.writestr(filename, content)
+    return buffer.getvalue()
+
+
+def _seven_zip_bytes() -> bytes:
+    buffer = BytesIO()
+    with py7zr.SevenZipFile(buffer, "w") as archive:
+        archive.writestr(b"report", "report.txt")
+    return buffer.getvalue()
+
+
+def _tar_bytes(*, compressed: bool = False) -> bytes:
+    buffer = BytesIO()
+    mode = "w:gz" if compressed else "w"
+    with tarfile.open(fileobj=buffer, mode=mode) as archive:
+        member = tarfile.TarInfo("report.txt")
+        member.size = len(b"report")
+        archive.addfile(member, BytesIO(b"report"))
     return buffer.getvalue()
 
 
@@ -77,6 +98,9 @@ def _zip_with_invalid_deflate_stream() -> bytes:
 
 
 _ZIP = _zip_bytes()
+_SEVEN_ZIP = _seven_zip_bytes()
+_TAR = _tar_bytes()
+_TAR_GZ = _tar_bytes(compressed=True)
 
 
 def _upload(client: TestClient, markdown_id: str, files):
@@ -176,9 +200,7 @@ def test_upload_accepts_supported_images_and_preserves_order(tmp_path, monkeypat
         "",
     ],
 )
-def test_upload_accepts_zip_browser_mime_variants(
-    tmp_path, monkeypatch, content_type
-):
+def test_upload_accepts_zip_browser_mime_variants(tmp_path, monkeypatch, content_type):
     docs_root = tmp_path / "docs"
     monkeypatch.setattr(webapp, "DOCS_ROOT", docs_root)
     client = TestClient(webapp.app)
@@ -223,7 +245,7 @@ def test_upload_rejects_disguised_or_mismatched_archives(
         {
             "filename": filename,
             "code": "unsupported_or_mismatched_archive",
-            "message": "Only valid ZIP archives are supported",
+            "message": "Only valid ZIP, 7Z, TAR, TAR.GZ, and TGZ archives are supported",
         }
     ]
 
@@ -244,7 +266,7 @@ def test_upload_rejects_zip_with_corrupt_member_crc(tmp_path, monkeypatch):
         {
             "filename": "corrupt.zip",
             "code": "unsupported_or_mismatched_archive",
-            "message": "Only valid ZIP archives are supported",
+            "message": "Only valid ZIP, 7Z, TAR, TAR.GZ, and TGZ archives are supported",
         }
     ]
 
@@ -267,9 +289,7 @@ def test_upload_checks_crc_for_duplicate_named_zip_members(tmp_path, monkeypatch
 
     assert response.status_code == 200
     assert response.json()["assets"] == []
-    assert response.json()["errors"][0]["code"] == (
-        "unsupported_or_mismatched_archive"
-    )
+    assert response.json()["errors"][0]["code"] == ("unsupported_or_mismatched_archive")
 
 
 def test_upload_normalizes_malformed_deflate_as_ordered_archive_error(
@@ -293,9 +313,7 @@ def test_upload_normalizes_malformed_deflate_as_ordered_archive_error(
         "one.png",
         "two.gif",
     ]
-    assert response.json()["errors"][0]["code"] == (
-        "unsupported_or_mismatched_archive"
-    )
+    assert response.json()["errors"][0]["code"] == ("unsupported_or_mismatched_archive")
 
 
 def test_upload_rejects_zip_with_excessive_member_count(tmp_path, monkeypatch):
@@ -314,9 +332,7 @@ def test_upload_rejects_zip_with_excessive_member_count(tmp_path, monkeypatch):
 
     assert response.status_code == 200
     assert response.json()["assets"] == []
-    assert response.json()["errors"][0]["code"] == (
-        "unsupported_or_mismatched_archive"
-    )
+    assert response.json()["errors"][0]["code"] == ("unsupported_or_mismatched_archive")
 
 
 def test_upload_preserves_mixed_asset_order_and_stores_archives_opaque(
@@ -344,9 +360,7 @@ def test_upload_preserves_mixed_asset_order_and_stores_archives_opaque(
         "two.gif",
     ]
     archive = data["assets"][1]
-    archive_dir = (
-        docs_root / "markdown-threads" / "123456" / "images" / archive["id"]
-    )
+    archive_dir = docs_root / "markdown-threads" / "123456" / "images" / archive["id"]
     assert (archive_dir / "payload").read_bytes() == _ZIP
     assert sorted(path.name for path in archive_dir.iterdir()) == [
         "metadata.json",
@@ -386,7 +400,7 @@ def test_mixed_upload_returns_partial_errors_without_reordering_successes(
 
 
 def test_upload_returns_ordered_partial_errors_without_writing_invalid_files(
-        tmp_path, monkeypatch
+    tmp_path, monkeypatch
 ):
     docs_root = tmp_path / "docs"
     monkeypatch.setattr(webapp, "DOCS_ROOT", docs_root)
@@ -503,8 +517,347 @@ def test_upload_rejects_oversized_archive_per_item(tmp_path, monkeypatch):
     }
 
 
+def test_extended_uploads_accept_mixed_max_five_batches_in_input_order(
+    tmp_path, monkeypatch
+):
+    docs_root = tmp_path / "docs"
+    monkeypatch.setattr(webapp, "DOCS_ROOT", docs_root)
+    monkeypatch.delenv("MARKDOWN_EXTENDED_ATTACHMENT_UPLOADS_ENABLED", raising=False)
+    client = TestClient(webapp.app)
+    office_payloads = {
+        "report.docx": (b"", ""),
+        "ledger.xlsx": (b"excel", "application/octet-stream"),
+        "slides.pptx": (b"powerpoint", "image/png"),
+        "database.accdb": (b"access", "application/vnd.ms-access"),
+        "diagram.vsdx": (b"visio", "application/x-tar"),
+        "notes.one": (b"onenote", "application/onenote"),
+        "schedule.mpp": (b"project", "text/plain"),
+        "mail.msg": (b"outlook", "application/vnd.ms-outlook"),
+        "layout.pub": (b"publisher", "application/x-publisher"),
+        "form.xsn": (b"infopath", "application/vnd.ms-infopath"),
+    }
+    items = [
+        ("chart.png", _PNG, "image/png", "image/png"),
+        ("evidence.zip", _ZIP, "application/x-zip-compressed", "application/zip"),
+        (
+            "evidence.7z",
+            _SEVEN_ZIP,
+            "application/vnd.7zip",
+            "application/x-7z-compressed",
+        ),
+        *[
+            (filename, payload, content_type, "application/octet-stream")
+            for filename, (payload, content_type) in list(office_payloads.items())[:2]
+        ],
+        ("evidence.tar", _TAR, "application/tar", "application/x-tar"),
+        *[
+            (filename, payload, content_type, "application/octet-stream")
+            for filename, (payload, content_type) in list(office_payloads.items())[2:6]
+        ],
+        ("evidence.tar.gz", _TAR_GZ, "application/x-gzip", "application/gzip"),
+        ("evidence.tgz", _TAR_GZ, "application/x-tgz", "application/gzip"),
+        *[
+            (filename, payload, content_type, "application/octet-stream")
+            for filename, (payload, content_type) in list(office_payloads.items())[6:9]
+        ],
+        *[
+            (filename, payload, content_type, "application/octet-stream")
+            for filename, (payload, content_type) in list(office_payloads.items())[9:]
+        ],
+    ]
+
+    for batch_index, start in enumerate(range(0, len(items), 5)):
+        markdown_id = f"{123450 + batch_index:06d}"
+        batch = items[start : start + 5]
+        response = _upload(
+            client,
+            markdown_id,
+            [
+                (filename, payload, declared_type)
+                for filename, payload, declared_type, _ in batch
+            ],
+        )
+
+        assert response.status_code == 200
+        assert response.json()["errors"] == []
+        assets = response.json()["assets"]
+        assert [asset["filename"] for asset in assets] == [item[0] for item in batch]
+        assert [asset["content_type"] for asset in assets] == [
+            item[3] for item in batch
+        ]
+        for asset, (_, payload, _, _) in zip(assets, batch, strict=True):
+            asset_dir = (
+                docs_root / "markdown-threads" / markdown_id / "images" / asset["id"]
+            )
+            assert (asset_dir / "payload").read_bytes() == payload
+
+
+@pytest.mark.parametrize("disabled_value", ["false", " FALSE ", "FaLsE"])
+def test_feature_gate_disables_extended_and_office_items_only(
+    tmp_path, monkeypatch, disabled_value
+):
+    monkeypatch.setattr(webapp, "DOCS_ROOT", tmp_path / "docs")
+    monkeypatch.setenv("MARKDOWN_EXTENDED_ATTACHMENT_UPLOADS_ENABLED", disabled_value)
+    client = TestClient(webapp.app)
+
+    first = _upload(
+        client,
+        "123456",
+        [
+            ("chart.png", _PNG, "image/png"),
+            ("evidence.zip", _ZIP, "application/zip"),
+            ("evidence.7z", _SEVEN_ZIP, "application/x-7z-compressed"),
+            ("evidence.tar", _TAR, "application/x-tar"),
+            (
+                "report.docx",
+                b"office",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            ),
+        ],
+    )
+    second = _upload(
+        client,
+        "123457",
+        [
+            ("evidence.tar.gz", _TAR_GZ, "application/gzip"),
+            ("evidence.tgz", _TAR_GZ, "application/x-tgz"),
+            ("mail.msg", b"mail", "application/vnd.ms-outlook"),
+        ],
+    )
+
+    assert [asset["filename"] for asset in first.json()["assets"]] == [
+        "chart.png",
+        "evidence.zip",
+    ]
+    assert [error["filename"] for error in first.json()["errors"]] == [
+        "evidence.7z",
+        "evidence.tar",
+        "report.docx",
+    ]
+    assert [error["filename"] for error in second.json()["errors"]] == [
+        "evidence.tar.gz",
+        "evidence.tgz",
+        "mail.msg",
+    ]
+    assert all(
+        error["code"] == "extended_attachment_upload_disabled"
+        for response in (first, second)
+        for error in response.json()["errors"]
+    )
+
+
+@pytest.mark.parametrize("enabled_value", [None, "true", "0", "disabled", ""])
+def test_feature_gate_absent_or_non_false_value_defaults_enabled(
+    tmp_path, monkeypatch, enabled_value
+):
+    monkeypatch.setattr(webapp, "DOCS_ROOT", tmp_path / "docs")
+    if enabled_value is None:
+        monkeypatch.delenv(
+            "MARKDOWN_EXTENDED_ATTACHMENT_UPLOADS_ENABLED", raising=False
+        )
+    else:
+        monkeypatch.setenv(
+            "MARKDOWN_EXTENDED_ATTACHMENT_UPLOADS_ENABLED", enabled_value
+        )
+    client = TestClient(webapp.app)
+
+    response = _upload(
+        client,
+        "123456",
+        [
+            ("evidence.tar", _TAR, "application/x-tar"),
+            ("report.docx", b"office", "application/x-tar"),
+        ],
+    )
+
+    assert response.status_code == 200
+    assert response.json()["errors"] == []
+    assert [asset["filename"] for asset in response.json()["assets"]] == [
+        "evidence.tar",
+        "report.docx",
+    ]
+
+
+def test_archive_overload_rejects_whole_batch_before_any_write_then_retries(
+    tmp_path, monkeypatch
+):
+    docs_root = tmp_path / "docs"
+    monkeypatch.setattr(webapp, "DOCS_ROOT", docs_root)
+    monkeypatch.setattr(markdown_images, "_ARCHIVE_BATCH_LIMITER", asyncio.Semaphore(0))
+    monkeypatch.setattr(markdown_images, "_ARCHIVE_BATCH_WAIT_SECONDS", 0.001)
+    client = TestClient(webapp.app)
+    files = [
+        ("chart.png", _PNG, "image/png"),
+        ("evidence.tar", _TAR, "application/x-tar"),
+    ]
+
+    overloaded = _upload(client, "123456", files)
+
+    assert overloaded.status_code == 503
+    assert overloaded.json() == {"detail": "Archive validation is busy"}
+    assert overloaded.headers["retry-after"] == "2"
+    assert not (docs_root / "markdown-threads" / "123456" / "images").exists()
+
+    monkeypatch.setattr(markdown_images, "_ARCHIVE_BATCH_LIMITER", asyncio.Semaphore(2))
+    retried = _upload(client, "123456", files)
+
+    assert retried.status_code == 200
+    assert retried.json()["errors"] == []
+    assert [asset["filename"] for asset in retried.json()["assets"]] == [
+        "chart.png",
+        "evidence.tar",
+    ]
+    images_root = docs_root / "markdown-threads" / "123456" / "images"
+    assert (
+        len([path for path in images_root.iterdir() if not path.name.startswith(".")])
+        == 2
+    )
+
+
+def test_archive_specific_mime_mismatch_participates_in_overload_limit(
+    tmp_path, monkeypatch
+):
+    docs_root = tmp_path / "docs"
+    monkeypatch.setattr(webapp, "DOCS_ROOT", docs_root)
+    monkeypatch.setattr(markdown_images, "_ARCHIVE_BATCH_LIMITER", asyncio.Semaphore(0))
+    monkeypatch.setattr(markdown_images, "_ARCHIVE_BATCH_WAIT_SECONDS", 0.001)
+    client = TestClient(webapp.app)
+
+    response = _upload(
+        client,
+        "123456",
+        [("chart.png", _PNG, "application/x-tar")],
+    )
+
+    assert response.status_code == 503
+    assert not (docs_root / "markdown-threads" / "123456" / "images").exists()
+
+
+def test_archive_validation_runs_off_loop_sequentially(tmp_path, monkeypatch):
+    monkeypatch.setattr(webapp, "DOCS_ROOT", tmp_path / "docs")
+    original_validate = markdown_images.validate_archive
+    validation_calls: list[tuple[str, bool]] = []
+
+    def tracked_validate(filename, content_type, data):
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            off_loop = True
+        else:
+            off_loop = False
+        validation_calls.append((filename, off_loop))
+        return original_validate(filename, content_type, data)
+
+    monkeypatch.setattr(markdown_images, "validate_archive", tracked_validate)
+    client = TestClient(webapp.app)
+
+    response = _upload(
+        client,
+        "123456",
+        [
+            ("evidence.tar", _TAR, "application/x-tar"),
+            ("evidence.7z", _SEVEN_ZIP, "application/x-7z-compressed"),
+        ],
+    )
+
+    assert response.status_code == 200
+    assert [call[0] for call in validation_calls] == ["evidence.tar", "evidence.7z"]
+    assert all(call[1] for call in validation_calls)
+
+
+def test_office_only_batches_never_acquire_archive_limiter(tmp_path, monkeypatch):
+    monkeypatch.setattr(webapp, "DOCS_ROOT", tmp_path / "docs")
+
+    class ExplodingLimiter:
+        async def acquire(self):
+            raise AssertionError("Office uploads must not acquire archive limiter")
+
+        def release(self):
+            raise AssertionError("Office uploads must not release archive limiter")
+
+    monkeypatch.setattr(markdown_images, "_ARCHIVE_BATCH_LIMITER", ExplodingLimiter())
+    client = TestClient(webapp.app)
+
+    response = _upload(
+        client,
+        "123456",
+        [
+            ("chart.png", _PNG, "image/png"),
+            ("report.docx", b"office", "application/x-tar"),
+        ],
+    )
+
+    assert response.status_code == 200
+    assert response.json()["errors"] == []
+
+
+def test_extended_invalid_errors_are_classified_and_ordered_before_later_successes(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(webapp, "DOCS_ROOT", tmp_path / "docs")
+    client = TestClient(webapp.app)
+
+    response = _upload(
+        client,
+        "123456",
+        [
+            ("broken.tar", b"not-a-tar", "application/x-tar"),
+            ("notes.txt", b"notes", "text/plain"),
+            ("icon.ico", b"not-a-png", "image/png"),
+            ("report.docx", b"office", "application/x-tar"),
+            ("chart.png", _PNG, "image/png"),
+        ],
+    )
+
+    assert response.status_code == 200
+    assert [asset["filename"] for asset in response.json()["assets"]] == [
+        "report.docx",
+        "chart.png",
+    ]
+    assert response.json()["errors"] == [
+        {
+            "filename": "broken.tar",
+            "code": "unsupported_or_mismatched_archive",
+            "message": "Only valid ZIP, 7Z, TAR, TAR.GZ, and TGZ archives are supported",
+        },
+        {
+            "filename": "notes.txt",
+            "code": "unsupported_or_mismatched_attachment",
+            "message": "Only supported images, archives, and Microsoft Office files are supported",
+        },
+        {
+            "filename": "icon.ico",
+            "code": "unsupported_or_mismatched_image",
+            "message": "Only valid PNG, JPEG, GIF, and WebP images are supported",
+        },
+    ]
+
+
+def test_feature_gate_never_blocks_reads_of_stored_extended_assets(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(webapp, "DOCS_ROOT", tmp_path / "docs")
+    monkeypatch.delenv("MARKDOWN_EXTENDED_ATTACHMENT_UPLOADS_ENABLED", raising=False)
+    client = TestClient(webapp.app)
+    uploaded = _upload(
+        client,
+        "123456",
+        [("report.docx", b"office", "application/vnd.ms-word")],
+    ).json()
+    monkeypatch.setenv("MARKDOWN_EXTENDED_ATTACHMENT_UPLOADS_ENABLED", " false ")
+
+    response = client.get(
+        f"/markdown-threads/123456/images/{uploaded['assets'][0]['id']}",
+        headers=_AUTH_HEADERS,
+    )
+
+    assert response.status_code == 200
+    assert response.content == b"office"
+    assert response.headers["content-type"].startswith("application/octet-stream")
+
+
 def test_inline_and_download_return_exact_bytes_and_original_filename(
-        tmp_path, monkeypatch
+    tmp_path, monkeypatch
 ):
     monkeypatch.setattr(webapp, "DOCS_ROOT", tmp_path / "docs")
     client = TestClient(webapp.app)
@@ -554,10 +907,7 @@ def test_archive_routes_return_exact_opaque_bytes_as_safe_download(
         assert response.content == _ZIP
         assert response.headers["content-type"].startswith("application/zip")
         assert response.headers["content-disposition"].startswith("attachment")
-        assert (
-            "audit%20r%C3%A9sum%C3%A9.zip"
-            in response.headers["content-disposition"]
-        )
+        assert "audit%20r%C3%A9sum%C3%A9.zip" in response.headers["content-disposition"]
         assert "\r" not in response.headers["content-disposition"]
         assert "\n" not in response.headers["content-disposition"]
 
@@ -578,6 +928,31 @@ def test_missing_or_corrupt_assets_are_not_served(tmp_path, monkeypatch):
     assert missing.status_code == 404
 
 
+def test_non_string_stored_content_type_is_not_served(tmp_path, monkeypatch):
+    docs_root = tmp_path / "docs"
+    monkeypatch.setattr(webapp, "DOCS_ROOT", docs_root)
+    client = TestClient(webapp.app, raise_server_exceptions=False)
+    uploaded = _upload(client, "123456", [("one.png", _PNG, "image/png")]).json()
+    asset_id = uploaded["assets"][0]["id"]
+    metadata_path = (
+        docs_root
+        / "markdown-threads"
+        / "123456"
+        / "images"
+        / asset_id
+        / "metadata.json"
+    )
+    metadata = json.loads(metadata_path.read_text())
+    metadata["content_type"] = 7
+    metadata_path.write_text(json.dumps(metadata))
+
+    response = client.get(
+        f"/markdown-threads/123456/images/{asset_id}", headers=_AUTH_HEADERS
+    )
+
+    assert response.status_code == 404
+
+
 def test_same_size_corrupt_payload_is_not_served(tmp_path, monkeypatch):
     docs_root = tmp_path / "docs"
     monkeypatch.setattr(webapp, "DOCS_ROOT", docs_root)
@@ -585,7 +960,7 @@ def test_same_size_corrupt_payload_is_not_served(tmp_path, monkeypatch):
     uploaded = _upload(client, "123456", [("one.png", _PNG, "image/png")]).json()
     asset_id = uploaded["assets"][0]["id"]
     payload = (
-            docs_root / "markdown-threads" / "123456" / "images" / asset_id / "payload"
+        docs_root / "markdown-threads" / "123456" / "images" / asset_id / "payload"
     )
     payload.write_bytes(b"x" * len(_PNG))
 
@@ -619,7 +994,7 @@ def test_same_size_corrupt_archive_payload_is_not_served(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("markdown_id", ["12345", "1234567", "12a456", "１２３４５６"])
 def test_markdown_id_requires_exactly_six_ascii_digits(
-        tmp_path, monkeypatch, markdown_id
+    tmp_path, monkeypatch, markdown_id
 ):
     monkeypatch.setattr(webapp, "DOCS_ROOT", tmp_path / "docs")
     client = TestClient(webapp.app)
