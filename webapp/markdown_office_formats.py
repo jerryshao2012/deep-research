@@ -94,9 +94,10 @@ def _build_office_family_by_extension(
     family_by_extension: dict[str, str] = {}
     for family, extensions in extensions_by_family.items():
         for extension in extensions:
-            if extension in family_by_extension:
-                raise ValueError(f"Duplicate Office extension: {extension}")
-            family_by_extension[extension] = family
+            normalized_extension = extension.lower()
+            if normalized_extension in family_by_extension:
+                raise ValueError(f"Duplicate Office extension: {normalized_extension}")
+            family_by_extension[normalized_extension] = family
     return MappingProxyType(family_by_extension)
 
 
@@ -107,6 +108,8 @@ OFFICE_FAMILY_BY_EXTENSION: Mapping[str, str] = _build_office_family_by_extensio
 
 def office_family_for_filename(filename: str) -> str | None:
     """Return Office family for filename's final suffix, if supported."""
+    if "/" in filename or "\\" in filename:
+        return None
     return OFFICE_FAMILY_BY_EXTENSION.get(Path(filename).suffix.lower())
 
 

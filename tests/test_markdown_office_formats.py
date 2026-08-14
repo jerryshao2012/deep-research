@@ -139,6 +139,16 @@ def test_reverse_catalog_builder_fails_fast_on_duplicate_extensions() -> None:
         _build_office_family_by_extension(duplicate_catalog)
 
 
+def test_reverse_catalog_builder_rejects_case_colliding_extensions() -> None:
+    case_colliding_catalog = {
+        "word": frozenset({".docx"}),
+        "excel": frozenset({".DOCX"}),
+    }
+
+    with pytest.raises(ValueError, match=r"Duplicate Office extension: \.docx"):
+        _build_office_family_by_extension(case_colliding_catalog)
+
+
 @pytest.mark.parametrize(
     ("family", "extension"),
     [
@@ -184,6 +194,37 @@ def test_office_extensions_are_case_insensitive(family: str, extension: str) -> 
 def test_only_final_real_suffix_is_considered(filename: str) -> None:
     assert office_family_for_filename(filename) is None
     assert is_office_upload(filename) is False
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "report.docx/",
+        "report.docx/.",
+        "dir/report.docx",
+        "report.docx\\",
+        "report.docx\\.",
+        "dir\\report.docx",
+    ],
+)
+def test_path_like_inputs_are_rejected(filename: str) -> None:
+    assert office_family_for_filename(filename) is None
+    assert is_office_upload(filename) is False
+
+
+@pytest.mark.parametrize(
+    ("filename", "family"),
+    [
+        ("Résumé Final.DOCX", "word"),
+        ("分析 資料.XlSx", "excel"),
+        ("QUARTERLY status.PpTx", "powerpoint"),
+    ],
+)
+def test_literal_filenames_preserve_unicode_spaces_and_case_insensitivity(
+    filename: str, family: str
+) -> None:
+    assert office_family_for_filename(filename) == family
+    assert is_office_upload(filename) is True
 
 
 @pytest.mark.parametrize(
