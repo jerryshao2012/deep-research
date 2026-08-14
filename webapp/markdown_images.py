@@ -310,36 +310,38 @@ def register_markdown_image_routes(app) -> None:
         assets: list[dict[str, Any]] = []
         errors: list[dict[str, str]] = []
         stored_asset_ids: list[str] = []
-        async with request.form(
-            max_files=_MAX_IMAGE_COUNT,
-            max_fields=0,
-            max_part_size=_MAX_IMAGE_BYTES,
-        ) as form:
-            files = form.getlist("files")
-            if not files or any(not isinstance(upload, UploadFile) for upload in files):
-                raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                    detail="files must contain uploaded assets",
-                )
-            archive_slot_acquired = False
-            needs_archive_slot = any(
-                _is_archive_candidate(upload.filename or "", upload.content_type)
-                for upload in files
-            )
-            if needs_archive_slot:
-                try:
-                    await asyncio.wait_for(
-                        _ARCHIVE_BATCH_LIMITER.acquire(),
-                        timeout=_ARCHIVE_BATCH_WAIT_SECONDS,
-                    )
-                except TimeoutError as exc:
+        archive_slot_acquired = False
+        try:
+            async with request.form(
+                max_files=_MAX_IMAGE_COUNT,
+                max_fields=0,
+                max_part_size=_MAX_IMAGE_BYTES,
+            ) as form:
+                files = form.getlist("files")
+                if not files or any(
+                    not isinstance(upload, UploadFile) for upload in files
+                ):
                     raise HTTPException(
-                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                        detail="Archive validation is busy",
-                        headers={"Retry-After": "2"},
-                    ) from exc
-                archive_slot_acquired = True
-            try:
+                        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                        detail="files must contain uploaded assets",
+                    )
+                needs_archive_slot = any(
+                    _is_archive_candidate(upload.filename or "", upload.content_type)
+                    for upload in files
+                )
+                if needs_archive_slot:
+                    try:
+                        await asyncio.wait_for(
+                            _ARCHIVE_BATCH_LIMITER.acquire(),
+                            timeout=_ARCHIVE_BATCH_WAIT_SECONDS,
+                        )
+                    except TimeoutError as exc:
+                        raise HTTPException(
+                            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail="Archive validation is busy",
+                            headers={"Retry-After": "2"},
+                        ) from exc
+                    archive_slot_acquired = True
                 extended_uploads_enabled = _extended_attachment_uploads_enabled()
                 for upload in files:
                     raw_filename = upload.filename or ""
@@ -430,9 +432,6 @@ def register_markdown_image_routes(app) -> None:
                             )
                         continue
                     except OSError as exc:
-                        await _run_worker_to_completion(
-                            _rollback_request_assets, images_root, stored_asset_ids
-                        )
                         raise HTTPException(
                             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                             detail="Asset storage failed",
@@ -445,14 +444,15 @@ def register_markdown_image_routes(app) -> None:
                             "size": len(data),
                         }
                     )
-            except asyncio.CancelledError:
+        except (Exception, asyncio.CancelledError):
+            if stored_asset_ids:
                 await _run_worker_to_completion(
                     _rollback_request_assets, images_root, stored_asset_ids
                 )
-                raise
-            finally:
-                if archive_slot_acquired:
-                    _ARCHIVE_BATCH_LIMITER.release()
+            raise
+        finally:
+            if archive_slot_acquired:
+                _ARCHIVE_BATCH_LIMITER.release()
         return {"assets": assets, "errors": errors}
 
     def image_response(markdown_id: str, asset_id: str, *, download: bool):

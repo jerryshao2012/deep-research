@@ -860,6 +860,62 @@ def test_cancelled_storage_waits_then_rolls_back_completed_and_current_assets(
     assert not images_root.exists() or not any(images_root.iterdir())
 
 
+def test_cancelled_form_cleanup_rolls_back_assets_before_retry(tmp_path, monkeypatch):
+    docs_root = tmp_path / "docs"
+    monkeypatch.setattr(webapp, "DOCS_ROOT", docs_root)
+    original_close = markdown_images.UploadFile.close
+    cleanup_started = threading.Event()
+    block_next_cleanup = True
+
+    async def blocking_first_close(upload):
+        nonlocal block_next_cleanup
+        if not block_next_cleanup:
+            await original_close(upload)
+            return
+        block_next_cleanup = False
+        cleanup_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            await original_close(upload)
+
+    monkeypatch.setattr(markdown_images.UploadFile, "close", blocking_first_close)
+
+    async def scenario() -> None:
+        async with AsyncClient(
+            transport=ASGITransport(app=webapp.app), base_url="http://test"
+        ) as client:
+            request = asyncio.create_task(
+                client.post(
+                    "/markdown-threads/123456/images",
+                    headers=_AUTH_HEADERS,
+                    files={"files": ("chart.png", _PNG, "image/png")},
+                )
+            )
+            assert await asyncio.to_thread(cleanup_started.wait, 2)
+            images_root = docs_root / "markdown-threads" / "123456" / "images"
+            assert len(list(images_root.iterdir())) == 1
+
+            request.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(request, 2)
+
+            assert not images_root.exists() or not any(images_root.iterdir())
+            retried = await client.post(
+                "/markdown-threads/123456/images",
+                headers=_AUTH_HEADERS,
+                files={"files": ("chart.png", _PNG, "image/png")},
+            )
+            assert retried.status_code == 200
+            assert retried.json()["errors"] == []
+            assert [asset["filename"] for asset in retried.json()["assets"]] == [
+                "chart.png"
+            ]
+            assert len(list(images_root.iterdir())) == 1
+
+    asyncio.run(scenario())
+
+
 def test_feature_gate_disabled_archive_candidates_wait_on_saturated_limiter(
     tmp_path, monkeypatch
 ):
