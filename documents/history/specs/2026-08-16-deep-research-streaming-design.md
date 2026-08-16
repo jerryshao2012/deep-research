@@ -32,8 +32,10 @@ Add `has_documents: bool | None` to graph state and keep matching tri-state fron
 Add one fail-closed predicate shared by middleware and `llm_wiki_query`:
 
 - Explicit `has_documents=false` always means unavailable, even when `doc_folder` is stale.
-- Explicit `has_documents=true` requires a normalized, non-empty `doc_folder` and at least one source file in that folder; truthiness alone is insufficient.
-- When the flag is absent for CLI compatibility, an existing local `doc_folder` containing at least one readable source file or a state file under `/raw/` or `/docs/` counts as available.
+- Explicit `has_documents=true` requires at least one supported source in the normalized local `doc_folder` or the physical Thread Wiki raw directory resolved for the same LangGraph thread ID; truthiness alone is insufficient.
+- When the flag is absent for CLI compatibility, the same physical-source check applies. Virtual agent state paths such as `/raw/` or `/docs/` do not count as upload evidence.
+- The Thread Wiki raw directory is `<wiki-base>/docs/threads-wiki/<thread-id>/raw`, resolved through `ThreadWikiPaths`; `<thread-id>` is the existing LangGraph deep-agent thread ID already used by upload, ingest, and chat state.
+- Supported evidence uses one shared Thread Wiki source policy: Markdown/text, JSON, CSV, YAML, supported office documents, and supported source-code formats. Generated wiki/report files do not count.
 - Whitespace, malformed paths, empty or missing folders, generated research files, and agent-writable `/wiki/` paths do not count.
 
 Resolve current-turn parameter extraction before progress wording and evaluate the predicate against merged state (`state` plus extracted updates). Use the same predicate for progress wording, model-request configuration, and the wiki tool guard so these behaviors cannot drift.
@@ -102,7 +104,7 @@ Completed historical runs may fall back to nested calls parsed from the task res
 Backend tests must prove:
 
 - no-document requests hide `llm_wiki_query` and `read_docs_folder`;
-- validated non-empty local folders, `/raw/`, and `/docs/` context expose them;
+- validated non-empty upload folders or physical `docs/threads-wiki/<thread-id>/raw` sources expose them, including JSON, CSV, YAML, and supported code;
 - stale, whitespace, missing, empty, and explicitly cleared document state hides them;
 - generated research files alone do not expose them;
 - the guarded wiki tool never invokes `run_query` without valid document context;
