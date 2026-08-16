@@ -21,6 +21,9 @@ from typing import Any, Iterable
 
 from tree_sitter import Language, Node, Parser
 
+from .source_types import CODE_EXTENSION_LANGUAGES
+from .source_types import SUPPORTED_CODE_SUFFIXES as SUPPORTED_CODE_SUFFIXES
+
 _DEFAULT_MAX_BYTES = 2_097_152
 _DEFAULT_MAX_CHARS = 40_000
 _MANIFEST_NAME = ".code_ingest_manifest.json"
@@ -189,34 +192,6 @@ class RepositoryIndex:
         }
 
 
-_EXTENSION_LANGUAGES: dict[str, str] = {
-    ".py": "python",
-    ".pyw": "python",
-    ".js": "javascript",
-    ".mjs": "javascript",
-    ".cjs": "javascript",
-    ".jsx": "javascript",
-    ".ts": "typescript",
-    ".mts": "typescript",
-    ".cts": "typescript",
-    ".tsx": "tsx",
-    ".java": "java",
-    ".go": "go",
-    ".rs": "rust",
-    ".c": "c",
-    ".h": "c_or_cpp",
-    ".cc": "cpp",
-    ".cpp": "cpp",
-    ".cxx": "cpp",
-    ".hh": "cpp",
-    ".hpp": "cpp",
-    ".hxx": "cpp",
-    ".cs": "c_sharp",
-    ".rb": "ruby",
-    ".php": "php",
-}
-SUPPORTED_CODE_SUFFIXES = frozenset(_EXTENSION_LANGUAGES)
-
 _FENCE_LANGUAGES: dict[str, str] = {
     "python": "python",
     "py": "python",
@@ -349,7 +324,7 @@ def _env_int(name: str, default: int) -> int:
 def detect_code_language(path: Path, prefix: bytes | None = None) -> CodeDetection | None:
     """Detect supported source code by extension, then extensionless shebang."""
     suffix = path.suffix.lower()
-    language = _EXTENSION_LANGUAGES.get(suffix)
+    language = CODE_EXTENSION_LANGUAGES.get(suffix)
     if language is not None:
         return CodeDetection(language=language, method="extension")
     if suffix:

@@ -37,8 +37,8 @@ from research_agent.model_factory import get_configured_model
 from research_agent.research_subagent.utils.text_search import (
     load_or_build_search_index,
 )
+
 from .code_ingestion import (
-    SUPPORTED_CODE_SUFFIXES,
     analyze_code_sources,
     analyze_embedded_code_sources,
     build_repository_index,
@@ -59,6 +59,7 @@ from .models import (
     parse_frontmatter,
 )
 from .progress import remove_progress_snapshot, save_progress
+from .source_types import BINARY_SOURCE_SUFFIXES, SUPPORTED_WIKI_SOURCE_SUFFIXES
 
 if TYPE_CHECKING:
     from langchain_core.documents import Document  # noqa: F401
@@ -68,15 +69,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # ── Constants ────────────────────────────────────────────────────────────────
-
-# Text-based formats: read directly with read_text().
-_ALLOWED_TEXT_SUFFIXES = {".md", ".txt", ".json", ".yaml", ".yml", ".csv"}
-# Binary formats: require content_extractors for text extraction.
-_BINARY_EXTRACT_SUFFIXES = {".pdf", ".docx", ".pptx", ".xlsx"}
-# All supported source types.
-_ALLOWED_SOURCE_SUFFIXES = (
-        _ALLOWED_TEXT_SUFFIXES | _BINARY_EXTRACT_SUFFIXES | set(SUPPORTED_CODE_SUFFIXES)
-)
 
 # Context budget: proportional allocation of the LLM's context window.
 # Mirrors LLM Wiki's approach: 5% index, 50% wiki pages, 15% response reserve,
@@ -383,7 +375,9 @@ def _extract_binary_source(file_path: Path) -> str:
     error message if extraction fails rather than raising.
     """
     try:
-        from research_agent.research_subagent.utils.content_extractors import extract_supported_document
+        from research_agent.research_subagent.utils.content_extractors import (
+            extract_supported_document,
+        )
 
         return extract_supported_document(file_path)
     except ImportError:
@@ -450,7 +444,7 @@ def _stage_sources(
 
         suffix = source.suffix.lower()
         code_detection = detect_code_language(source)
-        if suffix not in _ALLOWED_SOURCE_SUFFIXES and code_detection is None:
+        if suffix not in SUPPORTED_WIKI_SOURCE_SUFFIXES and code_detection is None:
             logger.warning("Unsupported source type (%s), skipping: %s", suffix, source)
             continue
 
@@ -463,7 +457,7 @@ def _stage_sources(
         destination_parent = raw_dir / relative.parent
         destination_parent.mkdir(parents=True, exist_ok=True)
 
-        is_binary = suffix in _BINARY_EXTRACT_SUFFIXES
+        is_binary = suffix in BINARY_SOURCE_SUFFIXES
         if is_binary:
             destination = destination_parent / f"{source.name}.md"
             stem = f"{source.stem}.{suffix.lstrip('.')}"
@@ -554,7 +548,9 @@ def _chunk_large_source(raw_dir: Path, filename: str) -> list[dict] | None:
         return None  # Small enough — no chunking needed
 
     try:
-        from research_agent.research_subagent.utils.text_search import chunk_markdown_by_boundaries
+        from research_agent.research_subagent.utils.text_search import (
+            chunk_markdown_by_boundaries,
+        )
     except ImportError:
         logger.warning("text_search module unavailable; cannot chunk %s", filename)
         return None

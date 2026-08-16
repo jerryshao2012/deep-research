@@ -17,6 +17,8 @@ from dotenv import load_dotenv
 from langchain_core.tools import InjectedToolArg, tool
 from langgraph.prebuilt import InjectedState
 
+from research_agent.cli_utils import str2bool
+from research_agent.document_context import has_document_context
 from research_agent.logger_utils import setup_logger
 from research_agent.research_subagent.utils.knowledge_filesystem import (
     glob_impl,
@@ -195,6 +197,19 @@ def read_docs_folder(
     Returns:
         Extracted text from supported documents, a summary for large folders, or an error message.
     """
+    if not has_document_context(state):
+        if str2bool((state or {}).get("no_web"), False):
+            return (
+                "No uploaded documents are available for this session. "
+                "Web research is disabled, so use only the available local "
+                "workflow and output tools."
+            )
+        return (
+            "No uploaded documents are available for this session. "
+            "If web access is enabled, use `task` with "
+            '`subagent_type="research-agent"` for web research.'
+        )
+
     logger.info(
         f"Reading documents folder: {folder_path}, Specific files: {specific_files}"
     )
@@ -501,6 +516,19 @@ def llm_wiki_query(
         Raw wiki findings with documents citations — must be synthesized into
         the final report, not output directly.
     """
+    if not has_document_context(state):
+        if str2bool((state or {}).get("no_web"), False):
+            return (
+                "No uploaded documents are available for this session. "
+                "Web research is disabled, so use only the available local "
+                "workflow and output tools."
+            )
+        return (
+            "No uploaded documents are available for this session. "
+            "If web access is enabled, use `task` with "
+            '`subagent_type="research-agent"` for web research.'
+        )
+
     # Resolve thread_id from doc_folder in state.
     doc_folder = (state or {}).get("doc_folder") or os.environ.get("DOC_FOLDER", "")
     thread_id = None
