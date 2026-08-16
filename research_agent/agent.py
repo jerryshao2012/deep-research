@@ -103,6 +103,35 @@ EVAL_LOG_QUESTIONS = str2bool(os.environ.get("EVAL_LOG_QUESTIONS"), False)
 # MAX_VERIFICATION_ROUNDS / ENABLE_VERIFICATION are defined in
 # research_agent.research_subagent.utils.verification — re-exported here for convenience.
 
+
+def _build_verification_todo(
+        *, verdict_status: str, verification_round: int, max_rounds: int
+) -> dict[str, str]:
+    """Build the verification todo shown after one quality-review attempt."""
+    attempt = verification_round + 1
+    if verdict_status == "needs_revision":
+        if attempt < max_rounds:
+            content = (
+                f"Verification {attempt}/{max_rounds} complete — revision required"
+            )
+            status = "in_progress"
+        else:
+            content = (
+                f"Verification {attempt}/{max_rounds} complete — "
+                "revision limit reached"
+            )
+            status = "completed"
+    else:
+        content = f"Verified report quality (round {attempt}/{max_rounds})"
+        status = "completed"
+
+    return {
+        "id": "verification_pass",
+        "content": content,
+        "status": status,
+    }
+
+
 # Get current date
 current_date = datetime.now().strftime("%Y-%m-%d")
 
@@ -521,16 +550,13 @@ class ResearchStateMiddleware(AgentMiddleware):
                             error_message=str(exc),
                         )
 
-                    # ── Mark verification to do as completed ─────────────
-                    completed_verification_todo = {
-                        "id": "verification_pass",
-                        "content": (
-                            f"Verified report quality "
-                            f"(round {verification_round + 1}/{MAX_VERIFICATION_ROUNDS})"
-                        ),
-                        "status": "completed",
-                    }
-                    updates["todos"] = filtered_todos + [completed_verification_todo]
+                    updates["todos"] = filtered_todos + [
+                        _build_verification_todo(
+                            verdict_status=verdict.status,
+                            verification_round=verification_round,
+                            max_rounds=MAX_VERIFICATION_ROUNDS,
+                        )
+                    ]
 
                     if verdict.status == "needs_revision":
                         feedback_text = format_feedback(verdict)
@@ -802,16 +828,13 @@ class ResearchStateMiddleware(AgentMiddleware):
                             error_message=str(exc),
                         )
 
-                    # ── Mark verification to do as completed ─────────────
-                    completed_verification_todo = {
-                        "id": "verification_pass",
-                        "content": (
-                            f"Verified report quality "
-                            f"(round {verification_round + 1}/{MAX_VERIFICATION_ROUNDS})"
-                        ),
-                        "status": "completed",
-                    }
-                    updates["todos"] = filtered_todos + [completed_verification_todo]
+                    updates["todos"] = filtered_todos + [
+                        _build_verification_todo(
+                            verdict_status=verdict.status,
+                            verification_round=verification_round,
+                            max_rounds=MAX_VERIFICATION_ROUNDS,
+                        )
+                    ]
 
                     if verdict.status == "needs_revision":
                         feedback_text = format_feedback(verdict)
