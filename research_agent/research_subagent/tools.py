@@ -221,9 +221,9 @@ def read_docs_folder(
 
 @tool(parse_docstring=True)
 def write_file(
-        file_path: str,
         content: str,
         state: Annotated[dict, InjectedState],
+        file_path: str = "/final_report.md",
 ) -> str:
     """Write content to a file.
 
@@ -231,7 +231,9 @@ def write_file(
     This tool will overwrite existing files if they exist.
 
     Args:
-        file_path: The path where the file should be written (e.g., 'report.md', './output/findings.txt').
+        file_path: The path where the file should be written. Omit only for the
+            final research report, which defaults to `/final_report.md`. Provide
+            an explicit path for every non-final artifact.
         content: The text content to write to the file.
 
     Returns:
