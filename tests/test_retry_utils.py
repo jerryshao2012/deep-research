@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -67,6 +68,23 @@ class _TokenRecorder(BaseCallbackHandler):
         self.tokens.append(token)
 
 
+class _StreamEventRecorder(BaseCallbackHandler):
+    def __init__(self) -> None:
+        self.events: list[Any] = []
+
+    def on_stream_event(self, event: Any, **_kwargs: Any) -> None:
+        self.events.append(event)
+
+
+class _FailingStreamEventRecorder(_StreamEventRecorder):
+    run_inline = True
+    raise_error = True
+
+    def on_stream_event(self, event: Any, **kwargs: Any) -> None:
+        super().on_stream_event(event, **kwargs)
+        raise RuntimeError("429 from visible callback")
+
+
 class _CallbackThenRateLimitedModel(BaseChatModel):
     attempts: int = 0
 
@@ -87,6 +105,32 @@ class _CallbackThenRateLimitedModel(BaseChatModel):
             raise RuntimeError("429 rate limit after visible token")
         return ChatResult(
             generations=[ChatGeneration(message=AIMessage(content="phantom retry"))]
+        )
+
+
+class _StreamEventThenRateLimitedModel(BaseChatModel):
+    attempts: int = 0
+    emit_before_failure: bool
+
+    @property
+    def _llm_type(self) -> str:
+        return "stream-event-then-rate-limit"
+
+    def _generate(self, *args, **kwargs):
+        del args, kwargs
+        raise AssertionError("guarded sync path must use provider async path")
+
+    async def _agenerate(self, *args, run_manager=None, **kwargs):
+        del args, kwargs
+        self.attempts += 1
+        event = {"type": "content-block-delta", "delta": {"text": "partial"}}
+        if self.attempts == 1:
+            if self.emit_before_failure:
+                await run_manager.on_stream_event(event)
+            raise RuntimeError("429 rate limit around stream event")
+        await run_manager.on_stream_event(event)
+        return ChatResult(
+            generations=[ChatGeneration(message=AIMessage(content="recovered"))]
         )
 
 
@@ -500,6 +544,74 @@ def test_model_level_visible_callback_prevents_non_stream_retry() -> None:
 
     assert model.attempts == 1
     assert callback.tokens == ["partial"]
+    assert clock.sleeps == []
+
+
+@pytest.mark.parametrize("method", ["invoke", "ainvoke"])
+def test_visible_stream_event_prevents_non_stream_retry(method: str) -> None:
+    clock = _FakeClock()
+    callback = _StreamEventRecorder()
+    model = _guarded_retry_model(
+        _StreamEventThenRateLimitedModel(emit_before_failure=True),
+        clock,
+    )
+
+    with pytest.raises(RuntimeError, match="around stream event"):
+        if method == "invoke":
+            model.invoke("hello", config={"callbacks": [callback]})
+        else:
+            asyncio.run(model.ainvoke("hello", config={"callbacks": [callback]}))
+
+    assert model.attempts == 1
+    assert callback.events == [
+        {"type": "content-block-delta", "delta": {"text": "partial"}}
+    ]
+    assert clock.sleeps == []
+
+
+@pytest.mark.parametrize("method", ["invoke", "ainvoke"])
+def test_failure_before_stream_event_can_retry_without_duplicate_event(
+    method: str,
+) -> None:
+    clock = _FakeClock()
+    callback = _StreamEventRecorder()
+    model = _guarded_retry_model(
+        _StreamEventThenRateLimitedModel(emit_before_failure=False),
+        clock,
+    )
+
+    if method == "invoke":
+        result = model.invoke("hello", config={"callbacks": [callback]})
+    else:
+        result = asyncio.run(model.ainvoke("hello", config={"callbacks": [callback]}))
+
+    assert result.content == "recovered"
+    assert model.attempts == 2
+    assert callback.events == [
+        {"type": "content-block-delta", "delta": {"text": "partial"}}
+    ]
+    assert clock.sleeps == [0.0]
+
+
+@pytest.mark.parametrize("method", ["invoke", "ainvoke"])
+def test_stream_event_is_visible_before_user_callback_can_fail(method: str) -> None:
+    clock = _FakeClock()
+    callback = _FailingStreamEventRecorder()
+    model = _guarded_retry_model(
+        _StreamEventThenRateLimitedModel(emit_before_failure=True),
+        clock,
+    )
+
+    with pytest.raises(RuntimeError, match="visible callback"):
+        if method == "invoke":
+            model.invoke("hello", config={"callbacks": [callback]})
+        else:
+            asyncio.run(model.ainvoke("hello", config={"callbacks": [callback]}))
+
+    assert model.attempts == 1
+    assert callback.events == [
+        {"type": "content-block-delta", "delta": {"text": "partial"}}
+    ]
     assert clock.sleeps == []
 
 

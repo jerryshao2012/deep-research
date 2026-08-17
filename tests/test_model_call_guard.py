@@ -2,7 +2,9 @@ import asyncio
 import contextvars
 import json
 import logging
+import os
 import pickle
+import socket
 import subprocess
 import sys
 import threading
@@ -14,17 +16,22 @@ from functools import wraps
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from math import inf, nan
 from typing import Any
+from uuid import uuid4
 
 import httpx
 import pytest
 from langchain.agents.middleware import ModelRequest
-from langchain_core.callbacks import BaseCallbackHandler
+from langchain_core.callbacks import (
+    AsyncCallbackHandler,
+    AsyncCallbackManager,
+    BaseCallbackHandler,
+)
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, AIMessageChunk
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 from langchain_core.runnables import RunnableLambda
 from langchain_core.runnables.config import var_child_runnable_config
-from pydantic import PrivateAttr
+from pydantic import PrivateAttr, SecretStr
 
 from research_agent.model_call_guard import (
     DEFAULT_MODEL_CALL_TIMEOUT_SECONDS,
@@ -39,6 +46,7 @@ from research_agent.model_call_guard import (
     _maybe_unload_ollama,
     _run_with_deadline,
     adapt_model_override,
+    build_guarded_provider_model,
     cancel_model_call_scope,
     guard_model,
 )
@@ -54,7 +62,11 @@ _TEST_CONTEXT = contextvars.ContextVar(
 
 
 @contextmanager
-def _ollama_compatible_server():
+def _ollama_compatible_server(
+    *,
+    request_started: threading.Event | None = None,
+    client_disconnected: threading.Event | None = None,
+):
     requests: list[dict[str, Any]] = []
     requests_lock = threading.Lock()
 
@@ -66,8 +78,42 @@ def _ollama_compatible_server():
             request = json.loads(self.rfile.read(length))
             with requests_lock:
                 requests.append(request)
-            response = json.dumps(
-                {
+            if request_started is not None:
+                request_started.set()
+            if client_disconnected is not None:
+                self.close_connection = True
+                self.connection.settimeout(0.5)
+                try:
+                    if self.connection.recv(1, socket.MSG_PEEK) == b"":
+                        client_disconnected.set()
+                except OSError:
+                    pass
+                return
+            if self.path.endswith("/chat/completions"):
+                response_payload = {
+                    "id": "chatcmpl-local",
+                    "object": "chat.completion",
+                    "created": 1,
+                    "model": request["model"],
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": "local-reply",
+                            },
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": 1,
+                        "completion_tokens": 1,
+                        "total_tokens": 2,
+                    },
+                }
+                content_type = "application/json"
+            else:
+                response_payload = {
                     "model": request["model"],
                     "created_at": "2026-08-17T00:00:00Z",
                     "message": {"role": "assistant", "content": "local-reply"},
@@ -80,9 +126,10 @@ def _ollama_compatible_server():
                     "eval_count": 1,
                     "eval_duration": 1,
                 }
-            ).encode()
+                content_type = "application/x-ndjson"
+            response = json.dumps(response_payload).encode()
             self.send_response(200)
-            self.send_header("Content-Type", "application/x-ndjson")
+            self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(response)))
             self.end_headers()
             self.wfile.write(response)
@@ -122,6 +169,93 @@ def _guarded_local_ollama(base_url: str) -> BaseChatModel:
     )
 
 
+def _guarded_local_bedrock_openai(base_url: str) -> BaseChatModel:
+    from langchain_openai import ChatOpenAI
+
+    policy = ModelCallPolicy(timeout_seconds=1.0, force_ollama_unload=False)
+    return build_guarded_provider_model(
+        ChatOpenAI,
+        {
+            "model": "bedrock-local-test",
+            "base_url": f"{base_url}/v1",
+            "api_key": SecretStr("test-key"),
+            "max_retries": 0,
+            "request_timeout": 1.0,
+            "http_client": httpx.Client(timeout=1.0),
+            "http_async_client": httpx.AsyncClient(timeout=1.0),
+        },
+        ModelRuntimeMetadata(
+            provider="aws_bedrock",
+            model_name="bedrock-local-test",
+            base_url=f"{base_url}/v1",
+        ),
+        policy,
+    )
+
+
+def _guarded_default_openai() -> BaseChatModel:
+    from langchain_openai import ChatOpenAI
+
+    return guard_model(
+        ChatOpenAI(
+            model="fork-default-client-test",
+            api_key=SecretStr("test-key"),
+            http_socket_options=(),
+        ),
+        metadata=ModelRuntimeMetadata(
+            provider="openai",
+            model_name="fork-default-client-test",
+        ),
+        policy=ModelCallPolicy(timeout_seconds=1.0, force_ollama_unload=False),
+    )
+
+
+def _guarded_default_ollama() -> BaseChatModel:
+    from langchain_ollama import ChatOllama
+
+    return guard_model(
+        ChatOllama(model="fork-default-ollama-test"),
+        metadata=ModelRuntimeMetadata(
+            provider="ollama",
+            model_name="fork-default-ollama-test",
+            base_url="http://localhost:11434",
+        ),
+        policy=ModelCallPolicy(timeout_seconds=1.0, force_ollama_unload=False),
+    )
+
+
+def _guarded_default_google() -> BaseChatModel:
+    from langchain_google_genai import ChatGoogleGenerativeAI
+
+    return guard_model(
+        ChatGoogleGenerativeAI(
+            model="fork-default-google-test",
+            api_key=SecretStr("test-key"),
+        ),
+        metadata=ModelRuntimeMetadata(
+            provider="google",
+            model_name="fork-default-google-test",
+        ),
+        policy=ModelCallPolicy(timeout_seconds=1.0, force_ollama_unload=False),
+    )
+
+
+def _guarded_default_anthropic() -> BaseChatModel:
+    from langchain_anthropic import ChatAnthropic
+
+    return guard_model(
+        ChatAnthropic(
+            model="fork-default-anthropic-test",
+            api_key=SecretStr("test-key"),
+        ),
+        metadata=ModelRuntimeMetadata(
+            provider="anthropic",
+            model_name="fork-default-anthropic-test",
+        ),
+        policy=ModelCallPolicy(timeout_seconds=1.0, force_ollama_unload=False),
+    )
+
+
 def _close_guarded_local_ollama(model: BaseChatModel) -> None:
     import research_agent.model_call_guard as guard
 
@@ -138,6 +272,94 @@ def _close_guarded_local_ollama(model: BaseChatModel) -> None:
         metadata=model._runtime_metadata,
     )
     model._client._client.close()
+
+
+def _close_guarded_local_openai(model: BaseChatModel) -> None:
+    import research_agent.model_call_guard as guard
+
+    deadline = time.monotonic() + 1.0
+    control = guard._start_bridge(
+        model.http_async_client.aclose,
+        scope_id="local-openai-client-close",
+        registry=model._bridge_registry,
+    )
+    guard._bridge_result(
+        control,
+        deadline,
+        policy=model._model_call_policy,
+        metadata=model._runtime_metadata,
+    )
+    model.http_client.close()
+
+
+def _close_guarded_default_openai(model: BaseChatModel) -> None:
+    import research_agent.model_call_guard as guard
+
+    deadline = time.monotonic() + 1.0
+    control = guard._start_bridge(
+        model.root_async_client.close,
+        scope_id="default-openai-client-close",
+        registry=model._bridge_registry,
+    )
+    guard._bridge_result(
+        control,
+        deadline,
+        policy=model._model_call_policy,
+        metadata=model._runtime_metadata,
+    )
+    model.root_client.close()
+
+
+def _close_guarded_default_google(model: BaseChatModel) -> None:
+    import research_agent.model_call_guard as guard
+
+    deadline = time.monotonic() + 1.0
+    control = guard._start_bridge(
+        model.client.aio.aclose,
+        scope_id="default-google-client-close",
+        registry=model._bridge_registry,
+    )
+    guard._bridge_result(
+        control,
+        deadline,
+        policy=model._model_call_policy,
+        metadata=model._runtime_metadata,
+    )
+    model.client.close()
+
+
+def _close_guarded_default_anthropic(model: BaseChatModel) -> None:
+    import research_agent.model_call_guard as guard
+
+    deadline = time.monotonic() + 1.0
+    control = guard._start_bridge(
+        model._async_client.close,
+        scope_id="default-anthropic-client-close",
+        registry=model._bridge_registry,
+    )
+    guard._bridge_result(
+        control,
+        deadline,
+        policy=model._model_call_policy,
+        metadata=model._runtime_metadata,
+    )
+    model._client.close()
+
+
+def _pending_bridge_tasks() -> list[str]:
+    import research_agent.model_call_guard as guard
+
+    async def inspect() -> list[str]:
+        current = asyncio.current_task()
+        return [
+            repr(task)
+            for task in asyncio.all_tasks()
+            if task is not current and not task.done()
+        ]
+
+    loop = guard._GLOBAL_BRIDGE_RUNTIME._loop
+    assert loop is not None
+    return asyncio.run_coroutine_threadsafe(inspect(), loop).result(0.5)
 
 
 def _configured_retry_controller() -> ModelRetryController:
@@ -246,6 +468,10 @@ class _IndependentBindToolsChatModel(_AsyncOnlyChatModel):
             return AIMessage(content="independent")
 
         return RunnableLambda(slow_tool_runnable)
+
+
+class _ForkOnlyChatModel(_AsyncOnlyChatModel):
+    """Provider class first guarded inside a forked child."""
 
 
 class _DetachedBindToolsChatModel(_AsyncOnlyChatModel):
@@ -388,6 +614,21 @@ class _RecordingCallback(BaseCallbackHandler):
 
     def on_llm_end(self, response: Any, **kwargs: Any) -> None:
         self.ends.append((response, kwargs))
+
+
+class _LoopAffineAsyncCallback(AsyncCallbackHandler):
+    raise_error = True
+
+    def __init__(self, gate: asyncio.Future[None]) -> None:
+        self.gate = gate
+        self.loops: list[asyncio.AbstractEventLoop] = []
+
+    async def on_chat_model_start(
+        self, serialized: dict[str, Any], messages: list[list[Any]], **kwargs: Any
+    ) -> None:
+        del serialized, messages, kwargs
+        self.loops.append(asyncio.get_running_loop())
+        await self.gate
 
 
 def _policy(timeout: float = 0.03, *, unload: bool = False) -> ModelCallPolicy:
@@ -1735,8 +1976,13 @@ async def test_ainvoke_captures_total_deadline_before_coroutine_is_awaited():
 @_async_test
 async def test_ainvoke_external_cancellation_reaches_provider():
     guarded = _guarded_fake(timeout=1, delay=1)
+    scope_id = "async-caller-cancel"
 
-    caller = asyncio.create_task(guarded.ainvoke("hello"))
+    caller = asyncio.create_task(
+        guarded.ainvoke(
+            "hello", config={"configurable": {"model_call_scope_id": scope_id}}
+        )
+    )
     await asyncio.sleep(0.01)
     caller.cancel("caller")
 
@@ -1744,6 +1990,8 @@ async def test_ainvoke_external_cancellation_reaches_provider():
         await caller
     assert raised.value.args == ("caller",)
     assert guarded._cancelled.is_set()
+    assert guarded._bridge_registry.active_count(scope_id) == 0
+    assert _pending_bridge_tasks() == []
 
 
 @_async_test
@@ -1838,6 +2086,34 @@ async def test_astream_cancel_suppression_cannot_replace_or_extend_timeout(monke
 
 
 @_async_test
+async def test_astream_aclose_does_not_block_caller_loop_during_bridge_cleanup(
+    monkeypatch,
+):
+    import research_agent.model_call_guard as guard
+
+    monkeypatch.setattr(guard, "MODEL_CANCEL_GRACE_SECONDS", 0.08)
+    raw = _AsyncOnlyChatModel(
+        chunk_delay=1,
+        chunks=[AIMessageChunk(content="too-late")],
+        suppress_stream_cancel=True,
+    )
+    guarded = guard_model(raw, metadata=_fake_metadata(), policy=_policy(1))
+    stream = guarded.astream("hello")
+    pull = asyncio.create_task(anext(stream))
+    while not guarded._stream_started.is_set():
+        await asyncio.sleep(0)
+
+    started = time.monotonic()
+    close = asyncio.create_task(stream.aclose())
+    await asyncio.sleep(0.01)
+    elapsed = time.monotonic() - started
+    guarded._release_stream.set()
+    await asyncio.gather(close, pull, return_exceptions=True)
+
+    assert elapsed < 0.04
+
+
+@_async_test
 async def test_astream_preserves_message_chunk_metadata_tool_calls_and_usage():
     chunk = AIMessageChunk(
         content="",
@@ -1904,18 +2180,585 @@ def test_concurrent_sync_invokes_share_real_provider_bridge_loop_safely():
     assert len(requests) == 4
 
 
-def test_sync_bridge_copies_calling_contextvars():
+def test_real_provider_sync_async_sync_calls_share_one_transport_loop():
+    with _ollama_compatible_server() as (base_url, requests):
+        guarded = _guarded_local_ollama(base_url)
+        try:
+            first = guarded.invoke("sync-first")
+            second = asyncio.run(guarded.ainvoke("async-middle"))
+            third = guarded.invoke("sync-last")
+        finally:
+            _close_guarded_local_ollama(guarded)
+
+    assert [first.content, second.content, third.content] == ["local-reply"] * 3
+    assert len(requests) == 3
+
+
+def test_real_provider_async_sync_async_calls_share_one_transport_loop():
+    async def run_sequence(guarded: BaseChatModel) -> list[Any]:
+        loop = asyncio.get_running_loop()
+        first = await guarded.ainvoke("async-first")
+        second = await loop.run_in_executor(None, guarded.invoke, "sync-middle")
+        third = await guarded.ainvoke("async-last")
+        return [first, second, third]
+
+    with _ollama_compatible_server() as (base_url, requests):
+        guarded = _guarded_local_ollama(base_url)
+        try:
+            replies = asyncio.run(run_sequence(guarded))
+        finally:
+            _close_guarded_local_ollama(guarded)
+
+    assert [reply.content for reply in replies] == ["local-reply"] * 3
+    assert len(requests) == 3
+
+
+def test_real_provider_concurrent_sync_and_async_calls_share_transport_loop():
+    async def run_concurrently(guarded: BaseChatModel) -> list[Any]:
+        loop = asyncio.get_running_loop()
+        sync_call = loop.run_in_executor(None, guarded.invoke, "sync-concurrent")
+        async_call = guarded.ainvoke("async-concurrent")
+        return list(await asyncio.gather(sync_call, async_call))
+
+    with _ollama_compatible_server() as (base_url, requests):
+        guarded = _guarded_local_ollama(base_url)
+        try:
+            replies = asyncio.run(run_concurrently(guarded))
+        finally:
+            _close_guarded_local_ollama(guarded)
+
+    assert [reply.content for reply in replies] == ["local-reply"] * 2
+    assert len(requests) == 2
+    assert _pending_bridge_tasks() == []
+
+
+@_async_test
+async def test_real_async_caller_cancellation_disconnects_provider_transport():
+    request_started = threading.Event()
+    client_disconnected = threading.Event()
+    with _ollama_compatible_server(
+        request_started=request_started,
+        client_disconnected=client_disconnected,
+    ) as (base_url, _requests):
+        guarded = _guarded_local_ollama(base_url)
+        try:
+            scope_id = "real-async-cancel"
+            caller = asyncio.create_task(
+                guarded.ainvoke(
+                    "cancel-real-request",
+                    config={"configurable": {"model_call_scope_id": scope_id}},
+                )
+            )
+            assert await asyncio.to_thread(request_started.wait, 0.5)
+            caller.cancel("real-caller")
+            with pytest.raises(asyncio.CancelledError) as raised:
+                await caller
+            assert raised.value.args == ("real-caller",)
+            assert await asyncio.to_thread(client_disconnected.wait, 0.5)
+            assert guarded._bridge_registry.active_count(scope_id) == 0
+            assert _pending_bridge_tasks() == []
+        finally:
+            _close_guarded_local_ollama(guarded)
+
+
+def test_real_provider_sync_and_async_streams_share_transport_loop():
+    async def collect(guarded: BaseChatModel) -> list[Any]:
+        return [chunk async for chunk in guarded.astream("async-stream")]
+
+    with _ollama_compatible_server() as (base_url, requests):
+        guarded = _guarded_local_ollama(base_url)
+        try:
+            sync_first = list(guarded.stream("sync-stream-first"))
+            async_middle = asyncio.run(collect(guarded))
+            sync_last = list(guarded.stream("sync-stream-last"))
+        finally:
+            _close_guarded_local_ollama(guarded)
+
+    assert sync_first[0].content == "local-reply"
+    assert async_middle[0].content == "local-reply"
+    assert sync_last[0].content == "local-reply"
+    assert len(requests) == 3
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork")
+def test_bridge_runtime_resets_in_child_and_parent_remains_usable():
+    guarded = _guarded_fake(timeout=0.2)
+    assert guarded.invoke("parent-before").content == "complete"
+    read_fd, write_fd = os.pipe()
+    child_pid = os.fork()
+    if child_pid == 0:
+        os.close(read_fd)
+        try:
+            child_reply = guarded.invoke("child-success")
+            slow = _guarded_fake(timeout=0.02, delay=1)
+            try:
+                slow.invoke("child-cancel")
+            except ModelCallTimeoutError:
+                cancelled = slow._cancelled.wait(0.2)
+            else:
+                cancelled = False
+            payload = f"{child_reply.content}:{cancelled}".encode()
+        except BaseException as exc:
+            payload = f"error:{type(exc).__name__}:{exc}".encode()
+        os.write(write_fd, payload)
+        os.close(write_fd)
+        os._exit(0)
+
+    os.close(write_fd)
+    deadline = time.monotonic() + 2.0
+    status = None
+    while time.monotonic() < deadline:
+        completed_pid, status = os.waitpid(child_pid, os.WNOHANG)
+        if completed_pid == child_pid:
+            break
+        time.sleep(0.01)
+    else:
+        os.kill(child_pid, 9)
+        os.waitpid(child_pid, 0)
+        pytest.fail("forked child did not exit promptly")
+
+    payload = os.read(read_fd, 4096).decode()
+    os.close(read_fd)
+    assert os.waitstatus_to_exitcode(status) == 0
+    assert payload == "complete:True"
+    assert guarded.invoke("parent-after").content == "complete"
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork")
+def test_forked_child_recreates_inherited_real_provider_transport():
+    with _ollama_compatible_server() as (base_url, requests):
+        guarded = _guarded_local_ollama(base_url)
+        try:
+            assert guarded.invoke("parent-before-fork").content == "local-reply"
+            read_fd, write_fd = os.pipe()
+            child_pid = os.fork()
+            if child_pid == 0:
+                os.close(read_fd)
+                try:
+                    payload = guarded.invoke("child-after-fork").content.encode()
+                except BaseException as exc:
+                    payload = f"error:{type(exc).__name__}:{exc}".encode()
+                os.write(write_fd, payload)
+                os.close(write_fd)
+                os._exit(0)
+
+            os.close(write_fd)
+            deadline = time.monotonic() + 2.0
+            status = None
+            while time.monotonic() < deadline:
+                completed_pid, status = os.waitpid(child_pid, os.WNOHANG)
+                if completed_pid == child_pid:
+                    break
+                time.sleep(0.01)
+            else:
+                os.kill(child_pid, 9)
+                os.waitpid(child_pid, 0)
+                pytest.fail("forked provider child did not exit promptly")
+            payload = os.read(read_fd, 4096).decode()
+            os.close(read_fd)
+            assert os.waitstatus_to_exitcode(status) == 0
+            assert payload == "local-reply"
+            assert guarded.invoke("parent-after-fork").content == "local-reply"
+        finally:
+            _close_guarded_local_ollama(guarded)
+
+    assert len(requests) == 3
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork")
+def test_forked_child_model_copy_recreates_inherited_provider_transport():
+    with _ollama_compatible_server() as (base_url, requests):
+        guarded = _guarded_local_ollama(base_url)
+        try:
+            assert guarded.invoke("parent-before-fork").content == "local-reply"
+            read_fd, write_fd = os.pipe()
+            child_pid = os.fork()
+            if child_pid == 0:
+                os.close(read_fd)
+                try:
+                    copied = guarded.model_copy()
+                    payload = copied.invoke("copied-child-after-fork").content.encode()
+                except BaseException as exc:
+                    payload = f"error:{type(exc).__name__}:{exc}".encode()
+                os.write(write_fd, payload)
+                os.close(write_fd)
+                os._exit(0)
+
+            os.close(write_fd)
+            deadline = time.monotonic() + 2.0
+            status = None
+            while time.monotonic() < deadline:
+                completed_pid, status = os.waitpid(child_pid, os.WNOHANG)
+                if completed_pid == child_pid:
+                    break
+                time.sleep(0.01)
+            else:
+                os.kill(child_pid, 9)
+                os.waitpid(child_pid, 0)
+                pytest.fail("forked model-copy child did not exit promptly")
+            payload = os.read(read_fd, 4096).decode()
+            os.close(read_fd)
+            assert os.waitstatus_to_exitcode(status) == 0
+            assert payload == "local-reply"
+            assert guarded.invoke("parent-after-fork").content == "local-reply"
+        finally:
+            _close_guarded_local_ollama(guarded)
+
+    assert len(requests) == 3
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork")
+def test_forked_child_recreates_bedrock_openai_compatible_transport():
+    with _ollama_compatible_server() as (base_url, requests):
+        guarded = _guarded_local_bedrock_openai(base_url)
+        try:
+            assert guarded.invoke("parent-before-fork").content == "local-reply"
+            read_fd, write_fd = os.pipe()
+            child_pid = os.fork()
+            if child_pid == 0:
+                os.close(read_fd)
+                try:
+                    payload = guarded.invoke("child-after-fork").content.encode()
+                except BaseException as exc:
+                    payload = f"error:{type(exc).__name__}:{exc}".encode()
+                os.write(write_fd, payload)
+                os.close(write_fd)
+                os._exit(0)
+
+            os.close(write_fd)
+            deadline = time.monotonic() + 2.0
+            status = None
+            while time.monotonic() < deadline:
+                completed_pid, status = os.waitpid(child_pid, os.WNOHANG)
+                if completed_pid == child_pid:
+                    break
+                time.sleep(0.01)
+            else:
+                os.kill(child_pid, 9)
+                os.waitpid(child_pid, 0)
+                pytest.fail("forked Bedrock-compatible child did not exit promptly")
+            payload = os.read(read_fd, 4096).decode()
+            os.close(read_fd)
+            assert os.waitstatus_to_exitcode(status) == 0
+            assert payload == "local-reply"
+            assert guarded.invoke("parent-after-fork").content == "local-reply"
+        finally:
+            _close_guarded_local_openai(guarded)
+
+    assert len(requests) == 3
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork")
+def test_forked_child_recreates_default_openai_clients_without_proxy_discovery():
+    import research_agent.model_call_guard as guard
+
+    guarded = _guarded_default_openai()
+    assert _guarded_fake(timeout=0.2).invoke("initialize-runtime").content == "complete"
+    read_fd, write_fd = os.pipe()
+    child_pid = os.fork()
+    if child_pid == 0:
+        os.close(read_fd)
+        try:
+            guard._ensure_model_process(guarded)
+            payload = b"refreshed"
+        except BaseException as exc:
+            payload = f"error:{type(exc).__name__}:{exc}".encode()
+        os.write(write_fd, payload)
+        os.close(write_fd)
+        os._exit(0)
+
+    os.close(write_fd)
+    deadline = time.monotonic() + 2.0
+    status = None
+    try:
+        while time.monotonic() < deadline:
+            completed_pid, status = os.waitpid(child_pid, os.WNOHANG)
+            if completed_pid == child_pid:
+                break
+            time.sleep(0.01)
+        else:
+            os.kill(child_pid, 9)
+            os.waitpid(child_pid, 0)
+            pytest.fail("forked default OpenAI child did not exit promptly")
+        payload = os.read(read_fd, 4096).decode()
+        assert os.waitstatus_to_exitcode(status) == 0
+        assert payload == "refreshed"
+    finally:
+        os.close(read_fd)
+        _close_guarded_default_openai(guarded)
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_fork_client_reconstruction_preserves_resolved_proxy_mounts(
+    asynchronous: bool,
+):
+    import research_agent.model_call_guard as guard
+
+    proxy_url = "http://fork-proxy.invalid:8443"
+    policy = _policy(0.2)
+    if asynchronous:
+        original = httpx.AsyncClient(proxy=proxy_url, trust_env=False)
+        fresh = guard._fresh_httpx_async_client_after_fork(original, policy)
+    else:
+        original = httpx.Client(proxy=proxy_url, trust_env=False)
+        fresh = guard._fresh_httpx_client_after_fork(original, policy)
+    try:
+        proxy_pools = [
+            transport._pool
+            for transport in fresh._mounts.values()
+            if transport is not None
+            and getattr(transport._pool, "_proxy_url", None) is not None
+        ]
+
+        assert [bytes(pool._proxy_url) for pool in proxy_pools] == [
+            b"http://fork-proxy.invalid:8443/"
+        ]
+        assert all(
+            transport not in original._mounts.values()
+            for transport in fresh._mounts.values()
+        )
+        assert fresh._trust_env is False
+    finally:
+        if asynchronous:
+            asyncio.run(original.aclose())
+            asyncio.run(fresh.aclose())
+        else:
+            original.close()
+            fresh.close()
+
+
+@pytest.mark.parametrize(
+    "provider",
+    ["openai", "ollama", "google", "anthropic"],
+)
+def test_provider_reconstruction_preserves_pre_resolved_environment_proxy(
+    provider: str,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import research_agent.model_call_guard as guard
+
+    proxy_url = "http://resolved-before-fork.invalid:8443"
+    monkeypatch.setenv("HTTP_PROXY", proxy_url)
+    monkeypatch.setenv("HTTPS_PROXY", proxy_url)
+    builders = {
+        "openai": _guarded_default_openai,
+        "ollama": _guarded_default_ollama,
+        "google": _guarded_default_google,
+        "anthropic": _guarded_default_anthropic,
+    }
+    closers = {
+        "openai": _close_guarded_default_openai,
+        "ollama": _close_guarded_local_ollama,
+        "google": _close_guarded_default_google,
+        "anthropic": _close_guarded_default_anthropic,
+    }
+    guarded = builders[provider]()
+    if provider == "openai":
+        guarded.root_client._client.close()
+        asyncio.run(guarded.root_async_client._client.aclose())
+        guarded.root_client._client = httpx.Client(
+            proxy=proxy_url,
+            trust_env=False,
+        )
+        guarded.root_async_client._client = httpx.AsyncClient(
+            proxy=proxy_url,
+            trust_env=False,
+        )
+    monkeypatch.delenv("HTTP_PROXY")
+    monkeypatch.delenv("HTTPS_PROXY")
+    guarded._guard_pid = -1
+
+    guard._ensure_model_process(guarded)
+    if provider == "openai":
+        clients = (guarded.http_client, guarded.http_async_client)
+    elif provider == "ollama":
+        clients = (guarded._client._client, guarded._async_client._client)
+    elif provider == "google":
+        api_client = guarded.client._api_client
+        clients = (api_client._httpx_client, api_client._async_httpx_client)
+    else:
+        clients = (guarded._client._client, guarded._async_client._client)
+    try:
+        for client in clients:
+            resolved_proxies = {
+                bytes(transport._pool._proxy_url).decode("ascii")
+                for transport in client._mounts.values()
+                if transport is not None
+                and getattr(transport._pool, "_proxy_url", None) is not None
+            }
+            assert proxy_url + "/" in resolved_proxies
+            assert client._trust_env is False
+    finally:
+        closers[provider](guarded)
+
+
+def test_ollama_reconstruction_never_reuses_custom_inherited_transports():
+    from langchain_ollama import ChatOllama
+
+    import research_agent.model_call_guard as guard
+
+    sync_transport = httpx.MockTransport(lambda _request: httpx.Response(200))
+    async_transport = httpx.MockTransport(lambda _request: httpx.Response(200))
+    guarded = guard_model(
+        ChatOllama(
+            model="fork-custom-transport-test",
+            sync_client_kwargs={"transport": sync_transport},
+            async_client_kwargs={"transport": async_transport},
+        ),
+        metadata=ModelRuntimeMetadata(
+            provider="ollama",
+            model_name="fork-custom-transport-test",
+        ),
+        policy=_policy(0.2),
+    )
+    guarded._guard_pid = -1
+
+    guard._ensure_model_process(guarded)
+    try:
+        assert guarded._client._client._transport is not sync_transport
+        assert guarded._async_client._client._transport is not async_transport
+        assert isinstance(guarded._client._client._transport, httpx.HTTPTransport)
+        assert isinstance(
+            guarded._async_client._client._transport,
+            httpx.AsyncHTTPTransport,
+        )
+    finally:
+        _close_guarded_local_ollama(guarded)
+
+
+@pytest.mark.parametrize("provider", ["ollama", "google", "anthropic"])
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork")
+def test_forked_child_recreates_default_provider_clients_without_env_proxy(
+    provider: str,
+):
+    import research_agent.model_call_guard as guard
+
+    builders = {
+        "ollama": _guarded_default_ollama,
+        "google": _guarded_default_google,
+        "anthropic": _guarded_default_anthropic,
+    }
+    closers = {
+        "ollama": _close_guarded_local_ollama,
+        "google": _close_guarded_default_google,
+        "anthropic": _close_guarded_default_anthropic,
+    }
+    guarded = builders[provider]()
+    assert _guarded_fake(timeout=0.2).invoke("initialize-runtime").content == "complete"
+    read_fd, write_fd = os.pipe()
+    child_pid = os.fork()
+    if child_pid == 0:
+        os.close(read_fd)
+        try:
+            guard._ensure_model_process(guarded)
+            if provider == "ollama":
+                trust_env = (
+                    guarded._client._client._trust_env,
+                    guarded._async_client._client._trust_env,
+                )
+            elif provider == "google":
+                api_client = guarded.client._api_client
+                trust_env = (
+                    api_client._httpx_client._trust_env,
+                    api_client._async_httpx_client._trust_env,
+                )
+            else:
+                trust_env = (
+                    guarded._client._client._trust_env,
+                    guarded._async_client._client._trust_env,
+                )
+            payload = repr(trust_env).encode()
+        except BaseException as exc:
+            payload = f"error:{type(exc).__name__}:{exc}".encode()
+        os.write(write_fd, payload)
+        os.close(write_fd)
+        os._exit(0)
+
+    os.close(write_fd)
+    deadline = time.monotonic() + 2.0
+    status = None
+    try:
+        while time.monotonic() < deadline:
+            completed_pid, status = os.waitpid(child_pid, os.WNOHANG)
+            if completed_pid == child_pid:
+                break
+            time.sleep(0.01)
+        else:
+            os.kill(child_pid, 9)
+            os.waitpid(child_pid, 0)
+            pytest.fail(f"forked default {provider} child did not exit promptly")
+        payload = os.read(read_fd, 4096).decode()
+        assert os.waitstatus_to_exitcode(status) == 0
+        assert payload == "(False, False)"
+    finally:
+        os.close(read_fd)
+        closers[provider](guarded)
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork")
+def test_forked_child_resets_guarded_provider_class_lock():
+    import research_agent.model_call_guard as guard
+
+    parent_holds_lock = threading.Event()
+    release_parent_lock = threading.Event()
+
+    def hold_parent_lock() -> None:
+        with guard._GUARDED_PROVIDER_CLASSES_LOCK:
+            parent_holds_lock.set()
+            release_parent_lock.wait(1.0)
+
+    holder = threading.Thread(target=hold_parent_lock)
+    holder.start()
+    assert parent_holds_lock.wait(0.2)
+    read_fd, write_fd = os.pipe()
+    child_pid = os.fork()
+    if child_pid == 0:
+        os.close(read_fd)
+        acquired = guard._GUARDED_PROVIDER_CLASSES_LOCK.acquire(timeout=0.2)
+        if acquired:
+            guard._GUARDED_PROVIDER_CLASSES_LOCK.release()
+            guarded = guard_model(
+                _ForkOnlyChatModel(),
+                metadata=_fake_metadata(),
+                policy=_policy(0.2),
+            )
+            payload = str(isinstance(guarded, _ForkOnlyChatModel)).encode()
+        else:
+            payload = b"inherited-locked"
+        os.write(write_fd, payload)
+        os.close(write_fd)
+        os._exit(0)
+
+    os.close(write_fd)
+    try:
+        completed_pid, status = os.waitpid(child_pid, 0)
+        assert completed_pid == child_pid
+        payload = os.read(read_fd, 4096).decode()
+        assert os.waitstatus_to_exitcode(status) == 0
+        assert payload == "True"
+    finally:
+        os.close(read_fd)
+        release_parent_lock.set()
+        holder.join(0.5)
+
+
+@pytest.mark.parametrize("method", ["invoke", "ainvoke"])
+def test_bridge_copies_calling_contextvars(method: str):
     guarded = _guarded_fake()
     token = _TEST_CONTEXT.set("caller-context")
     try:
-        guarded.invoke("hello")
+        if method == "invoke":
+            guarded.invoke("hello")
+        else:
+            asyncio.run(guarded.ainvoke("hello"))
     finally:
         _TEST_CONTEXT.reset(token)
 
     assert guarded._context_values == ["caller-context"]
 
 
-def test_callbacks_tags_metadata_and_configurable_config_survive_guard():
+@pytest.mark.parametrize("method", ["invoke", "ainvoke"])
+def test_callbacks_tags_metadata_and_configurable_config_survive_guard(method: str):
     callback = _RecordingCallback()
     guarded = _guarded_fake()
     config = {
@@ -1925,7 +2768,10 @@ def test_callbacks_tags_metadata_and_configurable_config_survive_guard():
         "configurable": {"model_call_scope_id": "callback-scope", "tenant": "kept"},
     }
 
-    result = guarded.invoke("hello", config=config)
+    if method == "invoke":
+        result = guarded.invoke("hello", config=config)
+    else:
+        result = asyncio.run(guarded.ainvoke("hello", config=config))
 
     assert result.content == "complete"
     assert len(callback.starts) == 1
@@ -1938,6 +2784,77 @@ def test_callbacks_tags_metadata_and_configurable_config_survive_guard():
         "model_call_scope_id": "callback-scope",
         "tenant": "kept",
     }
+
+
+@pytest.mark.parametrize("method", ["ainvoke", "astream"])
+@pytest.mark.parametrize("callback_source", ["config", "model"])
+@_async_test
+async def test_async_callbacks_remain_on_caller_loop(
+    callback_source: str,
+    method: str,
+):
+    caller_loop = asyncio.get_running_loop()
+    gate = caller_loop.create_future()
+    callback = _LoopAffineAsyncCallback(gate)
+    raw = _AsyncOnlyChatModel(
+        callbacks=[callback] if callback_source == "model" else None,
+        chunks=[AIMessageChunk(content="complete")],
+    )
+    guarded = guard_model(raw, metadata=_fake_metadata(), policy=_policy(0.2))
+    config = {"callbacks": [callback]} if callback_source == "config" else None
+    caller_loop.call_later(0.01, gate.set_result, None)
+
+    if method == "ainvoke":
+        result = await guarded.ainvoke("hello", config=config)
+        assert result.content == "complete"
+    else:
+        chunks = [chunk async for chunk in guarded.astream("hello", config=config)]
+        assert "".join(str(chunk.content) for chunk in chunks) == "complete"
+
+    assert callback.loops == [caller_loop]
+
+
+@_async_test
+async def test_model_callback_manager_context_survives_caller_loop_proxy():
+    import research_agent.model_call_guard as guard
+
+    callback = _RecordingCallback()
+    inherited = _RecordingCallback()
+    parent_run_id = uuid4()
+    callback_manager = AsyncCallbackManager(
+        handlers=[callback, inherited],
+        inheritable_handlers=[inherited],
+        parent_run_id=parent_run_id,
+        tags=["local-tag"],
+        inheritable_tags=["inherited-tag"],
+        metadata={"local": "value"},
+        inheritable_metadata={"inherited": "value"},
+    )
+    guarded = guard_model(
+        _AsyncOnlyChatModel(callbacks=callback_manager),
+        metadata=_fake_metadata(),
+        policy=_policy(0.2),
+    )
+
+    provider_view = guard._provider_on_caller_callback_loop(
+        guarded,
+        asyncio.get_running_loop(),
+    )
+
+    assert isinstance(provider_view.callbacks, AsyncCallbackManager)
+    assert provider_view.callbacks.parent_run_id == parent_run_id
+    assert provider_view.callbacks.tags == ["local-tag"]
+    assert provider_view.callbacks.inheritable_tags == ["inherited-tag"]
+    assert provider_view.callbacks.metadata == {"local": "value"}
+    assert provider_view.callbacks.inheritable_metadata == {"inherited": "value"}
+    assert [proxy._handler for proxy in provider_view.callbacks.handlers] == [
+        callback,
+        inherited,
+    ]
+    assert [
+        proxy._handler for proxy in provider_view.callbacks.inheritable_handlers
+    ] == [inherited]
+    assert guarded.callbacks is callback_manager
 
 
 def test_sync_stream_close_cancels_async_provider_and_cleans_bridge():
