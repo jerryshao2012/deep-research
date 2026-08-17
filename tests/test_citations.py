@@ -11,7 +11,6 @@ from research_agent.research_subagent.utils.content_extractors import _render_pa
 from thread_wiki.models import SourceCitation, WikiQueryResult
 from thread_wiki.service import _extract_citations
 
-
 # ── _render_page_chunk ─────────────────────────────────────────────────────
 
 
