@@ -52,11 +52,13 @@ Add a dedicated `CompletionGuardMiddleware` and persist its small amount of cont
 - current request's plan owner;
 - current request's report-ownership flag;
 - whether an explicit resume adopted the previous request generation; and
-- the ordinary request's baseline `/final_report.md` `modified_at` value.
+- the ordinary request's baseline `/final_report.md` `modified_at` value;
+- verified report `modified_at` and accepted-at-verification-limit state; and
+- exhausted run ID plus safe incomplete/malformed counts and report reason.
 
 `before_agent` runs once for each visible LangGraph run. It uses top-level `get_config()["run_id"]`, normalized to a string, as request identity, with a generated invocation token only for direct graph calls that do not provide a run ID. This matches LangGraph API-shaped configuration and avoids content-hash ambiguity when a user submits identical text twice. Automatic `jump_to: "model"` continuations bypass `before_agent`, so they retain the same counter.
 
-Every visible run receives a fresh three-attempt budget, including an explicit resume after a previous exhausted run. An ordinary new research run clears stale todos, marks its plan and report unowned, records the prior report's `modified_at` baseline, and resets streamed-file ownership. An explicit `resume_incomplete_todos` run preserves the prior plan, baseline, and report-ownership flag while resetting only the automatic-attempt budget. Resume never promotes a report to owned merely because a non-empty canonical report exists; request B therefore cannot adopt request A's stale report.
+Every visible run receives a fresh resolved `MAX_COMPLETION_ATTEMPTS` budget, including an explicit resume after a previous exhausted run. `before_agent` clears the exhausted run ID and its safe reason/count fields on every visible run start. An ordinary new research run clears stale todos, marks its plan and report unowned, records the prior report's `modified_at` baseline, clears prior verification acceptance, and resets streamed-file ownership. An explicit `resume_incomplete_todos` run preserves the prior plan, baseline, report-ownership flag, and valid verification ownership while resetting the automatic-attempt budget and exhaustion fields. Resume never promotes a report to owned merely because a non-empty canonical report exists; request B therefore cannot adopt request A's stale report.
 
 `CompletionGuardMiddleware.before_model` and `abefore_model` activate artifacts after the tools node. They correlate the latest `AIMessage` tool-call IDs with successful `ToolMessage.tool_call_id` values:
 
@@ -78,7 +80,7 @@ The guard is deliberately tied to an active todo plan. Clarification-only turns 
 
 ### Automatic continuation
 
-When a terminal response fails the completion assessment and fewer than three attempts have been used, middleware:
+When a terminal response fails the completion assessment and fewer than the resolved `MAX_COMPLETION_ATTEMPTS` have been used, middleware:
 
 1. increments the completion-attempt counter;
 2. returns `jump_to: "model"`;
@@ -91,7 +93,7 @@ The counter is total per user request, not consecutive. Successful tool calls do
 
 Each incomplete terminal `AIMessage` that causes an automatic continuation is tagged with the existing `resume_intermediate` response metadata. This preserves the frontend's current suppression contract so promises such as “I will proceed” are not presented as final answers.
 
-Both sync and async completion hooks declare `@hook_config(can_jump_to=["model"])`. Compiled-graph tests must prove that the returned jump actually reaches a second model invocation.
+Both sync and async completion hooks declare `@hook_config(can_jump_to=["model", "end"])`. Compiled-graph tests must prove that the returned continuation jump actually reaches a second model invocation and the exhaustion jump reaches `after_agent`.
 
 Middleware registration order is:
 
@@ -114,13 +116,13 @@ The guard evaluates state produced by earlier middleware nodes, including verifi
 
 ### Retry exhaustion
 
-On the fourth incomplete terminal response—the initial stop plus three automatic continuation attempts—middleware raises a dedicated `ResearchIncompleteError` containing:
+On incomplete terminal response `MAX_COMPLETION_ATTEMPTS + 1`—the initial stop plus the configured automatic continuation attempts—middleware raises a dedicated `ResearchIncompleteError` containing:
 
-- the three automatic attempts used;
+- the resolved automatic-attempt limit used;
 - count of incomplete or malformed todos; and
 - whether the current request's `/final_report.md` is stale, missing, malformed, or empty.
 
-`CompletionGuardMiddleware.after_model` does not raise immediately on exhaustion. It first tags the exhausted terminal `AIMessage` as `resume_intermediate`, stores safe exhaustion metadata, and returns `jump_to: "end"`. That node update is checkpointed before `CompletionGuardMiddleware.after_agent` raises `ResearchIncompleteError`. This ensures live and restored history suppress the partial terminal response while LangGraph still marks the run failed.
+`CompletionGuardMiddleware.after_model` does not raise immediately on exhaustion. It first tags the exhausted terminal `AIMessage` as `resume_intermediate`, stores current run ID plus safe exhaustion metadata, and returns `jump_to: "end"`. That node update is checkpointed before `CompletionGuardMiddleware.after_agent` raises `ResearchIncompleteError`. `after_agent` raises only when stored exhausted run ID equals current top-level run ID. This guarantees restored-history suppression of the partial terminal response while LangGraph still marks the run failed. Live token chunks cannot be retracted by backend middleware; frontend reconciliation remains governed by its existing finalized-message metadata handling.
 
 `ResearchIncompleteError` subclasses `RuntimeError`, and the installed LangGraph API serializer exposes `RuntimeError` text instead of replacing it with “An internal error occurred.” The message is deliberately safe and contains counts, not todo labels or research text. Existing task state retains the remaining labels for the UI. No separate hidden run is created.
 
@@ -140,6 +142,7 @@ Required cases:
 - stale incomplete plan cannot activate a new ordinary request;
 - request B followed by explicit resume cannot adopt request A's stale report when B never owned a report;
 - explicit resume adopts prior plan/report but receives a fresh retry budget;
+- exhausted run followed by explicit resume clears stale exhaustion state and can complete without `after_agent` raising again;
 - repeated identical user messages receive distinct request generations;
 - malformed todo entries, unknown statuses, malformed file data, and file-conversion failures cannot pass;
 - verification revision explicitly jumps to model, injects feedback ephemerally, preserves Ollama role order, and consumes no completion attempt;
@@ -152,6 +155,9 @@ Required cases:
 - compiled sync and async graph executions make the second model call after a completion jump;
 - compiled sync and async activation starts inactive, calls real `write_todos`, correlates its successful tool result, observes non-empty todo state, and then guards the next incomplete terminal response;
 - failed, mismatched, and malformed `write_todos` tool results do not activate a plan;
+- compiled sync and async `write_file` ownership covers omitted default path and explicit canonical path, requiring a matching successful `ToolMessage`, changed `modified_at`, valid state data, and non-empty content;
+- failed, mismatched, malformed, stale-`modified_at`, and non-final `write_file` results do not establish report ownership;
+- compiled attempt-limit cases `1`, `2`, and `3` consume exactly that many automatic continuations before exhaustion;
 - graph integration keeps one run ID and preserves files, todos, and tool events across continuations;
 - explicit resume behavior and registered `write_todos` tool remain unchanged.
 
