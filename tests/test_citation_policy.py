@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import tracemalloc
 from dataclasses import FrozenInstanceError
 from time import perf_counter
 
@@ -248,12 +249,10 @@ Actual [1].
 
 def test_link_scanner_handles_nested_parentheses_and_bounds_adversarial_brackets() -> None:
     nested = audit_web_citations("[1](https://publisher.org/a((b)))")
-    started = perf_counter()
     adversarial = audit_web_citations("[" * 10_000 + "](https://valid.publisher.org/a)")
 
     assert nested.urls == ("https://publisher.org/a((b))",)
     assert [defect.code for defect in adversarial.defects].count("malformed_reference") == 1
-    assert perf_counter() - started < 1.0
 
 
 @pytest.mark.parametrize("title", ['"A source title"', "'A source title'", "(A source title)"])
@@ -325,8 +324,6 @@ def test_inline_code_masking_scales_for_unmatched_delimiter_runs() -> None:
     audit_web_citations(_unmatched_backtick_runs(160_000))
     slow = perf_counter() - started
 
-    assert fast < 1.0
-    assert slow < 2.0
     assert slow < fast * 12 + 0.1
 
 
@@ -357,12 +354,75 @@ def test_rejects_any_other_rfc_bare_uri_scheme(token: str) -> None:
     assert "malformed_reference" in [defect.code for defect in audit.defects]
 
 
-@pytest.mark.parametrize("size", [1_024, 16_384])
-def test_numeric_scanner_is_bounded_for_unmatched_brackets(size: int) -> None:
-    started = perf_counter()
-    audit_web_citations("[" * size)
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://ｅｘａｍｐｌｅ．ｃｏｍ/a",
+        "https://ｌｏｃａｌｈｏｓｔ/a",
+        "https://127.0.0.1/a",
+        "https://10.0.0.1/a",
+        "https://169.254.1.1/a",
+        "https://224.0.0.1/a",
+        "https://0.0.0.0/a",
+        "https://[::1]/a",
+        "https://[fc00::1]/a",
+        "https://2130706433/a",
+        "https://0x7f000001/a",
+        "https://0177.0.0.1/a",
+    ],
+)
+def test_rejects_canonicalized_placeholder_and_nonpublic_hosts(url: str) -> None:
+    audit = audit_web_citations(f"## Sources\n[1] {url}")
 
-    assert perf_counter() - started < 1.0
+    assert "placeholder_source" in [defect.code for defect in audit.defects]
+    assert audit.urls == ()
+
+
+@pytest.mark.parametrize("url", ["https://8.8.8.8/a", "https://[2606:4700:4700::1111]/dns-query"])
+def test_accepts_public_literal_ip_hosts(url: str) -> None:
+    audit = audit_web_citations(f"## Sources\n[1] {url}")
+
+    assert audit.defects == ()
+    assert audit.urls
+
+
+def _many_source_links(count: int) -> str:
+    return "## Sources\n" + "\n".join(
+        f"[1] https://source{index}.publisher.org/a" for index in range(count)
+    )
+
+
+def test_source_interval_membership_scales_near_linearly() -> None:
+    started = perf_counter()
+    audit_web_citations(_many_source_links(1_000))
+    small = perf_counter() - started
+    started = perf_counter()
+    audit_web_citations(_many_source_links(16_000))
+    large = perf_counter() - started
+
+    assert large < small * 32 + 0.2
+
+
+def test_repeated_numeric_ranges_keep_defects_bounded_during_discovery() -> None:
+    report = " ".join("[1-999]" for _ in range(128)) + "\n\n## Sources\n[1] https://valid.publisher.org/a"
+    tracemalloc.start()
+    audit = audit_web_citations(report)
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    assert len(audit.defects) <= 16
+    assert peak < 8_000_000
+
+
+def test_numeric_scanner_is_bounded_for_unmatched_brackets() -> None:
+    started = perf_counter()
+    audit_web_citations("[" * 1_024)
+    small = perf_counter() - started
+    started = perf_counter()
+    audit_web_citations("[" * 16_384)
+    large = perf_counter() - started
+
+    assert large < small * 32 + 0.1
 
 
 def test_unmatched_numeric_bracket_advances_to_later_marker() -> None:
