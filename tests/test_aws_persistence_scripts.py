@@ -649,6 +649,8 @@ def test_aws_deploy_defaults_to_read_only_snapshot_rollout() -> None:
         "LANGGRAPH_FENCE_INTERVAL_SECONDS": "2",
         "LANGGRAPH_SNAPSHOT_RETENTION_COUNT": "5",
         "LANGGRAPH_WRITER_EPOCH": "${APP_NAME}",
+        "MODEL_CALL_TIMEOUT_SECONDS": "300",
+        "OLLAMA_FORCE_UNLOAD_ON_CANCEL": "false",
     }
     for name, value in expected_environment.items():
         assert f'"{name}": "{value}"' in source

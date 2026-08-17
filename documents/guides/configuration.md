@@ -83,6 +83,8 @@ Verification applies after a non-empty `/final_report.md` is written. It adds mo
 | --- | ---: | --- |
 | `MODEL_TPM` | `120000` | Provider token quota supplied to proactive shaping. |
 | `MODEL_RPM` | `500` | Provider request quota supplied to proactive shaping. |
+| `MODEL_CALL_TIMEOUT_SECONDS` | `300` | Total wall-clock deadline for each model call; invalid or nonpositive values fall back to `300`. |
+| `OLLAMA_FORCE_UNLOAD_ON_CANCEL` | `false` | Request Ollama model unload after cancellation; keep disabled for shared or cloud deployments. |
 | `MODEL_MAX_RETRIES` | `5` | Retries after the initial rate-limited call. |
 | `MODEL_INITIAL_BACKOFF` | `1.0` | Initial nominal delay in seconds. |
 | `MODEL_MAX_BACKOFF` | `60.0` | Maximum nominal delay in seconds. |

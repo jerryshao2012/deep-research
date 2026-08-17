@@ -105,6 +105,8 @@ def main() -> int:
         ("ALLOW_ALL_THREADS", "false"),
         ("MODEL_TPM", "120000"),
         ("MODEL_RPM", "500"),
+        ("MODEL_CALL_TIMEOUT_SECONDS", "300"),
+        ("OLLAMA_FORCE_UNLOAD_ON_CANCEL", "false"),
         ("GRAPH_RECURSION_LIMIT", "200"),
         ("MAX_CONCURRENT_RESEARCH_UNITS", "3"),
         ("MAX_RESEARCHER_ITERATIONS", "3"),

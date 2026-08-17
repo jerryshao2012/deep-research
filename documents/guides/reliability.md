@@ -15,6 +15,18 @@ Treat each model deployment as finite-capacity system. Deep Research uses two co
 
 Use both layers for cloud models. Shaping reduces avoidable `429` responses; retries cover shared-capacity drops and timing races shaping cannot predict. Neither layer creates provider capacity or replaces deployment monitoring.
 
+### Bound model-call duration
+
+`MODEL_CALL_TIMEOUT_SECONDS` sets a total wall-clock deadline for each model call. It measures elapsed time from call start through completion, not inactivity between streamed chunks. Invalid or nonpositive values fall back to the `300` second default. When deadline expires, in-flight request work is cancelled and the call returns a timeout error.
+
+`OLLAMA_FORCE_UNLOAD_ON_CANCEL` defaults to `false`. Keep it disabled for multi-user and cloud deployments because unloading cancels the shared Ollama model for other callers. For a single-user local Ollama process only, opt in with:
+
+```bash
+export OLLAMA_FORCE_UNLOAD_ON_CANCEL=true
+```
+
+After changing either setting, restart the CLI or server and clear any model/runtime cache so newly created calls use updated policy.
+
 Operational order matters:
 
 1. configure actual deployment quotas rather than account-wide guesses;
