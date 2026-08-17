@@ -1,7 +1,7 @@
 """Tests for agent contract validation."""
 
 from pathlib import Path
-from typing import Any
+from typing import Any, get_type_hints
 
 import pytest
 from deepagents import create_deep_agent
@@ -9,6 +9,8 @@ from langchain.agents.middleware import ModelRequest
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.tools import tool
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.graph import END, START, StateGraph
 
 from research_agent.model_call_guard import (
     ModelCallGuardMiddleware,
@@ -220,3 +222,127 @@ def test_all_model_boundaries_guard_known_and_reject_unknown_late_overrides() ->
                 handler,
             )
         assert len(seen) == 1
+
+
+def test_web_mode_is_scoped_to_current_visible_generation() -> None:
+    from research_agent.agent import ResearchStateMiddleware
+
+    middleware = ResearchStateMiddleware(
+        config_getter=lambda: {"run_id": "first", "configurable": {}}
+    )
+    first_state = {
+        "messages": [HumanMessage(id="first-human", content="Research offline")],
+        "no_web": True,
+    }
+
+    first = middleware.before_agent(first_state, runtime=None)
+
+    assert first is not None
+    assert first["effective_no_web"] is True
+    assert first["strict_web_citations"] is False
+    assert first["web_mode_last_human_id"] == "first-human"
+    assert first["web_mode_last_human_count"] == 1
+
+    next_state = {
+        "messages": first_state["messages"],
+        **first,
+    }
+    next_state.pop("no_web", None)
+    next_state.pop("messages", None)
+    next_state["messages"] = first_state["messages"]
+    next_update = middleware.before_agent(next_state, runtime=None)
+
+    assert next_update is not None
+    assert next_update["effective_no_web"] is False
+    assert next_update["strict_web_citations"] is True
+
+
+def test_web_mode_does_not_reparse_stale_text_during_explicit_resume() -> None:
+    from research_agent.agent import ResearchStateMiddleware
+
+    message = HumanMessage(id="original", content="Research this with no web")
+    middleware = ResearchStateMiddleware(
+        config_getter=lambda: {
+            "run_id": "resume", "configurable": {"resume_incomplete_todos": True}
+        }
+    )
+    state = {
+        "messages": [message],
+        "todos": [{"content": "Finish report", "status": "pending"}],
+        "web_mode_last_human_id": "original",
+        "web_mode_last_human_count": 1,
+        "effective_no_web": True,
+        "strict_web_citations": False,
+    }
+
+    update = middleware.before_agent(state, runtime=None)
+
+    assert update is not None
+    assert update["effective_no_web"] is False
+    assert update["strict_web_citations"] is True
+
+
+def test_web_mode_treats_appended_idless_identical_human_as_new() -> None:
+    from research_agent.agent import ResearchStateMiddleware
+
+    middleware = ResearchStateMiddleware(
+        config_getter=lambda: {"run_id": "second", "configurable": {}}
+    )
+    message = HumanMessage(content="Research with no web")
+    state = {
+        "messages": [message, HumanMessage(content="Research with no web")],
+        "web_mode_last_human_id": None,
+        "web_mode_last_human_count": 1,
+    }
+
+    update = middleware.before_agent(state, runtime=None)
+
+    assert update is not None
+    assert update["effective_no_web"] is True
+    assert update["strict_web_citations"] is False
+    assert update["web_mode_last_human_count"] == 2
+
+
+def test_raw_no_web_channel_is_ephemeral_and_not_checkpointed() -> None:
+    from research_agent.agent import ResearchState, ResearchStateMiddleware
+
+    hints = get_type_hints(ResearchState, include_extras=True)
+    assert "EphemeralValue" in repr(hints["no_web"])
+    middleware = ResearchStateMiddleware(
+        config_getter=lambda: {"run_id": "checkpointed", "configurable": {}}
+    )
+
+    def retain_mode(state: ResearchState) -> dict[str, Any]:
+        update = middleware.before_agent(state, runtime=None) or {}
+        return {
+            field: update[field]
+            for field in (
+                "effective_no_web",
+                "strict_web_citations",
+                "web_mode_last_human_id",
+                "web_mode_last_human_count",
+            )
+        }
+
+    graph_builder = StateGraph(ResearchState)
+    graph_builder.add_node("retain_mode", retain_mode)
+    graph_builder.add_edge(START, "retain_mode")
+    graph_builder.add_edge("retain_mode", END)
+    graph = graph_builder.compile(checkpointer=InMemorySaver())
+    config = {"configurable": {"thread_id": "ephemeral-web-mode"}}
+
+    graph.invoke(
+        {"messages": [HumanMessage(id="checkpoint-human", content="Research")], "no_web": True},
+        config=config,
+    )
+
+    first_snapshot = graph.get_state(config).values
+    assert "no_web" not in first_snapshot
+    assert first_snapshot["effective_no_web"] is True
+
+    graph.invoke({}, config=config)
+
+    resumed_snapshot = graph.get_state(config).values
+    assert "no_web" not in resumed_snapshot
+    assert resumed_snapshot["effective_no_web"] is False
+    assert resumed_snapshot["strict_web_citations"] is True

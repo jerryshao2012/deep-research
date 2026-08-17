@@ -729,7 +729,9 @@ def test_verification_runs_only_for_current_owned_report_after_research_complete
 ) -> None:
     calls = 0
 
-    async def fake_verify_report(*, question: str, report: str) -> VerificationVerdict:
+    async def fake_verify_report(
+        *, question: str, report: str, **_kwargs: Any
+    ) -> VerificationVerdict:
         nonlocal calls
         calls += 1
         return VerificationVerdict(status="complete", sufficiency_score=1.0)
@@ -752,7 +754,9 @@ def test_nonfinal_revision_routes_to_model_without_persisted_system_message(
     monkeypatch: pytest.MonkeyPatch,
     async_: bool,
 ) -> None:
-    async def fake_verify_report(*, question: str, report: str) -> VerificationVerdict:
+    async def fake_verify_report(
+        *, question: str, report: str, **_kwargs: Any
+    ) -> VerificationVerdict:
         assert question == "What is graph engineering?"
         assert report == "Final report"
         return _needs_revision_verdict()
@@ -787,6 +791,42 @@ def test_nonfinal_revision_routes_to_model_without_persisted_system_message(
 
 
 @pytest.mark.parametrize("async_", [False, True])
+@pytest.mark.parametrize("effective_no_web", [False, True])
+def test_verification_uses_request_scoped_strict_citation_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    async_: bool,
+    effective_no_web: bool,
+) -> None:
+    received_modes: list[bool] = []
+
+    async def fake_verify_report(
+        *, question: str, report: str, strict_web_citations: bool
+    ) -> VerificationVerdict:
+        del question, report
+        received_modes.append(strict_web_citations)
+        return VerificationVerdict(status="complete", sufficiency_score=1.0)
+
+    monkeypatch.setattr(agent_module, "ENABLE_VERIFICATION", True)
+    monkeypatch.setattr(agent_module, "ENABLE_EVAL_TRACKING", False)
+    monkeypatch.setattr(agent_module, "verify_report", fake_verify_report)
+    state = _verification_state()
+    state.update(
+        {
+            "doc_folder": "docs",
+            "effective_no_web": effective_no_web,
+            "strict_web_citations": not effective_no_web,
+        }
+    )
+
+    result = _run_after_model(
+        agent_module.ResearchStateMiddleware(), state, async_=async_
+    )
+
+    assert received_modes == [not effective_no_web]
+    assert result is not None
+
+
+@pytest.mark.parametrize("async_", [False, True])
 @pytest.mark.parametrize("request_file_kind", ["valid", "empty", "malformed"])
 def test_resumed_verification_uses_original_current_generation_question(
     monkeypatch: pytest.MonkeyPatch,
@@ -795,7 +835,9 @@ def test_resumed_verification_uses_original_current_generation_question(
 ) -> None:
     seen_questions: list[str] = []
 
-    async def fake_verify_report(*, question: str, report: str) -> VerificationVerdict:
+    async def fake_verify_report(
+        *, question: str, report: str, **_kwargs: Any
+    ) -> VerificationVerdict:
         seen_questions.append(question)
         return VerificationVerdict(status="complete", sufficiency_score=1.0)
 
@@ -841,7 +883,9 @@ def test_repeated_resume_controls_never_replace_generation_owned_question(
     original_question = "Continue comparing graph systems with evidence"
     seen_questions: list[str] = []
 
-    async def fake_verify_report(*, question: str, report: str) -> VerificationVerdict:
+    async def fake_verify_report(
+        *, question: str, report: str, **_kwargs: Any
+    ) -> VerificationVerdict:
         seen_questions.append(question)
         return VerificationVerdict(status="complete", sufficiency_score=1.0)
 
@@ -947,7 +991,9 @@ def test_passing_verification_records_current_report_ownership(
     monkeypatch: pytest.MonkeyPatch,
     async_: bool,
 ) -> None:
-    async def fake_verify_report(*, question: str, report: str) -> VerificationVerdict:
+    async def fake_verify_report(
+        *, question: str, report: str, **_kwargs: Any
+    ) -> VerificationVerdict:
         return VerificationVerdict(status="complete", sufficiency_score=1.0)
 
     monkeypatch.setattr(agent_module, "ENABLE_VERIFICATION", True)
@@ -972,7 +1018,9 @@ def test_final_revision_limit_accepts_only_current_owned_report_without_jump(
     monkeypatch: pytest.MonkeyPatch,
     async_: bool,
 ) -> None:
-    async def fake_verify_report(*, question: str, report: str) -> VerificationVerdict:
+    async def fake_verify_report(
+        *, question: str, report: str, **_kwargs: Any
+    ) -> VerificationVerdict:
         return _needs_revision_verdict()
 
     monkeypatch.setattr(agent_module, "ENABLE_VERIFICATION", True)
@@ -1073,7 +1121,9 @@ def test_verification_revision_does_not_stream_provisional_report(
     monkeypatch: pytest.MonkeyPatch,
     async_: bool,
 ) -> None:
-    async def fake_verify_report(*, question: str, report: str) -> VerificationVerdict:
+    async def fake_verify_report(
+        *, question: str, report: str, **_kwargs: Any
+    ) -> VerificationVerdict:
         return _needs_revision_verdict()
 
     monkeypatch.setattr(agent_module, "ENABLE_VERIFICATION", True)
@@ -1102,7 +1152,9 @@ def test_accepted_report_streams_ordered_output_exactly_once(
     monkeypatch: pytest.MonkeyPatch,
     async_: bool,
 ) -> None:
-    async def fake_verify_report(*, question: str, report: str) -> VerificationVerdict:
+    async def fake_verify_report(
+        *, question: str, report: str, **_kwargs: Any
+    ) -> VerificationVerdict:
         return VerificationVerdict(status="complete", sufficiency_score=1.0)
 
     monkeypatch.setattr(agent_module, "ENABLE_VERIFICATION", True)
@@ -1154,7 +1206,9 @@ def test_edited_report_invalidates_prior_acceptance_and_stays_provisional(
 ) -> None:
     calls = 0
 
-    async def fake_verify_report(*, question: str, report: str) -> VerificationVerdict:
+    async def fake_verify_report(
+        *, question: str, report: str, **_kwargs: Any
+    ) -> VerificationVerdict:
         nonlocal calls
         calls += 1
         return _needs_revision_verdict()
@@ -1231,7 +1285,9 @@ def test_verification_round_limit_controls_verification_and_finalization_once(
     verification_calls = 0
     eval_calls = 0
 
-    async def fake_verify_report(*, question: str, report: str) -> VerificationVerdict:
+    async def fake_verify_report(
+        *, question: str, report: str, **_kwargs: Any
+    ) -> VerificationVerdict:
         nonlocal verification_calls
         verification_calls += 1
         return VerificationVerdict(status="complete", sufficiency_score=1.0)
@@ -1407,7 +1463,9 @@ def test_same_timestamp_changed_report_is_verified_and_finalized(
 ) -> None:
     calls = 0
 
-    async def fake_verify_report(*, question: str, report: str) -> VerificationVerdict:
+    async def fake_verify_report(
+        *, question: str, report: str, **_kwargs: Any
+    ) -> VerificationVerdict:
         nonlocal calls
         calls += 1
         assert report == "Final report"
@@ -1445,7 +1503,9 @@ def test_same_timestamp_unchanged_report_is_rejected_and_continued(
 ) -> None:
     calls = 0
 
-    async def fake_verify_report(*, question: str, report: str) -> VerificationVerdict:
+    async def fake_verify_report(
+        *, question: str, report: str, **_kwargs: Any
+    ) -> VerificationVerdict:
         nonlocal calls
         calls += 1
         return VerificationVerdict(status="complete", sufficiency_score=1.0)

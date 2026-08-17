@@ -17,7 +17,7 @@ import traceback
 from collections.abc import Awaitable, Callable, Mapping
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any, NotRequired
 
 from deepagents import SubAgent, create_deep_agent
 from deepagents.backends.utils import (
@@ -32,12 +32,14 @@ from langchain.agents.middleware import (
     TodoListMiddleware,
     hook_config,
 )
+from langchain.agents.middleware.types import OmitFromInput
 from langchain_core.messages import (
     AIMessage,
     HumanMessage,
     SystemMessage,
 )
 from langchain_core.runnables import RunnableConfig
+from langgraph.channels.ephemeral_value import EphemeralValue
 from langgraph.config import get_config
 
 from research_agent.cli_utils import get_ssl_verify_config, str2bool
@@ -491,7 +493,12 @@ class ResearchState(CompletionState):
     doc_folder: str | None
     has_documents: bool | None
     skill: str | None
-    no_web: bool | None
+    no_web: Annotated[NotRequired[bool | None], EphemeralValue(bool | None)]
+    effective_no_web: Annotated[NotRequired[bool], OmitFromInput]
+    strict_web_citations: Annotated[NotRequired[bool], OmitFromInput]
+    web_mode_run_id: Annotated[NotRequired[str | None], OmitFromInput]
+    web_mode_last_human_id: Annotated[NotRequired[str | None], OmitFromInput]
+    web_mode_last_human_count: Annotated[NotRequired[int], OmitFromInput]
     chat_start_time: float | None
     chat_elapsed_seconds: float | None
     _last_user_msg_hash: str | None
@@ -538,6 +545,67 @@ class ResearchStateMiddleware(AgentMiddleware):
         return last_user_content
 
     @staticmethod
+    def _latest_human_marker(messages: list) -> tuple[str | None, int, str | None]:
+        """Return latest human identity, count, and text without parsing intent."""
+        latest_id: str | None = None
+        latest_text: str | None = None
+        human_count = 0
+        for message in messages:
+            is_human = (
+                isinstance(message, dict) and message.get("role") == "user"
+            ) or (
+                hasattr(message, "type") and getattr(message, "type", None) == "human"
+            )
+            if not is_human:
+                continue
+            human_count += 1
+            if isinstance(message, dict):
+                latest_text = str(message.get("content", ""))
+                message_id = message.get("id")
+            else:
+                latest_text = str(getattr(message, "content", ""))
+                message_id = getattr(message, "id", None)
+            latest_id = (
+                message_id.strip()
+                if isinstance(message_id, str) and message_id.strip()
+                else None
+            )
+        return latest_id, human_count, latest_text
+
+    def _web_mode_updates(
+            self, state: ResearchState, messages: list
+    ) -> dict[str, Any]:
+        """Derive request-scoped web mode before normal or resumed generation."""
+        latest_id, human_count, latest_text = self._latest_human_marker(messages)
+        previous_id = state.get("web_mode_last_human_id")
+        previous_count = state.get("web_mode_last_human_count")
+        if latest_id is not None:
+            has_new_human = latest_id != previous_id
+        else:
+            has_new_human = human_count != previous_count
+
+        raw_no_web = state.get("no_web")
+        if "no_web" in state and isinstance(raw_no_web, bool):
+            effective_no_web = raw_no_web
+        elif has_new_human and latest_text is not None:
+            effective_no_web = self._extract_no_web(latest_text) is True
+        else:
+            effective_no_web = False
+
+        try:
+            config = self._config_getter()
+        except RuntimeError:
+            config = {}
+        run_id = config.get("run_id") if isinstance(config, Mapping) else None
+        return {
+            "effective_no_web": effective_no_web,
+            "strict_web_citations": not effective_no_web,
+            "web_mode_run_id": str(run_id) if run_id is not None else None,
+            "web_mode_last_human_id": latest_id,
+            "web_mode_last_human_count": human_count,
+        }
+
+    @staticmethod
     def _seed_research_request_file(
             user_message: str | None, state: ResearchState
     ) -> dict[str, Any]:
@@ -566,23 +634,25 @@ class ResearchStateMiddleware(AgentMiddleware):
         """
         messages = state.get("messages", [])
         current_user_message = self._get_current_user_message(messages)
+        web_mode_updates = self._web_mode_updates(state, messages)
         is_resume_round = self._is_resume_round(state)
         if is_resume_round:
             extracted_updates: dict[str, Any] = {}
-            effective_state = state
         else:
             extracted_updates = self._extract_parameters_from_user_input(
                 state,
                 messages,
             )
-            effective_state = {**state, **extracted_updates}
+        effective_state = {**state, **web_mode_updates, **extracted_updates}
 
-        updates: dict[str, Any] = {}
+        updates: dict[str, Any] = dict(web_mode_updates)
         if not is_resume_round:
             # Seed the research request file with the latest user message.
-            updates = self._seed_research_request_file(
-                current_user_message,
-                state,
+            updates.update(
+                self._seed_research_request_file(
+                    current_user_message,
+                    effective_state,
+                )
             )
             updates.update(extracted_updates)
 
@@ -782,6 +852,9 @@ class ResearchStateMiddleware(AgentMiddleware):
                         return await verify_report(
                             question=user_question,
                             report=report_text,
+                            strict_web_citations=state.get(
+                                "strict_web_citations", True
+                            ),
                         )
 
                     verdict: VerificationVerdict = _run_async_from_sync(
@@ -861,7 +934,7 @@ class ResearchStateMiddleware(AgentMiddleware):
                     "DOC_FOLDER", "N/A"
                 )
                 skill = state.get("skill", "research")
-                no_web = state.get("no_web", False)
+                no_web = state.get("effective_no_web", False)
                 model_name = os.environ.get(
                     "MODEL_NAME", os.environ.get("AZURE_OPENAI_DEPLOYMENT", "N/A")
                 )
@@ -972,6 +1045,7 @@ class ResearchStateMiddleware(AgentMiddleware):
                     verdict = await verify_report(
                         question=user_question,
                         report=report_text,
+                        strict_web_citations=state.get("strict_web_citations", True),
                     )
                     logger.info(
                         "Verification verdict: %s (score=%.2f, "
@@ -1041,7 +1115,7 @@ class ResearchStateMiddleware(AgentMiddleware):
                     "DOC_FOLDER", "N/A"
                 )
                 skill = state.get("skill", "research")
-                no_web = state.get("no_web", False)
+                no_web = state.get("effective_no_web", False)
                 model_name = os.environ.get(
                     "MODEL_NAME", os.environ.get("AZURE_OPENAI_DEPLOYMENT", "N/A")
                 )
@@ -1089,7 +1163,7 @@ class ResearchStateMiddleware(AgentMiddleware):
     def _extract_parameters_from_user_input(
             self, state: ResearchState, messages: list
     ) -> dict[str, Any]:
-        """Extract doc_folder, skill, and no_web from the **latest** user message.
+        """Extract doc_folder and skill from the **latest** user message.
 
         Parameters are always re-extracted from the most recent user message so
         that follow-up requests (e.g. switching skills mid-conversation) are
@@ -1125,12 +1199,6 @@ class ResearchStateMiddleware(AgentMiddleware):
         extracted_skill = self._extract_skill(user_message)
         if extracted_skill:
             updates["skill"] = extracted_skill
-
-        # Extract no_web if not already set
-        if state.get("no_web") is None:
-            no_web_value = self._extract_no_web(user_message)
-            if no_web_value is not None:
-                updates["no_web"] = no_web_value
 
         # Remove None values from updates
         return {k: v for k, v in updates.items() if v is not None}
@@ -1286,7 +1354,7 @@ class ResearchStateMiddleware(AgentMiddleware):
         """
         if documents_available is None:
             documents_available = has_document_context(state)
-        no_web = str2bool(state.get("no_web"), False)
+        no_web = str2bool(state.get("effective_no_web"), False)
         instruction = build_instruction(
             subject="",
             doc_folder=state.get("doc_folder") if documents_available else None,
