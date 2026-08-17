@@ -1261,38 +1261,44 @@ def test_compiled_inactive_plan_terminal_passes_through_untouched(
 
 
 @pytest.mark.parametrize("async_", [False, True])
+@pytest.mark.parametrize("limit", [1, 2, 3])
 def test_compiled_owned_plan_replaces_then_appends_and_checkpoints_exhaustion(
     monkeypatch: pytest.MonkeyPatch,
     async_: bool,
+    limit: int,
 ) -> None:
-    monkeypatch.setenv("MAX_COMPLETION_ATTEMPTS", "1")
+    monkeypatch.setenv("MAX_COMPLETION_ATTEMPTS", str(limit))
     run_id = uuid4()
+    partial_responses = [
+        f"Partial {attempt}" for attempt in range(1, limit + 2)
+    ]
     graph = _compiled_graph(
-        responses=["Partial one", "Partial two"],
+        responses=partial_responses,
         middleware=_OwnedPlanCompletionGuard(
             config_getter=lambda: {"run_id": run_id, "configurable": {}}
         ),
     )
     config = {
         "run_id": run_id,
-        "configurable": {"thread_id": f"exhausted-{async_}"},
+        "configurable": {
+            "thread_id": f"exhausted-{limit}-{async_}",
+        },
     }
 
     with pytest.raises(completion_guard.ResearchIncompleteError) as caught:
         _invoke_compiled(graph, config, async_=async_)
 
-    assert "attempt_limit=1" in str(caught.value)
+    assert f"attempt_limit={limit}" in str(caught.value)
     snapshot = graph.get_state(config)
     values = snapshot.values
-    assert values["completion_attempts"] == 1
+    assert values["completion_attempts"] == limit
     assert values["completion_exhausted_run_id"] == str(run_id)
     messages = values["messages"]
     assert [message.content for message in messages] == [
         "Research privately",
-        "Partial one",
-        "Partial two",
+        *partial_responses,
     ]
-    assert len({message.id for message in messages[1:]}) == 2
+    assert len({message.id for message in messages[1:]}) == limit + 1
     assert all(
         message.response_metadata.get("resume_intermediate") is True
         for message in messages[1:]
