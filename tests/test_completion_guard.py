@@ -130,8 +130,10 @@ def test_malformed_or_unknown_todo_is_incomplete(todos: object) -> None:
     ("files", "report_owned", "baseline", "reason"),
     [
         ({}, True, "prior", "missing"),
+        ("not-a-file-map", True, "prior", "malformed"),
         ({"/final_report.md": _file("   ")}, True, "prior", "empty"),
-        ({"/final_report.md": {"content": object()}}, True, "prior", "malformed"),
+        ({"/final_report.md": "not-file-data"}, True, "prior", "malformed"),
+        ({"/final_report.md": _file(object())}, True, "prior", "malformed"),
         ({"/final_report.md": _file("Finished", modified_at=None)}, True, "prior", "malformed"),
         ({"/final_report.md": _file("Finished")}, False, "prior", "stale"),
         ({"/final_report.md": _file("Finished", modified_at="same")}, True, "same", "stale"),
