@@ -493,6 +493,7 @@ def test_agent_registers_clarification_tool_and_middleware() -> None:
         middleware_block.group("body"),
     ) == [
                "ClarificationMiddleware",
+               "CompletionGuardMiddleware",
                "ResumeMiddleware",
                "ResearchStateMiddleware",
            ]

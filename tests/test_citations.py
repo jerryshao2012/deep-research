@@ -553,14 +553,12 @@ class TestTurnAwareReportNaming:
         assert not updates or "jump_to" not in updates
         assert not updates or "messages" not in updates
 
-    def test_after_model_has_can_jump_to_end(self) -> None:
-        """after_model must declare can_jump_to=['end'] so the framework
-        registers a conditional edge that honors jump_to (otherwise a static
-        edge is created and jump_to is silently ignored)."""
+    def test_after_model_has_can_jump_to_model_and_end(self) -> None:
+        """after_model must declare both completion-guard destinations."""
         from research_agent.agent import ResearchStateMiddleware
 
         can_jump = getattr(ResearchStateMiddleware.after_model, "__can_jump_to__", None)
-        assert can_jump == ["end"]
+        assert can_jump == ["model", "end"]
 
     def test_before_model_ignores_legacy_wiki_complete_flag(self) -> None:
         """Wiki findings remain research input and cannot skip synthesis."""
