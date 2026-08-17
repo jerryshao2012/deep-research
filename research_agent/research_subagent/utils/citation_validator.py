@@ -79,6 +79,19 @@ _resolver_queue: queue.Queue | None = None
 _resolver_threads: list[threading.Thread] = []
 
 
+def _reset_resolver_after_fork() -> None:
+    """Discard parent thread state in forked child without touching inherited locks."""
+    global _resolver_lock, _resolver_pid, _resolver_queue, _resolver_threads
+    _resolver_lock = threading.Lock()
+    _resolver_pid = None
+    _resolver_queue = None
+    _resolver_threads = []
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_resolver_after_fork)
+
+
 def _extract_claim_for_citation(text: str, cite_index: int) -> str | None:
     """Extract sentence containing [cite_index] reference."""
     pattern = rf"\[{cite_index}\]"

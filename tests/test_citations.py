@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import ssl
 import threading
 from pathlib import Path
@@ -62,6 +63,34 @@ class _FakeAsyncClient:
 
 
 class TestCitationValidatorSafeFetch:
+    @pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork")
+    def test_fork_replaces_inherited_resolver_lock(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        read_fd, write_fd = os.pipe()
+        monkeypatch.setattr(
+            citation_validator, "_resolve_host_addresses", lambda host, port: ("93.184.216.34",)
+        )
+        citation_validator._resolver_lock.acquire()
+        try:
+            child_pid = os.fork()
+            if child_pid == 0:
+                os.close(read_fd)
+                try:
+                    result = asyncio.run(
+                        citation_validator._safe_fetch_url("https://public.publisher.org/report")
+                    )
+                    os.write(write_fd, b"ok" if result[0] else b"failed")
+                finally:
+                    os._exit(0)
+            os.close(write_fd)
+        finally:
+            citation_validator._resolver_lock.release()
+
+        assert os.read(read_fd, 8) == b"ok"
+        _, status = os.waitpid(child_pid, 0)
+        assert os.WEXITSTATUS(status) == 0
+        assert asyncio.run(
+            citation_validator._safe_fetch_url("https://public.publisher.org/report")
+        )[0] is True
     def test_stalled_dns_is_bounded_and_does_not_use_default_executor(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
