@@ -1270,6 +1270,36 @@ def test_bound_with_config_ainvoke_captures_deadline_at_outer_call():
         asyncio.run(pending)
 
 
+def test_model_with_config_ainvoke_captures_deadline_at_outer_call():
+    guarded = _guarded_fake(timeout=0.03)
+    configured = guarded.with_config(
+        {"configurable": {"model_call_scope_id": "model-configured-invoke"}}
+    )
+
+    pending = configured.ainvoke("hello")
+    time.sleep(0.05)
+
+    with pytest.raises(ModelCallTimeoutError):
+        asyncio.run(pending)
+
+
+@_async_test
+async def test_model_with_config_astream_captures_deadline_at_outer_call():
+    guarded = _guarded_fake(
+        timeout=0.03,
+        chunks=[AIMessageChunk(content="too-late")],
+    )
+    configured = guarded.with_config(
+        {"configurable": {"model_call_scope_id": "model-configured-astream"}}
+    )
+
+    stream = configured.astream("hello")
+    await asyncio.sleep(0.05)
+
+    with pytest.raises(ModelCallTimeoutError):
+        await anext(stream)
+
+
 def test_bound_with_config_stream_captures_deadline_at_outer_call():
     guarded = _guarded_fake(
         timeout=0.03,
@@ -1307,15 +1337,45 @@ async def test_bound_with_config_astream_captures_deadline_at_outer_call():
 def test_bound_runnable_transformations_remain_guard_owned():
     bound = _guarded_fake().bind(extra="kept")
     wrapper_type = type(bound)
-    identity = RunnableLambda(lambda value: value)
     typed = bound.with_types(input_type=str, output_type=AIMessage)
-    transformations = [
+    decorators = [
         bound.bind(other="kept"),
         bound.with_config({"tags": ["kept"]}),
         bound.with_retry(wait_exponential_jitter=False),
         bound.with_listeners(),
         bound.with_alisteners(),
         typed,
+    ]
+
+    assert decorators
+    assert all(isinstance(decorator, wrapper_type) for decorator in decorators)
+    assert typed.InputType is str
+    assert typed.OutputType is AIMessage
+    assert typed.get_name() == typed.bound.get_name()
+    assert typed.config_specs == typed.bound.config_specs
+
+
+def test_model_call_decorators_remain_guard_owned():
+    guarded = _guarded_fake()
+    wrapper_type = type(guarded.bind(extra="kept"))
+
+    decorated = [
+        guarded.with_config({"tags": ["kept"]}),
+        guarded.with_retry(wait_exponential_jitter=False),
+        guarded.with_listeners(),
+        guarded.with_alisteners(),
+        guarded.with_types(input_type=str, output_type=AIMessage),
+    ]
+
+    assert all(isinstance(runnable, wrapper_type) for runnable in decorated)
+
+
+def test_bound_compositions_are_native_and_do_not_guard_downstream_work():
+    guarded = _guarded_fake(timeout=0.03)
+    bound = guarded.bind(extra="kept")
+    wrapper_type = type(bound)
+    identity = RunnableLambda(lambda value: value)
+    compositions = [
         bound.assign(extra=lambda value: value),
         bound.pick("content"),
         bound.map(),
@@ -1325,12 +1385,27 @@ def test_bound_runnable_transformations_remain_guard_owned():
         bound.with_fallbacks([identity]),
     ]
 
-    assert transformations
-    assert all(isinstance(transformed, wrapper_type) for transformed in transformations)
-    assert typed.InputType is str
-    assert typed.OutputType is AIMessage
-    assert typed.get_name() == typed.bound.get_name()
-    assert typed.config_specs == typed.bound.config_specs
+    assert all(
+        not isinstance(composition, wrapper_type) for composition in compositions
+    )
+
+    def slow_parser(message: AIMessage) -> str:
+        time.sleep(0.06)
+        return f"{message.content}-parsed"
+
+    pipeline = bound.pipe(RunnableLambda(slow_parser))
+    started = time.monotonic()
+
+    assert pipeline.invoke("hello") == "complete-parsed"
+    assert time.monotonic() - started >= 0.06
+
+
+def test_native_bound_composition_still_bounds_model_segment():
+    guarded = _guarded_fake(timeout=0.03, delay=0.1)
+    pipeline = guarded.bind(extra="kept").pipe(RunnableLambda(lambda value: value))
+
+    with pytest.raises(ModelCallTimeoutError):
+        pipeline.invoke("hello")
 
 
 def test_cancel_model_call_scope_cancels_all_sync_bridges_with_one_grace(monkeypatch):
@@ -1410,6 +1485,25 @@ def test_bound_with_config_scope_reaches_outer_bridge_registry():
         stream.close()
 
 
+def test_model_with_config_scope_reaches_outer_bridge_registry():
+    guarded = _guarded_fake(
+        timeout=1,
+        chunk_delay=0.1,
+        chunks=[AIMessageChunk(content="later")],
+    )
+    configured = guarded.with_config(
+        {"configurable": {"model_call_scope_id": "model-config-scope"}}
+    )
+
+    stream = configured.stream("hello", config=None)
+
+    try:
+        assert stream._control.scope_id == "model-config-scope"
+        assert guarded._bridge_registry.active_count("model-config-scope") == 1
+    finally:
+        stream.close()
+
+
 def test_scope_cancel_is_atomic_with_concurrent_bridge_registration(monkeypatch):
     import research_agent.model_call_guard as guard
 
@@ -1450,11 +1544,91 @@ def test_scope_cancel_is_atomic_with_concurrent_bridge_registration(monkeypatch)
     assert not guarded._calls
     assert guarded._bridge_registry.active_count(scope_id) == 0
 
-    with pytest.raises(asyncio.CancelledError):
-        guarded.invoke(
-            "hello", config={"configurable": {"model_call_scope_id": scope_id}}
-        )
+    result = guarded.invoke(
+        "hello", config={"configurable": {"model_call_scope_id": scope_id}}
+    )
+    assert result.content == "complete"
+    assert len(guarded._calls) == 1
+    cleanup_deadline = time.monotonic() + 0.1
+    while guarded._bridge_registry.active_count(scope_id):
+        assert time.monotonic() < cleanup_deadline
+        time.sleep(0.002)
     assert guarded._bridge_registry.active_count(scope_id) == 0
+
+
+def test_scope_cancellation_does_not_retain_inactive_tombstones():
+    import research_agent.model_call_guard as guard
+
+    registry = guard.BridgeRegistry()
+
+    for index in range(1000):
+        registry.cancel_scope(f"inactive-{index}")
+
+    assert registry._cancelling == {}
+    assert registry._controls == {}
+
+
+def test_registration_during_scope_cancellation_is_rejected_and_cancelled(
+    monkeypatch,
+):
+    import research_agent.model_call_guard as guard
+
+    monkeypatch.setattr(guard, "MODEL_CANCEL_GRACE_SECONDS", 0.2)
+    registry = guard.BridgeRegistry()
+    monkeypatch.setattr(guard, "_GLOBAL_BRIDGE_REGISTRY", registry)
+    scope_id = "during-cancel-scope"
+    join_entered = threading.Event()
+    release_join = threading.Event()
+
+    class BlockingControl:
+        def __init__(self) -> None:
+            self.scope_id = scope_id
+
+        def cancel(self) -> None:
+            pass
+
+        def join(self, timeout: float) -> None:
+            join_entered.set()
+            release_join.wait(timeout)
+            registry.unregister(self)
+
+    active = BlockingControl()
+    assert registry.register(active)
+    cancellation = threading.Thread(
+        target=guard.cancel_model_call_scope, args=(scope_id,)
+    )
+    cancellation.start()
+    assert join_entered.wait(0.1)
+
+    factory_started = threading.Event()
+
+    async def late_factory() -> str:
+        factory_started.set()
+        return "escaped"
+
+    late_registry = guard.BridgeRegistry()
+    late = guard._BridgeControl(
+        late_factory,
+        scope_id=scope_id,
+        registry=late_registry,
+    )
+    late.start()
+
+    assert late._cancel_requested
+    assert not factory_started.is_set()
+    kind, error = late.results.get(timeout=0.1)
+    assert kind == "error"
+    assert isinstance(error, asyncio.CancelledError)
+    assert late_registry._controls == {}
+    release_join.set()
+    cancellation.join(0.5)
+    assert not cancellation.is_alive()
+    assert registry._cancelling == {}
+    assert registry._controls == {}
+
+    reusable = BlockingControl()
+    assert registry.register(reusable)
+    registry.unregister(reusable)
 
 
 def test_unknown_raw_override_fails_before_invocation_without_unload():

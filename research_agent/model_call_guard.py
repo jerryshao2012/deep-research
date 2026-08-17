@@ -391,10 +391,10 @@ class BridgeRegistry:
         """Create an empty registry guarded by a standard thread lock."""
         self._lock = threading.Lock()
         self._controls: dict[str, set[_BridgeControl[Any]]] = {}
-        self._cancelling: set[str] = set()
+        self._cancelling: dict[str, int] = {}
 
     def register(self, control: _BridgeControl[Any]) -> bool:
-        """Register unless the scope has entered persistent cancellation."""
+        """Register unless cancellation is currently active for the scope."""
         with self._lock:
             if control.scope_id in self._cancelling:
                 return False
@@ -419,13 +419,21 @@ class BridgeRegistry:
     def cancel_scope(self, scope_id: str) -> None:
         """Cancel every bridge in a scope against one shared join grace."""
         with self._lock:
-            self._cancelling.add(scope_id)
+            self._cancelling[scope_id] = self._cancelling.get(scope_id, 0) + 1
             controls = tuple(self._controls.get(scope_id, ()))
-        for control in controls:
-            control.cancel()
-        join_deadline = time.monotonic() + MODEL_CANCEL_GRACE_SECONDS
-        for control in controls:
-            control.join(max(0.0, join_deadline - time.monotonic()))
+        try:
+            for control in controls:
+                control.cancel()
+            join_deadline = time.monotonic() + MODEL_CANCEL_GRACE_SECONDS
+            for control in controls:
+                control.join(max(0.0, join_deadline - time.monotonic()))
+        finally:
+            with self._lock:
+                remaining = self._cancelling[scope_id] - 1
+                if remaining:
+                    self._cancelling[scope_id] = remaining
+                else:
+                    self._cancelling.pop(scope_id, None)
 
 
 _GLOBAL_BRIDGE_REGISTRY = BridgeRegistry()
@@ -676,9 +684,8 @@ def _bridge_result[ResultT](
         control.cancel()
         control.join(MODEL_CANCEL_GRACE_SECONDS)
         raise _timeout_error(policy, metadata) from None
-    finally:
-        if not control._thread.is_alive():
-            control.join(0)
+    if not control._thread.is_alive():
+        control.join(0)
     if kind == "error":
         raise value
     return value
@@ -972,48 +979,6 @@ class _GuardedBoundRunnable[InputT, OutputT](Runnable[InputT, OutputT]):
             self.bound.with_types(input_type=input_type, output_type=output_type)
         )
 
-    def assign(self, **kwargs: Any) -> _GuardedBoundRunnable[Any, Any]:
-        """Assign output fields while retaining guarded boundaries."""
-        return self._rewrap(self.bound.assign(**kwargs))
-
-    def pick(self, keys: str | list[str]) -> _GuardedBoundRunnable[Any, Any]:
-        """Pick output fields while retaining guarded boundaries."""
-        return self._rewrap(self.bound.pick(keys))
-
-    def map(self) -> _GuardedBoundRunnable[Sequence[InputT], list[OutputT]]:
-        """Map calls while retaining guarded boundaries for the whole call."""
-        return self._rewrap(self.bound.map())
-
-    def pipe(
-        self,
-        *others: Any,
-        name: str | None = None,
-    ) -> _GuardedBoundRunnable[InputT, Any]:
-        """Compose a pipeline while retaining guarded outer boundaries."""
-        return self._rewrap(self.bound.pipe(*others, name=name))
-
-    def __or__(self, other: Any) -> _GuardedBoundRunnable[InputT, Any]:
-        return self._rewrap(self.bound | other)
-
-    def __ror__(self, other: Any) -> _GuardedBoundRunnable[Any, OutputT]:
-        return self._rewrap(other | self.bound)
-
-    def with_fallbacks(
-        self,
-        fallbacks: Sequence[Runnable[InputT, OutputT]],
-        *,
-        exceptions_to_handle: tuple[type[BaseException], ...] = (Exception,),
-        exception_key: str | None = None,
-    ) -> _GuardedBoundRunnable[InputT, OutputT]:
-        """Apply fallbacks inside one guard-owned total deadline."""
-        return self._rewrap(
-            self.bound.with_fallbacks(
-                fallbacks,
-                exceptions_to_handle=exceptions_to_handle,
-                exception_key=exception_key,
-            )
-        )
-
 
 class ModelCallGuardMixin:
     """Provider-preserving public model boundaries with strict total deadlines."""
@@ -1167,6 +1132,84 @@ class ModelCallGuardMixin:
         """Bind model arguments while retaining eager guarded boundaries."""
         bound = super().bind(**kwargs)
         return _GuardedBoundRunnable(bound, self)
+
+    def with_config(
+        self: BaseChatModel,
+        config: RunnableConfig | None = None,
+        **kwargs: Any,
+    ) -> Runnable[Any, Any]:
+        """Bind model config behind an eager guarded boundary."""
+        explicit_config = {**(config or {}), **kwargs}
+        return _GuardedBoundRunnable(
+            super().with_config(config, **kwargs),
+            self,
+            boundary_config=merge_configs(None, explicit_config),
+        )
+
+    def with_retry(
+        self: BaseChatModel,
+        *,
+        retry_if_exception_type: tuple[type[BaseException], ...] = (Exception,),
+        wait_exponential_jitter: bool = True,
+        exponential_jitter_params: Any = None,
+        stop_after_attempt: int = 3,
+    ) -> Runnable[Any, Any]:
+        """Decorate model retries inside one eager guarded boundary."""
+        return _GuardedBoundRunnable(
+            super().with_retry(
+                retry_if_exception_type=retry_if_exception_type,
+                wait_exponential_jitter=wait_exponential_jitter,
+                exponential_jitter_params=exponential_jitter_params,
+                stop_after_attempt=stop_after_attempt,
+            ),
+            self,
+        )
+
+    def with_listeners(
+        self: BaseChatModel,
+        *,
+        on_start: Any = None,
+        on_end: Any = None,
+        on_error: Any = None,
+    ) -> Runnable[Any, Any]:
+        """Attach sync listeners behind an eager guarded boundary."""
+        return _GuardedBoundRunnable(
+            super().with_listeners(
+                on_start=on_start,
+                on_end=on_end,
+                on_error=on_error,
+            ),
+            self,
+        )
+
+    def with_alisteners(
+        self: BaseChatModel,
+        *,
+        on_start: Any = None,
+        on_end: Any = None,
+        on_error: Any = None,
+    ) -> Runnable[Any, Any]:
+        """Attach async listeners behind an eager guarded boundary."""
+        return _GuardedBoundRunnable(
+            super().with_alisteners(
+                on_start=on_start,
+                on_end=on_end,
+                on_error=on_error,
+            ),
+            self,
+        )
+
+    def with_types(
+        self: BaseChatModel,
+        *,
+        input_type: type[Any] | None = None,
+        output_type: type[Any] | None = None,
+    ) -> Runnable[Any, Any]:
+        """Apply model input/output types behind an eager guarded boundary."""
+        return _GuardedBoundRunnable(
+            super().with_types(input_type=input_type, output_type=output_type),
+            self,
+        )
 
     def bind_tools(
         self: BaseChatModel,
