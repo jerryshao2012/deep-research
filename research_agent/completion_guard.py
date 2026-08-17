@@ -108,7 +108,12 @@ class CompletionGuardMiddleware(AgentMiddleware):
     ) -> dict[str, Any] | None:
         """Start one ordinary generation or adopt it for an explicit resume."""
         config = self._config()
-        current_run_id = _normalize_run_id(config.get("run_id"))
+        current_run_id = _resolve_run_id(
+            config,
+            runtime,
+            generate_fallback=True,
+        )
+        assert current_run_id is not None
         if state.get("completion_current_run_id") == current_run_id:
             return None
 
@@ -223,8 +228,9 @@ class CompletionGuardMiddleware(AgentMiddleware):
             return None
         exhausted_run_id = state.get("completion_exhausted_run_id")
         current_run_id = state.get("completion_current_run_id")
-        actual_run_id = _configured_run_id(
+        actual_run_id = _resolve_run_id(
             self._config(),
+            runtime,
             fallback=current_run_id,
         )
         if (
@@ -598,25 +604,41 @@ def _completion_attempt_limit(value: object) -> int:
     return DEFAULT_MAX_COMPLETION_ATTEMPTS
 
 
-def _configured_run_id(
+def _normalize_optional_run_id(value: object) -> str | None:
+    if isinstance(value, UUID):
+        return str(value)
+    if isinstance(value, str) and value:
+        return value
+    return None
+
+
+def _runtime_run_id(runtime: object) -> str | None:
+    execution_info = getattr(runtime, "execution_info", None)
+    if isinstance(execution_info, Mapping):
+        value = execution_info.get("run_id")
+    else:
+        value = getattr(execution_info, "run_id", None)
+    return _normalize_optional_run_id(value)
+
+
+def _resolve_run_id(
     config: Mapping[str, Any],
+    runtime: object,
     *,
-    fallback: object,
+    fallback: object = None,
+    generate_fallback: bool = False,
 ) -> str | None:
-    value = config.get("run_id")
-    if isinstance(value, UUID):
-        return str(value)
-    if isinstance(value, str) and value:
-        return value
-    return fallback if isinstance(fallback, str) and fallback else None
-
-
-def _normalize_run_id(value: object) -> str:
-    if isinstance(value, UUID):
-        return str(value)
-    if isinstance(value, str) and value:
-        return value
-    return str(uuid4())
+    """Resolve run ownership, preferring actual runtime identity on conflict."""
+    configured = _normalize_optional_run_id(config.get("run_id"))
+    actual = _runtime_run_id(runtime)
+    if actual is not None:
+        return actual
+    if configured is not None:
+        return configured
+    normalized_fallback = _normalize_optional_run_id(fallback)
+    if normalized_fallback is not None:
+        return normalized_fallback
+    return str(uuid4()) if generate_fallback else None
 
 
 def _report_modified_at(files: object) -> str | None:

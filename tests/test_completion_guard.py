@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -50,6 +51,12 @@ def _middleware(
 
 def _apply(state: dict[str, Any], update: dict[str, Any] | None) -> dict[str, Any]:
     return {**state, **(update or {})}
+
+
+def _runtime(run_id: UUID | str | None) -> SimpleNamespace:
+    return SimpleNamespace(
+        execution_info=SimpleNamespace(run_id=run_id),
+    )
 
 
 def test_compiled_guard_schema_accepts_minimal_ordinary_input() -> None:
@@ -1455,6 +1462,59 @@ def test_after_agent_is_inactive_without_current_plan_ownership() -> None:
     assert _middleware(run_id="run-b").after_agent(state, runtime=None) is None
 
 
+def test_runtime_run_id_wins_conflicting_top_level_config_at_start() -> None:
+    middleware = _middleware(run_id="stale-config-run")
+
+    update = middleware.before_agent(
+        {"messages": [], "files": {}},
+        runtime=_runtime("actual-runtime-run"),
+    )
+
+    assert update is not None
+    assert update["completion_current_run_id"] == "actual-runtime-run"
+    assert update["completion_request_generation"] == "actual-runtime-run"
+
+
+def test_runtime_run_id_prevents_stale_exhaustion_match_on_new_run() -> None:
+    state = _incomplete_state(_terminal_message(), attempts=2, limit=2)
+    state.update(
+        {
+            "completion_current_run_id": "old-run",
+            "completion_exhausted_run_id": "old-run",
+            "completion_exhausted_incomplete_todo_count": 1,
+            "completion_exhausted_malformed_todo_count": 0,
+            "completion_exhausted_report_reason": "missing",
+        }
+    )
+
+    assert (
+        _middleware(run_id="old-run").after_agent(
+            state,
+            runtime=_runtime("new-actual-run"),
+        )
+        is None
+    )
+
+
+def test_runtime_run_id_allows_matching_exhaustion_despite_stale_config() -> None:
+    state = _incomplete_state(_terminal_message(), attempts=2, limit=2)
+    state.update(
+        {
+            "completion_current_run_id": "actual-runtime-run",
+            "completion_exhausted_run_id": "actual-runtime-run",
+            "completion_exhausted_incomplete_todo_count": 1,
+            "completion_exhausted_malformed_todo_count": 0,
+            "completion_exhausted_report_reason": "missing",
+        }
+    )
+
+    with pytest.raises(completion_guard.ResearchIncompleteError):
+        _middleware(run_id="stale-config-run").after_agent(
+            state,
+            runtime=_runtime("actual-runtime-run"),
+        )
+
+
 def test_research_incomplete_error_serializes_safe_summary_only() -> None:
     error = completion_guard.ResearchIncompleteError(
         incomplete_todo_count=2,
@@ -1655,9 +1715,24 @@ def test_compiled_after_model_hooks_unwind_research_resume_completion(
 class _RecordingCompletionGuard(completion_guard.CompletionGuardMiddleware):
     """Record ownership after each real tool-result correlation hook."""
 
-    def __init__(self, *, run_id: UUID) -> None:
-        super().__init__(config_getter=lambda: {"run_id": run_id})
+    def __init__(self) -> None:
+        super().__init__()
         self.ownership_observations: list[tuple[str | None, str | None, bool]] = []
+        self.runtime_run_ids: list[str | None] = []
+        self.model_runtime_run_ids: list[str | None] = []
+
+    @staticmethod
+    def _runtime_run_id(runtime: Any) -> str | None:
+        execution_info = getattr(runtime, "execution_info", None)
+        return getattr(execution_info, "run_id", None)
+
+    def before_agent(
+        self,
+        state: completion_guard.CompletionState,
+        runtime: Any,
+    ) -> dict[str, Any] | None:
+        self.runtime_run_ids.append(self._runtime_run_id(runtime))
+        return super().before_agent(state, runtime)
 
     def _record(
         self,
@@ -1680,6 +1755,7 @@ class _RecordingCompletionGuard(completion_guard.CompletionGuardMiddleware):
         state: completion_guard.CompletionState,
         runtime: Any,
     ) -> dict[str, Any] | None:
+        self.model_runtime_run_ids.append(self._runtime_run_id(runtime))
         update = super().before_model(state, runtime)
         self._record(state, update)
         return update
@@ -1689,6 +1765,7 @@ class _RecordingCompletionGuard(completion_guard.CompletionGuardMiddleware):
         state: completion_guard.CompletionState,
         runtime: Any,
     ) -> dict[str, Any] | None:
+        self.model_runtime_run_ids.append(self._runtime_run_id(runtime))
         update = await super().abefore_model(state, runtime)
         self._record(state, update)
         return update
@@ -1769,7 +1846,7 @@ def test_compiled_production_stack_owns_only_successful_real_report_write(
     write_args: dict[str, Any],
 ) -> None:
     run_id = uuid4()
-    guard = _RecordingCompletionGuard(run_id=run_id)
+    guard = _RecordingCompletionGuard()
     responses = [
         _tool_call(
             "write_todos",
@@ -1806,6 +1883,8 @@ def test_compiled_production_stack_owns_only_successful_real_report_write(
     result = _run_production_like_graph(graph, config=config, async_=async_)
 
     assert model.call_count == len(responses)
+    assert guard.runtime_run_ids == [str(run_id)]
+    assert guard.model_runtime_run_ids == [str(run_id)] * len(responses)
     assert result["completion_current_run_id"] == str(run_id)
     assert result["completion_attempts"] == 1
     assert result["completion_report_owned"] is True
@@ -1875,9 +1954,7 @@ def test_compiled_real_tools_exhaust_exact_continuation_limit_and_checkpoint(
         *terminal_responses,
     ]
     run_id = uuid4()
-    guard = completion_guard.CompletionGuardMiddleware(
-        config_getter=lambda: {"run_id": run_id}
-    )
+    guard = _RecordingCompletionGuard()
     graph, model = _production_like_graph(
         monkeypatch,
         responses=responses,
@@ -1895,6 +1972,8 @@ def test_compiled_real_tools_exhaust_exact_continuation_limit_and_checkpoint(
         _run_production_like_graph(graph, config=config, async_=async_)
 
     assert model.call_count == limit + 3
+    assert guard.runtime_run_ids == [str(run_id)]
+    assert guard.model_runtime_run_ids == [str(run_id)] * (limit + 3)
     snapshot = graph.get_state(config)
     values = snapshot.values
     assert values["completion_current_run_id"] == str(run_id)
@@ -1915,3 +1994,87 @@ def test_compiled_real_tools_exhaust_exact_continuation_limit_and_checkpoint(
         is True
         for attempt in range(limit + 1)
     )
+
+
+@pytest.mark.parametrize("async_", [False, True])
+def test_compiled_resume_uses_new_runtime_run_and_clears_stale_exhaustion(
+    monkeypatch: pytest.MonkeyPatch,
+    async_: bool,
+) -> None:
+    monkeypatch.setenv("MAX_COMPLETION_ATTEMPTS", "1")
+    first_run_id = uuid4()
+    resumed_run_id = uuid4()
+    guard = _RecordingCompletionGuard()
+    responses = [
+        _tool_call(
+            "write_todos",
+            {"todos": [{"content": "Finish report", "status": "pending"}]},
+            call_id="resume-todo-open-call",
+            message_id="resume-todo-open-message",
+        ),
+        AIMessage(content="First partial", id="resume-partial-0"),
+        AIMessage(content="Second partial", id="resume-partial-1"),
+        _tool_call(
+            "write_file",
+            {"file_path": "/final_report.md", "content": "Resumed report"},
+            call_id="resume-report-call",
+            message_id="resume-report-message",
+        ),
+        _tool_call(
+            "write_todos",
+            {"todos": [{"content": "Finish report", "status": "completed"}]},
+            call_id="resume-todo-done-call",
+            message_id="resume-todo-done-message",
+        ),
+        AIMessage(content="Resumed research complete", id="resume-terminal"),
+    ]
+    graph, model = _production_like_graph(
+        monkeypatch,
+        responses=responses,
+        completion=guard,
+        full_stack=False,
+        with_checkpointer=True,
+    )
+    thread_id = f"stale-exhaustion-resume-{async_}"
+    first_config = {
+        "run_id": first_run_id,
+        "recursion_limit": 200,
+        "configurable": {"thread_id": thread_id},
+    }
+
+    with pytest.raises(completion_guard.ResearchIncompleteError):
+        _run_production_like_graph(graph, config=first_config, async_=async_)
+
+    exhausted = graph.get_state(first_config).values
+    original_generation = exhausted["completion_request_generation"]
+    assert exhausted["completion_current_run_id"] == str(first_run_id)
+    assert exhausted["completion_exhausted_run_id"] == str(first_run_id)
+
+    resumed_config = {
+        "run_id": resumed_run_id,
+        "recursion_limit": 200,
+        "configurable": {
+            "thread_id": thread_id,
+            "resume_incomplete_todos": True,
+        },
+    }
+    result = _run_production_like_graph(
+        graph,
+        config=resumed_config,
+        async_=async_,
+    )
+
+    assert model.call_count == len(responses)
+    assert guard.runtime_run_ids == [str(first_run_id), str(resumed_run_id)]
+    assert guard.model_runtime_run_ids == [
+        *([str(first_run_id)] * 3),
+        *([str(resumed_run_id)] * 3),
+    ]
+    assert result["completion_current_run_id"] == str(resumed_run_id)
+    assert result["completion_request_generation"] == original_generation
+    assert result["completion_resume_adopted_generation"] == original_generation
+    assert result["completion_exhausted_run_id"] is None
+    assert result["completion_attempts"] == 0
+    assert result["completion_report_owned"] is True
+    assert result["files"]["/final_report.md"]["content"] == "Resumed report"
+    assert result["todos"] == [{"content": "Finish report", "status": "completed"}]
