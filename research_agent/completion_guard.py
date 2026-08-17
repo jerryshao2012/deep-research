@@ -26,14 +26,6 @@ FINAL_REPORT_PATH = "/final_report.md"
 
 ReportFailureReason = Literal["missing", "empty", "malformed", "stale"]
 
-COMPLETION_GUIDANCE = """<CompletionGuard>
-The prior response was not terminal because required research artifacts remain
-incomplete. Continue the existing research workflow now. Finish every active task
-and write a changed, non-empty /final_report.md before giving a terminal answer.
-Do not restart completed work.
-</CompletionGuard>"""
-
-
 class CompletionState(FilesystemState, PlanningState):
     """Request-scoped state used by completion enforcement middleware."""
 
@@ -323,7 +315,9 @@ def _completion_update(state: CompletionState) -> dict[str, Any] | None:
     }
 
 
-def _inspect_state_completion(state: CompletionState) -> CompletionInspection:
+def _inspect_state_completion(
+    state: Mapping[str, Any],
+) -> CompletionInspection:
     generation = state.get("completion_request_generation")
     plan_active = (
         isinstance(generation, str)
@@ -353,26 +347,54 @@ def _configure_continuation_request(request: ModelRequest) -> ModelRequest:
     attempts = _safe_count(state.get("completion_attempts"))
     if attempts <= 0 or state.get("completion_exhausted_run_id") is not None:
         return request
+    limit = _completion_attempt_limit(state.get("completion_attempt_limit"))
+    guidance = _completion_guidance(
+        inspection=_inspect_state_completion(state),
+        attempt=min(attempts, limit),
+        limit=limit,
+    )
 
     system_message = request.system_message
     if system_message is None:
-        configured_system = SystemMessage(content=COMPLETION_GUIDANCE)
+        configured_system = SystemMessage(content=guidance)
     elif isinstance(system_message.content, str):
         configured_system = system_message.model_copy(
-            update={
-                "content": f"{system_message.content}\n\n{COMPLETION_GUIDANCE}"
-            }
+            update={"content": f"{system_message.content}\n\n{guidance}"}
         )
     else:
         configured_system = system_message.model_copy(
             update={
                 "content": [
                     *system_message.content,
-                    {"type": "text", "text": COMPLETION_GUIDANCE},
+                    {"type": "text", "text": guidance},
                 ]
             }
         )
     return request.override(system_message=configured_system)
+
+
+def _completion_guidance(
+    *,
+    inspection: CompletionInspection,
+    attempt: int,
+    limit: int,
+) -> str:
+    plan_active = "true" if inspection.plan_active else "false"
+    report_reason = inspection.report_reason or "complete"
+    blockers = (
+        f"plan_active={plan_active}, "
+        f"incomplete_todos={inspection.incomplete_todo_count}, "
+        f"malformed_todos={inspection.malformed_todo_count}, "
+        f"report={report_reason}"
+    )
+    return f"""<CompletionGuard>
+The prior response was not terminal because required research artifacts remain
+incomplete. Continuation attempt {attempt} of {limit}. Completion blockers:
+{blockers}.
+Continue the existing research workflow now. Finish every active task and write a
+changed, non-empty /final_report.md before giving a terminal answer. Do not restart
+completed work.
+</CompletionGuard>"""
 
 
 def _safe_count(value: object) -> int:

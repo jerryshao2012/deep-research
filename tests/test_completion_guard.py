@@ -977,6 +977,12 @@ def _model_request(state: dict[str, Any]) -> ModelRequest:
 
 def test_sync_wrap_model_call_appends_ephemeral_leading_system_guidance() -> None:
     state = _incomplete_state(_terminal_message(), attempts=1)
+    state["files"] = {
+        "/final_report.md": _file(
+            "Sensitive report prose",
+            modified_at="current",
+        )
+    }
     request = _model_request(state)
     captured: list[ModelRequest] = []
 
@@ -993,8 +999,16 @@ def test_sync_wrap_model_call_appends_ephemeral_leading_system_guidance() -> Non
     assert configured.system_message.id == "system-message"
     assert configured.system_message.additional_kwargs == {"provider": "ollama"}
     assert configured.system_message.content.startswith("Existing system guidance")
-    assert "<CompletionGuard>" in str(configured.system_message.content)
-    assert "Private research detail" not in str(configured.system_message.content)
+    guidance = str(configured.system_message.content)
+    assert "<CompletionGuard>" in guidance
+    assert "Continuation attempt 1 of 3" in guidance
+    assert (
+        "incomplete_todos=2, malformed_todos=0, report=stale" in guidance
+    )
+    assert "Private research detail" not in guidance
+    assert "Sensitive report prose" not in guidance
+    assert "Research privately" not in guidance
+    assert "Partial answer" not in guidance
     assert request.system_message is not None
     assert "<CompletionGuard>" not in str(request.system_message.content)
     assert state["messages"][-1].content == _terminal_message().content
@@ -1023,7 +1037,17 @@ def test_async_wrap_model_call_matches_sync_ollama_message_ordering() -> None:
     assert str(captured[0].system_message.content).startswith(
         "Existing system guidance"
     )
-    assert "<CompletionGuard>" in str(captured[0].system_message.content)
+    guidance = str(captured[0].system_message.content)
+    assert "<CompletionGuard>" in guidance
+    assert "Continuation attempt 1 of 3" in guidance
+    assert (
+        "incomplete_todos=2, malformed_todos=0, report=missing" in guidance
+    )
+    assert "Private research detail" not in guidance
+    assert "Research privately" not in guidance
+    assert "Partial answer" not in guidance
+    assert request.messages == [HumanMessage(content="Continue")]
+    assert state["messages"][-1].content == _terminal_message().content
 
 
 def test_exhaustion_checkpoints_only_safe_summary_and_jumps_to_end() -> None:
