@@ -272,6 +272,20 @@ async def test_sync_raising_unload_failure_preserves_timeout_error():
 
 
 @_async_test
+async def test_self_cancelling_unload_failure_preserves_timeout_error():
+    async def unload() -> None:
+        raise asyncio.CancelledError
+
+    async def pending() -> None:
+        await asyncio.Event().wait()
+
+    with pytest.raises(ModelCallTimeoutError):
+        await _run_with_deadline(
+            pending, policy=_policy(unload=True), metadata=_ollama_metadata(), unload=unload
+        )
+
+
+@_async_test
 async def test_unload_failure_preserves_external_cancellation():
     started = asyncio.Event()
 
@@ -299,6 +313,29 @@ async def test_sync_raising_unload_failure_preserves_external_cancellation():
 
     def unload() -> Any:
         raise RuntimeError("unload failed before creating awaitable")
+
+    async def pending() -> None:
+        started.set()
+        await asyncio.Event().wait()
+
+    caller = asyncio.create_task(
+        _run_with_deadline(
+            pending, policy=_policy(1, unload=True), metadata=_ollama_metadata(), unload=unload
+        )
+    )
+    await started.wait()
+    caller.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+
+
+@_async_test
+async def test_self_cancelling_unload_preserves_external_cancellation():
+    started = asyncio.Event()
+
+    async def unload() -> None:
+        raise asyncio.CancelledError
 
     async def pending() -> None:
         started.set()

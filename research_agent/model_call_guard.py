@@ -223,7 +223,10 @@ async def _bounded_shielded_unload(operation: Awaitable[Any]) -> None:
     except asyncio.CancelledError:
         if not task.done():
             task.add_done_callback(_consume_task_exception)
-        raise
+        current_task = asyncio.current_task()
+        if current_task is not None and current_task.cancelling():
+            raise
+        _LOGGER.warning("Ollama unload cancelled after cancelled model call")
     except Exception:
         if task.done():
             _consume_task_exception(task)
