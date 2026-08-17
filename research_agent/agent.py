@@ -40,6 +40,7 @@ from langgraph.config import get_config
 
 from research_agent.cli_utils import get_ssl_verify_config, str2bool
 from research_agent.completion_guard import (
+    CompletionGuardMiddleware,
     CompletionState,
     artifact_fingerprint,
     completion_ready_for_finalization,
@@ -1385,6 +1386,7 @@ _agent_kwargs: dict[str, Any] = dict(
     middleware=[
         TodoListMiddleware(system_prompt=""),
         ClarificationMiddleware(),
+        CompletionGuardMiddleware(),
         ResumeMiddleware(),
         ResearchStateMiddleware(),
     ],

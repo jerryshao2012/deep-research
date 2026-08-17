@@ -7,10 +7,14 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
+from deepagents import create_deep_agent
 from langchain.agents import create_agent
-from langchain.agents.middleware import TodoListMiddleware
+from langchain.agents.middleware import AgentMiddleware, TodoListMiddleware, hook_config
 from langchain.agents.middleware.types import ModelRequest
-from langchain_core.language_models.fake_chat_models import FakeListChatModel
+from langchain_core.language_models.fake_chat_models import (
+    FakeListChatModel,
+    FakeMessagesListChatModel,
+)
 from langchain_core.messages import (
     AIMessage,
     HumanMessage,
@@ -26,6 +30,11 @@ from research_agent.completion_guard import (
     get_max_completion_attempts,
     inspect_completion,
 )
+from research_agent.research_subagent.clarification.middleware import (
+    ClarificationMiddleware,
+)
+from research_agent.research_subagent.resume.middleware import ResumeMiddleware
+from research_agent.research_subagent.tools import write_file
 
 
 def _middleware(
@@ -1572,4 +1581,337 @@ def test_compiled_owned_plan_replaces_then_appends_and_checkpoints_exhaustion(
     assert all(
         message.response_metadata.get("resume_intermediate") is True
         for message in messages[1:]
+    )
+
+
+class _DeterministicToolModel(FakeMessagesListChatModel):
+    """Fake model that supports tool binding and records every model turn."""
+
+    call_count: int = 0
+
+    def bind_tools(self, *args: Any, **kwargs: Any) -> _DeterministicToolModel:
+        return self
+
+    def _generate(self, *args: Any, **kwargs: Any) -> Any:
+        self.call_count += 1
+        return super()._generate(*args, **kwargs)
+
+
+class _AfterModelTraceMiddleware(AgentMiddleware):
+    """Record compiled after-model hook unwinding order."""
+
+    def __init__(self, label: str, events: list[str]) -> None:
+        super().__init__()
+        self.label = label
+        self.events = events
+
+    @hook_config(can_jump_to=["model", "end"])
+    def after_model(self, state: Any, runtime: Any) -> None:
+        self.events.append(self.label)
+
+    @hook_config(can_jump_to=["model", "end"])
+    async def aafter_model(self, state: Any, runtime: Any) -> None:
+        self.events.append(self.label)
+
+
+class _CompletionTraceMiddleware(_AfterModelTraceMiddleware):
+    pass
+
+
+class _ResumeTraceMiddleware(_AfterModelTraceMiddleware):
+    pass
+
+
+class _ResearchTraceMiddleware(_AfterModelTraceMiddleware):
+    pass
+
+
+@pytest.mark.parametrize("async_", [False, True])
+def test_compiled_after_model_hooks_unwind_research_resume_completion(
+    async_: bool,
+) -> None:
+    events: list[str] = []
+    graph = create_agent(
+        _DeterministicToolModel(responses=[AIMessage(content="Done")]),
+        tools=[],
+        middleware=[
+            TodoListMiddleware(system_prompt=""),
+            ClarificationMiddleware(feature_enabled=False),
+            _CompletionTraceMiddleware("completion", events),
+            _ResumeTraceMiddleware("resume", events),
+            _ResearchTraceMiddleware("research", events),
+        ],
+    )
+
+    _invoke_compiled(
+        graph,
+        {"configurable": {"thread_id": f"hook-order-{async_}"}},
+        async_=async_,
+    )
+
+    assert events == ["research", "resume", "completion"]
+
+
+class _RecordingCompletionGuard(completion_guard.CompletionGuardMiddleware):
+    """Record ownership after each real tool-result correlation hook."""
+
+    def __init__(self, *, run_id: UUID) -> None:
+        super().__init__(config_getter=lambda: {"run_id": run_id})
+        self.ownership_observations: list[tuple[str | None, str | None, bool]] = []
+
+    def _record(
+        self,
+        state: completion_guard.CompletionState,
+        update: dict[str, Any] | None,
+    ) -> None:
+        effective = {**state, **(update or {})}
+        messages = state.get("messages") or []
+        last = messages[-1] if messages else None
+        self.ownership_observations.append(
+            (
+                getattr(last, "name", None),
+                getattr(last, "status", None),
+                effective.get("completion_report_owned") is True,
+            )
+        )
+
+    def before_model(
+        self,
+        state: completion_guard.CompletionState,
+        runtime: Any,
+    ) -> dict[str, Any] | None:
+        update = super().before_model(state, runtime)
+        self._record(state, update)
+        return update
+
+    async def abefore_model(
+        self,
+        state: completion_guard.CompletionState,
+        runtime: Any,
+    ) -> dict[str, Any] | None:
+        update = await super().abefore_model(state, runtime)
+        self._record(state, update)
+        return update
+
+
+def _tool_call(
+    name: str,
+    args: dict[str, Any],
+    *,
+    call_id: str,
+    message_id: str,
+) -> AIMessage:
+    return AIMessage(
+        content="",
+        id=message_id,
+        tool_calls=[{"name": name, "args": args, "id": call_id}],
+    )
+
+
+def _production_like_graph(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    responses: list[AIMessage],
+    completion: completion_guard.CompletionGuardMiddleware | None = None,
+    full_stack: bool = True,
+    with_checkpointer: bool = False,
+) -> tuple[Any, _DeterministicToolModel]:
+    import research_agent.agent as agent_module
+
+    monkeypatch.setattr(agent_module, "ENABLE_VERIFICATION", False)
+    monkeypatch.setattr(agent_module, "ENABLE_EVAL_TRACKING", False)
+    model = _DeterministicToolModel(responses=responses)
+    guard = completion or completion_guard.CompletionGuardMiddleware()
+    middleware: list[AgentMiddleware[Any, Any]] = [
+        TodoListMiddleware(system_prompt=""),
+        guard,
+    ]
+    if full_stack:
+        middleware = [
+            TodoListMiddleware(system_prompt=""),
+            ClarificationMiddleware(feature_enabled=False),
+            guard,
+            ResumeMiddleware(),
+            agent_module.ResearchStateMiddleware(),
+        ]
+    graph = create_deep_agent(
+        model=model,
+        tools=[write_file],
+        middleware=middleware,
+        checkpointer=InMemorySaver() if with_checkpointer else None,
+    )
+    return graph, model
+
+
+def _run_production_like_graph(
+    graph: Any,
+    *,
+    config: dict[str, Any],
+    async_: bool,
+) -> dict[str, Any]:
+    input_state = {"messages": [HumanMessage(content="Research graph systems")]}
+    if async_:
+        return asyncio.run(graph.ainvoke(input_state, config=config))
+    return graph.invoke(input_state, config=config)
+
+
+@pytest.mark.parametrize("async_", [False, True])
+@pytest.mark.parametrize(
+    "write_args",
+    [
+        {"content": "Accepted report"},
+        {"file_path": "/final_report.md", "content": "Accepted report"},
+    ],
+)
+def test_compiled_production_stack_owns_only_successful_real_report_write(
+    monkeypatch: pytest.MonkeyPatch,
+    async_: bool,
+    write_args: dict[str, Any],
+) -> None:
+    run_id = uuid4()
+    guard = _RecordingCompletionGuard(run_id=run_id)
+    responses = [
+        _tool_call(
+            "write_todos",
+            {"todos": [{"content": "Write report", "status": "pending"}]},
+            call_id="todo-open-call",
+            message_id="todo-open-message",
+        ),
+        AIMessage(content="Stopping early", id="early-terminal"),
+        _tool_call(
+            "write_file",
+            write_args,
+            call_id="successful-report-call",
+            message_id="successful-report-message",
+        ),
+        _tool_call(
+            "write_todos",
+            {"todos": [{"content": "Write report", "status": "completed"}]},
+            call_id="todo-done-call",
+            message_id="todo-done-message",
+        ),
+        AIMessage(content="Research complete", id="accepted-terminal"),
+    ]
+    graph, model = _production_like_graph(
+        monkeypatch,
+        responses=responses,
+        completion=guard,
+    )
+    config = {
+        "run_id": run_id,
+        "recursion_limit": 200,
+        "configurable": {"thread_id": f"accepted-{async_}-{bool(write_args.get('file_path'))}"},
+    }
+
+    result = _run_production_like_graph(graph, config=config, async_=async_)
+
+    assert model.call_count == len(responses)
+    assert result["completion_current_run_id"] == str(run_id)
+    assert result["completion_attempts"] == 1
+    assert result["completion_report_owned"] is True
+    assert result["files"]["/final_report.md"]["content"] == "Accepted report"
+    assert result["todos"] == [{"content": "Write report", "status": "completed"}]
+    successful = [
+        observed
+        for observed in guard.ownership_observations
+        if observed[:2] == ("write_file", "success")
+    ]
+    assert successful == [("write_file", "success", True)]
+    successful_index = guard.ownership_observations.index(successful[0])
+    assert all(
+        not owned
+        for _name, _status, owned in guard.ownership_observations[:successful_index]
+    )
+    messages = result["messages"]
+    opening_todo_result = next(
+        message
+        for message in messages
+        if isinstance(message, ToolMessage)
+        and message.tool_call_id == "todo-open-call"
+    )
+    assert opening_todo_result.status == "success"
+    assert messages.index(opening_todo_result) < next(
+        index for index, message in enumerate(messages) if message.id == "early-terminal"
+    )
+    assert next(message for message in messages if message.id == "early-terminal").response_metadata[
+        "resume_intermediate"
+    ] is True
+    assert {message.id for message in messages}.issuperset(
+        {
+            "todo-open-message",
+            "early-terminal",
+            "successful-report-message",
+            "todo-done-message",
+            "accepted-terminal",
+        }
+    )
+
+
+@pytest.mark.parametrize("async_", [False, True])
+@pytest.mark.parametrize("limit", [1, 2, 3])
+def test_compiled_real_tools_exhaust_exact_continuation_limit_and_checkpoint(
+    monkeypatch: pytest.MonkeyPatch,
+    async_: bool,
+    limit: int,
+) -> None:
+    monkeypatch.setenv("MAX_COMPLETION_ATTEMPTS", str(limit))
+    terminal_responses = [
+        AIMessage(content=f"Partial {attempt}", id=f"partial-{attempt}")
+        for attempt in range(limit + 1)
+    ]
+    responses = [
+        _tool_call(
+            "write_file",
+            {"file_path": "/notes.md", "content": "Durable notes"},
+            call_id="notes-call",
+            message_id="notes-message",
+        ),
+        _tool_call(
+            "write_todos",
+            {"todos": [{"content": "Finish report", "status": "pending"}]},
+            call_id="todo-call",
+            message_id="todo-message",
+        ),
+        *terminal_responses,
+    ]
+    run_id = uuid4()
+    guard = completion_guard.CompletionGuardMiddleware(
+        config_getter=lambda: {"run_id": run_id}
+    )
+    graph, model = _production_like_graph(
+        monkeypatch,
+        responses=responses,
+        completion=guard,
+        full_stack=False,
+        with_checkpointer=True,
+    )
+    config = {
+        "run_id": run_id,
+        "recursion_limit": 200,
+        "configurable": {"thread_id": f"real-exhaustion-{limit}-{async_}"},
+    }
+
+    with pytest.raises(completion_guard.ResearchIncompleteError):
+        _run_production_like_graph(graph, config=config, async_=async_)
+
+    assert model.call_count == limit + 3
+    snapshot = graph.get_state(config)
+    values = snapshot.values
+    assert values["completion_current_run_id"] == str(run_id)
+    assert values["completion_attempts"] == limit
+    assert values["completion_exhausted_run_id"] == str(run_id)
+    assert values["completion_exhausted_incomplete_todo_count"] == 1
+    assert values["completion_exhausted_malformed_todo_count"] == 0
+    assert values["completion_exhausted_report_reason"] == "missing"
+    assert values["files"]["/notes.md"]["content"] == "Durable notes"
+    assert values["todos"] == [{"content": "Finish report", "status": "pending"}]
+    messages = values["messages"]
+    assert {message.id for message in messages}.issuperset(
+        {"notes-message", "todo-message", *(f"partial-{i}" for i in range(limit + 1))}
+    )
+    assert all(
+        next(message for message in messages if message.id == f"partial-{attempt}")
+        .response_metadata.get("resume_intermediate")
+        is True
+        for attempt in range(limit + 1)
     )
