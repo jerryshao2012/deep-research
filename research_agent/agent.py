@@ -210,20 +210,39 @@ def _verification_round(state: Mapping[str, Any]) -> int:
 def _verification_question(
     state: Mapping[str, Any], files: Mapping[str, Any]
 ) -> str:
-    messages = state.get("messages")
-    if isinstance(messages, list):
-        for message in reversed(messages):
-            if isinstance(message, HumanMessage):
-                return str(message.content)
-            if isinstance(message, Mapping) and message.get("role") == "user":
-                return str(message.get("content", ""))
     request_file = files.get("/research_request.md")
     if isinstance(request_file, Mapping):
         try:
-            return file_data_to_string(request_file)  # type: ignore[arg-type]
+            request_text = file_data_to_string(  # type: ignore[arg-type]
+                request_file
+            )
         except (KeyError, TypeError, ValueError):
-            pass
-    return ""
+            request_text = ""
+        if request_text.strip():
+            return request_text
+
+    human_questions: list[str] = []
+    messages = state.get("messages")
+    if isinstance(messages, list):
+        for message in messages:
+            if isinstance(message, HumanMessage):
+                question = str(message.content)
+            elif isinstance(message, Mapping) and message.get("role") == "user":
+                question = str(message.get("content", ""))
+            else:
+                continue
+            if question.strip():
+                human_questions.append(question)
+
+    generation = state.get("completion_request_generation")
+    is_current_generation_resume = (
+        isinstance(generation, str)
+        and bool(generation)
+        and state.get("completion_resume_adopted_generation") == generation
+    )
+    if is_current_generation_resume and len(human_questions) >= 2:
+        return human_questions[-2]
+    return human_questions[-1] if human_questions else ""
 
 
 def _tag_verification_intermediate(message: AIMessage) -> AIMessage:
@@ -252,6 +271,7 @@ def _apply_verification_verdict(
         updates["verification_round"] = verification_round
         updates["verification_feedback"] = None
         updates["completion_verified_report_modified_at"] = report_modified_at
+        updates["completion_accepted_at_limit_report_modified_at"] = None
         return
 
     next_round = verification_round + 1
@@ -261,6 +281,7 @@ def _apply_verification_verdict(
         updates["completion_accepted_at_limit_report_modified_at"] = (
             report_modified_at
         )
+        updates["completion_verified_report_modified_at"] = None
         return
 
     updates["verification_feedback"] = format_feedback(verdict)

@@ -368,6 +368,51 @@ def test_nonfinal_revision_routes_to_model_without_persisted_system_message(
     }
 
 
+@pytest.mark.parametrize("async_", [False, True])
+@pytest.mark.parametrize("request_file_kind", ["valid", "empty", "malformed"])
+def test_resumed_verification_uses_original_current_generation_question(
+    monkeypatch: pytest.MonkeyPatch,
+    async_: bool,
+    request_file_kind: str,
+) -> None:
+    seen_questions: list[str] = []
+
+    async def fake_verify_report(*, question: str, report: str) -> VerificationVerdict:
+        seen_questions.append(question)
+        return VerificationVerdict(status="complete", sufficiency_score=1.0)
+
+    monkeypatch.setattr(agent_module, "ENABLE_VERIFICATION", True)
+    monkeypatch.setattr(agent_module, "ENABLE_EVAL_TRACKING", False)
+    monkeypatch.setattr(agent_module, "verify_report", fake_verify_report)
+    state = _verification_state()
+    state["messages"] = [
+        HumanMessage(content="Stale prior-generation question"),
+        HumanMessage(content="Original current-generation research question"),
+        HumanMessage(content="continue"),
+        AIMessage(content="Research complete.", id="terminal-response"),
+    ]
+    state["completion_resume_adopted_generation"] = "generation-v1"
+    request_files: dict[str, object] = {
+        "valid": _report(
+            "Original current-generation research question",
+            modified_at="request-v1",
+        ),
+        "empty": _report("   ", modified_at="request-v1"),
+        "malformed": {
+            "content": object(),
+            "encoding": "utf-8",
+            "modified_at": "request-v1",
+        },
+    }
+    state["files"]["/research_request.md"] = request_files[request_file_kind]
+
+    _run_after_model(agent_module.ResearchStateMiddleware(), state, async_=async_)
+
+    assert seen_questions == ["Original current-generation research question"]
+    assert "Stale prior-generation question" not in seen_questions
+    assert "continue" not in seen_questions
+
+
 def test_next_model_request_injects_verification_feedback_system_first() -> None:
     feedback = "<VerificationFeedback>Add evidence.</VerificationFeedback>"
     state = _verification_state()
@@ -404,15 +449,15 @@ def test_passing_verification_records_current_report_ownership(
     monkeypatch.setattr(agent_module, "ENABLE_EVAL_TRACKING", False)
     monkeypatch.setattr(agent_module, "verify_report", fake_verify_report)
 
+    state = _verification_state(report_modified_at="report-v2")
+    state["completion_accepted_at_limit_report_modified_at"] = "old-accepted"
     result = _run_after_model(
-        agent_module.ResearchStateMiddleware(),
-        _verification_state(report_modified_at="report-v2"),
-        async_=async_,
+        agent_module.ResearchStateMiddleware(), state, async_=async_
     )
 
     assert result is not None
     assert result["completion_verified_report_modified_at"] == "report-v2"
-    assert "completion_accepted_at_limit_report_modified_at" not in result
+    assert result["completion_accepted_at_limit_report_modified_at"] is None
     assert "jump_to" not in result
     assert "completion_attempts" not in result
 
@@ -430,19 +475,19 @@ def test_final_revision_limit_accepts_only_current_owned_report_without_jump(
     monkeypatch.setattr(agent_module, "MAX_VERIFICATION_ROUNDS", 2)
     monkeypatch.setattr(agent_module, "verify_report", fake_verify_report)
 
+    state = _verification_state(
+        report_modified_at="report-v2", verification_round=1
+    )
+    state["completion_verified_report_modified_at"] = "old-verified"
     result = _run_after_model(
-        agent_module.ResearchStateMiddleware(),
-        _verification_state(
-            report_modified_at="report-v2", verification_round=1
-        ),
-        async_=async_,
+        agent_module.ResearchStateMiddleware(), state, async_=async_
     )
 
     assert result is not None
     assert result["completion_accepted_at_limit_report_modified_at"] == "report-v2"
     assert result["verification_round"] == 2
     assert result["verification_feedback"] is None
-    assert "completion_verified_report_modified_at" not in result
+    assert result["completion_verified_report_modified_at"] is None
     assert "jump_to" not in result
     assert "completion_attempts" not in result
 
