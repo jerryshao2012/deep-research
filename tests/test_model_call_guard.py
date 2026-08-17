@@ -1,5 +1,7 @@
 import asyncio
+import contextvars
 import logging
+import threading
 import time
 from dataclasses import FrozenInstanceError
 from functools import wraps
@@ -8,26 +10,132 @@ from typing import Any
 
 import httpx
 import pytest
+from langchain.agents.middleware import ModelRequest
+from langchain_core.callbacks import BaseCallbackHandler
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import AIMessage, AIMessageChunk
+from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
+from pydantic import PrivateAttr
 
 from research_agent.model_call_guard import (
     DEFAULT_MODEL_CALL_TIMEOUT_SECONDS,
     MODEL_CANCEL_GRACE_SECONDS,
     OLLAMA_UNLOAD_TIMEOUT_SECONDS,
+    ModelCallGuardMiddleware,
+    ModelCallGuardMixin,
     ModelCallPolicy,
     ModelCallTimeoutError,
     ModelRuntimeMetadata,
     UnsupportedModelOverrideError,
     _maybe_unload_ollama,
     _run_with_deadline,
+    adapt_model_override,
+    cancel_model_call_scope,
+    guard_model,
 )
+
+_TEST_CONTEXT = contextvars.ContextVar(
+    "test_model_call_bridge_context", default="missing"
+)
+
+
+class _AsyncOnlyChatModel(BaseChatModel):
+    """Network-free provider fake whose synchronous path must never run."""
+
+    delay: float = 0.0
+    chunk_delay: float = 0.0
+    chunks: list[AIMessageChunk] = []
+    model_runtime_metadata: Any = None
+    suppress_invoke_cancel: bool = False
+    suppress_stream_cancel: bool = False
+    _cancelled: threading.Event = PrivateAttr(default_factory=threading.Event)
+    _calls: list[dict[str, Any]] = PrivateAttr(default_factory=list)
+    _release_stream: asyncio.Event = PrivateAttr(default_factory=asyncio.Event)
+    _release_invoke: asyncio.Event = PrivateAttr(default_factory=asyncio.Event)
+    _stream_started: threading.Event = PrivateAttr(default_factory=threading.Event)
+    _context_values: list[str] = PrivateAttr(default_factory=list)
+
+    @property
+    def _llm_type(self) -> str:
+        return "async-only-test-provider"
+
+    def _generate(self, *_args: Any, **_kwargs: Any) -> ChatResult:
+        raise AssertionError("guarded sync methods must use provider async path")
+
+    async def _agenerate(
+        self,
+        messages: list[Any],
+        stop: list[str] | None = None,
+        run_manager: Any = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        self._calls.append({"messages": messages, "stop": stop, "kwargs": kwargs})
+        self._context_values.append(_TEST_CONTEXT.get())
+        try:
+            await asyncio.sleep(self.delay)
+        except (asyncio.CancelledError, GeneratorExit):
+            self._cancelled.set()
+            if self.suppress_invoke_cancel:
+                await self._release_invoke.wait()
+            raise
+        message = AIMessage(
+            content="complete",
+            id="message-id",
+            response_metadata={"provider": "fake", "trace": "kept"},
+            usage_metadata={"input_tokens": 2, "output_tokens": 3, "total_tokens": 5},
+        )
+        return ChatResult(
+            generations=[ChatGeneration(message=message)],
+            llm_output={"native": "kept"},
+        )
+
+    async def _astream(
+        self,
+        messages: list[Any],
+        stop: list[str] | None = None,
+        run_manager: Any = None,
+        **kwargs: Any,
+    ):
+        self._calls.append({"messages": messages, "stop": stop, "kwargs": kwargs})
+        self._stream_started.set()
+        try:
+            for chunk in self.chunks:
+                await asyncio.sleep(self.chunk_delay)
+                yield ChatGenerationChunk(message=chunk)
+        except (asyncio.CancelledError, GeneratorExit):
+            self._cancelled.set()
+            if self.suppress_stream_cancel:
+                await self._release_stream.wait()
+            raise
+
+    def bind_tools(self, tools: Any, *, tool_choice: str | None = None, **kwargs: Any):
+        return self.bind(tools=tools, tool_choice=tool_choice, **kwargs)
+
+
+class _RecordingCallback(BaseCallbackHandler):
+    def __init__(self) -> None:
+        self.starts: list[dict[str, Any]] = []
+        self.ends: list[Any] = []
+
+    def on_chat_model_start(
+        self, serialized: dict[str, Any], messages: list[list[Any]], **kwargs: Any
+    ) -> None:
+        self.starts.append({"serialized": serialized, "messages": messages, **kwargs})
+
+    def on_llm_end(self, response: Any, **kwargs: Any) -> None:
+        self.ends.append((response, kwargs))
 
 
 def _policy(timeout: float = 0.03, *, unload: bool = False) -> ModelCallPolicy:
     return ModelCallPolicy(timeout_seconds=timeout, force_ollama_unload=unload)
 
 
-def _ollama_metadata(base_url: str | None = "http://localhost:11434") -> ModelRuntimeMetadata:
-    return ModelRuntimeMetadata(provider="ollama", model_name="gemma4:latest", base_url=base_url)
+def _ollama_metadata(
+    base_url: str | None = "http://localhost:11434",
+) -> ModelRuntimeMetadata:
+    return ModelRuntimeMetadata(
+        provider="ollama", model_name="gemma4:latest", base_url=base_url
+    )
 
 
 def _async_test(test: Any) -> Any:
@@ -51,7 +159,9 @@ async def test_run_with_deadline_returns_exact_async_result_before_deadline():
 
 
 @_async_test
-async def test_run_with_deadline_cancels_request_within_bounded_cleanup_grace(monkeypatch):
+async def test_run_with_deadline_cancels_request_within_bounded_cleanup_grace(
+    monkeypatch,
+):
     import research_agent.model_call_guard as guard
 
     monkeypatch.setattr(guard, "MODEL_CANCEL_GRACE_SECONDS", 0.03)
@@ -75,7 +185,9 @@ async def test_run_with_deadline_cancels_request_within_bounded_cleanup_grace(mo
 
 
 @_async_test
-async def test_run_with_deadline_propagates_external_cancellation_unchanged(monkeypatch):
+async def test_run_with_deadline_propagates_external_cancellation_unchanged(
+    monkeypatch,
+):
     import research_agent.model_call_guard as guard
 
     monkeypatch.setattr(guard, "MODEL_CANCEL_GRACE_SECONDS", 0.03)
@@ -91,7 +203,9 @@ async def test_run_with_deadline_propagates_external_cancellation_unchanged(monk
             raise
 
     caller = asyncio.create_task(
-        _run_with_deadline(pending, policy=_policy(1), metadata=_ollama_metadata(), unload=None)
+        _run_with_deadline(
+            pending, policy=_policy(1), metadata=_ollama_metadata(), unload=None
+        )
     )
     await started.wait()
     caller.cancel()
@@ -102,7 +216,9 @@ async def test_run_with_deadline_propagates_external_cancellation_unchanged(monk
 
 
 @_async_test
-async def test_cancellation_suppressing_handler_cannot_exceed_cleanup_grace(monkeypatch):
+async def test_cancellation_suppressing_handler_cannot_exceed_cleanup_grace(
+    monkeypatch,
+):
     import research_agent.model_call_guard as guard
 
     monkeypatch.setattr(guard, "MODEL_CANCEL_GRACE_SECONDS", 0.03)
@@ -178,7 +294,10 @@ async def test_timeout_cancels_streaming_http_transport_request(monkeypatch):
 
     with pytest.raises(ModelCallTimeoutError):
         await _run_with_deadline(
-            streaming_request, policy=_policy(), metadata=_ollama_metadata(), unload=None
+            streaming_request,
+            policy=_policy(),
+            metadata=_ollama_metadata(),
+            unload=None,
         )
     assert disconnected.is_set()
 
@@ -196,7 +315,10 @@ async def test_default_policy_never_calls_ollama_unload():
 
     with pytest.raises(ModelCallTimeoutError):
         await _run_with_deadline(
-            pending, policy=_policy(unload=False), metadata=_ollama_metadata(), unload=unload
+            pending,
+            policy=_policy(unload=False),
+            metadata=_ollama_metadata(),
+            unload=unload,
         )
     assert unload_calls == 0
 
@@ -227,7 +349,10 @@ async def test_timeout_unload_lifecycle_is_bounded_including_client_close(monkey
 
     caller = asyncio.create_task(
         _run_with_deadline(
-            pending, policy=_policy(unload=True), metadata=_ollama_metadata(), unload=None
+            pending,
+            policy=_policy(unload=True),
+            metadata=_ollama_metadata(),
+            unload=None,
         )
     )
     try:
@@ -264,7 +389,10 @@ async def test_external_cancellation_during_timeout_unload_attempts_once(monkeyp
 
     caller = asyncio.create_task(
         _run_with_deadline(
-            pending, policy=_policy(0.02, unload=True), metadata=_ollama_metadata(), unload=unload
+            pending,
+            policy=_policy(0.02, unload=True),
+            metadata=_ollama_metadata(),
+            unload=unload,
         )
     )
     try:
@@ -294,7 +422,10 @@ async def test_unload_failure_log_excludes_integration_exception(caplog):
 
     with pytest.raises(ModelCallTimeoutError):
         await _run_with_deadline(
-            pending, policy=_policy(unload=True), metadata=_ollama_metadata(), unload=unload
+            pending,
+            policy=_policy(unload=True),
+            metadata=_ollama_metadata(),
+            unload=unload,
         )
 
     assert secret not in caplog.text
@@ -327,9 +458,7 @@ async def test_opt_in_ollama_unloads_once_with_safe_generate_payload(
         post=post,
     )
 
-    assert requests == [
-        (expected_url, {"model": "gemma4:latest", "keep_alive": 0})
-    ]
+    assert requests == [(expected_url, {"model": "gemma4:latest", "keep_alive": 0})]
 
 
 @_async_test
@@ -341,7 +470,9 @@ async def test_cloud_provider_never_unloads_even_when_enabled():
         called = True
 
     await _maybe_unload_ollama(
-        metadata=ModelRuntimeMetadata(provider="openai", model_name="gpt", base_url="https://api.openai.com"),
+        metadata=ModelRuntimeMetadata(
+            provider="openai", model_name="gpt", base_url="https://api.openai.com"
+        ),
         policy=_policy(unload=True),
         post=post,
     )
@@ -358,7 +489,10 @@ async def test_unload_failure_preserves_timeout_error():
 
     with pytest.raises(ModelCallTimeoutError):
         await _run_with_deadline(
-            pending, policy=_policy(unload=True), metadata=_ollama_metadata(), unload=unload
+            pending,
+            policy=_policy(unload=True),
+            metadata=_ollama_metadata(),
+            unload=unload,
         )
 
 
@@ -372,7 +506,10 @@ async def test_sync_raising_unload_failure_preserves_timeout_error():
 
     with pytest.raises(ModelCallTimeoutError):
         await _run_with_deadline(
-            pending, policy=_policy(unload=True), metadata=_ollama_metadata(), unload=unload
+            pending,
+            policy=_policy(unload=True),
+            metadata=_ollama_metadata(),
+            unload=unload,
         )
 
 
@@ -386,7 +523,10 @@ async def test_sync_cancelling_unload_failure_preserves_timeout_error():
 
     with pytest.raises(ModelCallTimeoutError):
         await _run_with_deadline(
-            pending, policy=_policy(unload=True), metadata=_ollama_metadata(), unload=unload
+            pending,
+            policy=_policy(unload=True),
+            metadata=_ollama_metadata(),
+            unload=unload,
         )
 
 
@@ -400,7 +540,10 @@ async def test_self_cancelling_unload_failure_preserves_timeout_error():
 
     with pytest.raises(ModelCallTimeoutError):
         await _run_with_deadline(
-            pending, policy=_policy(unload=True), metadata=_ollama_metadata(), unload=unload
+            pending,
+            policy=_policy(unload=True),
+            metadata=_ollama_metadata(),
+            unload=unload,
         )
 
 
@@ -417,7 +560,10 @@ async def test_unload_failure_preserves_external_cancellation():
 
     caller = asyncio.create_task(
         _run_with_deadline(
-            pending, policy=_policy(1, unload=True), metadata=_ollama_metadata(), unload=unload
+            pending,
+            policy=_policy(1, unload=True),
+            metadata=_ollama_metadata(),
+            unload=unload,
         )
     )
     await started.wait()
@@ -439,7 +585,10 @@ async def test_sync_raising_unload_failure_preserves_external_cancellation():
 
     caller = asyncio.create_task(
         _run_with_deadline(
-            pending, policy=_policy(1, unload=True), metadata=_ollama_metadata(), unload=unload
+            pending,
+            policy=_policy(1, unload=True),
+            metadata=_ollama_metadata(),
+            unload=unload,
         )
     )
     await started.wait()
@@ -463,7 +612,10 @@ async def test_sync_cancelling_unload_preserves_external_cancellation_marker():
 
     caller = asyncio.create_task(
         _run_with_deadline(
-            pending, policy=_policy(1, unload=True), metadata=_ollama_metadata(), unload=unload
+            pending,
+            policy=_policy(1, unload=True),
+            metadata=_ollama_metadata(),
+            unload=unload,
         )
     )
     await started.wait()
@@ -487,7 +639,10 @@ async def test_self_cancelling_unload_preserves_external_cancellation():
 
     caller = asyncio.create_task(
         _run_with_deadline(
-            pending, policy=_policy(1, unload=True), metadata=_ollama_metadata(), unload=unload
+            pending,
+            policy=_policy(1, unload=True),
+            metadata=_ollama_metadata(),
+            unload=unload,
         )
     )
     await started.wait()
@@ -514,7 +669,10 @@ async def test_repeated_external_cancellation_interrupts_unload_promptly():
 
     caller = asyncio.create_task(
         _run_with_deadline(
-            pending, policy=_policy(1, unload=True), metadata=_ollama_metadata(), unload=unload
+            pending,
+            policy=_policy(1, unload=True),
+            metadata=_ollama_metadata(),
+            unload=unload,
         )
     )
     await started.wait()
@@ -534,7 +692,9 @@ async def test_repeated_external_cancellation_interrupts_unload_promptly():
 
 @_async_test
 @pytest.mark.parametrize("model_name", [None, 42, "   "])
-async def test_malformed_ollama_model_name_skips_unload_and_preserves_timeout(model_name):
+async def test_malformed_ollama_model_name_skips_unload_and_preserves_timeout(
+    model_name,
+):
     unload_calls = 0
 
     async def unload() -> None:
@@ -562,8 +722,12 @@ async def test_invalid_ollama_unload_metadata_skips_network_without_leaking_mode
         nonlocal calls
         calls += 1
 
-    metadata = ModelRuntimeMetadata(provider="ollama", model_name="secret model", base_url=None)
-    await _maybe_unload_ollama(metadata=metadata, policy=_policy(unload=True), post=post)
+    metadata = ModelRuntimeMetadata(
+        provider="ollama", model_name="secret model", base_url=None
+    )
+    await _maybe_unload_ollama(
+        metadata=metadata, policy=_policy(unload=True), post=post
+    )
     assert calls == 0
 
 
@@ -597,9 +761,13 @@ def test_finite_positive_timeout_is_accepted(monkeypatch, value):
 
 def test_non_finite_numeric_timeout_uses_safe_default(monkeypatch):
     monkeypatch.setenv("MODEL_CALL_TIMEOUT_SECONDS", str(nan))
-    assert ModelCallPolicy.from_env().timeout_seconds == DEFAULT_MODEL_CALL_TIMEOUT_SECONDS
+    assert (
+        ModelCallPolicy.from_env().timeout_seconds == DEFAULT_MODEL_CALL_TIMEOUT_SECONDS
+    )
     monkeypatch.setenv("MODEL_CALL_TIMEOUT_SECONDS", str(inf))
-    assert ModelCallPolicy.from_env().timeout_seconds == DEFAULT_MODEL_CALL_TIMEOUT_SECONDS
+    assert (
+        ModelCallPolicy.from_env().timeout_seconds == DEFAULT_MODEL_CALL_TIMEOUT_SECONDS
+    )
 
 
 def test_cancellation_constants_are_bounded():
@@ -702,10 +870,13 @@ def test_unsupported_override_error_does_not_retain_arbitrary_content():
     assert not hasattr(error, "model_name")
 
 
-@pytest.mark.parametrize("model_name", [
-    "sk-proj-secret-token-123",
-    "x" * 10000,
-])
+@pytest.mark.parametrize(
+    "model_name",
+    [
+        "sk-proj-secret-token-123",
+        "x" * 10000,
+    ],
+)
 def test_unsupported_override_error_does_not_retain_model_name(model_name):
     error = UnsupportedModelOverrideError(provider="ollama", model_name=model_name)
 
@@ -714,3 +885,717 @@ def test_unsupported_override_error_does_not_retain_model_name(model_name):
     assert model_name not in repr(error.args)
     assert model_name not in repr(vars(error))
     assert not hasattr(error, "model_name")
+
+
+def _fake_metadata() -> ModelRuntimeMetadata:
+    return ModelRuntimeMetadata(provider="openai", model_name="fake-model")
+
+
+def _guarded_fake(
+    *,
+    timeout: float = 0.1,
+    delay: float = 0.0,
+    chunk_delay: float = 0.0,
+    chunks: list[AIMessageChunk] | None = None,
+) -> BaseChatModel:
+    return guard_model(
+        _AsyncOnlyChatModel(
+            delay=delay,
+            chunk_delay=chunk_delay,
+            chunks=[] if chunks is None else chunks,
+        ),
+        metadata=_fake_metadata(),
+        policy=_policy(timeout),
+    )
+
+
+def test_guard_model_creates_cached_provider_preserving_dynamic_class():
+    first = _guarded_fake()
+    second = _guarded_fake()
+
+    assert isinstance(first, BaseChatModel)
+    assert isinstance(first, _AsyncOnlyChatModel)
+    assert isinstance(first, ModelCallGuardMixin)
+    assert type(first) is type(second)
+    assert type(first).__mro__[:3] == (
+        type(first),
+        ModelCallGuardMixin,
+        _AsyncOnlyChatModel,
+    )
+
+
+def test_generated_private_attrs_are_initialized_values_and_copy_is_independent():
+    guarded = _guarded_fake()
+    copied = guarded.model_copy()
+
+    for name in (
+        "_model_call_policy",
+        "_runtime_metadata",
+        "_bridge_registry",
+        "_retry_controller",
+    ):
+        assert getattr(guarded, name).__class__.__name__ != "ModelPrivateAttr"
+        assert getattr(copied, name).__class__.__name__ != "ModelPrivateAttr"
+    assert copied is not guarded
+    assert type(copied) is type(guarded)
+    assert copied._bridge_registry is not guarded._bridge_registry
+    assert copied._model_call_policy == guarded._model_call_policy
+    assert copied._runtime_metadata == guarded._runtime_metadata
+
+
+@_async_test
+async def test_ainvoke_captures_total_deadline_before_coroutine_is_awaited():
+    guarded = _guarded_fake(timeout=0.03)
+
+    pending = guarded.ainvoke("hello")
+    await asyncio.sleep(0.05)
+
+    started = time.monotonic()
+    with pytest.raises(ModelCallTimeoutError):
+        await pending
+    assert time.monotonic() - started < 0.04
+
+
+@_async_test
+async def test_ainvoke_external_cancellation_reaches_provider():
+    guarded = _guarded_fake(timeout=1, delay=1)
+
+    caller = asyncio.create_task(guarded.ainvoke("hello"))
+    await asyncio.sleep(0.01)
+    caller.cancel("caller")
+
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await caller
+    assert raised.value.args == ("caller",)
+    assert guarded._cancelled.is_set()
+
+
+@_async_test
+async def test_astream_captures_deadline_before_first_pull():
+    guarded = _guarded_fake(
+        timeout=0.03,
+        chunks=[AIMessageChunk(content="too-late")],
+    )
+
+    stream = guarded.astream("hello")
+    await asyncio.sleep(0.05)
+
+    started = time.monotonic()
+    with pytest.raises(ModelCallTimeoutError):
+        await anext(stream)
+    assert time.monotonic() - started < 0.04
+    assert not guarded._calls
+
+
+@_async_test
+async def test_astream_uses_one_eager_deadline_across_slow_trickle():
+    chunks = [
+        AIMessageChunk(content="a", id="chunk-id"),
+        AIMessageChunk(content="b", id="chunk-id"),
+        AIMessageChunk(content="", id="chunk-id"),
+    ]
+    chunks[-1].tool_call_chunks = [
+        {"name": "search", "args": '{"q":"x"}', "id": "tool-1", "index": 0}
+    ]
+    chunks[-1].usage_metadata = {
+        "input_tokens": 2,
+        "output_tokens": 3,
+        "total_tokens": 5,
+    }
+    guarded = _guarded_fake(timeout=0.045, chunk_delay=0.02, chunks=chunks)
+
+    stream = guarded.astream("hello")
+    received = []
+    with pytest.raises(ModelCallTimeoutError):
+        async for chunk in stream:
+            received.append(chunk)
+
+    assert received
+    assert [chunk.content for chunk in received] in (["a"], ["a", "b"])
+    assert guarded._cancelled.is_set()
+
+
+@_async_test
+async def test_astream_cancel_suppression_cannot_replace_or_extend_timeout(monkeypatch):
+    import research_agent.model_call_guard as guard
+
+    monkeypatch.setattr(guard, "MODEL_CANCEL_GRACE_SECONDS", 0.02)
+    raw = _AsyncOnlyChatModel(
+        chunk_delay=1,
+        chunks=[AIMessageChunk(content="too-late")],
+        suppress_stream_cancel=True,
+    )
+    guarded = guard_model(raw, metadata=_fake_metadata(), policy=_policy(0.02))
+
+    started = time.monotonic()
+    try:
+        with pytest.raises(ModelCallTimeoutError):
+            await anext(guarded.astream("hello"))
+        assert time.monotonic() - started < 0.1
+    finally:
+        guarded._release_stream.set()
+        await asyncio.sleep(0)
+
+
+@_async_test
+async def test_astream_preserves_message_chunk_metadata_tool_calls_and_usage():
+    chunk = AIMessageChunk(
+        content="",
+        id="chunk-id",
+        response_metadata={"trace": "kept"},
+        tool_call_chunks=[
+            {"name": "search", "args": '{"q":"x"}', "id": "tool-1", "index": 0}
+        ],
+        usage_metadata={"input_tokens": 2, "output_tokens": 3, "total_tokens": 5},
+    )
+    guarded = _guarded_fake(chunks=[chunk])
+
+    received = [item async for item in guarded.astream("hello")]
+
+    # BaseChatModel adds a terminal empty chunk; provider chunk remains unchanged.
+    assert len(received) == 2
+    assert received[0].id == "chunk-id"
+    assert received[0].response_metadata == {"trace": "kept"}
+    assert received[0].tool_call_chunks == chunk.tool_call_chunks
+    assert received[0].usage_metadata == chunk.usage_metadata
+
+
+def test_sync_invoke_uses_async_provider_path_and_preserves_message_metadata():
+    guarded = _guarded_fake()
+
+    message = guarded.invoke("hello", stop=["stop"], configurable_key="kept")
+
+    assert message.content == "complete"
+    assert message.id == "message-id"
+    assert message.response_metadata["provider"] == "fake"
+    assert message.usage_metadata == {
+        "input_tokens": 2,
+        "output_tokens": 3,
+        "total_tokens": 5,
+    }
+    assert guarded._calls[0]["stop"] == ["stop"]
+    assert guarded._calls[0]["kwargs"]["configurable_key"] == "kept"
+
+
+def test_sync_bridge_copies_calling_contextvars():
+    guarded = _guarded_fake()
+    token = _TEST_CONTEXT.set("caller-context")
+    try:
+        guarded.invoke("hello")
+    finally:
+        _TEST_CONTEXT.reset(token)
+
+    assert guarded._context_values == ["caller-context"]
+
+
+def test_callbacks_tags_metadata_and_configurable_config_survive_guard():
+    callback = _RecordingCallback()
+    guarded = _guarded_fake()
+    config = {
+        "callbacks": [callback],
+        "tags": ["guarded-tag"],
+        "metadata": {"request": "kept"},
+        "configurable": {"model_call_scope_id": "callback-scope", "tenant": "kept"},
+    }
+
+    result = guarded.invoke("hello", config=config)
+
+    assert result.content == "complete"
+    assert len(callback.starts) == 1
+    assert len(callback.ends) == 1
+    assert callback.starts[0]["tags"] == ["guarded-tag"]
+    assert callback.starts[0]["metadata"]["request"] == "kept"
+    assert config["configurable"] == {
+        "model_call_scope_id": "callback-scope",
+        "tenant": "kept",
+    }
+
+
+def test_sync_stream_close_cancels_async_provider_and_cleans_bridge():
+    guarded = _guarded_fake(
+        timeout=1,
+        chunk_delay=0.01,
+        chunks=[AIMessageChunk(content="a"), AIMessageChunk(content="b")],
+    )
+
+    stream = guarded.stream(
+        "hello", config={"configurable": {"model_call_scope_id": "close-scope"}}
+    )
+    assert next(stream).content == "a"
+    stream.close()
+
+    assert guarded._cancelled.wait(0.2)
+    assert guarded._bridge_registry.active_count("close-scope") == 0
+
+
+def test_sync_stream_without_scope_retains_private_scope_on_control():
+    guarded = _guarded_fake(
+        timeout=1,
+        chunk_delay=0.05,
+        chunks=[AIMessageChunk(content="a")],
+    )
+
+    stream = guarded.stream("hello")
+    scope_id = stream._control.scope_id
+    try:
+        assert scope_id.startswith("private-")
+        assert guarded._bridge_registry.active_count(scope_id) == 1
+    finally:
+        stream.close()
+
+
+def test_sync_stream_delayed_consumption_observes_original_total_deadline():
+    guarded = _guarded_fake(
+        timeout=0.03,
+        chunk_delay=0.1,
+        chunks=[AIMessageChunk(content="too-late")],
+    )
+
+    stream = guarded.stream("hello")
+    time.sleep(0.06)
+    started = time.monotonic()
+    with pytest.raises(ModelCallTimeoutError):
+        next(stream)
+    assert time.monotonic() - started < 0.04
+
+
+def test_sync_bridge_cleans_or_drains_late_cancel_on_daemon_loop(monkeypatch):
+    import research_agent.model_call_guard as guard
+
+    monkeypatch.setattr(guard, "MODEL_CANCEL_GRACE_SECONDS", 0.02)
+    raw = _AsyncOnlyChatModel(
+        delay=1,
+        suppress_invoke_cancel=True,
+    )
+    guarded = guard_model(raw, metadata=_fake_metadata(), policy=_policy(0.05))
+    controls = []
+    original_start_bridge = guard._start_bridge
+
+    def capture_bridge(*args, **kwargs):
+        control = original_start_bridge(*args, **kwargs)
+        controls.append(control)
+        return control
+
+    monkeypatch.setattr(guard, "_start_bridge", capture_bridge)
+    with pytest.raises(ModelCallTimeoutError):
+        guarded.invoke(
+            "hello", config={"configurable": {"model_call_scope_id": "late-cleanup"}}
+        )
+
+    control = controls[0]
+    assert control._thread.daemon
+    assert control._thread.name.startswith("model-call-bridge-late-cleanup")
+    unregister_deadline = time.monotonic() + 0.1
+    while guarded._bridge_registry.active_count("late-cleanup"):
+        assert time.monotonic() < unregister_deadline
+        time.sleep(0.002)
+    assert guarded._bridge_registry.active_count("late-cleanup") == 0
+    if control._thread.is_alive():
+        loop = control._loop
+        assert loop is not None
+        loop.call_soon_threadsafe(guarded._release_invoke.set)
+    control.join(0.2)
+    assert not control._thread.is_alive()
+
+
+def test_bind_and_bind_tools_return_eager_guarded_bound_runnables():
+    guarded = _guarded_fake(timeout=0.03)
+
+    for bound in (guarded.bind(extra="kept"), guarded.bind_tools([], extra="kept")):
+        pending = bound.ainvoke("hello")
+        time.sleep(0.05)
+        with pytest.raises(ModelCallTimeoutError):
+            asyncio.run(pending)
+
+
+@_async_test
+async def test_bound_stream_and_astream_preserve_chunk_parity():
+    chunk = AIMessageChunk(
+        content="tool",
+        id="bound-chunk-id",
+        response_metadata={"bound": "kept"},
+        usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+    )
+    guarded = _guarded_fake(chunks=[chunk])
+    bound = guarded.bind(marker="kept")
+
+    sync_chunks = list(bound.stream("hello"))
+    async_chunks = [item async for item in bound.astream("hello")]
+
+    assert [item.content for item in sync_chunks] == [
+        item.content for item in async_chunks
+    ]
+    assert len(sync_chunks) == len(async_chunks) == 2
+    assert sync_chunks[0].id == "bound-chunk-id"
+    assert sync_chunks[0].response_metadata == {"bound": "kept"}
+    assert sync_chunks[0].usage_metadata == chunk.usage_metadata
+
+
+def test_bound_sync_stream_deadline_includes_bridge_start_delay(monkeypatch):
+    original_start = threading.Thread.start
+
+    def delayed_start(thread: threading.Thread) -> None:
+        time.sleep(0.05)
+        original_start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", delayed_start)
+    guarded = _guarded_fake(
+        timeout=0.03,
+        chunk_delay=0.1,
+        chunks=[AIMessageChunk(content="too-late")],
+    )
+
+    stream = guarded.bind(extra="kept").stream("hello")
+    started = time.monotonic()
+    with pytest.raises(ModelCallTimeoutError):
+        next(stream)
+    assert time.monotonic() - started < 0.02
+
+
+def test_cancel_model_call_scope_cancels_all_sync_bridges_with_one_grace(monkeypatch):
+    import research_agent.model_call_guard as guard
+
+    monkeypatch.setattr(guard, "MODEL_CANCEL_GRACE_SECONDS", 0.05)
+    guarded = _guarded_fake(timeout=2, delay=2)
+    scope_id = "shared-run"
+    errors: list[BaseException] = []
+
+    def call() -> None:
+        try:
+            guarded.invoke(
+                "hello", config={"configurable": {"model_call_scope_id": scope_id}}
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    callers = [threading.Thread(target=call) for _ in range(2)]
+    for caller in callers:
+        caller.start()
+    deadline = time.monotonic() + 0.5
+    while guarded._bridge_registry.active_count(scope_id) != 2:
+        assert time.monotonic() < deadline
+        time.sleep(0.005)
+
+    started = time.monotonic()
+    cancel_model_call_scope(scope_id)
+    elapsed = time.monotonic() - started
+    for caller in callers:
+        caller.join(0.2)
+
+    assert elapsed < 0.05 + 0.08
+    assert all(not caller.is_alive() for caller in callers)
+    assert len(errors) == 2
+    assert all(isinstance(exc, asyncio.CancelledError) for exc in errors)
+    assert guarded._bridge_registry.active_count(scope_id) == 0
+
+
+def test_unknown_raw_override_fails_before_invocation_without_unload():
+    raw = _AsyncOnlyChatModel()
+
+    with pytest.raises(UnsupportedModelOverrideError) as raised:
+        adapt_model_override(raw, policy=_policy(unload=True))
+
+    assert raised.value.provider == "unknown"
+    assert not raw._calls
+
+
+def test_custom_runtime_descriptor_allows_safe_override_adaptation():
+    raw = _AsyncOnlyChatModel()
+    raw.model_runtime_metadata = _fake_metadata()
+
+    adapted = adapt_model_override(raw, policy=_policy())
+
+    assert isinstance(adapted, _AsyncOnlyChatModel)
+    assert isinstance(adapted, ModelCallGuardMixin)
+    assert adapt_model_override(adapted, policy=_policy()) is adapted
+
+
+def test_middleware_adapts_override_exactly_once_for_sync_handler():
+    raw = _AsyncOnlyChatModel()
+    raw.model_runtime_metadata = _fake_metadata()
+    middleware = ModelCallGuardMiddleware(policy=_policy())
+    request = ModelRequest(model=raw, messages=[])
+    seen: list[BaseChatModel] = []
+
+    def handler(adapted_request: ModelRequest) -> AIMessage:
+        seen.append(adapted_request.model)
+        return AIMessage(content="ok")
+
+    result = middleware.wrap_model_call(request, handler)
+
+    assert result.content == "ok"
+    assert len(seen) == 1
+    assert isinstance(seen[0], ModelCallGuardMixin)
+    assert adapt_model_override(seen[0]) is seen[0]
+
+
+@_async_test
+async def test_middleware_adapts_override_exactly_once_for_async_handler():
+    raw = _AsyncOnlyChatModel()
+    raw.model_runtime_metadata = _fake_metadata()
+    middleware = ModelCallGuardMiddleware(policy=_policy())
+    request = ModelRequest(model=raw, messages=[])
+    seen: list[BaseChatModel] = []
+
+    async def handler(adapted_request: ModelRequest) -> AIMessage:
+        seen.append(adapted_request.model)
+        return AIMessage(content="ok")
+
+    result = await middleware.awrap_model_call(request, handler)
+
+    assert result.content == "ok"
+    assert len(seen) == 1
+    assert isinstance(seen[0], ModelCallGuardMixin)
+
+
+def _installed_provider_cases() -> list[
+    tuple[type[BaseChatModel], dict[str, Any], str, str]
+]:
+    cases: list[tuple[type[BaseChatModel], dict[str, Any], str, str]] = []
+    try:
+        from langchain_ollama import ChatOllama
+
+        cases.append(
+            (
+                ChatOllama,
+                {"model": "ollama-explicit", "base_url": "http://localhost:11434"},
+                "ollama",
+                "model",
+            )
+        )
+    except ImportError:
+        pass
+    try:
+        from langchain_openai import AzureChatOpenAI, ChatOpenAI
+
+        cases.extend(
+            [
+                (
+                    ChatOpenAI,
+                    {"model": "openai-explicit", "api_key": "sk-test"},
+                    "openai",
+                    "model_name",
+                ),
+                (
+                    AzureChatOpenAI,
+                    {
+                        "model": "azure-explicit",
+                        "azure_deployment": "deployment-explicit",
+                        "azure_endpoint": "https://explicit.openai.azure.com",
+                        "api_version": "2024-01-01",
+                        "api_key": "sk-test",
+                    },
+                    "azure_openai",
+                    "model_name",
+                ),
+            ]
+        )
+    except ImportError:
+        pass
+    try:
+        from langchain_anthropic import ChatAnthropic
+
+        cases.append(
+            (
+                ChatAnthropic,
+                {"model_name": "anthropic-explicit", "api_key": "sk-test"},
+                "anthropic",
+                "model",
+            )
+        )
+    except ImportError:
+        pass
+    try:
+        from langchain_google_genai import ChatGoogleGenerativeAI
+
+        cases.append(
+            (
+                ChatGoogleGenerativeAI,
+                {"model": "gemini-explicit", "api_key": "test"},
+                "google",
+                "model",
+            )
+        )
+    except ImportError:
+        pass
+    return cases
+
+
+@pytest.mark.parametrize(
+    ("provider_class", "constructor", "provider", "model_field"),
+    _installed_provider_cases(),
+    ids=lambda value: value.__name__ if isinstance(value, type) else None,
+)
+def test_known_provider_guard_preserves_identity_fields_profile_and_copy_state(
+    monkeypatch, provider_class, constructor, provider, model_field
+):
+    monkeypatch.setenv("MODEL_NAME", "environment-must-not-win")
+    monkeypatch.setenv("OPENAI_API_KEY", "environment-must-not-win")
+    raw = provider_class(**constructor)
+    guarded = adapt_model_override(raw, policy=_policy(0.2))
+
+    assert isinstance(guarded, provider_class)
+    assert isinstance(guarded, BaseChatModel)
+    assert isinstance(guarded, ModelCallGuardMixin)
+    assert type(guarded).__mro__[1] is ModelCallGuardMixin
+    assert getattr(guarded, model_field) == getattr(raw, model_field)
+    assert guarded.profile == raw.profile
+    timeout_keys = {"timeout", "request_timeout", "default_request_timeout"}
+    assert {
+        key: value
+        for key, value in guarded._identifying_params.items()
+        if key not in timeout_keys
+    } == {
+        key: value
+        for key, value in raw._identifying_params.items()
+        if key not in timeout_keys
+    }
+    assert guarded._runtime_metadata.provider == provider
+    assert "environment-must-not-win" not in guarded._runtime_metadata.model_name
+    for name in (
+        "_model_call_policy",
+        "_runtime_metadata",
+        "_bridge_registry",
+        "_retry_controller",
+    ):
+        assert getattr(guarded, name).__class__.__name__ != "ModelPrivateAttr"
+
+    copied = guarded.model_copy()
+    assert isinstance(copied, provider_class)
+    assert copied._bridge_registry is not guarded._bridge_registry
+    assert copied._model_call_policy == guarded._model_call_policy
+
+    updated = guarded.model_copy(update={model_field: "copy-explicit"})
+    assert isinstance(updated, provider_class)
+    assert updated._runtime_metadata.model_name == "copy-explicit"
+    assert updated._bridge_registry is not guarded._bridge_registry
+
+
+@pytest.mark.parametrize(
+    ("provider_class", "constructor", "provider", "model_field"),
+    _installed_provider_cases(),
+    ids=lambda value: value.__name__ if isinstance(value, type) else None,
+)
+def test_known_provider_guard_invoke_and_bind_use_provider_async_path(
+    monkeypatch, provider_class, constructor, provider, model_field
+):
+    del provider, model_field
+
+    async def fake_agenerate(self, messages, stop=None, run_manager=None, **kwargs):
+        return ChatResult(
+            generations=[
+                ChatGeneration(
+                    message=AIMessage(
+                        content="provider-result",
+                        id="provider-id",
+                        response_metadata={"kept": True},
+                    )
+                )
+            ]
+        )
+
+    monkeypatch.setattr(provider_class, "_agenerate", fake_agenerate)
+    guarded = adapt_model_override(provider_class(**constructor), policy=_policy(0.2))
+
+    direct = guarded.invoke("hello")
+    bound = guarded.bind(extra="value").invoke("hello")
+
+    assert direct.content == bound.content == "provider-result"
+    assert direct.id == bound.id == "provider-id"
+    assert direct.response_metadata == bound.response_metadata == {"kept": True}
+
+
+@pytest.mark.parametrize(
+    ("provider_class", "constructor", "provider", "model_field"),
+    _installed_provider_cases(),
+    ids=lambda value: value.__name__ if isinstance(value, type) else None,
+)
+def test_known_provider_rebuild_applies_native_timeout_without_env_influence(
+    monkeypatch, provider_class, constructor, provider, model_field
+):
+    del model_field
+    monkeypatch.setenv("MODEL_CALL_TIMEOUT_SECONDS", "999")
+    guarded = adapt_model_override(provider_class(**constructor), policy=_policy(0.2))
+
+    if provider == "ollama":
+        assert guarded.client_kwargs["timeout"] == 0.2
+        assert guarded.async_client_kwargs["timeout"] == 0.2
+        assert guarded.sync_client_kwargs["timeout"] == 0.2
+    elif provider in {"openai", "azure_openai"}:
+        assert guarded.request_timeout == 0.2
+    elif provider == "anthropic":
+        assert guarded.default_request_timeout == 0.2
+    else:
+        assert guarded.timeout == 0.2
+
+
+def test_guarded_provider_keeps_langchain_provider_strategy_identity():
+    from langchain.agents.middleware.provider_tool_search import _get_model_provider
+    from langchain_anthropic import ChatAnthropic
+    from langchain_google_genai import ChatGoogleGenerativeAI
+    from langchain_ollama import ChatOllama
+    from langchain_openai import ChatOpenAI
+
+    models = [
+        (ChatOllama(model="ollama-explicit"), "ollama"),
+        (ChatOpenAI(model="openai-explicit", api_key="sk-test"), "openai"),
+        (
+            ChatAnthropic(model_name="anthropic-explicit", api_key="sk-test"),
+            "anthropic",
+        ),
+        (
+            ChatGoogleGenerativeAI(model="gemini-explicit", api_key="test"),
+            "google_genai",
+        ),
+    ]
+
+    for raw, expected in models:
+        guarded = adapt_model_override(raw, policy=_policy())
+        assert _get_model_provider(guarded, runtime=None) == expected
+
+
+def test_guarded_openai_and_google_keep_multimodal_file_handling_identity():
+    from deepagents.middleware.filesystem import _model_tolerates_non_pdf_files
+    from langchain_google_genai import ChatGoogleGenerativeAI
+    from langchain_openai import ChatOpenAI
+
+    guarded_openai = adapt_model_override(
+        ChatOpenAI(model="openai-explicit", api_key="sk-test"), policy=_policy()
+    )
+    guarded_google = adapt_model_override(
+        ChatGoogleGenerativeAI(model="gemini-explicit", api_key="test"),
+        policy=_policy(),
+    )
+
+    assert _model_tolerates_non_pdf_files(guarded_openai)
+    assert _model_tolerates_non_pdf_files(guarded_google)
+
+
+def test_anthropic_prompt_caching_middleware_recognizes_guarded_model():
+    from langchain_anthropic import ChatAnthropic
+    from langchain_anthropic.middleware import AnthropicPromptCachingMiddleware
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    guarded = adapt_model_override(
+        ChatAnthropic(model_name="anthropic-explicit", api_key="sk-test"),
+        policy=_policy(),
+    )
+    request = ModelRequest(
+        model=guarded,
+        messages=[HumanMessage(content="hello")],
+        system_message=SystemMessage(content="system"),
+    )
+    seen: list[ModelRequest] = []
+
+    def handler(adapted: ModelRequest) -> AIMessage:
+        seen.append(adapted)
+        return AIMessage(content="ok")
+
+    middleware = AnthropicPromptCachingMiddleware(unsupported_model_behavior="raise")
+    middleware.wrap_model_call(request, handler)
+
+    assert seen[0].model is guarded
+    assert seen[0].model_settings["cache_control"] == {
+        "type": "ephemeral",
+        "ttl": "5m",
+    }
