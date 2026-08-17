@@ -7,6 +7,7 @@ skills mapping.
 
 import asyncio
 import concurrent.futures
+import contextvars
 import hashlib
 import os
 import re
@@ -434,8 +435,9 @@ def _run_async_from_sync(
             asyncio.set_event_loop(None)
             loop.close()
 
+    caller_context = contextvars.copy_context()
     worker = threading.Thread(
-        target=run_in_thread,
+        target=lambda: caller_context.run(run_in_thread),
         name="research-eval-logger",
         daemon=True,
     )

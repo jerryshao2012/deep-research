@@ -13,8 +13,10 @@ import pytest
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
+from langchain_core.runnables.config import var_child_runnable_config
 from pydantic import PrivateAttr
 
+from research_agent import agent as agent_module
 from research_agent import cli as research_agent_cli
 from research_agent.model_call_guard import (
     ModelCallPolicy,
@@ -78,6 +80,45 @@ def _guarded_blocking_model(timeout_seconds: float = 0.5):
         ),
     )
     return provider, guarded
+
+
+def _start_two_guarded_calls(guarded, config: dict) -> tuple[list[threading.Thread], list[BaseException]]:
+    scope_id = config["configurable"]["model_call_scope_id"]
+    errors: list[BaseException] = []
+
+    def invoke_guarded() -> None:
+        try:
+            guarded.invoke("research", config=config)
+        except BaseException as exc:
+            errors.append(exc)
+
+    callers = [threading.Thread(target=invoke_guarded) for _ in range(2)]
+    for caller in callers:
+        caller.start()
+    deadline = time.monotonic() + 0.5
+    while guarded._bridge_registry.active_count(scope_id) != 2:
+        assert time.monotonic() < deadline
+        time.sleep(0.005)
+    assert guarded._started.wait(timeout=0.5)
+    return callers, errors
+
+
+def _assert_guarded_callers_cancelled(
+    guarded,
+    scope_id: str,
+    callers: list[threading.Thread],
+    errors: list[BaseException],
+) -> None:
+    deadline = time.monotonic() + 0.5
+    while guarded._bridge_registry.active_count(scope_id):
+        assert time.monotonic() < deadline
+        time.sleep(0.005)
+    for caller in callers:
+        caller.join(timeout=0.5)
+    assert all(not caller.is_alive() for caller in callers)
+    assert guarded._cancelled.wait(timeout=0.5)
+    assert len(errors) == 2
+    assert all(isinstance(error, asyncio.CancelledError) for error in errors)
 
 
 def _run_cli(monkeypatch, tmp_path: Path, argv: list[str], fake_agent: FakeAgent, title: str) -> Path:
@@ -564,29 +605,11 @@ def test_cli_keyboard_interrupt_cancels_two_real_bridges_in_same_scope(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _provider, guarded = _guarded_blocking_model(timeout_seconds=2.0)
-    caller_errors: list[BaseException] = []
-
     class InterruptingAgent(FakeAgent):
         def stream(self, messages, config=None, stream_mode="values"):  # noqa: ANN001
             self.stream_calls += 1
             self.last_config = config
-            scope_id = config["configurable"]["model_call_scope_id"]
-
-            def invoke_guarded() -> None:
-                try:
-                    guarded.invoke("research", config=config)
-                except BaseException as exc:
-                    caller_errors.append(exc)
-
-            callers = [threading.Thread(target=invoke_guarded) for _ in range(2)]
-            self.callers = callers
-            for caller in callers:
-                caller.start()
-            deadline = time.monotonic() + 0.5
-            while guarded._bridge_registry.active_count(scope_id) != 2:
-                assert time.monotonic() < deadline
-                time.sleep(0.005)
-            assert guarded._started.wait(timeout=0.5)
+            self.callers, self.caller_errors = _start_two_guarded_calls(guarded, config)
             raise KeyboardInterrupt
             yield {}
 
@@ -603,18 +626,85 @@ def test_cli_keyboard_interrupt_cancels_two_real_bridges_in_same_scope(
         research_agent_cli.main()
 
     scope_id = fake_agent.last_config["configurable"]["model_call_scope_id"]
-    deadline = time.monotonic() + 0.5
-    while guarded._bridge_registry.active_count(scope_id):
-        assert time.monotonic() < deadline
-        time.sleep(0.005)
-    assert guarded._cancelled.wait(timeout=0.5)
     assert cancelled_scopes == [scope_id]
-    for caller in fake_agent.callers:
-        caller.join(timeout=0.5)
-    assert all(not caller.is_alive() for caller in fake_agent.callers)
-    assert len(caller_errors) == 2
-    assert all(isinstance(error, asyncio.CancelledError) for error in caller_errors)
+    _assert_guarded_callers_cancelled(
+        guarded, scope_id, fake_agent.callers, fake_agent.caller_errors
+    )
     assert all(spinner.stops >= 1 for spinner in _RecordingSpinner.instances)
+
+
+@pytest.mark.parametrize(
+    ("mode", "argv"),
+    [
+        ("fallback", ["topic", "--verbose", "True"]),
+        ("nonverbose", ["topic", "--verbose", "False"]),
+    ],
+)
+def test_cli_keyboard_interrupt_cancels_guarded_fallback_and_nonverbose_paths(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mode: str,
+    argv: list[str],
+) -> None:
+    _provider, guarded = _guarded_blocking_model(timeout_seconds=2.0)
+    class InterruptingAgent(FakeAgent):
+        def invoke(self, messages, config=None):  # noqa: ANN001
+            self.invoke_calls += 1
+            self.last_config = config
+            self.callers, self.caller_errors = _start_two_guarded_calls(guarded, config)
+            raise KeyboardInterrupt
+
+        def stream(self, messages, config=None, stream_mode="values"):  # noqa: ANN001
+            self.stream_calls += 1
+            self.last_config = config
+            if mode == "fallback":
+                raise RuntimeError("stream unsupported")
+            yield {}
+
+    fake_agent = InterruptingAgent()
+    cancelled_scopes = _configure_timeout_cli(
+        monkeypatch,
+        tmp_path,
+        fake_agent,
+        argv=argv,
+        cancel_real_bridges=True,
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        research_agent_cli.main()
+
+    scope_id = fake_agent.last_config["configurable"]["model_call_scope_id"]
+    assert cancelled_scopes == [scope_id]
+    assert fake_agent.invoke_calls == 1
+    assert fake_agent.stream_calls == (1 if mode == "fallback" else 0)
+    _assert_guarded_callers_cancelled(
+        guarded, scope_id, fake_agent.callers, fake_agent.caller_errors
+    )
+    assert all(spinner.stops >= 1 for spinner in _RecordingSpinner.instances)
+
+
+def test_title_keyboard_interrupt_cancels_two_guarded_bridges_without_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _provider, guarded = _guarded_blocking_model(timeout_seconds=2.0)
+    config = {"configurable": {"thread_id": "thread-1", "model_call_scope_id": "scope-1"}}
+    seen_configs: list[dict] = []
+    class InterruptingTitleModel:
+        def invoke(self, messages, config=None):  # noqa: ANN001
+            seen_configs.append(config)
+            self.callers, self.caller_errors = _start_two_guarded_calls(guarded, config)
+            raise KeyboardInterrupt
+
+    title_model = InterruptingTitleModel()
+    monkeypatch.setattr(research_agent_cli, "model", title_model)
+
+    with pytest.raises(KeyboardInterrupt):
+        research_agent_cli.generate_research_title("content", config=config)
+
+    assert seen_configs == [config]
+    _assert_guarded_callers_cancelled(
+        guarded, "scope-1", title_model.callers, title_model.caller_errors
+    )
 
 
 def test_title_guarded_timeout_preserves_scope_and_never_uses_default(
@@ -638,3 +728,39 @@ def test_title_guarded_timeout_preserves_scope_and_never_uses_default(
     assert guarded._started.wait(timeout=0.5)
     assert guarded._cancelled.wait(timeout=0.5)
     assert guarded._bridge_registry.active_count("scope-1") == 0
+
+
+def test_sync_verifier_bridge_preserves_ambient_model_call_scope() -> None:
+    _provider, guarded = _guarded_blocking_model(timeout_seconds=2.0)
+    scope_id = "cli-scope"
+    config = {"configurable": {"model_call_scope_id": scope_id}}
+    errors: list[BaseException] = []
+
+    def call_verifier() -> None:
+        token = var_child_runnable_config.set(config)
+        try:
+            agent_module._run_async_from_sync(
+                lambda: guarded.invoke("verify", config=None),
+                timeout_seconds=None,
+                propagate_cancel=True,
+            )
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            var_child_runnable_config.reset(token)
+
+    caller = threading.Thread(target=call_verifier)
+    caller.start()
+    deadline = time.monotonic() + 0.5
+    while guarded._bridge_registry.active_count(scope_id) != 1:
+        assert time.monotonic() < deadline
+        time.sleep(0.005)
+    assert guarded._started.wait(timeout=0.5)
+
+    cancel_model_call_scope(scope_id)
+    caller.join(timeout=0.5)
+
+    assert not caller.is_alive()
+    assert errors and isinstance(errors[0], asyncio.CancelledError)
+    assert guarded._cancelled.wait(timeout=0.5)
+    assert guarded._bridge_registry.active_count(scope_id) == 0
