@@ -61,11 +61,13 @@ Configuration is resolved when the model guard is created. Force-unload logic is
 
 Introduce a `GuardedChatModel` wrapper plus an idempotent request-boundary adapter. The model factory returns guarded models, and the request adapter wraps a late `ModelRequest.model` override only when it is not already guarded. This combination covers inherited models and final request overrides without applying two deadlines.
 
-Every provider adapter also receives its SDK's native HTTP request deadline. Sync invocations use that native deadline directly; they do not run the HTTP call in an unmanaged executor. Native timeout exceptions are normalized to `ModelCallTimeoutError`. This avoids a worker that continues running after the caller has returned. Python exposes no portable early-cancel primitive for a synchronous call already executing in another thread, so interactive LangGraph service execution must use the async invocation path; direct sync callers remain bounded by the same native 300-second deadline.
+Every provider adapter also receives its SDK's native HTTP request deadline, but native inactivity timeouts are only a second line of defense. Total model-call duration is measured from invocation start through final response or final streamed chunk, including retries and token trickle.
+
+All application-owned sync entrypoints, including the packaged CLI and synchronous compiled-graph calls, use a synchronous bridge over the guarded provider's async invocation. The bridge creates a dedicated daemon thread with its own event loop, propagates the current context, and exposes its request task and loop to the caller. At the total wall-clock deadline, the caller schedules task cancellation on that loop, waits only the cleanup grace, performs optional bounded unload, and raises `ModelCallTimeoutError`. Supported provider async transports close their request on cancellation. The daemon fallback prevents a cancellation-suppressing third-party coroutine from blocking interpreter shutdown, while late exceptions are consumed. No application-owned path calls a raw synchronous provider transport.
 
 For asynchronous calls, create a task for the model request and race it against the resolved deadline. On timeout or external cancellation, cancel the request task so the async HTTP client closes the active response/connection. Wait for cleanup only for a short fixed grace period using `asyncio.wait`, which does not wait indefinitely for a cancellation-suppressing handler. If the task remains pending, detach it, attach a callback that consumes any late exception, and preserve the timeout or `CancelledError` as the authoritative result.
 
-Async tests include a local streaming HTTP server whose disconnect event proves timeout and cancellation close the client request. A fake handler that suppresses cancellation proves the cleanup grace is bounded and late exceptions are consumed. Sync tests prove each supported provider adapter receives a native deadline and returns the normalized error when its SDK reports timeout.
+Async tests include a local streaming HTTP server whose disconnect event proves timeout and cancellation close the client request. A fake handler that suppresses cancellation proves the cleanup grace is bounded and late exceptions are consumed. Sync-bridge tests use a slow trickle stream whose chunks arrive before SDK inactivity timeout but whose total duration exceeds the configured deadline; they assert bounded end-to-end elapsed time, server disconnect, bridge-thread exit for each supported provider adapter, and normalized `ModelCallTimeoutError`.
 
 The dedicated timeout error subclasses `RuntimeError` and contains only safe operational text: provider, configured duration, and whether unload was requested. It does not include prompts, document content, credentials, or model responses.
 
@@ -98,6 +100,17 @@ Coverage is explicit:
 
 Existing request-rewriting middleware still builds the final `ModelRequest`; timeout wrapping changes neither message content nor role order. Strict Ollama templates therefore keep system content first, and no timeout control message is persisted.
 
+The wrapper preserves LangChain runnable behavior:
+
+- `bind_tools()` and `bind()` delegate to the inner model/runnable and return another guarded wrapper carrying the same immutable runtime metadata;
+- `invoke()` and `ainvoke()` apply one total deadline;
+- `stream()` and `astream()` pass through chunks unchanged while applying one deadline from iterator creation through exhaustion, and close/cancel the underlying iterator on timeout or cancellation; and
+- configuration, callbacks, tags, response metadata, tool-call chunks, and usage metadata pass through unchanged.
+
+The idempotent marker survives binding so DeepAgents cannot accidentally unwrap the guard while adding tools. Compiled root and subagent regressions must prove tool binding, complete tool-call messages, and live nested streaming remain unchanged.
+
+Late model overrides follow an explicit adapter registry. Already guarded models are accepted unchanged. Known supported LangChain provider classes are inspected and rebuilt with authoritative provider/model/base-URL metadata plus native timeout, then wrapped. A custom override may implement the documented `ModelRuntimeDescriptor` protocol to supply equivalent immutable metadata and an async cancellable runnable. Unknown raw overrides are rejected before invocation with safe `UnsupportedModelOverrideError`; they are never guessed as Ollama, never unloaded, and never allowed to bypass the deadline.
+
 Timeout does not trigger the completion guard's automatic continuation. It is an execution failure, not a valid terminal model response. Existing state and checkpoints remain available for an explicit user retry or resume.
 
 ## Deterministic Web-Citation Gate
@@ -106,7 +119,7 @@ Timeout does not trigger the completion guard's automatic continuation. It is an
 
 Strict checks apply whenever the current request permits web research, independently of `ENABLE_VERIFICATION` and `MAX_VERIFICATION_ROUNDS`. Structural citation validation is an artifact-acceptance invariant; optional LLM sufficiency and adversarial judging remain separately configurable.
 
-At each visible request generation, `before_agent` normalizes the current input's `no_web` value with the shared boolean parser and overwrites a hidden, input-omitted strict-citation state field. Missing `no_web` uses the public default for that new request, never a prior checkpoint value. Tests cover web→no-web and no-web→web transitions on one thread.
+Add a Pydantic `ResearchRequestInput` at the exported graph boundary. Its pre-merge validator always materializes normalized `no_web`, defaulting an omitted field to `false`, and stamps a generation-scoped request-options value before checkpoint state is merged. `before_agent` copies that stamped value into a hidden, input-omitted strict-citation state field and records current run ID. It never reads an inherited bare `no_web` value. Internal continuation jumps retain the same stamp; each visible request receives a new one. Tests cover web→no-web, no-web→web, and prior true→omitted transitions on one thread.
 
 `document-only` means document context is present **and** normalized `no_web` is true. Documents alone do not exempt a web-enabled run. No-web and document-only runs skip only the public-URL structural gate; they retain existing report sufficiency and document-grounding behavior when LLM verification is enabled.
 
@@ -118,7 +131,7 @@ Before invoking the LLM judge, remove fenced code blocks and parse report Markdo
 2. no placeholder source labels or targets inside a source entry, including case-insensitive forms such as `Conceptual Source`, `placeholder`, `example source`, `source needed`, `citation needed`, or `TBD`; and
 3. no unresolved numbered references such as `[1]`, `[2]`, or ranges whose referenced source number has no corresponding concrete URL-bearing source entry.
 
-Source sections begin under Markdown headings named `Sources`, `References`, `Bibliography`, or `Works Cited`, case-insensitively, and end at the next heading of equal or higher level. Numbered entries accept `[1]`, `1.`, or Markdown reference-definition forms. Valid URLs are Markdown link destinations or bare URLs whose parsed scheme is HTTP(S), whose authority is non-empty, and whose hostname is not a reserved example/placeholder host. Trailing punctuation is excluded from the URL.
+Source sections begin under Markdown headings named `Sources`, `References`, `Bibliography`, or `Works Cited`, case-insensitively, and end at the next heading of equal or higher level. Numbered entries accept `[1]`, `1.`, or Markdown reference-definition forms. Valid URLs are Markdown link destinations or bare URLs whose parsed scheme is HTTP(S), whose authority is non-empty, and whose hostname is not `example.com`, `example.org`, `example.net`, `localhost`, or any host ending in `.example`, `.invalid`, `.test`, or `.localhost`. Trailing punctuation is excluded from the URL.
 
 Inline `[1](https://host/path)` links resolve themselves. Prose citations accept single references, comma/semicolon groups, and ascending ranges such as `[1, 3]` or `[2-4]`; each expanded number must map to a concrete URL-bearing source entry. Reference-like text inside source sections, Markdown links, escaped text, and fenced code is not counted as an unresolved prose citation.
 
@@ -151,7 +164,7 @@ Carry the per-generation strict-web-citation snapshot from research state into b
 
 - Model timeout: run fails with `ModelCallTimeoutError`; no completion continuation is consumed.
 - External async cancellation: request connection closes, optional unload finishes or hits its own deadline, then `CancelledError` propagates unchanged.
-- Direct synchronous invocation: provider-native request deadline bounds the call; interactive cancellation is supported through the async LangGraph server path.
+- Direct synchronous invocation: sync-to-async bridge enforces the same total deadline and aborts the async provider request; no raw sync provider call is used.
 - Default Ollama cancellation: cancel request only; model remains loaded according to Ollama policy.
 - Opt-in Ollama cancellation: cancel request, then best-effort bounded unload.
 - Unload failure: warning only; original timeout/cancellation outcome wins.
@@ -166,7 +179,8 @@ Tests are written before production changes.
 
 - valid default, positive override, and malformed/non-finite/nonpositive fallback to 300 seconds;
 - synchronous handler returns before deadline;
-- every supported sync provider adapter receives a native deadline and normalizes its timeout to the dedicated safe error;
+- every supported sync provider adapter runs through the cancellable async bridge, receives a native deadline as secondary protection, and normalizes timeout to the dedicated safe error;
+- slow token trickle cannot extend sync or async total duration beyond the configured deadline plus cleanup grace;
 - asynchronous handler returns before deadline;
 - asynchronous handler is cancelled with a bounded cleanup grace on timeout;
 - cancellation-suppressing async handler cannot block return and its late exception is consumed;
@@ -178,8 +192,11 @@ Tests are written before production changes.
 - unload is never called for cloud providers;
 - unload failure preserves the original timeout/cancellation exception;
 - timeout covers root, explicit `research-agent`, inherited `general-purpose`, late model override, sufficiency judge, and adversarial judge paths;
+- `bind_tools`/`bind` retain the guard; `invoke`/`ainvoke` and `stream`/`astream` preserve tool calls, chunks, callbacks, and metadata;
+- compiled root and nested subagent paths retain complete tool-call messages and live nested streaming;
 - mixed-provider environment precedence and final-model metadata prevent false Ollama unload;
-- sync timeout cannot leave an application-owned executor worker; and
+- known late overrides are rebuilt through the adapter registry, descriptor-protocol overrides stay cancellable, and unknown raw overrides fail closed without unload;
+- sync timeout cannot leave a non-daemon application-owned worker or block interpreter shutdown; and
 - completion-continuation counters do not advance on timeout.
 
 ### Citation preflight
@@ -195,7 +212,8 @@ Tests are written before production changes.
 - document-only request is exempt only when documents are present and web is disabled;
 - documents plus web enabled remains strict;
 - same thread web→no-web and no-web→web transitions replace stale request context;
-- source-section boundaries, valid-URL parsing, grouped/ranged references, inline numbered links, code-fence exclusion, reserved example hosts, and non-URL document entries follow the defined grammar;
+- prior `no_web=true` followed by omitted `no_web` restores the public web-enabled default at the graph input boundary;
+- source-section boundaries, valid-URL parsing, grouped/ranged references, inline numbered links, code-fence exclusion, exact reserved host set, and non-URL document entries follow the defined grammar;
 - sync and async verification paths receive identical strictness; and
 - revision feedback remains ephemeral and respects the configured round limit;
 - zero-round or disabled LLM verification still enforces structural citations and allows exactly one correction;
