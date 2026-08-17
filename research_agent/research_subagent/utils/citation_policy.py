@@ -21,7 +21,6 @@ _MAX_MARKER_TOKENS = 32
 _MAX_LINK_LABEL_LENGTH = 512
 _MAX_LINK_DESTINATION_LENGTH = 2_048
 _MAX_LINK_NESTING = 8
-_BARE_NONHIERARCHICAL_SCHEMES = {"data", "file", "javascript", "mailto", "news", "tel", "urn"}
 _SOURCE_HEADINGS = {"sources", "references", "bibliography", "works cited"}
 _PLACEHOLDER_RE = re.compile(
     r"\b(?:conceptual\s+source|placeholder|example\s+source|source\s+needed|"
@@ -590,12 +589,12 @@ def _is_scheme_character(character: str) -> bool:
 
 
 def _is_clear_bare_uri(scheme: str, content: str) -> bool:
-    if content.startswith("//"):
-        return len(content) > 2
-    scheme = scheme.lower()
-    if scheme not in _BARE_NONHIERARCHICAL_SCHEMES or not content:
+    if not content:
         return False
-    return content.startswith("/") if scheme == "file" else True
+    normalized_scheme = scheme.lower()
+    if normalized_scheme in {"isbn", "doi"}:
+        return False
+    return not (len(scheme) == 1 and content[0] in "\\/")
 
 
 def _is_explicit_uri(value: str) -> bool:

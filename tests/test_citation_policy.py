@@ -350,6 +350,13 @@ def test_bare_windows_and_bibliographic_prefixes_are_not_uri_tokens() -> None:
     assert audit_web_citations(report).defects == (CitationDefect("missing_url", "web"),)
 
 
+@pytest.mark.parametrize("token", ["custom:value", "ssh:user@host"])
+def test_rejects_any_other_rfc_bare_uri_scheme(token: str) -> None:
+    audit = audit_web_citations(f"## Sources\n[1] {token}\n[2] https://valid.publisher.org/a")
+
+    assert "malformed_reference" in [defect.code for defect in audit.defects]
+
+
 @pytest.mark.parametrize("size", [1_024, 16_384])
 def test_numeric_scanner_is_bounded_for_unmatched_brackets(size: int) -> None:
     started = perf_counter()
