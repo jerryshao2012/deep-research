@@ -131,7 +131,7 @@ Before invoking the LLM judge, remove fenced code blocks and parse report Markdo
 2. no placeholder source labels or targets inside a source entry, including case-insensitive forms such as `Conceptual Source`, `placeholder`, `example source`, `source needed`, `citation needed`, or `TBD`; and
 3. no unresolved numbered references such as `[1]`, `[2]`, or ranges whose referenced source number has no corresponding concrete URL-bearing source entry.
 
-Source sections begin under Markdown headings named `Sources`, `References`, `Bibliography`, or `Works Cited`, case-insensitively, and end at the next heading of equal or higher level. Numbered entries accept `[1]`, `1.`, or Markdown reference-definition forms. Valid URLs are Markdown link destinations or bare URLs whose parsed scheme is HTTP(S), whose authority is non-empty, and whose hostname is not `example.com`, `example.org`, `example.net`, `localhost`, or any host ending in `.example`, `.invalid`, `.test`, or `.localhost`. Trailing punctuation is excluded from the URL.
+Source sections begin under Markdown headings named `Sources`, `References`, `Bibliography`, or `Works Cited`, case-insensitively, and end at the next heading of equal or higher level. Numbered entries accept `[1]`, `1.`, or Markdown reference-definition forms. Valid URLs are Markdown link destinations or bare URLs whose parsed scheme is HTTP(S), whose authority is non-empty, and whose hostname is neither `example.com`, `example.org`, `example.net`, nor `localhost`, nor a subdomain of those hosts, nor any host ending in `.example`, `.invalid`, `.test`, or `.localhost`. Trailing punctuation is excluded from the URL.
 
 Inline `[1](https://host/path)` links resolve themselves. Prose citations accept single references, comma/semicolon groups, and ascending ranges such as `[1, 3]` or `[2-4]`; each expanded number must map to a concrete URL-bearing source entry. Reference-like text inside source sections, Markdown links, escaped text, and fenced code is not counted as an unresolved prose citation.
 
@@ -181,6 +181,7 @@ Tests are written before production changes.
 - synchronous handler returns before deadline;
 - every supported sync provider adapter runs through the cancellable async bridge, receives a native deadline as secondary protection, and normalizes timeout to the dedicated safe error;
 - slow token trickle cannot extend sync or async total duration beyond the configured deadline plus cleanup grace;
+- CLI `KeyboardInterrupt` or generator close cancels the sync bridge task and closes the provider request before the configured deadline;
 - asynchronous handler returns before deadline;
 - asynchronous handler is cancelled with a bounded cleanup grace on timeout;
 - cancellation-suppressing async handler cannot block return and its late exception is consumed;
