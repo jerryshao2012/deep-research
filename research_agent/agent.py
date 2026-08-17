@@ -7,6 +7,7 @@ skills mapping.
 
 import asyncio
 import concurrent.futures
+import contextvars
 import hashlib
 import os
 import re
@@ -52,7 +53,10 @@ from research_agent.document_context import (
     has_document_context,
 )
 from research_agent.logger_utils import setup_logger
-from research_agent.model_call_guard import ModelCallGuardMiddleware
+from research_agent.model_call_guard import (
+    ModelCallGuardMiddleware,
+    ModelCallTimeoutError,
+)
 from research_agent.model_factory import create_memory_saver, get_configured_model
 from research_agent.research_subagent import (
     RESEARCH_WORKFLOW_INSTRUCTIONS,
@@ -384,7 +388,8 @@ def _merge_finalization_update(
 def _run_async_from_sync(
     coroutine_factory: Callable[[], Awaitable[Any]],
     *,
-    timeout_seconds: float,
+    timeout_seconds: float | None,
+    propagate_cancel: bool = False,
 ) -> Any:
     """Run a coroutine with a bounded wait, distinguishing timeout from None."""
     result: concurrent.futures.Future[Any] = concurrent.futures.Future()
@@ -411,6 +416,8 @@ def _run_async_from_sync(
             try:
                 value = loop.run_until_complete(task)
             except asyncio.CancelledError:
+                if propagate_cancel:
+                    raise
                 value = None
             if not result.done():
                 result.set_result(value)
@@ -428,12 +435,17 @@ def _run_async_from_sync(
             asyncio.set_event_loop(None)
             loop.close()
 
+    caller_context = contextvars.copy_context()
     worker = threading.Thread(
-        target=run_in_thread,
+        target=lambda: caller_context.run(run_in_thread),
         name="research-eval-logger",
         daemon=True,
     )
     worker.start()
+    if timeout_seconds is None:
+        ready.wait()
+        return result.result()
+
     deadline = time.monotonic() + max(timeout_seconds, 0.0)
     ready.wait(timeout=max(deadline - time.monotonic(), 0.0))
     try:
@@ -449,6 +461,17 @@ def _run_async_from_sync(
             loop.call_soon_threadsafe(task.cancel)
         worker.join(timeout=min(max(timeout_seconds, 0.0), 0.05))
         return _SYNC_AWAIT_TIMEOUT
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        cancellation_requested.set()
+        with control_lock:
+            loop = control.get("loop")
+            task = control.get("task")
+        if isinstance(loop, asyncio.AbstractEventLoop) and isinstance(
+            task, asyncio.Task
+        ):
+            loop.call_soon_threadsafe(task.cancel)
+        worker.join(timeout=0.05)
+        raise
 
 
 # Get current date
@@ -757,23 +780,11 @@ class ResearchStateMiddleware(AgentMiddleware):
                             report=report_text,
                         )
 
-                    def _run_verify():
-                        return asyncio.run(_verify())
-
-                    try:
-                        current_loop = asyncio.get_running_loop()
-                    except RuntimeError:
-                        current_loop = None
-
-                    if current_loop is not None and current_loop.is_running():
-                        with concurrent.futures.ThreadPoolExecutor(
-                                max_workers=1
-                        ) as pool:
-                            verdict: VerificationVerdict = pool.submit(
-                                _run_verify
-                            ).result(timeout=120)
-                    else:
-                        verdict = asyncio.run(_verify())
+                    verdict: VerificationVerdict = _run_async_from_sync(
+                        _verify,
+                        timeout_seconds=None,
+                        propagate_cancel=True,
+                    )
 
                     logger.info(
                         "Verification verdict: %s (score=%.2f, "
@@ -787,6 +798,8 @@ class ResearchStateMiddleware(AgentMiddleware):
                         ),
                         len(verdict.adversarial_gaps),
                     )
+                except (ModelCallTimeoutError, asyncio.CancelledError):
+                    raise
                 except Exception as exc:
                     logger.warning(
                         "Verification check failed: %s. "
@@ -968,6 +981,8 @@ class ResearchStateMiddleware(AgentMiddleware):
                         ),
                         len(verdict.adversarial_gaps),
                     )
+                except (ModelCallTimeoutError, asyncio.CancelledError):
+                    raise
                 except Exception as exc:
                     logger.warning(
                         "Verification check failed: %s. "

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import sys
 from pathlib import Path
 
@@ -9,6 +10,7 @@ import pytest
 from langchain_core.messages import AIMessage, ToolMessage
 
 from research_agent import cli as research_agent_cli
+from research_agent.model_call_guard import ModelCallTimeoutError
 
 
 class FakeAgent:
@@ -32,7 +34,11 @@ class FakeAgent:
 def _run_cli(monkeypatch, tmp_path: Path, argv: list[str], fake_agent: FakeAgent, title: str) -> Path:
     monkeypatch.setattr(research_agent_cli, "agent", fake_agent)
     monkeypatch.setenv("REPORTS_OUTPUT_FOLDER", str(tmp_path))
-    monkeypatch.setattr(research_agent_cli, "generate_research_title", lambda _content: title)
+    monkeypatch.setattr(
+        research_agent_cli,
+        "generate_research_title",
+        lambda _content, *, config: title,
+    )
     monkeypatch.setattr(research_agent_cli, "show_prompt", lambda *args, **kwargs: None)
     monkeypatch.setattr(research_agent_cli, "format_messages", lambda *args, **kwargs: None)
     monkeypatch.setattr(research_agent_cli, "file_data_to_string", lambda data: data)
@@ -285,3 +291,166 @@ def test_should_retry_with_invoke_delegates_incomplete_todos_to_shared_policy(
         }
     )
     assert inspected == [todos]
+
+
+class _RecordingSpinner:
+    instances: list["_RecordingSpinner"] = []
+
+    def __init__(self, message: str = "Working...") -> None:
+        self.message = message
+        self.starts = 0
+        self.stops = 0
+        self.instances.append(self)
+
+    def start(self, message: str | None = None) -> None:
+        self.starts += 1
+        if message is not None:
+            self.message = message
+
+    def stop(self) -> None:
+        self.stops += 1
+
+
+def _configure_timeout_cli(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    fake_agent: FakeAgent,
+    *,
+    argv: list[str],
+) -> list[str]:
+    cancelled_scopes: list[str] = []
+    _RecordingSpinner.instances = []
+    monkeypatch.setattr(research_agent_cli, "agent", fake_agent)
+    monkeypatch.setenv("REPORTS_OUTPUT_FOLDER", str(tmp_path))
+    monkeypatch.setattr(research_agent_cli, "Spinner", _RecordingSpinner)
+    monkeypatch.setattr(
+        research_agent_cli,
+        "cancel_model_call_scope",
+        cancelled_scopes.append,
+    )
+    monkeypatch.setattr(research_agent_cli, "show_prompt", lambda *args, **kwargs: None)
+    monkeypatch.setattr(research_agent_cli, "format_messages", lambda *args, **kwargs: None)
+    monkeypatch.setattr(sys, "argv", ["research_agent/cli.py", *argv])
+    return cancelled_scopes
+
+
+@pytest.mark.parametrize(
+    "error",
+    [ModelCallTimeoutError("ollama", 1.0, False), asyncio.CancelledError()],
+)
+def test_cli_timeout_during_verbose_stream_stops_spinner_cancels_scope_and_does_not_fallback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, error: BaseException
+) -> None:
+    fake_agent = FakeAgent()
+
+    def stream(*args, **kwargs):  # noqa: ANN002, ANN003
+        raise error
+        yield  # pragma: no cover
+
+    fake_agent.stream = stream
+    cancelled_scopes = _configure_timeout_cli(
+        monkeypatch,
+        tmp_path,
+        fake_agent,
+        argv=["topic", "--verbose", "True"],
+    )
+
+    with pytest.raises(type(error)) as raised:
+        research_agent_cli.main()
+
+    assert raised.value is error
+    assert fake_agent.invoke_calls == 0
+    assert len(cancelled_scopes) == 1
+    assert all(spinner.stops >= 1 for spinner in _RecordingSpinner.instances)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [ModelCallTimeoutError("ollama", 1.0, False), asyncio.CancelledError()],
+)
+def test_cli_timeout_during_fallback_invoke_stops_spinner_cancels_scope_and_does_not_retry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, error: BaseException
+) -> None:
+    class FallbackTimeoutAgent(FakeAgent):
+        def stream(self, messages, config=None, stream_mode="values"):  # noqa: ANN001
+            self.stream_calls += 1
+            raise RuntimeError("stream unsupported")
+            yield  # pragma: no cover
+
+        def invoke(self, messages, config=None):  # noqa: ANN001
+            self.invoke_calls += 1
+            raise error
+
+    fake_agent = FallbackTimeoutAgent()
+    cancelled_scopes = _configure_timeout_cli(
+        monkeypatch,
+        tmp_path,
+        fake_agent,
+        argv=["topic", "--verbose", "True"],
+    )
+
+    with pytest.raises(type(error)) as raised:
+        research_agent_cli.main()
+
+    assert raised.value is error
+    assert fake_agent.stream_calls == 1
+    assert fake_agent.invoke_calls == 1
+    assert len(cancelled_scopes) == 1
+    assert all(spinner.stops >= 1 for spinner in _RecordingSpinner.instances)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [ModelCallTimeoutError("ollama", 1.0, False), asyncio.CancelledError()],
+)
+def test_cli_timeout_during_nonverbose_invoke_cancels_scope_without_retry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, error: BaseException
+) -> None:
+    class TimeoutAgent(FakeAgent):
+        def invoke(self, messages, config=None):  # noqa: ANN001
+            self.invoke_calls += 1
+            self.last_config = config
+            raise error
+
+    fake_agent = TimeoutAgent()
+    cancelled_scopes = _configure_timeout_cli(
+        monkeypatch,
+        tmp_path,
+        fake_agent,
+        argv=["topic", "--verbose", "False"],
+    )
+
+    with pytest.raises(type(error)) as raised:
+        research_agent_cli.main()
+
+    assert raised.value is error
+    assert fake_agent.invoke_calls == 1
+    assert cancelled_scopes == [fake_agent.last_config["configurable"]["model_call_scope_id"]]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [ModelCallTimeoutError("ollama", 1.0, False), asyncio.CancelledError()],
+)
+def test_title_timeout_receives_exact_scope_cancels_and_never_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+    error: BaseException,
+) -> None:
+    seen_configs: list[dict] = []
+    cancelled_scopes: list[str] = []
+
+    class TimeoutTitleModel:
+        def invoke(self, messages, config=None):  # noqa: ANN001
+            seen_configs.append(config)
+            raise error
+
+    config = {"configurable": {"thread_id": "thread-1", "model_call_scope_id": "scope-1"}}
+    monkeypatch.setattr(research_agent_cli, "model", TimeoutTitleModel())
+    monkeypatch.setattr(research_agent_cli, "cancel_model_call_scope", cancelled_scopes.append)
+
+    with pytest.raises(type(error)) as raised:
+        research_agent_cli.generate_research_title("content", config=config)
+
+    assert raised.value is error
+    assert seen_configs == [config]
+    assert cancelled_scopes == ["scope-1"]

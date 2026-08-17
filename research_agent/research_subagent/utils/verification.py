@@ -9,7 +9,6 @@ middleware uses to decide whether to loop back for revision or terminate.
 from __future__ import annotations
 
 import asyncio
-import concurrent.futures
 import logging
 import os
 import re
@@ -17,6 +16,7 @@ from dataclasses import dataclass, field
 
 from langchain_core.messages import HumanMessage
 
+from research_agent.model_call_guard import ModelCallTimeoutError
 from research_agent.model_factory import get_configured_model
 from research_agent.research_subagent.utils.citation_validator import (
     ValidationResult,
@@ -114,7 +114,7 @@ def _extract_citations_from_report(report_text: str) -> list[SourceCitation]:
 # ---------------------------------------------------------------------------
 
 
-def _check_report_sufficiency(question: str, report: str) -> tuple[float, str]:
+async def _check_report_sufficiency(question: str, report: str) -> tuple[float, str]:
     """Ask an LLM evaluator whether the report fully answers the question.
 
     Returns a tuple of ``(score 0.0–1.0, reason_string)``.  Reuses the proven
@@ -146,27 +146,16 @@ def _check_report_sufficiency(question: str, report: str) -> tuple[float, str]:
         "}"
     )
 
-    def _invoke():
-        return model.invoke([HumanMessage(content=prompt)])
-
     try:
-        try:
-            current_loop = asyncio.get_running_loop()
-        except RuntimeError:
-            current_loop = None
-
-        if current_loop is not None and current_loop.is_running():
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                response = pool.submit(_invoke).result(timeout=60)
-        else:
-            response = _invoke()
-
+        response = await model.ainvoke([HumanMessage(content=prompt)])
         data = robust_json_loads(response.content.strip())
         score = float(data.get("sufficiency_score", 0.5))
         reason = str(data.get("reason", "No reason provided."))
         # Clamp to valid range.
         score = max(0.0, min(1.0, score))
         return score, reason
+    except (ModelCallTimeoutError, asyncio.CancelledError):
+        raise
     except Exception as exc:
         logger.warning("Sufficiency check failed: %s. Defaulting to neutral.", exc)
         return 0.5, f"Sufficiency check error: {exc}"
@@ -177,7 +166,7 @@ def _check_report_sufficiency(question: str, report: str) -> tuple[float, str]:
 # ---------------------------------------------------------------------------
 
 
-def _adversarial_gap_analysis(question: str, report: str) -> list[str]:
+async def _adversarial_gap_analysis(question: str, report: str) -> list[str]:
     """Prompt an LLM in a devil's-advocate role to surface missing perspectives.
 
     Returns a list of gap descriptions (empty list = no gaps found).
@@ -210,26 +199,15 @@ def _adversarial_gap_analysis(question: str, report: str) -> list[str]:
         "return an empty gaps array."
     )
 
-    def _invoke():
-        return model.invoke([HumanMessage(content=prompt)])
-
     try:
-        try:
-            current_loop = asyncio.get_running_loop()
-        except RuntimeError:
-            current_loop = None
-
-        if current_loop is not None and current_loop.is_running():
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                response = pool.submit(_invoke).result(timeout=60)
-        else:
-            response = _invoke()
-
+        response = await model.ainvoke([HumanMessage(content=prompt)])
         data = robust_json_loads(response.content.strip())
         gaps = data.get("gaps", [])
         if not isinstance(gaps, list):
             gaps = []
         return [str(g) for g in gaps[:5]]  # Cap at 5 gaps.
+    except (ModelCallTimeoutError, asyncio.CancelledError):
+        raise
     except Exception as exc:
         logger.warning("Adversarial analysis failed: %s", exc)
         return []
@@ -336,6 +314,8 @@ async def verify_report(
                 text_content=report,
                 fetched_contents=fetched_contents,
             )
+        except (ModelCallTimeoutError, asyncio.CancelledError):
+            raise
         except Exception as exc:
             logger.warning("Citation grounding failed: %s", exc)
 
@@ -344,12 +324,12 @@ async def verify_report(
     )
 
     # ── 2. LLM-as-judge sufficiency ────────────────────────────────────
-    sufficiency_score, sufficiency_reason = _check_report_sufficiency(
+    sufficiency_score, sufficiency_reason = await _check_report_sufficiency(
         question, report
     )
 
     # ── 3. Adversarial gap analysis ────────────────────────────────────
-    adversarial_gaps = _adversarial_gap_analysis(question, report)
+    adversarial_gaps = await _adversarial_gap_analysis(question, report)
 
     # ── Composite verdict ──────────────────────────────────────────────
     status = make_verdict(sufficiency_score, grounding_failures, adversarial_gaps)

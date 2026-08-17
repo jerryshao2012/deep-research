@@ -16,6 +16,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from research_agent import agent as agent_module
 from research_agent import completion_guard
 from research_agent.completion_guard import CompletionState
+from research_agent.model_call_guard import ModelCallTimeoutError
 from research_agent.research_subagent.utils import verification as verification_module
 from research_agent.research_subagent.utils.verification import (
     VerificationVerdict,
@@ -34,6 +35,9 @@ class _FakeJudgeModel:
     def invoke(self, messages):
         assert messages
         return AIMessage(content=self.content)
+
+    async def ainvoke(self, messages):
+        return self.invoke(messages)
 
 
 @pytest.mark.parametrize(
@@ -186,20 +190,59 @@ class TestCheckReportSufficiency:
             ),
         )
 
-        score, reason = _check_report_sufficiency(
-            question="What is 2+2?",
-            report="2+2 equals 4. This is a fundamental arithmetic fact.",
+        score, reason = asyncio.run(
+            _check_report_sufficiency(
+                question="What is 2+2?",
+                report="2+2 equals 4. This is a fundamental arithmetic fact.",
+            )
         )
         assert score == 0.95
         assert reason == "Complete."
 
     def test_empty_report_scores_zero(self):
-        score, reason = _check_report_sufficiency(
-            question="What is 2+2?",
-            report="",
+        score, reason = asyncio.run(
+            _check_report_sufficiency(
+                question="What is 2+2?",
+                report="",
+            )
         )
         assert score == 0.0
         assert reason
+
+    def test_uses_async_model_invocation(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        class AsyncOnlyJudge:
+            def invoke(self, messages: list[HumanMessage]) -> AIMessage:
+                raise AssertionError("sufficiency judge must use ainvoke")
+
+            async def ainvoke(self, messages: list[HumanMessage]) -> AIMessage:
+                assert messages
+                return AIMessage(
+                    content='{"sufficiency_score": 0.8, "reason": "Complete."}'
+                )
+
+        monkeypatch.setattr(
+            verification_module, "get_configured_model", lambda: AsyncOnlyJudge()
+        )
+
+        assert asyncio.run(
+            _check_report_sufficiency("What is X?", "X is explained.")
+        ) == (0.8, "Complete.")
+
+    @pytest.mark.parametrize("error", [
+        ModelCallTimeoutError("ollama", 1.0, False),
+        asyncio.CancelledError(),
+    ])
+    def test_control_errors_propagate(self, monkeypatch: pytest.MonkeyPatch, error: BaseException) -> None:
+        class FailingJudge:
+            async def ainvoke(self, messages: list[HumanMessage]) -> AIMessage:
+                raise error
+
+        monkeypatch.setattr(
+            verification_module, "get_configured_model", lambda: FailingJudge()
+        )
+
+        with pytest.raises(type(error)):
+            asyncio.run(_check_report_sufficiency("What is X?", "X is explained."))
 
 
 # ---------------------------------------------------------------------------
@@ -218,16 +261,35 @@ class TestAdversarialGapAnalysis:
             ),
         )
 
-        gaps = _adversarial_gap_analysis(
-            question="Compare Python vs JavaScript for web development.",
-            report="Python is good. JavaScript is also good.",
+        gaps = asyncio.run(
+            _adversarial_gap_analysis(
+                question="Compare Python vs JavaScript for web development.",
+                report="Python is good. JavaScript is also good.",
+            )
         )
         assert gaps == ["Missing framework-specific tradeoffs."]
 
     def test_empty_report_returns_gap(self):
-        gaps = _adversarial_gap_analysis(question="What is X?", report="")
+        gaps = asyncio.run(
+            _adversarial_gap_analysis(question="What is X?", report="")
+        )
         assert len(gaps) >= 1
         assert any("empty" in g.lower() for g in gaps)
+
+    def test_control_errors_propagate(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        error = ModelCallTimeoutError("ollama", 1.0, False)
+
+        class FailingJudge:
+            async def ainvoke(self, messages: list[HumanMessage]) -> AIMessage:
+                raise error
+
+        monkeypatch.setattr(
+            verification_module, "get_configured_model", lambda: FailingJudge()
+        )
+
+        with pytest.raises(ModelCallTimeoutError) as raised:
+            asyncio.run(_adversarial_gap_analysis("What is X?", "X is explained."))
+        assert raised.value is error
 
 
 # ---------------------------------------------------------------------------
@@ -315,6 +377,33 @@ def _needs_revision_verdict() -> VerificationVerdict:
         sufficiency_score=0.5,
         sufficiency_reason="Add missing evidence.",
     )
+
+
+@pytest.mark.parametrize("async_", [False, True])
+@pytest.mark.parametrize(
+    "error",
+    [ModelCallTimeoutError("ollama", 1.0, False), asyncio.CancelledError()],
+)
+def test_verification_control_errors_propagate_without_completion_update(
+    monkeypatch: pytest.MonkeyPatch,
+    async_: bool,
+    error: BaseException,
+) -> None:
+    async def failing_verify_report(**kwargs: Any) -> VerificationVerdict:
+        raise error
+
+    monkeypatch.setattr(agent_module, "ENABLE_VERIFICATION", True)
+    monkeypatch.setattr(agent_module, "ENABLE_EVAL_TRACKING", False)
+    monkeypatch.setattr(agent_module, "verify_report", failing_verify_report)
+    state = _verification_state()
+    original_attempts = state["completion_attempts"]
+
+    with pytest.raises(type(error)):
+        _run_after_model(
+            agent_module.ResearchStateMiddleware(), state, async_=async_
+        )
+
+    assert state["completion_attempts"] == original_attempts
 
 
 @pytest.mark.parametrize("async_", [False, True])

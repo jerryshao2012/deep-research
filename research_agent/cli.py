@@ -4,6 +4,7 @@ Sets up argument parsers, tracks thread state memory, displays a console spinner
 during processing, and prints final response messages and outputs.
 """
 
+import asyncio
 import itertools
 import os
 import re
@@ -16,13 +17,19 @@ from pathlib import Path
 
 from deepagents.backends.utils import file_data_to_string
 from dotenv import load_dotenv
-from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 
 from research_agent.agent import agent, model
+from research_agent.cli_utils import format_messages, show_prompt, str2bool
+from research_agent.model_call_guard import (
+    ModelCallTimeoutError,
+    cancel_model_call_scope,
+)
 from research_agent.research_subagent.resume import inspect_todos
 from research_agent.research_subagent.utils.cli import build_parser, list_skills
-from research_agent.research_subagent.utils.knowledge_filesystem import normalize_path_for_filesystem_tools
-from research_agent.cli_utils import format_messages, show_prompt, str2bool
+from research_agent.research_subagent.utils.knowledge_filesystem import (
+    normalize_path_for_filesystem_tools,
+)
 
 # Load environment variables
 load_dotenv()
@@ -104,7 +111,7 @@ CSV_EXPORT_PATH_RE = re.compile(r"\*\*CSV exported to:\*\*\s*`([^`]+)`")
 MAX_STREAM_DIAGNOSTIC_CHARS = 600
 
 
-def generate_research_title(research_content):
+def generate_research_title(research_content, *, config):
     """Generate a concise title for the research content using the configured LLM."""
     try:
         content_snippet = extract_message_content(research_content)[:2000]
@@ -116,7 +123,7 @@ def generate_research_title(research_content):
             f"{content_snippet}"
         )
 
-        response = model.invoke([HumanMessage(content=prompt)])
+        response = model.invoke([HumanMessage(content=prompt)], config=config)
         title = response.content.strip()
 
         # Format title with underscores and proper capitalization
@@ -126,6 +133,12 @@ def generate_research_title(research_content):
         title = re.sub(r'_+', '_', title)  # Replace multiple underscores with single
         title = title.strip('_')  # Remove leading/trailing underscores
         return title if title else "research-report"
+    except (ModelCallTimeoutError, asyncio.CancelledError, KeyboardInterrupt):
+        configurable = config.get("configurable", {})
+        scope_id = configurable.get("model_call_scope_id")
+        if scope_id is not None:
+            cancel_model_call_scope(scope_id)
+        raise
     except Exception as e:
         print(f"Warning: Could not generate title ({e}). Using default.")
         return "research-report"
@@ -300,7 +313,13 @@ def should_retry_with_invoke(result: dict, skill: str | None = None) -> bool:
     return _looks_like_incomplete_delegation(content)
 
 
-def save_research_to_file(research_content, filename=None, output_folder=None):
+def save_research_to_file(
+    research_content,
+    filename=None,
+    output_folder=None,
+    *,
+    config=None,
+):
     """Save research output to a timestamped Markdown file.
 
     Generates a concise title using the LLM and writes the content to
@@ -319,7 +338,7 @@ def save_research_to_file(research_content, filename=None, output_folder=None):
     current_date = datetime.now().strftime("%Y-%m-%d_%I_%M_%S_%p")
 
     # Generate a title for the research
-    title = generate_research_title(research_content)
+    title = generate_research_title(research_content, config=config)
 
     # If filename is not provided, use the generated title as the filename
     if not filename:
@@ -419,7 +438,13 @@ def main():
 
     # Generate or use provided thread_id for state tracking (enables wiki context, etc.)
     thread_id = args.thread_id or str(uuid.uuid4())
-    config = {"configurable": {"thread_id": thread_id}}
+    model_call_scope_id = str(uuid.uuid4())
+    config = {
+        "configurable": {
+            "thread_id": thread_id,
+            "model_call_scope_id": model_call_scope_id,
+        }
+    }
     print(f"Thread ID: {thread_id}")
 
     print(f"Starting research on: {args.subject}")
@@ -516,6 +541,10 @@ def main():
             spinner.stop()
             total_time = time.time() - start_time
             print(f"\n✨ Research completed in {total_time:.1f}s!\n")
+        except (ModelCallTimeoutError, asyncio.CancelledError, KeyboardInterrupt):
+            spinner.stop()
+            cancel_model_call_scope(model_call_scope_id)
+            raise
         except Exception as e:
             spinner.stop()
             total_time = time.time() - start_time
@@ -538,20 +567,30 @@ def main():
 
             spinner.start("Running fallback synchronous invoke...")
             start_invoke = time.time()
-            result = agent.invoke(
-                messages,
-                config=config,
-            )
-            spinner.stop()
+            try:
+                result = agent.invoke(
+                    messages,
+                    config=config,
+                )
+            except (ModelCallTimeoutError, asyncio.CancelledError, KeyboardInterrupt):
+                spinner.stop()
+                cancel_model_call_scope(model_call_scope_id)
+                raise
+            else:
+                spinner.stop()
 
             invoke_time = time.time() - start_invoke
             print(f"\n✨ Fallback research completed in {invoke_time:.1f}s!\n")
     else:
         # Run the agent directly without showing progress
-        result = agent.invoke(
-            messages,
-            config=config,
-        )
+        try:
+            result = agent.invoke(
+                messages,
+                config=config,
+            )
+        except (ModelCallTimeoutError, asyncio.CancelledError, KeyboardInterrupt):
+            cancel_model_call_scope(model_call_scope_id)
+            raise
         total_time = time.time() - start_time
         print(f"\n✨ Research completed in {total_time:.1f}s!\n")
 
@@ -559,11 +598,17 @@ def main():
         spinner = Spinner("Stream ended with incomplete output; running final synchronous pass...")
         spinner.start()
         start_invoke = time.time()
-        result = agent.invoke(
-            messages,
-            config=config,
-        )
-        spinner.stop()
+        try:
+            result = agent.invoke(
+                messages,
+                config=config,
+            )
+        except (ModelCallTimeoutError, asyncio.CancelledError, KeyboardInterrupt):
+            spinner.stop()
+            cancel_model_call_scope(model_call_scope_id)
+            raise
+        else:
+            spinner.stop()
         invoke_time = time.time() - start_invoke
         print(f"\n🔁 Finalization pass completed in {invoke_time:.1f}s!\n")
 
@@ -572,7 +617,12 @@ def main():
         format_messages([wrap_as_message(m) for m in result["messages"]])
 
     file_content = select_output_content(result, args.skill)
-    filename = save_research_to_file(file_content, title, output_folder=output_folder)
+    filename = save_research_to_file(
+        file_content,
+        title,
+        output_folder=output_folder,
+        config=config,
+    )
 
     print("\n" + "=" * 80)
     if "/final_report.md" in result.get("files", {}):
