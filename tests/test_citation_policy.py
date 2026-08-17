@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
+from time import perf_counter
 
 import pytest
 
@@ -228,6 +229,49 @@ Actual [1].
 """
 
     assert audit_web_citations(report).defects == ()
+
+
+def test_four_space_fence_cannot_close_an_open_fence() -> None:
+    report = """```
+[99]
+    ```
+[88]
+```
+Actual [1].
+
+## Sources
+[1] https://source.publisher.org/a
+"""
+
+    assert audit_web_citations(report).defects == ()
+
+
+def test_link_scanner_handles_nested_parentheses_and_bounds_adversarial_brackets() -> None:
+    nested = audit_web_citations("[1](https://publisher.org/a((b)))")
+    started = perf_counter()
+    adversarial = audit_web_citations("[" * 10_000 + "](https://valid.publisher.org/a)")
+
+    assert nested.urls == ("https://publisher.org/a((b))",)
+    assert [defect.code for defect in adversarial.defects].count("malformed_reference") == 1
+    assert perf_counter() - started < 1.0
+
+
+@pytest.mark.parametrize("size", [1_024, 16_384])
+def test_numeric_scanner_is_bounded_for_unmatched_brackets(size: int) -> None:
+    started = perf_counter()
+    audit_web_citations("[" * size)
+
+    assert perf_counter() - started < 1.0
+
+
+def test_unmatched_numeric_bracket_advances_to_later_marker() -> None:
+    audit = audit_web_citations("Broken [1 then [2]")
+
+    assert {defect.code for defect in audit.defects} == {
+        "malformed_reference",
+        "missing_url",
+        "unresolved_reference",
+    }
 
 
 def test_reports_unresolved_single_group_and_descending_markers() -> None:
