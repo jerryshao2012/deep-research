@@ -231,6 +231,107 @@ def test_factory_preserves_provider_precedence_with_mixed_environment(
     )
 
 
+@pytest.mark.parametrize(
+    ("provider_environment", "provider_class", "metadata"),
+    [
+        (
+            {
+                "AWS_BEDROCK_ENDPOINT": "https://bedrock.example.test/v1",
+                "AWS_BEARER_TOKEN_BEDROCK": "secret-test-value",
+            },
+            "ChatOpenAI",
+            ModelRuntimeMetadata(
+                provider="aws_bedrock",
+                model_name="precedence-model",
+                base_url="https://bedrock.example.test/v1",
+            ),
+        ),
+        (
+            {
+                "AZURE_OPENAI_ENDPOINT": "https://legacy.openai.azure.test",
+                "AZURE_OPENAI_DEPLOYMENT": "legacy-deployment",
+                "AZURE_OPENAI_API_KEY": "secret-test-value",
+                "AZURE_OPENAI_API_VERSION": "2024-10-21",
+            },
+            "AzureChatOpenAI",
+            ModelRuntimeMetadata(
+                provider="azure_openai",
+                model_name="legacy-deployment",
+                base_url="https://legacy.openai.azure.test",
+            ),
+        ),
+        (
+            {
+                "AZURE_OPENAI_ENDPOINT": "https://current.openai.azure.test/v1",
+                "AZURE_OPENAI_DEPLOYMENT": "current-deployment",
+                "AZURE_OPENAI_API_KEY": "secret-test-value",
+            },
+            "ChatOpenAI",
+            ModelRuntimeMetadata(
+                provider="azure_openai",
+                model_name="current-deployment",
+                base_url="https://current.openai.azure.test/v1",
+            ),
+        ),
+        (
+            {"GOOGLE_API_KEY": "secret-test-value"},
+            "ChatGoogleGenerativeAI",
+            ModelRuntimeMetadata(provider="google", model_name="precedence-model"),
+        ),
+        (
+            {"ANTHROPIC_API_KEY": "secret-test-value"},
+            "ChatAnthropic",
+            ModelRuntimeMetadata(provider="anthropic", model_name="precedence-model"),
+        ),
+        (
+            {"OLLAMA_API_BASE": "http://ollama.example.test:11434"},
+            "ChatOllama",
+            ModelRuntimeMetadata(
+                provider="ollama",
+                model_name="precedence-model",
+                base_url="http://ollama.example.test:11434",
+            ),
+        ),
+    ],
+)
+def test_existing_provider_wins_pairwise_over_standalone_openai(
+    monkeypatch: pytest.MonkeyPatch,
+    provider_environment: dict[str, str],
+    provider_class: str,
+    metadata: ModelRuntimeMetadata,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "secret-test-value")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://openai-fallback.example.test/v1")
+    monkeypatch.setenv("MODEL_NAME", "precedence-model")
+    for name, value in provider_environment.items():
+        monkeypatch.setenv(name, value)
+
+    model = model_factory.get_configured_model(bypass_cache=True)
+
+    assert any(cls.__name__ == provider_class for cls in type(model).__mro__)
+    assert model._runtime_metadata == metadata
+
+
+def test_standalone_openai_is_fallback_when_no_existing_provider_is_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "secret-test-value")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://openai-fallback.example.test/v1")
+    monkeypatch.setenv("MODEL_NAME", "openai-fallback-model")
+
+    model = model_factory.get_configured_model(bypass_cache=True)
+
+    assert any(cls.__name__ == "ChatOpenAI" for cls in type(model).__mro__)
+    _assert_common_model_contract(
+        model,
+        ModelRuntimeMetadata(
+            provider="openai",
+            model_name="openai-fallback-model",
+            base_url="https://openai-fallback.example.test/v1",
+        ),
+    )
+
+
 def test_cached_model_keeps_construction_policy_until_cache_is_cleared(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

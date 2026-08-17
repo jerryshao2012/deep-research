@@ -400,30 +400,6 @@ def _build_configured_model():
             ),
         )
 
-    if os.getenv("OPENAI_API_KEY") and os.getenv("MODEL_NAME"):
-        from langchain_openai import ChatOpenAI
-
-        model_name = os.environ["MODEL_NAME"]
-        endpoint = os.getenv("OPENAI_BASE_URL")
-        http_client, http_async_client = openai_clients()
-        return finalize(
-            ChatOpenAI,
-            {
-                "api_key": SecretStr(os.environ["OPENAI_API_KEY"]),
-                "model": model_name,
-                "request_timeout": policy.timeout_seconds,
-                "http_client": http_client,
-                "http_async_client": http_async_client,
-                "stream_usage": True,
-                **({"base_url": endpoint} if endpoint else {}),
-            },
-            ModelRuntimeMetadata(
-                provider="openai",
-                model_name=model_name,
-                base_url=endpoint,
-            ),
-        )
-
     if os.getenv("GOOGLE_API_KEY") and os.getenv("MODEL_NAME"):
         from langchain_google_genai import ChatGoogleGenerativeAI
 
@@ -487,6 +463,30 @@ def _build_configured_model():
             },
             ModelRuntimeMetadata(
                 provider="ollama",
+                model_name=model_name,
+                base_url=endpoint,
+            ),
+        )
+
+    if os.getenv("OPENAI_API_KEY") and os.getenv("MODEL_NAME"):
+        from langchain_openai import ChatOpenAI
+
+        model_name = os.environ["MODEL_NAME"]
+        endpoint = os.getenv("OPENAI_BASE_URL")
+        http_client, http_async_client = openai_clients()
+        return finalize(
+            ChatOpenAI,
+            {
+                "api_key": SecretStr(os.environ["OPENAI_API_KEY"]),
+                "model": model_name,
+                "request_timeout": policy.timeout_seconds,
+                "http_client": http_client,
+                "http_async_client": http_async_client,
+                "stream_usage": True,
+                **({"base_url": endpoint} if endpoint else {}),
+            },
+            ModelRuntimeMetadata(
+                provider="openai",
                 model_name=model_name,
                 base_url=endpoint,
             ),
