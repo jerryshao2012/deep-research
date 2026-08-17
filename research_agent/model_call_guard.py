@@ -16,9 +16,11 @@ from dataclasses import dataclass
 from typing import Any, Literal, Mapping, Protocol, runtime_checkable
 from urllib.parse import urlsplit, urlunsplit
 
+import httpx
 from langchain.agents.middleware import AgentMiddleware, ModelRequest
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.runnables import Runnable, RunnableConfig
+from langchain_core.runnables.config import ensure_config, merge_configs
 from pydantic import PrivateAttr
 
 DEFAULT_MODEL_CALL_TIMEOUT_SECONDS = 300.0
@@ -389,11 +391,15 @@ class BridgeRegistry:
         """Create an empty registry guarded by a standard thread lock."""
         self._lock = threading.Lock()
         self._controls: dict[str, set[_BridgeControl[Any]]] = {}
+        self._cancelling: set[str] = set()
 
-    def register(self, control: _BridgeControl[Any]) -> None:
-        """Register a control before its daemon thread starts."""
+    def register(self, control: _BridgeControl[Any]) -> bool:
+        """Register unless the scope has entered persistent cancellation."""
         with self._lock:
+            if control.scope_id in self._cancelling:
+                return False
             self._controls.setdefault(control.scope_id, set()).add(control)
+            return True
 
     def unregister(self, control: _BridgeControl[Any]) -> None:
         """Forget a completed bridge and prune its empty scope."""
@@ -413,6 +419,7 @@ class BridgeRegistry:
     def cancel_scope(self, scope_id: str) -> None:
         """Cancel every bridge in a scope against one shared join grace."""
         with self._lock:
+            self._cancelling.add(scope_id)
             controls = tuple(self._controls.get(scope_id, ()))
         for control in controls:
             control.cancel()
@@ -442,6 +449,8 @@ class _BridgeControl[ResultT]:
         self._cancel_requested = False
         self._loop: asyncio.AbstractEventLoop | None = None
         self._task: asyncio.Task[Any] | None = None
+        self._globally_registered = False
+        self._locally_registered = False
         self._thread_started = threading.Event()
         self._context = contextvars.copy_context()
         self._thread = threading.Thread(
@@ -452,18 +461,33 @@ class _BridgeControl[ResultT]:
 
     def start(self) -> None:
         """Register before making the bridge observable as a live thread."""
-        self._registry.register(self)
-        if self._registry is not _GLOBAL_BRIDGE_REGISTRY:
-            _GLOBAL_BRIDGE_REGISTRY.register(self)
+        globally_registered = _GLOBAL_BRIDGE_REGISTRY.register(self)
+        locally_registered = False
+        if globally_registered and self._registry is not _GLOBAL_BRIDGE_REGISTRY:
+            locally_registered = self._registry.register(self)
+        accepted = globally_registered and (
+            self._registry is _GLOBAL_BRIDGE_REGISTRY or locally_registered
+        )
+        self._globally_registered = globally_registered
+        self._locally_registered = locally_registered
+        if not accepted:
+            if globally_registered:
+                _GLOBAL_BRIDGE_REGISTRY.unregister(self)
+            if locally_registered:
+                self._registry.unregister(self)
+            self.cancel()
         try:
             self._thread.start()
             self._thread_started.set()
         except BaseException:
             self._thread_started.set()
-            self._registry.unregister(self)
-            if self._registry is not _GLOBAL_BRIDGE_REGISTRY:
+            if self._locally_registered:
+                self._registry.unregister(self)
+            if self._globally_registered:
                 _GLOBAL_BRIDGE_REGISTRY.unregister(self)
             raise
+        if not accepted:
+            self.join(MODEL_CANCEL_GRACE_SECONDS)
 
     def cancel(self) -> None:
         """Request task cancellation safely before or after loop creation."""
@@ -513,8 +537,9 @@ class _BridgeControl[ResultT]:
         finally:
             with self._lock:
                 self._task = None
-            self._registry.unregister(self)
-            if self._registry is not _GLOBAL_BRIDGE_REGISTRY:
+            if self._locally_registered:
+                self._registry.unregister(self)
+            if self._globally_registered:
                 _GLOBAL_BRIDGE_REGISTRY.unregister(self)
             pending = {
                 pending for pending in asyncio.all_tasks(loop) if not pending.done()
@@ -538,8 +563,14 @@ def cancel_model_call_scope(scope_id: str) -> None:
     _GLOBAL_BRIDGE_REGISTRY.cancel_scope(str(scope_id))
 
 
-def _scope_id_from_config(config: RunnableConfig | None) -> str:
-    configurable = config.get("configurable", {}) if config is not None else {}
+def _scope_id_from_config(
+    config: RunnableConfig | None,
+    bound_config: RunnableConfig | None = None,
+) -> str:
+    resolved = ensure_config(config)
+    if bound_config is not None:
+        resolved = merge_configs(bound_config, resolved)
+    configurable = resolved.get("configurable", {})
     requested = (
         configurable.get("model_call_scope_id")
         if isinstance(configurable, Mapping)
@@ -722,16 +753,51 @@ class _GuardedBoundRunnable[InputT, OutputT](Runnable[InputT, OutputT]):
     """Runnable binding whose public call boundaries capture deadlines eagerly."""
 
     def __init__(
-        self, target: Runnable[InputT, OutputT], owner: ModelCallGuardMixin
+        self,
+        target: Runnable[InputT, OutputT],
+        owner: ModelCallGuardMixin,
+        boundary_config: RunnableConfig | None = None,
     ) -> None:
         self.bound = target
         self._owner = owner
+        self._boundary_config = boundary_config
+
+    def _rewrap(self, target: Runnable[Any, Any]) -> _GuardedBoundRunnable[Any, Any]:
+        return _GuardedBoundRunnable(
+            target,
+            self._owner,
+            boundary_config=self._boundary_config,
+        )
+
+    def get_name(self, suffix: str | None = None, *, name: str | None = None) -> str:
+        return self.bound.get_name(suffix, name=name)
+
+    @property
+    def InputType(self) -> type[InputT]:
+        return self.bound.InputType
+
+    @property
+    def OutputType(self) -> type[OutputT]:
+        return self.bound.OutputType
+
+    def get_input_schema(self, config: RunnableConfig | None = None) -> Any:
+        return self.bound.get_input_schema(config)
+
+    def get_output_schema(self, config: RunnableConfig | None = None) -> Any:
+        return self.bound.get_output_schema(config)
+
+    @property
+    def config_specs(self) -> list[Any]:
+        return self.bound.config_specs
+
+    def get_graph(self, config: RunnableConfig | None = None) -> Any:
+        return self.bound.get_graph(config)
 
     def invoke(
         self, input: InputT, config: RunnableConfig | None = None, **kwargs: Any
     ) -> OutputT:
         deadline = _capture_deadline(self._owner._model_call_policy)
-        scope_id = _scope_id_from_config(config)
+        scope_id = _scope_id_from_config(config, self._boundary_config)
         control = _start_bridge(
             lambda: _run_with_absolute_deadline(
                 lambda: self.bound.ainvoke(input, config=config, **kwargs),
@@ -754,7 +820,7 @@ class _GuardedBoundRunnable[InputT, OutputT](Runnable[InputT, OutputT]):
         self, input: InputT, config: RunnableConfig | None = None, **kwargs: Any
     ) -> Awaitable[OutputT]:
         deadline = _capture_deadline(self._owner._model_call_policy)
-        scope_id = _scope_id_from_config(config)
+        scope_id = _scope_id_from_config(config, self._boundary_config)
 
         async def run() -> OutputT:
             return await _run_with_absolute_deadline(
@@ -771,7 +837,7 @@ class _GuardedBoundRunnable[InputT, OutputT](Runnable[InputT, OutputT]):
         self, input: InputT, config: RunnableConfig | None = None, **kwargs: Any
     ) -> Iterator[OutputT]:
         deadline = _capture_deadline(self._owner._model_call_policy)
-        scope_id = _scope_id_from_config(config)
+        scope_id = _scope_id_from_config(config, self._boundary_config)
         return _SyncStreamIterator(
             lambda: self._astream_with_deadline(
                 input,
@@ -791,7 +857,7 @@ class _GuardedBoundRunnable[InputT, OutputT](Runnable[InputT, OutputT]):
         self, input: InputT, config: RunnableConfig | None = None, **kwargs: Any
     ) -> AsyncIterator[OutputT]:
         deadline = _capture_deadline(self._owner._model_call_policy)
-        scope_id = _scope_id_from_config(config)
+        scope_id = _scope_id_from_config(config, self._boundary_config)
         return self._astream_with_deadline(
             input,
             config=config,
@@ -830,7 +896,123 @@ class _GuardedBoundRunnable[InputT, OutputT](Runnable[InputT, OutputT]):
         return iterate()
 
     def bind(self, **kwargs: Any) -> _GuardedBoundRunnable[InputT, OutputT]:
-        return _GuardedBoundRunnable(self.bound.bind(**kwargs), self._owner)
+        return self._rewrap(self.bound.bind(**kwargs))
+
+    def with_config(
+        self,
+        config: RunnableConfig | None = None,
+        **kwargs: Any,
+    ) -> _GuardedBoundRunnable[InputT, OutputT]:
+        """Apply config while retaining eager outer call boundaries."""
+        explicit_config = {**(config or {}), **kwargs}
+        return _GuardedBoundRunnable(
+            self.bound.with_config(config, **kwargs),
+            self._owner,
+            boundary_config=merge_configs(self._boundary_config, explicit_config),
+        )
+
+    def with_retry(
+        self,
+        *,
+        retry_if_exception_type: tuple[type[BaseException], ...] = (Exception,),
+        wait_exponential_jitter: bool = True,
+        exponential_jitter_params: Any = None,
+        stop_after_attempt: int = 3,
+    ) -> _GuardedBoundRunnable[InputT, OutputT]:
+        """Apply retries inside one guard-owned total deadline."""
+        return self._rewrap(
+            self.bound.with_retry(
+                retry_if_exception_type=retry_if_exception_type,
+                wait_exponential_jitter=wait_exponential_jitter,
+                exponential_jitter_params=exponential_jitter_params,
+                stop_after_attempt=stop_after_attempt,
+            )
+        )
+
+    def with_listeners(
+        self,
+        *,
+        on_start: Any = None,
+        on_end: Any = None,
+        on_error: Any = None,
+    ) -> _GuardedBoundRunnable[InputT, OutputT]:
+        """Attach synchronous listeners without exposing a lazy raw binding."""
+        return self._rewrap(
+            self.bound.with_listeners(
+                on_start=on_start,
+                on_end=on_end,
+                on_error=on_error,
+            )
+        )
+
+    def with_alisteners(
+        self,
+        *,
+        on_start: Any = None,
+        on_end: Any = None,
+        on_error: Any = None,
+    ) -> _GuardedBoundRunnable[InputT, OutputT]:
+        """Attach async listeners without exposing a lazy raw binding."""
+        return self._rewrap(
+            self.bound.with_alisteners(
+                on_start=on_start,
+                on_end=on_end,
+                on_error=on_error,
+            )
+        )
+
+    def with_types(
+        self,
+        *,
+        input_type: type[InputT] | None = None,
+        output_type: type[OutputT] | None = None,
+    ) -> _GuardedBoundRunnable[InputT, OutputT]:
+        """Apply input/output types while retaining guarded boundaries."""
+        return self._rewrap(
+            self.bound.with_types(input_type=input_type, output_type=output_type)
+        )
+
+    def assign(self, **kwargs: Any) -> _GuardedBoundRunnable[Any, Any]:
+        """Assign output fields while retaining guarded boundaries."""
+        return self._rewrap(self.bound.assign(**kwargs))
+
+    def pick(self, keys: str | list[str]) -> _GuardedBoundRunnable[Any, Any]:
+        """Pick output fields while retaining guarded boundaries."""
+        return self._rewrap(self.bound.pick(keys))
+
+    def map(self) -> _GuardedBoundRunnable[Sequence[InputT], list[OutputT]]:
+        """Map calls while retaining guarded boundaries for the whole call."""
+        return self._rewrap(self.bound.map())
+
+    def pipe(
+        self,
+        *others: Any,
+        name: str | None = None,
+    ) -> _GuardedBoundRunnable[InputT, Any]:
+        """Compose a pipeline while retaining guarded outer boundaries."""
+        return self._rewrap(self.bound.pipe(*others, name=name))
+
+    def __or__(self, other: Any) -> _GuardedBoundRunnable[InputT, Any]:
+        return self._rewrap(self.bound | other)
+
+    def __ror__(self, other: Any) -> _GuardedBoundRunnable[Any, OutputT]:
+        return self._rewrap(other | self.bound)
+
+    def with_fallbacks(
+        self,
+        fallbacks: Sequence[Runnable[InputT, OutputT]],
+        *,
+        exceptions_to_handle: tuple[type[BaseException], ...] = (Exception,),
+        exception_key: str | None = None,
+    ) -> _GuardedBoundRunnable[InputT, OutputT]:
+        """Apply fallbacks inside one guard-owned total deadline."""
+        return self._rewrap(
+            self.bound.with_fallbacks(
+                fallbacks,
+                exceptions_to_handle=exceptions_to_handle,
+                exception_key=exception_key,
+            )
+        )
 
 
 class ModelCallGuardMixin:
@@ -1025,8 +1207,31 @@ def _guarded_provider_class(provider_class: type[BaseChatModel]) -> type[BaseCha
         cached = _GUARDED_PROVIDER_CLASSES.get(provider_class)
         if cached is not None:
             return cached
+
+        def provider_lc_id(cls: type[BaseChatModel]) -> list[str]:
+            del cls
+            return provider_class.lc_id()
+
+        def provider_to_json(self: BaseChatModel) -> dict[str, Any]:
+            serialized = dict(provider_class.to_json(self))
+            serialized["id"] = provider_class.lc_id()
+            if "name" in serialized and not self.name:
+                serialized["name"] = provider_class.__name__
+            representation = serialized.get("repr")
+            dynamic_prefix = f"{type(self).__name__}("
+            if isinstance(representation, str) and representation.startswith(
+                dynamic_prefix
+            ):
+                serialized["repr"] = (
+                    f"{provider_class.__name__}("
+                    f"{representation.removeprefix(dynamic_prefix)}"
+                )
+            return serialized
+
         namespace = {
             "__module__": __name__,
+            "lc_id": classmethod(provider_lc_id),
+            "to_json": provider_to_json,
             "_model_call_policy": PrivateAttr(),
             "_runtime_metadata": PrivateAttr(),
             "_bridge_registry": PrivateAttr(),
@@ -1127,9 +1332,122 @@ def _extract_runtime_metadata(model: BaseChatModel) -> ModelRuntimeMetadata | No
 def _bounded_native_timeout(current: Any, policy: ModelCallPolicy) -> Any:
     if current is None:
         return policy.timeout_seconds
-    if isinstance(current, (int, float)) and current > policy.timeout_seconds:
+    if isinstance(current, bool):
         return policy.timeout_seconds
-    return current
+    if isinstance(current, (int, float)):
+        try:
+            valid = math.isfinite(current) and current >= 0
+        except (TypeError, ValueError):
+            valid = False
+        return (
+            min(float(current), policy.timeout_seconds)
+            if valid
+            else policy.timeout_seconds
+        )
+    if isinstance(current, (tuple, httpx.Timeout)):
+        try:
+            parsed = httpx.Timeout(current)
+        except (TypeError, ValueError):
+            return policy.timeout_seconds
+
+        def bounded_component(value: Any) -> float:
+            if isinstance(value, bool):
+                return policy.timeout_seconds
+            try:
+                valid = value is not None and math.isfinite(value) and value >= 0
+            except (TypeError, ValueError):
+                valid = False
+            return (
+                min(float(value), policy.timeout_seconds)
+                if valid
+                else policy.timeout_seconds
+            )
+
+        return httpx.Timeout(
+            connect=bounded_component(parsed.connect),
+            read=bounded_component(parsed.read),
+            write=bounded_component(parsed.write),
+            pool=bounded_component(parsed.pool),
+        )
+    return policy.timeout_seconds
+
+
+class _BorrowedSyncTransport(httpx.BaseTransport):
+    """Delegate requests without taking ownership of a caller's transport."""
+
+    def __init__(self, transport: httpx.BaseTransport) -> None:
+        self._transport = transport
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        return self._transport.handle_request(request)
+
+    def close(self) -> None:
+        pass
+
+
+class _BorrowedAsyncTransport(httpx.AsyncBaseTransport):
+    """Delegate requests without taking ownership of a caller's async transport."""
+
+    def __init__(self, transport: httpx.AsyncBaseTransport) -> None:
+        self._transport = transport
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        return await self._transport.handle_async_request(request)
+
+    async def aclose(self) -> None:
+        pass
+
+
+def _bounded_httpx_client(
+    client: httpx.Client, policy: ModelCallPolicy
+) -> httpx.Client:
+    mounts = {
+        pattern.pattern: (
+            None if transport is None else _BorrowedSyncTransport(transport)
+        )
+        for pattern, transport in client._mounts.items()
+    }
+    return httpx.Client(
+        auth=client._auth,
+        params=client.params,
+        headers=client.headers,
+        cookies=client.cookies,
+        trust_env=client._trust_env,
+        mounts=mounts,
+        timeout=_bounded_native_timeout(client.timeout, policy),
+        follow_redirects=client.follow_redirects,
+        max_redirects=client.max_redirects,
+        event_hooks={name: list(hooks) for name, hooks in client.event_hooks.items()},
+        base_url=client.base_url,
+        transport=_BorrowedSyncTransport(client._transport),
+        default_encoding=client._default_encoding,
+    )
+
+
+def _bounded_httpx_async_client(
+    client: httpx.AsyncClient, policy: ModelCallPolicy
+) -> httpx.AsyncClient:
+    mounts = {
+        pattern.pattern: (
+            None if transport is None else _BorrowedAsyncTransport(transport)
+        )
+        for pattern, transport in client._mounts.items()
+    }
+    return httpx.AsyncClient(
+        auth=client._auth,
+        params=client.params,
+        headers=client.headers,
+        cookies=client.cookies,
+        trust_env=client._trust_env,
+        mounts=mounts,
+        timeout=_bounded_native_timeout(client.timeout, policy),
+        follow_redirects=client.follow_redirects,
+        max_redirects=client.max_redirects,
+        event_hooks={name: list(hooks) for name, hooks in client.event_hooks.items()},
+        base_url=client.base_url,
+        transport=_BorrowedAsyncTransport(client._transport),
+        default_encoding=client._default_encoding,
+    )
 
 
 def _validated_provider_fields(
@@ -1151,6 +1469,16 @@ def _validated_provider_fields(
         fields["request_timeout"] = _bounded_native_timeout(
             fields.get("request_timeout"), policy
         )
+        for name in ("client", "async_client", "root_client", "root_async_client"):
+            fields.pop(name, None)
+        http_client = getattr(model, "http_client", None)
+        http_async_client = getattr(model, "http_async_client", None)
+        if isinstance(http_client, httpx.Client):
+            fields["http_client"] = _bounded_httpx_client(http_client, policy)
+        if isinstance(http_async_client, httpx.AsyncClient):
+            fields["http_async_client"] = _bounded_httpx_async_client(
+                http_async_client, policy
+            )
     elif metadata.provider == "anthropic":
         fields["default_request_timeout"] = _bounded_native_timeout(
             fields.get("default_request_timeout"), policy

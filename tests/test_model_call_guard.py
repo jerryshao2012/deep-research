@@ -15,6 +15,8 @@ from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, AIMessageChunk
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
+from langchain_core.runnables import RunnableLambda
+from langchain_core.runnables.config import var_child_runnable_config
 from pydantic import PrivateAttr
 
 from research_agent.model_call_guard import (
@@ -974,6 +976,7 @@ async def test_ainvoke_external_cancellation_reaches_provider():
 async def test_astream_captures_deadline_before_first_pull():
     guarded = _guarded_fake(
         timeout=0.03,
+        chunk_delay=0.1,
         chunks=[AIMessageChunk(content="too-late")],
     )
 
@@ -1103,6 +1106,8 @@ def test_callbacks_tags_metadata_and_configurable_config_survive_guard():
     assert result.content == "complete"
     assert len(callback.starts) == 1
     assert len(callback.ends) == 1
+    assert callback.starts[0]["serialized"]["id"] == _AsyncOnlyChatModel.lc_id()
+    assert callback.starts[0]["serialized"]["name"] == "_AsyncOnlyChatModel"
     assert callback.starts[0]["tags"] == ["guarded-tag"]
     assert callback.starts[0]["metadata"]["request"] == "kept"
     assert config["configurable"] == {
@@ -1252,6 +1257,82 @@ def test_bound_sync_stream_deadline_includes_bridge_start_delay(monkeypatch):
     assert time.monotonic() - started < 0.02
 
 
+def test_bound_with_config_ainvoke_captures_deadline_at_outer_call():
+    guarded = _guarded_fake(timeout=0.03)
+    configured = guarded.bind(extra="kept").with_config(
+        {"configurable": {"model_call_scope_id": "configured-invoke"}}
+    )
+
+    pending = configured.ainvoke("hello")
+    time.sleep(0.05)
+
+    with pytest.raises(ModelCallTimeoutError):
+        asyncio.run(pending)
+
+
+def test_bound_with_config_stream_captures_deadline_at_outer_call():
+    guarded = _guarded_fake(
+        timeout=0.03,
+        chunk_delay=0.1,
+        chunks=[AIMessageChunk(content="too-late")],
+    )
+    configured = guarded.bind(extra="kept").with_config(
+        {"configurable": {"model_call_scope_id": "configured-stream"}}
+    )
+
+    stream = configured.stream("hello")
+    time.sleep(0.05)
+
+    with pytest.raises(ModelCallTimeoutError):
+        next(stream)
+
+
+@_async_test
+async def test_bound_with_config_astream_captures_deadline_at_outer_call():
+    guarded = _guarded_fake(
+        timeout=0.03,
+        chunks=[AIMessageChunk(content="too-late")],
+    )
+    configured = guarded.bind(extra="kept").with_config(
+        {"configurable": {"model_call_scope_id": "configured-astream"}}
+    )
+
+    stream = configured.astream("hello")
+    await asyncio.sleep(0.05)
+
+    with pytest.raises(ModelCallTimeoutError):
+        await anext(stream)
+
+
+def test_bound_runnable_transformations_remain_guard_owned():
+    bound = _guarded_fake().bind(extra="kept")
+    wrapper_type = type(bound)
+    identity = RunnableLambda(lambda value: value)
+    typed = bound.with_types(input_type=str, output_type=AIMessage)
+    transformations = [
+        bound.bind(other="kept"),
+        bound.with_config({"tags": ["kept"]}),
+        bound.with_retry(wait_exponential_jitter=False),
+        bound.with_listeners(),
+        bound.with_alisteners(),
+        typed,
+        bound.assign(extra=lambda value: value),
+        bound.pick("content"),
+        bound.map(),
+        bound.pipe(identity),
+        bound | identity,
+        bound.__ror__(identity),
+        bound.with_fallbacks([identity]),
+    ]
+
+    assert transformations
+    assert all(isinstance(transformed, wrapper_type) for transformed in transformations)
+    assert typed.InputType is str
+    assert typed.OutputType is AIMessage
+    assert typed.get_name() == typed.bound.get_name()
+    assert typed.config_specs == typed.bound.config_specs
+
+
 def test_cancel_model_call_scope_cancels_all_sync_bridges_with_one_grace(monkeypatch):
     import research_agent.model_call_guard as guard
 
@@ -1286,6 +1367,93 @@ def test_cancel_model_call_scope_cancels_all_sync_bridges_with_one_grace(monkeyp
     assert all(not caller.is_alive() for caller in callers)
     assert len(errors) == 2
     assert all(isinstance(exc, asyncio.CancelledError) for exc in errors)
+    assert guarded._bridge_registry.active_count(scope_id) == 0
+
+
+def test_ambient_runnable_config_supplies_model_call_scope():
+    guarded = _guarded_fake(
+        timeout=1,
+        chunk_delay=0.1,
+        chunks=[AIMessageChunk(content="later")],
+    )
+    token = var_child_runnable_config.set(
+        {"configurable": {"model_call_scope_id": "ambient-scope"}}
+    )
+    try:
+        stream = guarded.stream("hello", config=None)
+    finally:
+        var_child_runnable_config.reset(token)
+
+    try:
+        assert stream._control.scope_id == "ambient-scope"
+        assert guarded._bridge_registry.active_count("ambient-scope") == 1
+    finally:
+        stream.close()
+
+
+def test_bound_with_config_scope_reaches_outer_bridge_registry():
+    guarded = _guarded_fake(
+        timeout=1,
+        chunk_delay=0.1,
+        chunks=[AIMessageChunk(content="later")],
+    )
+    configured = guarded.bind(extra="kept").with_config(
+        {"configurable": {"model_call_scope_id": "bound-config-scope"}}
+    )
+
+    stream = configured.stream("hello", config=None)
+
+    try:
+        assert stream._control.scope_id == "bound-config-scope"
+        assert guarded._bridge_registry.active_count("bound-config-scope") == 1
+    finally:
+        stream.close()
+
+
+def test_scope_cancel_is_atomic_with_concurrent_bridge_registration(monkeypatch):
+    import research_agent.model_call_guard as guard
+
+    monkeypatch.setattr(guard, "MODEL_CANCEL_GRACE_SECONDS", 0.02)
+    guarded = _guarded_fake(timeout=1, delay=0.2)
+    scope_id = "registration-race-scope"
+    local_register_entered = threading.Event()
+    release_local_register = threading.Event()
+    original_register = guarded._bridge_registry.register
+    errors: list[BaseException] = []
+
+    def paused_local_register(control):
+        local_register_entered.set()
+        assert release_local_register.wait(0.5)
+        return original_register(control)
+
+    monkeypatch.setattr(guarded._bridge_registry, "register", paused_local_register)
+
+    def call() -> None:
+        try:
+            guarded.invoke(
+                "hello", config={"configurable": {"model_call_scope_id": scope_id}}
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    caller = threading.Thread(target=call)
+    caller.start()
+    assert local_register_entered.wait(0.2)
+
+    cancel_model_call_scope(scope_id)
+    release_local_register.set()
+    caller.join(0.5)
+
+    assert not caller.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], asyncio.CancelledError)
+    assert not guarded._calls
+    assert guarded._bridge_registry.active_count(scope_id) == 0
+
+    with pytest.raises(asyncio.CancelledError):
+        guarded.invoke(
+            "hello", config={"configurable": {"model_call_scope_id": scope_id}}
+        )
     assert guarded._bridge_registry.active_count(scope_id) == 0
 
 
@@ -1440,6 +1608,15 @@ def test_known_provider_guard_preserves_identity_fields_profile_and_copy_state(
     assert type(guarded).__mro__[1] is ModelCallGuardMixin
     assert getattr(guarded, model_field) == getattr(raw, model_field)
     assert guarded.profile == raw.profile
+    assert guarded.lc_id() == raw.lc_id()
+    guarded_serialized = guarded.to_json()
+    raw_serialized = raw.to_json()
+    identity_fields = ("lc", "type", "id", "name")
+    assert {key: guarded_serialized.get(key) for key in identity_fields} == {
+        key: raw_serialized.get(key) for key in identity_fields
+    }
+    if "repr" in guarded_serialized:
+        assert guarded_serialized["repr"].startswith(f"{provider_class.__name__}(")
     timeout_keys = {"timeout", "request_timeout", "default_request_timeout"}
     assert {
         key: value
@@ -1527,6 +1704,194 @@ def test_known_provider_rebuild_applies_native_timeout_without_env_influence(
         assert guarded.default_request_timeout == 0.2
     else:
         assert guarded.timeout == 0.2
+
+
+def _openai_provider_cases():
+    from langchain_openai import AzureChatOpenAI, ChatOpenAI
+
+    return [
+        (
+            ChatOpenAI,
+            {"model": "openai-explicit", "api_key": "sk-test"},
+        ),
+        (
+            AzureChatOpenAI,
+            {
+                "model": "azure-explicit",
+                "azure_deployment": "deployment-explicit",
+                "azure_endpoint": "https://explicit.openai.azure.com",
+                "api_version": "2024-01-01",
+                "api_key": "sk-test",
+            },
+        ),
+    ]
+
+
+def _timeout_components(timeout: Any) -> list[float]:
+    if isinstance(timeout, httpx.Timeout):
+        values = [timeout.connect, timeout.read, timeout.write, timeout.pool]
+    elif isinstance(timeout, tuple):
+        values = list(timeout)
+    else:
+        values = [timeout]
+    return [float(value) for value in values if value is not None]
+
+
+@pytest.mark.parametrize(
+    ("provider_class", "constructor"),
+    _openai_provider_cases(),
+    ids=lambda value: value.__name__ if isinstance(value, type) else None,
+)
+@pytest.mark.parametrize(
+    "native_timeout",
+    [
+        17.0,
+        (17.0, 9.0),
+        httpx.Timeout(connect=17.0, read=9.0, write=0.1, pool=4.0),
+    ],
+    ids=["float", "tuple", "httpx"],
+)
+def test_openai_provider_rebuilds_distinct_clients_with_all_timeouts_bounded(
+    provider_class, constructor, native_timeout
+):
+    raw = provider_class(**constructor, timeout=native_timeout)
+
+    guarded = adapt_model_override(raw, policy=_policy(0.2))
+
+    assert guarded.client is not raw.client
+    assert guarded.async_client is not raw.async_client
+    assert guarded.root_client is not raw.root_client
+    assert guarded.root_async_client is not raw.root_async_client
+    for timeout in (
+        guarded.request_timeout,
+        guarded.root_client.timeout,
+        guarded.root_async_client.timeout,
+        guarded.root_client._client.timeout,
+        guarded.root_async_client._client.timeout,
+    ):
+        components = _timeout_components(timeout)
+        assert len(components) == 4 or not isinstance(timeout, httpx.Timeout)
+        assert components
+        assert max(components) <= 0.2
+
+
+@pytest.mark.parametrize(
+    ("provider_class", "constructor"),
+    _openai_provider_cases(),
+    ids=lambda value: value.__name__ if isinstance(value, type) else None,
+)
+def test_openai_provider_rebuilds_explicit_http_clients_without_owning_transport(
+    provider_class, constructor
+):
+    sync_requests: list[httpx.Request] = []
+    async_requests: list[httpx.Request] = []
+
+    class SyncTransport(httpx.BaseTransport):
+        closed = False
+
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            sync_requests.append(request)
+            return httpx.Response(200, request=request)
+
+        def close(self) -> None:
+            self.closed = True
+
+    class AsyncTransport(httpx.AsyncBaseTransport):
+        closed = False
+
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            async_requests.append(request)
+            return httpx.Response(200, request=request)
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    sync_transport = SyncTransport()
+    async_transport = AsyncTransport()
+    sync_mount_transport = SyncTransport()
+    async_mount_transport = AsyncTransport()
+    sync_client = httpx.Client(
+        timeout=17,
+        transport=sync_transport,
+        mounts={
+            "all://*bypass.test": None,
+            "https://mounted.test": sync_mount_transport,
+        },
+    )
+    async_client = httpx.AsyncClient(
+        timeout=17,
+        transport=async_transport,
+        mounts={
+            "all://*bypass.test": None,
+            "https://mounted.test": async_mount_transport,
+        },
+    )
+    raw = provider_class(
+        **constructor,
+        timeout=17,
+        http_client=sync_client,
+        http_async_client=async_client,
+    )
+
+    guarded = adapt_model_override(raw, policy=_policy(0.2))
+
+    assert guarded.http_client is not sync_client
+    assert guarded.http_async_client is not async_client
+    assert guarded.root_client._client is guarded.http_client
+    assert guarded.root_async_client._client is guarded.http_async_client
+    assert max(_timeout_components(guarded.http_client.timeout)) <= 0.2
+    assert max(_timeout_components(guarded.http_async_client.timeout)) <= 0.2
+    assert {pattern.pattern for pattern in guarded.http_client._mounts} == {
+        pattern.pattern for pattern in sync_client._mounts
+    }
+    assert {pattern.pattern for pattern in guarded.http_async_client._mounts} == {
+        pattern.pattern for pattern in async_client._mounts
+    }
+    assert (
+        next(
+            transport
+            for pattern, transport in guarded.http_client._mounts.items()
+            if pattern.pattern == "all://*bypass.test"
+        )
+        is None
+    )
+    assert (
+        next(
+            transport
+            for pattern, transport in guarded.http_async_client._mounts.items()
+            if pattern.pattern == "all://*bypass.test"
+        )
+        is None
+    )
+    assert guarded.http_client.get("https://example.test/sync").status_code == 200
+    assert guarded.http_client.get("https://mounted.test/sync").status_code == 200
+    assert (
+        asyncio.run(
+            guarded.http_async_client.get("https://example.test/async")
+        ).status_code
+        == 200
+    )
+    assert (
+        asyncio.run(
+            guarded.http_async_client.get("https://mounted.test/async")
+        ).status_code
+        == 200
+    )
+
+    guarded.root_client.close()
+    asyncio.run(guarded.root_async_client.close())
+    assert not sync_transport.closed
+    assert not async_transport.closed
+    assert not sync_mount_transport.closed
+    assert not async_mount_transport.closed
+    assert sync_client.get("https://example.test/raw").status_code == 200
+    assert sync_client.get("https://mounted.test/raw").status_code == 200
+    assert asyncio.run(async_client.get("https://example.test/raw")).status_code == 200
+    assert asyncio.run(async_client.get("https://mounted.test/raw")).status_code == 200
+    assert len(sync_requests) == 4
+    assert len(async_requests) == 4
+    sync_client.close()
+    asyncio.run(async_client.aclose())
 
 
 def test_guarded_provider_keeps_langchain_provider_strategy_identity():
