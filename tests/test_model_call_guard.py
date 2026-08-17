@@ -1,6 +1,8 @@
 import asyncio
 import contextvars
 import logging
+import pickle
+import sys
 import threading
 import time
 from dataclasses import FrozenInstanceError
@@ -51,6 +53,7 @@ class _AsyncOnlyChatModel(BaseChatModel):
     suppress_invoke_cancel: bool = False
     suppress_stream_cancel: bool = False
     _cancelled: threading.Event = PrivateAttr(default_factory=threading.Event)
+    _cancel_count: int = PrivateAttr(default=0)
     _calls: list[dict[str, Any]] = PrivateAttr(default_factory=list)
     _release_stream: asyncio.Event = PrivateAttr(default_factory=asyncio.Event)
     _release_invoke: asyncio.Event = PrivateAttr(default_factory=asyncio.Event)
@@ -76,6 +79,7 @@ class _AsyncOnlyChatModel(BaseChatModel):
         try:
             await asyncio.sleep(self.delay)
         except (asyncio.CancelledError, GeneratorExit):
+            self._cancel_count += 1
             self._cancelled.set()
             if self.suppress_invoke_cancel:
                 await self._release_invoke.wait()
@@ -105,6 +109,7 @@ class _AsyncOnlyChatModel(BaseChatModel):
                 await asyncio.sleep(self.chunk_delay)
                 yield ChatGenerationChunk(message=chunk)
         except (asyncio.CancelledError, GeneratorExit):
+            self._cancel_count += 1
             self._cancelled.set()
             if self.suppress_stream_cancel:
                 await self._release_stream.wait()
@@ -112,6 +117,28 @@ class _AsyncOnlyChatModel(BaseChatModel):
 
     def bind_tools(self, tools: Any, *, tool_choice: str | None = None, **kwargs: Any):
         return self.bind(tools=tools, tool_choice=tool_choice, **kwargs)
+
+
+class _PickleableChatModel(BaseChatModel):
+    """Minimal provider whose native instances support deep copy and pickle."""
+
+    payload: list[str]
+
+    @property
+    def _llm_type(self) -> str:
+        return "pickleable-test-provider"
+
+    def _generate(
+        self,
+        messages: list[Any],
+        stop: list[str] | None = None,
+        run_manager: Any = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        del messages, stop, run_manager, kwargs
+        return ChatResult(
+            generations=[ChatGeneration(message=AIMessage(content="pickleable"))]
+        )
 
 
 class _RecordingCallback(BaseCallbackHandler):
@@ -911,6 +938,87 @@ def _guarded_fake(
     )
 
 
+@pytest.mark.parametrize("decorator", ["direct", "bind", "config", "retry"])
+@pytest.mark.parametrize("method", ["invoke", "ainvoke", "stream", "astream"])
+def test_logical_guarded_operation_attempts_ollama_unload_once(
+    monkeypatch,
+    decorator,
+    method,
+):
+    import research_agent.model_call_guard as guard
+
+    unload_calls = 0
+
+    async def count_unload(**_kwargs: Any) -> None:
+        nonlocal unload_calls
+        unload_calls += 1
+
+    monkeypatch.setattr(guard, "_maybe_unload_ollama", count_unload)
+    guarded = guard_model(
+        _AsyncOnlyChatModel(
+            delay=0.1,
+            chunk_delay=0.1,
+            chunks=[AIMessageChunk(content="too-late")],
+        ),
+        metadata=_ollama_metadata(),
+        policy=_policy(0.02, unload=True),
+    )
+    if decorator == "bind":
+        runnable = guarded.bind(extra="kept")
+    elif decorator == "config":
+        runnable = guarded.with_config({"tags": ["kept"]})
+    elif decorator == "retry":
+        runnable = guarded.with_retry(wait_exponential_jitter=False)
+    else:
+        runnable = guarded
+
+    with pytest.raises(ModelCallTimeoutError):
+        if method == "invoke":
+            runnable.invoke("hello")
+        elif method == "ainvoke":
+            asyncio.run(runnable.ainvoke("hello"))
+        elif method == "stream":
+            next(runnable.stream("hello"))
+        else:
+
+            async def consume() -> None:
+                await anext(runnable.astream("hello"))
+
+            asyncio.run(consume())
+
+    assert unload_calls == 1
+    assert guarded._cancel_count == 1
+
+
+@_async_test
+async def test_bound_external_cancellation_owns_cleanup_once(monkeypatch):
+    import research_agent.model_call_guard as guard
+
+    unload_calls = 0
+
+    async def count_unload(**_kwargs: Any) -> None:
+        nonlocal unload_calls
+        unload_calls += 1
+
+    monkeypatch.setattr(guard, "_maybe_unload_ollama", count_unload)
+    guarded = guard_model(
+        _AsyncOnlyChatModel(delay=1),
+        metadata=_ollama_metadata(),
+        policy=_policy(1, unload=True),
+    )
+    caller = asyncio.create_task(guarded.bind(extra="kept").ainvoke("hello"))
+    while not guarded._calls:
+        await asyncio.sleep(0)
+
+    caller.cancel("caller")
+
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await caller
+    assert raised.value.args == ("caller",)
+    assert unload_calls == 1
+    assert guarded._cancel_count == 1
+
+
 def test_guard_model_creates_cached_provider_preserving_dynamic_class():
     first = _guarded_fake()
     second = _guarded_fake()
@@ -943,6 +1051,95 @@ def test_generated_private_attrs_are_initialized_values_and_copy_is_independent(
     assert copied._bridge_registry is not guarded._bridge_registry
     assert copied._model_call_policy == guarded._model_call_policy
     assert copied._runtime_metadata == guarded._runtime_metadata
+
+
+def test_guarded_model_deep_copy_excludes_registry_lock_and_reinitializes_state():
+    raw = _PickleableChatModel(payload=["original"])
+    raw_copy = raw.model_copy(deep=True)
+    guarded = guard_model(raw, metadata=_fake_metadata(), policy=_policy(0.2))
+
+    class ActiveControl:
+        scope_id = "copy-scope"
+
+    active = ActiveControl()
+    assert guarded._bridge_registry.register(active)
+    try:
+        copied = guarded.model_copy(deep=True)
+    finally:
+        guarded._bridge_registry.unregister(active)
+
+    assert raw_copy.payload == raw.payload
+    assert raw_copy.payload is not raw.payload
+    assert isinstance(copied, _PickleableChatModel)
+    assert type(copied) is type(guarded)
+    assert copied.payload == guarded.payload
+    assert copied.payload is not guarded.payload
+    assert copied._bridge_registry is not guarded._bridge_registry
+    assert copied._bridge_registry._lock is not guarded._bridge_registry._lock
+    assert copied._bridge_registry.active_count("copy-scope") == 0
+    assert copied._model_call_policy == guarded._model_call_policy
+    assert copied._model_call_policy is not guarded._model_call_policy
+    assert copied._runtime_metadata == guarded._runtime_metadata
+    assert copied._runtime_metadata is not guarded._runtime_metadata
+    assert copied._retry_controller is None
+
+
+def test_generated_guarded_class_is_module_addressable_and_pickleable():
+    guarded = guard_model(
+        _PickleableChatModel(payload=["pickle"]),
+        metadata=_fake_metadata(),
+        policy=_policy(0.2),
+    )
+    guarded_class = type(guarded)
+
+    assert getattr(sys.modules[guarded_class.__module__], guarded_class.__name__) is (
+        guarded_class
+    )
+    restored = pickle.loads(pickle.dumps(guarded))
+
+    assert type(restored) is guarded_class
+    assert isinstance(restored, _PickleableChatModel)
+    assert isinstance(restored, ModelCallGuardMixin)
+    assert restored.payload == guarded.payload
+    assert restored._model_call_policy == guarded._model_call_policy
+    assert restored._model_call_policy is not guarded._model_call_policy
+    assert restored._runtime_metadata == guarded._runtime_metadata
+    assert restored._runtime_metadata is not guarded._runtime_metadata
+    assert restored._bridge_registry is not guarded._bridge_registry
+    assert restored._retry_controller is None
+    assert restored.invoke("hello").content == "pickleable"
+
+
+def test_generated_guarded_class_names_avoid_provider_module_collisions():
+    import research_agent.model_call_guard as guard
+
+    first_provider = type(
+        "CollisionProvider",
+        (_PickleableChatModel,),
+        {"__module__": "providers.one"},
+    )
+    second_provider = type(
+        "CollisionProvider",
+        (_PickleableChatModel,),
+        {"__module__": "providers.two"},
+    )
+
+    first_guard = guard._guarded_provider_class(first_provider)
+    second_guard = guard._guarded_provider_class(second_provider)
+
+    assert first_guard.__name__ != second_guard.__name__
+    assert getattr(sys.modules[guard.__name__], first_guard.__name__) is first_guard
+    assert getattr(sys.modules[guard.__name__], second_guard.__name__) is second_guard
+
+
+def test_guard_pickle_preserves_native_nonpickleable_provider_failure():
+    raw = _AsyncOnlyChatModel()
+    guarded = guard_model(raw, metadata=_fake_metadata(), policy=_policy())
+
+    with pytest.raises(TypeError, match="cannot pickle"):
+        pickle.dumps(raw)
+    with pytest.raises(TypeError, match="cannot pickle"):
+        pickle.dumps(guarded)
 
 
 @_async_test
@@ -1016,6 +1213,29 @@ async def test_astream_uses_one_eager_deadline_across_slow_trickle():
     assert received
     assert [chunk.content for chunk in received] in (["a"], ["a", "b"])
     assert guarded._cancelled.is_set()
+
+
+@_async_test
+async def test_bound_astream_operation_context_keeps_one_deadline_across_chunks():
+    guarded = _guarded_fake(
+        timeout=0.045,
+        chunk_delay=0.02,
+        chunks=[
+            AIMessageChunk(content="a"),
+            AIMessageChunk(content="b"),
+            AIMessageChunk(content="c"),
+        ],
+    )
+    received: list[str] = []
+
+    with pytest.raises(ModelCallTimeoutError):
+        async for chunk in guarded.bind(extra="kept").astream("hello"):
+            received.append(str(chunk.content))
+
+    assert received
+    assert received == ["a", "b", "c"][: len(received)]
+    assert len(received) < 3
+    assert guarded._cancel_count == 1
 
 
 @_async_test

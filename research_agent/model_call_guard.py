@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import copy
+import hashlib
 import logging
 import math
 import os
 import queue
+import sys
 import threading
 import time
 import uuid
@@ -597,6 +600,22 @@ def _capture_deadline(policy: ModelCallPolicy) -> float:
     return time.monotonic() + policy.timeout_seconds
 
 
+async def _run_in_operation_context[ResultT](
+    factory: Callable[[], Awaitable[ResultT]],
+    *,
+    deadline: float,
+    scope_id: str,
+) -> ResultT:
+    """Expose one eager operation identity without owning cancellation."""
+    deadline_token = _ACTIVE_DEADLINE.set(deadline)
+    scope_token = _ACTIVE_SCOPE_ID.set(scope_id)
+    try:
+        return await factory()
+    finally:
+        _ACTIVE_SCOPE_ID.reset(scope_token)
+        _ACTIVE_DEADLINE.reset(deadline_token)
+
+
 def _timeout_error(
     policy: ModelCallPolicy, metadata: ModelRuntimeMetadata
 ) -> ModelCallTimeoutError:
@@ -806,12 +825,10 @@ class _GuardedBoundRunnable[InputT, OutputT](Runnable[InputT, OutputT]):
         deadline = _capture_deadline(self._owner._model_call_policy)
         scope_id = _scope_id_from_config(config, self._boundary_config)
         control = _start_bridge(
-            lambda: _run_with_absolute_deadline(
+            lambda: _run_in_operation_context(
                 lambda: self.bound.ainvoke(input, config=config, **kwargs),
                 deadline=deadline,
                 scope_id=scope_id,
-                policy=self._owner._model_call_policy,
-                metadata=self._owner._runtime_metadata,
             ),
             scope_id=scope_id,
             registry=self._owner._bridge_registry,
@@ -830,12 +847,10 @@ class _GuardedBoundRunnable[InputT, OutputT](Runnable[InputT, OutputT]):
         scope_id = _scope_id_from_config(config, self._boundary_config)
 
         async def run() -> OutputT:
-            return await _run_with_absolute_deadline(
+            return await _run_in_operation_context(
                 lambda: self.bound.ainvoke(input, config=config, **kwargs),
                 deadline=deadline,
                 scope_id=scope_id,
-                policy=self._owner._model_call_policy,
-                metadata=self._owner._runtime_metadata,
             )
 
         return run()
@@ -883,22 +898,31 @@ class _GuardedBoundRunnable[InputT, OutputT](Runnable[InputT, OutputT]):
         **kwargs: Any,
     ) -> AsyncIterator[OutputT]:
         async def iterate() -> AsyncIterator[OutputT]:
-            iterator = self.bound.astream(input, config=config, **kwargs)
+            async def create_iterator() -> AsyncIterator[OutputT]:
+                return self.bound.astream(input, config=config, **kwargs)
+
+            iterator = await _run_in_operation_context(
+                create_iterator,
+                deadline=deadline,
+                scope_id=scope_id,
+            )
             try:
                 while True:
                     try:
-                        item = await _run_with_absolute_deadline(
+                        item = await _run_in_operation_context(
                             lambda: anext(iterator),
                             deadline=deadline,
                             scope_id=scope_id,
-                            policy=self._owner._model_call_policy,
-                            metadata=self._owner._runtime_metadata,
                         )
                     except StopAsyncIteration:
                         return
                     yield item
             finally:
-                await _bounded_async_iterator_close(iterator)
+                await _run_in_operation_context(
+                    lambda: _bounded_async_iterator_close(iterator),
+                    deadline=deadline,
+                    scope_id=scope_id,
+                )
 
         return iterate()
 
@@ -1224,6 +1248,24 @@ class ModelCallGuardMixin:
             return bound
         return _GuardedBoundRunnable(bound, self)
 
+    def __getstate__(self: BaseChatModel) -> dict[str, Any]:
+        """Serialize provider state without non-pickleable guard runtime state."""
+        state = dict(super().__getstate__())
+        private = dict(state.get("__pydantic_private__") or {})
+        private.pop("_bridge_registry", None)
+        private.pop("_retry_controller", None)
+        state["__pydantic_private__"] = private
+        return state
+
+    def __setstate__(self: BaseChatModel, state: dict[str, Any]) -> None:
+        """Restore provider state and initialize a fresh guard runtime."""
+        super().__setstate__(state)
+        _initialize_guard_state(
+            self,
+            policy=self._model_call_policy,
+            metadata=self._runtime_metadata,
+        )
+
     def model_copy(
         self: BaseChatModel,
         *,
@@ -1231,16 +1273,32 @@ class ModelCallGuardMixin:
         deep: bool = False,
     ) -> BaseChatModel:
         """Copy provider fields while initializing independent guard state."""
-        copied = super().model_copy(update=update, deep=deep)
+        copied = super().model_copy(update=update, deep=False)
+        if deep:
+            private = dict(copied.__pydantic_private__ or {})
+            for name in _GUARD_PRIVATE_ATTR_NAMES:
+                private.pop(name, None)
+            object.__setattr__(copied, "__pydantic_private__", private)
+            copied = super(ModelCallGuardMixin, copied).model_copy(deep=True)
         metadata = _extract_runtime_metadata(copied) or self._runtime_metadata
+        policy = self._model_call_policy
+        if deep:
+            metadata = copy.deepcopy(metadata)
+            policy = copy.deepcopy(policy)
         _initialize_guard_state(
             copied,
-            policy=self._model_call_policy,
+            policy=policy,
             metadata=metadata,
         )
         return copied
 
 
+_GUARD_PRIVATE_ATTR_NAMES = (
+    "_model_call_policy",
+    "_runtime_metadata",
+    "_bridge_registry",
+    "_retry_controller",
+)
 _GUARDED_PROVIDER_CLASSES: dict[type[BaseChatModel], type[BaseChatModel]] = {}
 _GUARDED_PROVIDER_CLASSES_LOCK = threading.Lock()
 
@@ -1271,8 +1329,12 @@ def _guarded_provider_class(provider_class: type[BaseChatModel]) -> type[BaseCha
                 )
             return serialized
 
+        identity = f"{provider_class.__module__}:{provider_class.__qualname__}"
+        identity_digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+        generated_name = f"Guarded{provider_class.__name__}_{identity_digest}"
         namespace = {
             "__module__": __name__,
+            "__qualname__": generated_name,
             "lc_id": classmethod(provider_lc_id),
             "to_json": provider_to_json,
             "_model_call_policy": PrivateAttr(),
@@ -1281,10 +1343,11 @@ def _guarded_provider_class(provider_class: type[BaseChatModel]) -> type[BaseCha
             "_retry_controller": PrivateAttr(default=None),
         }
         guarded = type(
-            f"Guarded{provider_class.__name__}",
+            generated_name,
             (ModelCallGuardMixin, provider_class),
             namespace,
         )
+        setattr(sys.modules[__name__], generated_name, guarded)
         _GUARDED_PROVIDER_CLASSES[provider_class] = guarded
         return guarded
 
