@@ -43,6 +43,7 @@ _PROVIDER_ENV = {
     "ANTHROPIC_BASE_URL",
     "OLLAMA_API_BASE",
     "MODEL_NAME",
+    "MODEL_MAX_RETRIES",
 }
 
 
@@ -184,10 +185,14 @@ def test_factory_builds_provider_identifiable_guard_with_native_timeout(
     assert any(cls.__name__ == provider_class for cls in type(model).__mro__)
     _assert_common_model_contract(model, metadata)
     if native_kind == "openai":
+        assert model.max_retries == 0
+        assert model.root_client.max_retries == 0
+        assert model.root_async_client.max_retries == 0
         assert max(_timeout_values(model.request_timeout)) <= 0.2
         assert max(_timeout_values(model.http_client.timeout)) <= 0.2
         assert max(_timeout_values(model.http_async_client.timeout)) <= 0.2
     elif native_kind == "google":
+        assert model.max_retries == 0
         assert model.timeout == 0.2
         assert model.client is not None
         http_options = model.client._api_client._http_options
@@ -196,6 +201,9 @@ def test_factory_builds_provider_identifiable_guard_with_native_timeout(
         assert http_options.async_client_args["timeout"] == 0.2
         assert http_options.async_client_args["verify"] is True
     elif native_kind == "anthropic":
+        assert model.max_retries == 0
+        assert model._client.max_retries == 0
+        assert model._async_client.max_retries == 0
         assert model.default_request_timeout == 0.2
     else:
         assert model.client_kwargs["timeout"] == 0.2
@@ -330,6 +338,65 @@ def test_standalone_openai_is_fallback_when_no_existing_provider_is_configured(
             base_url="https://openai-fallback.example.test/v1",
         ),
     )
+
+
+@pytest.mark.parametrize("configured_retries", [0, 3])
+def test_controller_owns_configured_attempts_while_native_retries_stay_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+    configured_retries: int,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "secret-test-value")
+    monkeypatch.setenv("MODEL_NAME", "retry-owner-model")
+    monkeypatch.setenv("MODEL_MAX_RETRIES", str(configured_retries))
+
+    model = model_factory.get_configured_model(bypass_cache=True)
+
+    assert model.max_retries == 0
+    assert model.root_client.max_retries == 0
+    assert model.root_async_client.max_retries == 0
+    assert model._retry_controller.config.max_retries == configured_retries
+
+
+@pytest.mark.parametrize(
+    ("provider_environment", "provider", "provider_url_attribute"),
+    [
+        (
+            {"OPENAI_API_KEY": "secret-test-value"},
+            "openai",
+            "openai_api_base",
+        ),
+        (
+            {"ANTHROPIC_API_KEY": "secret-test-value"},
+            "anthropic",
+            "anthropic_api_url",
+        ),
+    ],
+)
+@pytest.mark.parametrize("blank_url", ["", "   \t"])
+def test_optional_provider_base_url_normalizes_blank_to_none(
+    monkeypatch: pytest.MonkeyPatch,
+    provider_environment: dict[str, str],
+    provider: str,
+    provider_url_attribute: str,
+    blank_url: str,
+) -> None:
+    for name, value in provider_environment.items():
+        monkeypatch.setenv(name, value)
+    url_variable = (
+        "OPENAI_BASE_URL" if provider == "openai" else "ANTHROPIC_API_URL"
+    )
+    monkeypatch.setenv(url_variable, blank_url)
+    monkeypatch.setenv("MODEL_NAME", "blank-url-model")
+
+    model = model_factory.get_configured_model(bypass_cache=True)
+
+    assert model._runtime_metadata == ModelRuntimeMetadata(
+        provider=provider,
+        model_name="blank-url-model",
+        base_url=None,
+    )
+    provider_url = getattr(model, provider_url_attribute, None)
+    assert provider_url is None or str(provider_url).strip()
 
 
 def test_cached_model_keeps_construction_policy_until_cache_is_cleared(

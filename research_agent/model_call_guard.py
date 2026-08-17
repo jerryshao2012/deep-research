@@ -20,6 +20,8 @@ from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 from langchain.agents.middleware import AgentMiddleware, ModelRequest
+from langchain_core.callbacks import BaseCallbackHandler
+from langchain_core.callbacks.manager import AsyncCallbackManager
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.runnables import Runnable, RunnableConfig
 from langchain_core.runnables.config import ensure_config, merge_configs
@@ -531,8 +533,45 @@ class BridgeRegistry:
 _GLOBAL_BRIDGE_REGISTRY = BridgeRegistry()
 
 
+class _BridgeRuntime:
+    """Process-wide daemon event loop for all synchronous model bridges."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._ready = threading.Event()
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._thread = threading.Thread(
+            target=self._thread_main,
+            name="model-call-bridge-runtime",
+            daemon=True,
+        )
+
+    def submit(self, control: _BridgeControl[Any]) -> None:
+        """Schedule one per-call control on the persistent bridge loop."""
+        with self._lock:
+            if not self._thread.is_alive():
+                self._thread.start()
+        self._ready.wait()
+        with self._lock:
+            loop = self._loop
+        if loop is None:
+            raise RuntimeError("model call bridge runtime failed to start")
+        loop.call_soon_threadsafe(control._schedule, loop)
+
+    def _thread_main(self) -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        with self._lock:
+            self._loop = loop
+        self._ready.set()
+        loop.run_forever()
+
+
+_GLOBAL_BRIDGE_RUNTIME = _BridgeRuntime()
+
+
 class _BridgeControl[ResultT]:
-    """One daemon event-loop thread used to execute an async provider path."""
+    """One cancellable task scheduled on the process-wide bridge runtime."""
 
     def __init__(
         self,
@@ -551,13 +590,8 @@ class _BridgeControl[ResultT]:
         self._task: asyncio.Task[Any] | None = None
         self._globally_registered = False
         self._locally_registered = False
-        self._thread_started = threading.Event()
+        self._completed = threading.Event()
         self._context = contextvars.copy_context()
-        self._thread = threading.Thread(
-            target=self._thread_main,
-            name=f"model-call-bridge-{scope_id}",
-            daemon=True,
-        )
 
     def start(self) -> None:
         """Register before making the bridge observable as a live thread."""
@@ -577,10 +611,8 @@ class _BridgeControl[ResultT]:
                 self._registry.unregister(self)
             self.cancel()
         try:
-            self._thread.start()
-            self._thread_started.set()
+            _GLOBAL_BRIDGE_RUNTIME.submit(self)
         except BaseException:
-            self._thread_started.set()
             if self._locally_registered:
                 self._registry.unregister(self)
             if self._globally_registered:
@@ -603,37 +635,28 @@ class _BridgeControl[ResultT]:
 
     def join(self, timeout: float) -> None:
         """Join without ever extending the caller's grace period."""
-        if threading.current_thread() is self._thread:
-            return
-        deadline = time.monotonic() + max(0.0, timeout)
-        if not self._thread_started.wait(max(0.0, timeout)):
-            return
-        if self._thread.ident is not None:
-            self._thread.join(max(0.0, deadline - time.monotonic()))
+        self._completed.wait(max(0.0, timeout))
 
-    def _thread_main(self) -> None:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+    def _schedule(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Create one task with caller context from inside the bridge loop."""
+        coroutine = self._context.run(self._factory)
+        task = self._context.run(loop.create_task, coroutine)
+        task.add_done_callback(self._task_done)
+        with self._lock:
+            self._loop = loop
+            self._task = task
+            cancel_requested = self._cancel_requested
+        if cancel_requested:
+            task.cancel()
 
-        async def execute() -> None:
-            try:
-                self.results.put(("result", await self._factory()))
-            except BaseException as exc:
-                self.results.put(("error", exc))
-
+    def _task_done(self, task: asyncio.Task[ResultT]) -> None:
+        """Publish one terminal result and unregister completed control state."""
         try:
-            with self._lock:
-                self._loop = loop
-                self._task = self._context.run(loop.create_task, execute())
-                cancel_requested = self._cancel_requested
-                task = self._task
-            if cancel_requested:
-                task.cancel()
-            try:
-                loop.run_until_complete(task)
-            except BaseException as exc:
-                # Cancellation can land before execute() reaches its own handler.
-                self.results.put(("error", exc))
+            if task.cancelled():
+                outcome: tuple[str, Any] = ("error", asyncio.CancelledError())
+            else:
+                error = task.exception()
+                outcome = ("error", error) if error is not None else ("result", task.result())
         finally:
             with self._lock:
                 self._task = None
@@ -641,21 +664,8 @@ class _BridgeControl[ResultT]:
                 self._registry.unregister(self)
             if self._globally_registered:
                 _GLOBAL_BRIDGE_REGISTRY.unregister(self)
-            pending = {
-                pending for pending in asyncio.all_tasks(loop) if not pending.done()
-            }
-            if pending:
-
-                def stop_after_late_cleanup(_task: asyncio.Task[Any]) -> None:
-                    if all(task.done() for task in pending):
-                        loop.stop()
-
-                for pending_task in pending:
-                    pending_task.add_done_callback(stop_after_late_cleanup)
-                loop.run_forever()
-            with self._lock:
-                self._loop = None
-            loop.close()
+            self.results.put(outcome)
+            self._completed.set()
 
 
 def cancel_model_call_scope(scope_id: str) -> None:
@@ -810,8 +820,7 @@ def _bridge_result[ResultT](
         control.cancel()
         control.join(MODEL_CANCEL_GRACE_SECONDS)
         raise _timeout_error(policy, metadata) from None
-    if not control._thread.is_alive():
-        control.join(0)
+    control.join(0)
     if kind == "error":
         raise value
     return value
@@ -885,6 +894,51 @@ class _SyncStreamIterator[OutputT](Iterator[OutputT]):
 
     def __del__(self) -> None:
         self.close()
+
+
+class _AttemptVisibility:
+    """Thread-safe record of output exposed by one logical model call."""
+
+    def __init__(self) -> None:
+        self._visible = threading.Event()
+
+    def mark_visible(self) -> None:
+        self._visible.set()
+
+    def can_retry(self) -> bool:
+        return not self._visible.is_set()
+
+
+class _VisibilityCallbackHandler(BaseCallbackHandler):
+    """Mark provider tokens before retry classification can observe failure."""
+
+    run_inline = True
+
+    def __init__(self, visibility: _AttemptVisibility) -> None:
+        self._visibility = visibility
+
+    def on_llm_new_token(self, _token: str, **_kwargs: Any) -> None:
+        self._visibility.mark_visible()
+
+
+def _config_with_visibility_callback(
+    config: RunnableConfig | None,
+    visibility: _AttemptVisibility,
+    local_callbacks: Any = None,
+) -> RunnableConfig:
+    """Copy call config and append tracking only when callbacks can escape."""
+    resolved = ensure_config(config)
+    configured_callbacks = resolved.get("callbacks")
+    if configured_callbacks is None and not local_callbacks:
+        return resolved
+    visibility_handler = _VisibilityCallbackHandler(visibility)
+    if configured_callbacks is None:
+        resolved["callbacks"] = [visibility_handler]
+    else:
+        callback_manager = AsyncCallbackManager.configure(configured_callbacks)
+        callback_manager.add_handler(visibility_handler, inherit=True)
+        resolved["callbacks"] = callback_manager
+    return resolved
 
 
 class _GuardedBoundRunnable[InputT, OutputT](Runnable[InputT, OutputT]):
@@ -1184,15 +1238,25 @@ class ModelCallGuardMixin:
         scope_id: str,
         **kwargs: Any,
     ) -> Any:
-        async def provider_call() -> Any:
-            return await super(ModelCallGuardMixin, self).ainvoke(
-                input, config=config, stop=stop, **kwargs
+        controller = self._retry_controller
+        visibility = _AttemptVisibility() if controller is not None else None
+        provider_config = config
+        if visibility is not None:
+            provider_config = _config_with_visibility_callback(
+                config,
+                visibility,
+                local_callbacks=getattr(self, "callbacks", None),
             )
 
-        controller = self._retry_controller
+        async def provider_call() -> Any:
+            return await super(ModelCallGuardMixin, self).ainvoke(
+                input, config=provider_config, stop=stop, **kwargs
+            )
+
         if controller is None:
             operation = provider_call
         else:
+            assert visibility is not None  # noqa: S101
 
             async def operation() -> Any:
                 return await controller.ainvoke(
@@ -1200,6 +1264,7 @@ class ModelCallGuardMixin:
                     deadline=deadline,
                     input=input,
                     max_tokens=kwargs.get("max_tokens", 1000) or 1000,
+                    can_retry=visibility.can_retry,
                 )
         return await _run_with_absolute_deadline(
             operation,
@@ -1266,7 +1331,33 @@ class ModelCallGuardMixin:
         scope_id: str,
         **kwargs: Any,
     ) -> AsyncIterator[Any]:
-        iterator = super().astream(input, config=config, stop=stop, **kwargs)
+        controller = self._retry_controller
+        if controller is None:
+            iterator = super().astream(input, config=config, stop=stop, **kwargs)
+        else:
+            visibility = _AttemptVisibility()
+            provider_config = _config_with_visibility_callback(
+                config,
+                visibility,
+                local_callbacks=getattr(self, "callbacks", None),
+            )
+
+            def provider_stream() -> AsyncIterator[Any]:
+                return super(ModelCallGuardMixin, self).astream(
+                    input,
+                    config=provider_config,
+                    stop=stop,
+                    **kwargs,
+                )
+
+            iterator = controller.astream(
+                provider_stream,
+                deadline=deadline,
+                input=input,
+                max_tokens=kwargs.get("max_tokens", 1000) or 1000,
+                can_retry=visibility.can_retry,
+                mark_visible=visibility.mark_visible,
+            )
         try:
             while True:
                 try:
@@ -1400,12 +1491,18 @@ class ModelCallGuardMixin:
     def __reduce_ex__(self: BaseChatModel, protocol: int) -> tuple[Any, tuple[Any, ...]]:
         """Pickle through provider-native state, never a generated class global."""
         del protocol
+        retry_settings = (
+            self._retry_controller.settings
+            if self._retry_controller is not None
+            else None
+        )
         return (
             rebuild_guarded_model,
             (
                 _provider_native_pickle_view(self),
                 self._runtime_metadata,
                 self._model_call_policy,
+                retry_settings,
             ),
         )
 
@@ -1425,6 +1522,7 @@ class ModelCallGuardMixin:
             copied = super(ModelCallGuardMixin, copied).model_copy(deep=True)
         metadata = _extract_runtime_metadata(copied) or self._runtime_metadata
         policy = self._model_call_policy
+        retry_controller = self._retry_controller
         if deep:
             metadata = copy.deepcopy(metadata)
             policy = copy.deepcopy(policy)
@@ -1433,6 +1531,8 @@ class ModelCallGuardMixin:
             policy=policy,
             metadata=metadata,
         )
+        if retry_controller is not None:
+            copied._retry_controller = retry_controller.clone().bind(copied)
         return copied
 
 
@@ -1565,9 +1665,16 @@ def rebuild_guarded_model(
     provider: BaseChatModel,
     metadata: ModelRuntimeMetadata,
     policy: ModelCallPolicy,
+    retry_settings: Any | None = None,
 ) -> BaseChatModel:
     """Reconstruct a guarded model from one natively serialized provider."""
     guarded = guard_model(provider, metadata=metadata, policy=policy)
+    if retry_settings is not None:
+        from research_agent.retry_utils import ModelRetryController
+
+        guarded._retry_controller = ModelRetryController.from_settings(
+            retry_settings
+        ).bind(guarded)
     guard_private = {
         name: getattr(guarded, name) for name in _GUARD_PRIVATE_ATTR_NAMES
     }
@@ -1788,6 +1895,8 @@ def _validated_provider_fields(
         for name in type(model).model_fields
         if hasattr(model, name)
     }
+    if metadata.provider in {"openai", "azure_openai", "anthropic", "google"}:
+        fields["max_retries"] = 0
     if metadata.provider == "ollama":
         for name in ("client_kwargs", "async_client_kwargs", "sync_client_kwargs"):
             native = dict(fields.get(name) or {})

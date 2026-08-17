@@ -10,8 +10,9 @@ import asyncio
 import os
 import threading
 import time
+from dataclasses import dataclass
 from functools import wraps
-from typing import Any, Awaitable, Callable, List, Tuple, TypeVar
+from typing import Any, AsyncIterator, Awaitable, Callable, List, Tuple, TypeVar
 
 import tiktoken
 from dotenv import load_dotenv
@@ -404,6 +405,19 @@ class RetryConfig:
         )
 
 
+@dataclass(frozen=True)
+class ModelRetrySettings:
+    """Serializable controller policy without mutable runtime accounting."""
+
+    max_retries: int
+    initial_backoff: float
+    max_backoff: float
+    backoff_multiplier: float
+    jitter: bool
+    tpm: int
+    rpm: int
+
+
 class ModelRetryController:
     """Compose proactive shaping and reactive retries under one deadline."""
 
@@ -424,6 +438,8 @@ class ModelRetryController:
         self._async_sleep = async_sleep
         self._metadata: Any = None
         self._policy: Any = None
+        self._tpm = tpm
+        self._rpm = rpm
         self._capacity = (
             _RateCapacity(
                 tpm=tpm,
@@ -432,6 +448,53 @@ class ModelRetryController:
             )
             if tpm > 0 and rpm > 0
             else None
+        )
+
+    @property
+    def settings(self) -> ModelRetrySettings:
+        """Return immutable policy needed to reconstruct independent state."""
+        return ModelRetrySettings(
+            max_retries=self.config.max_retries,
+            initial_backoff=self.config.initial_backoff,
+            max_backoff=self.config.max_backoff,
+            backoff_multiplier=self.config.backoff_multiplier,
+            jitter=self.config.jitter,
+            tpm=self._tpm,
+            rpm=self._rpm,
+        )
+
+    @classmethod
+    def from_settings(
+        cls,
+        settings: ModelRetrySettings,
+        *,
+        monotonic: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+        async_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    ) -> ModelRetryController:
+        """Build a controller with fresh counters and locks from safe policy."""
+        return cls(
+            config=RetryConfig(
+                max_retries=settings.max_retries,
+                initial_backoff=settings.initial_backoff,
+                max_backoff=settings.max_backoff,
+                backoff_multiplier=settings.backoff_multiplier,
+                jitter=settings.jitter,
+            ),
+            tpm=settings.tpm,
+            rpm=settings.rpm,
+            monotonic=monotonic,
+            sleep=sleep,
+            async_sleep=async_sleep,
+        )
+
+    def clone(self) -> ModelRetryController:
+        """Copy policy and dependencies without sharing mutable limiter state."""
+        return self.from_settings(
+            self.settings,
+            monotonic=self._monotonic,
+            sleep=self._sleep,
+            async_sleep=self._async_sleep,
         )
 
     def bind(self, model: Any) -> ModelRetryController:
@@ -501,6 +564,7 @@ class ModelRetryController:
         deadline: float,
         input: Any = "",
         max_tokens: int = 1000,
+        can_retry: Callable[[], bool] | None = None,
     ) -> T:
         """Run sync attempts and backoff without extending absolute deadline."""
         for attempt in range(self.config.max_retries + 1):
@@ -508,7 +572,11 @@ class ModelRetryController:
             try:
                 return operation()
             except Exception as error:
-                if not is_rate_limit_error(error) or attempt >= self.config.max_retries:
+                if (
+                    not is_rate_limit_error(error)
+                    or attempt >= self.config.max_retries
+                    or (can_retry is not None and not can_retry())
+                ):
                     raise
                 backoff = calculate_backoff(
                     attempt,
@@ -532,6 +600,7 @@ class ModelRetryController:
         deadline: float,
         input: Any = "",
         max_tokens: int = 1000,
+        can_retry: Callable[[], bool] | None = None,
     ) -> T:
         """Run async attempts and cancellable backoff under absolute deadline."""
         for attempt in range(self.config.max_retries + 1):
@@ -539,7 +608,11 @@ class ModelRetryController:
             try:
                 return await operation()
             except Exception as error:
-                if not is_rate_limit_error(error) or attempt >= self.config.max_retries:
+                if (
+                    not is_rate_limit_error(error)
+                    or attempt >= self.config.max_retries
+                    or (can_retry is not None and not can_retry())
+                ):
                     raise
                 backoff = calculate_backoff(
                     attempt,
@@ -554,4 +627,49 @@ class ModelRetryController:
                     self.config.max_retries + 1,
                 )
                 await self._async_wait(backoff, deadline)
+        raise RuntimeError("unreachable retry state")
+
+    async def astream(
+        self,
+        operation: Callable[[], AsyncIterator[T]],
+        *,
+        deadline: float,
+        input: Any = "",
+        max_tokens: int = 1000,
+        can_retry: Callable[[], bool] | None = None,
+        mark_visible: Callable[[], None] | None = None,
+    ) -> AsyncIterator[T]:
+        """Retry streams only before any callback or yielded chunk is visible."""
+        for attempt in range(self.config.max_retries + 1):
+            await self._async_shape(input, max_tokens, deadline)
+            iterator = operation()
+            try:
+                async for item in iterator:
+                    if mark_visible is not None:
+                        mark_visible()
+                    yield item
+                return
+            except Exception as error:
+                if (
+                    not is_rate_limit_error(error)
+                    or attempt >= self.config.max_retries
+                    or (can_retry is not None and not can_retry())
+                ):
+                    raise
+                backoff = calculate_backoff(
+                    attempt,
+                    self.config.initial_backoff,
+                    self.config.max_backoff,
+                    self.config.backoff_multiplier,
+                    self.config.jitter,
+                )
+                logger.warning(
+                    "Model provider stream rate limited attempt %s/%s; "
+                    "bounded retry scheduled",
+                    attempt + 1,
+                    self.config.max_retries + 1,
+                )
+                await self._async_wait(backoff, deadline)
+            finally:
+                await iterator.aclose()
         raise RuntimeError("unreachable retry state")

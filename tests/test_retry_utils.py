@@ -9,8 +9,11 @@ import time
 from unittest.mock import patch
 
 import pytest
+from langchain_core.callbacks import BaseCallbackHandler
+from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, AIMessageChunk
+from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 
 from research_agent import retry_utils
 from research_agent.model_call_guard import (
@@ -56,6 +59,60 @@ class _RateLimitedFakeModel(FakeMessagesListChatModel):
         return await super()._agenerate(*args, **kwargs)
 
 
+class _TokenRecorder(BaseCallbackHandler):
+    def __init__(self) -> None:
+        self.tokens: list[str] = []
+
+    def on_llm_new_token(self, token: str, **_kwargs) -> None:
+        self.tokens.append(token)
+
+
+class _CallbackThenRateLimitedModel(BaseChatModel):
+    attempts: int = 0
+
+    @property
+    def _llm_type(self) -> str:
+        return "callback-then-rate-limit"
+
+    def _generate(self, *args, **kwargs):
+        del args, kwargs
+        raise AssertionError("guarded sync path must use provider async path")
+
+    async def _agenerate(self, *args, run_manager=None, **kwargs):
+        del args, kwargs
+        self.attempts += 1
+        if self.attempts == 1:
+            chunk = ChatGenerationChunk(message=AIMessageChunk(content="partial"))
+            await run_manager.on_llm_new_token("partial", chunk=chunk)
+            raise RuntimeError("429 rate limit after visible token")
+        return ChatResult(
+            generations=[ChatGeneration(message=AIMessage(content="phantom retry"))]
+        )
+
+
+class _StreamingRateLimitedModel(BaseChatModel):
+    attempts: int = 0
+    fail_after_first_chunk: bool
+
+    @property
+    def _llm_type(self) -> str:
+        return "streaming-rate-limit"
+
+    def _generate(self, *args, **kwargs):
+        del args, kwargs
+        raise AssertionError("guarded sync path must use provider async path")
+
+    async def _astream(self, *args, **kwargs):
+        del args, kwargs
+        self.attempts += 1
+        if self.attempts == 1 and not self.fail_after_first_chunk:
+            raise RuntimeError("429 rate limit before first chunk")
+        if self.attempts == 1:
+            yield ChatGenerationChunk(message=AIMessageChunk(content="partial"))
+            raise RuntimeError("429 rate limit after visible chunk")
+        yield ChatGenerationChunk(message=AIMessageChunk(content="recovered"))
+
+
 def _guarded_ollama_for_retry():
     from langchain_ollama import ChatOllama
 
@@ -85,6 +142,36 @@ def _retry_controller(clock: _FakeClock):
         monotonic=clock.monotonic,
         sleep=clock.sleep,
         async_sleep=clock.async_sleep,
+    )
+
+
+def _immediate_retry_controller(clock: _FakeClock):
+    controller_class = getattr(retry_utils, "ModelRetryController")
+    return controller_class(
+        config=RetryConfig(
+            max_retries=1,
+            initial_backoff=0.0,
+            max_backoff=0.0,
+            backoff_multiplier=1.0,
+            jitter=False,
+        ),
+        tpm=0,
+        rpm=0,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+        async_sleep=clock.async_sleep,
+    )
+
+
+def _guarded_retry_model(raw: BaseChatModel, clock: _FakeClock):
+    model = guard_model(
+        raw,
+        metadata=ModelRuntimeMetadata(provider="openai", model_name="retry-visible"),
+        policy=ModelCallPolicy(timeout_seconds=1.0, force_ollama_unload=False),
+    )
+    return wrap_model_with_rate_limiting(
+        model,
+        controller=_immediate_retry_controller(clock),
     )
 
 
@@ -381,6 +468,106 @@ def test_guard_executes_retry_controller_inside_one_public_deadline(method: str)
     assert result.content == "retried"
     assert model.attempts == 2
     assert clock.sleeps == [0.1]
+
+
+@pytest.mark.parametrize("method", ["invoke", "ainvoke"])
+def test_visible_callback_token_prevents_non_stream_retry(method: str) -> None:
+    clock = _FakeClock()
+    callback = _TokenRecorder()
+    model = _guarded_retry_model(_CallbackThenRateLimitedModel(), clock)
+
+    with pytest.raises(RuntimeError, match="after visible token"):
+        if method == "invoke":
+            model.invoke("hello", config={"callbacks": [callback]})
+        else:
+            asyncio.run(model.ainvoke("hello", config={"callbacks": [callback]}))
+
+    assert model.attempts == 1
+    assert callback.tokens == ["partial"]
+    assert clock.sleeps == []
+
+
+def test_model_level_visible_callback_prevents_non_stream_retry() -> None:
+    clock = _FakeClock()
+    callback = _TokenRecorder()
+    model = _guarded_retry_model(
+        _CallbackThenRateLimitedModel(callbacks=[callback]),
+        clock,
+    )
+
+    with pytest.raises(RuntimeError, match="after visible token"):
+        model.invoke("hello")
+
+    assert model.attempts == 1
+    assert callback.tokens == ["partial"]
+    assert clock.sleeps == []
+
+
+def test_sync_stream_retries_rate_limit_before_first_visible_chunk() -> None:
+    clock = _FakeClock()
+    model = _guarded_retry_model(
+        _StreamingRateLimitedModel(fail_after_first_chunk=False),
+        clock,
+    )
+
+    chunks = list(model.stream("hello"))
+
+    assert chunks[0].content == "recovered"
+    assert model.attempts == 2
+    assert clock.sleeps == [0.0]
+
+
+@pytest.mark.anyio
+async def test_async_stream_retries_rate_limit_before_first_visible_chunk() -> None:
+    clock = _FakeClock()
+    model = _guarded_retry_model(
+        _StreamingRateLimitedModel(fail_after_first_chunk=False),
+        clock,
+    )
+
+    chunks = [chunk async for chunk in model.astream("hello")]
+
+    assert chunks[0].content == "recovered"
+    assert model.attempts == 2
+    assert clock.sleeps == [0.0]
+
+
+def test_sync_stream_does_not_retry_after_first_visible_chunk() -> None:
+    clock = _FakeClock()
+    callback = _TokenRecorder()
+    model = _guarded_retry_model(
+        _StreamingRateLimitedModel(fail_after_first_chunk=True),
+        clock,
+    )
+
+    stream = model.stream("hello", config={"callbacks": [callback]})
+    assert next(stream).content == "partial"
+    with pytest.raises(RuntimeError, match="after visible chunk"):
+        next(stream)
+
+    assert model.attempts == 1
+    assert callback.tokens == ["partial"]
+    assert clock.sleeps == []
+
+
+@pytest.mark.anyio
+async def test_async_stream_does_not_retry_after_first_visible_chunk() -> None:
+    clock = _FakeClock()
+    callback = _TokenRecorder()
+    model = _guarded_retry_model(
+        _StreamingRateLimitedModel(fail_after_first_chunk=True),
+        clock,
+    )
+
+    stream = model.astream("hello", config={"callbacks": [callback]})
+    first = await anext(stream)
+    assert first.content == "partial"
+    with pytest.raises(RuntimeError, match="after visible chunk"):
+        await anext(stream)
+
+    assert model.attempts == 1
+    assert callback.tokens == ["partial"]
+    assert clock.sleeps == []
 
 
 def run_verification():

@@ -1,13 +1,17 @@
 import asyncio
 import contextvars
+import json
 import logging
 import pickle
 import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import FrozenInstanceError
 from functools import wraps
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from math import inf, nan
 from typing import Any
 
@@ -38,10 +42,116 @@ from research_agent.model_call_guard import (
     cancel_model_call_scope,
     guard_model,
 )
+from research_agent.retry_utils import (
+    ModelRetryController,
+    RetryConfig,
+    wrap_model_with_rate_limiting,
+)
 
 _TEST_CONTEXT = contextvars.ContextVar(
     "test_model_call_bridge_context", default="missing"
 )
+
+
+@contextmanager
+def _ollama_compatible_server():
+    requests: list[dict[str, Any]] = []
+    requests_lock = threading.Lock()
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_POST(self) -> None:  # noqa: N802
+            length = int(self.headers.get("Content-Length", "0"))
+            request = json.loads(self.rfile.read(length))
+            with requests_lock:
+                requests.append(request)
+            response = json.dumps(
+                {
+                    "model": request["model"],
+                    "created_at": "2026-08-17T00:00:00Z",
+                    "message": {"role": "assistant", "content": "local-reply"},
+                    "done": True,
+                    "done_reason": "stop",
+                    "total_duration": 1,
+                    "load_duration": 1,
+                    "prompt_eval_count": 1,
+                    "prompt_eval_duration": 1,
+                    "eval_count": 1,
+                    "eval_duration": 1,
+                }
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson")
+            self.send_header("Content-Length", str(len(response)))
+            self.end_headers()
+            self.wfile.write(response)
+            self.wfile.flush()
+
+        def log_message(self, _format: str, *args: Any) -> None:
+            del args
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    try:
+        host, port = server.server_address
+        yield f"http://{host}:{port}", requests
+    finally:
+        server.shutdown()
+        server.server_close()
+        server_thread.join(1)
+
+
+def _guarded_local_ollama(base_url: str) -> BaseChatModel:
+    from langchain_ollama import ChatOllama
+
+    return guard_model(
+        ChatOllama(
+            model="local-bridge-test",
+            base_url=base_url,
+            client_kwargs={"timeout": 1.0, "trust_env": False},
+            async_client_kwargs={"timeout": 1.0, "trust_env": False},
+        ),
+        metadata=ModelRuntimeMetadata(
+            provider="ollama",
+            model_name="local-bridge-test",
+            base_url=base_url,
+        ),
+        policy=ModelCallPolicy(timeout_seconds=1.0, force_ollama_unload=False),
+    )
+
+
+def _close_guarded_local_ollama(model: BaseChatModel) -> None:
+    import research_agent.model_call_guard as guard
+
+    deadline = time.monotonic() + 1.0
+    control = guard._start_bridge(
+        model._async_client._client.aclose,
+        scope_id="local-client-close",
+        registry=model._bridge_registry,
+    )
+    guard._bridge_result(
+        control,
+        deadline,
+        policy=model._model_call_policy,
+        metadata=model._runtime_metadata,
+    )
+    model._client._client.close()
+
+
+def _configured_retry_controller() -> ModelRetryController:
+    return ModelRetryController(
+        config=RetryConfig(
+            max_retries=4,
+            initial_backoff=0.25,
+            max_backoff=3.0,
+            backoff_multiplier=1.5,
+            jitter=False,
+        ),
+        tpm=2_000,
+        rpm=80,
+    )
 
 
 class _AsyncOnlyChatModel(BaseChatModel):
@@ -1422,6 +1532,33 @@ def test_guarded_model_deep_copy_excludes_registry_lock_and_reinitializes_state(
     assert copied._retry_controller is None
 
 
+@pytest.mark.parametrize("deep", [False, True])
+def test_guarded_model_copy_preserves_independent_retry_controller_policy(deep):
+    guarded = guard_model(
+        _PickleableChatModel(payload=["copy-controller"]),
+        metadata=_fake_metadata(),
+        policy=_policy(0.2),
+    )
+    wrap_model_with_rate_limiting(guarded, controller=_configured_retry_controller())
+    guarded._retry_controller._capacity.token_window.append((1.0, 50))
+    guarded._retry_controller._capacity.last_request_time = 1.0
+
+    copied = guarded.model_copy(deep=deep)
+
+    original = guarded._retry_controller
+    restored = copied._retry_controller
+    assert restored is not None
+    assert restored is not original
+    assert restored.config is not original.config
+    assert restored.config.__dict__ == original.config.__dict__
+    assert restored._capacity is not original._capacity
+    assert restored._capacity._lock is not original._capacity._lock
+    assert restored._capacity.safe_tpm == original._capacity.safe_tpm
+    assert restored._capacity.min_interval == original._capacity.min_interval
+    assert restored._capacity.token_window == []
+    assert restored._capacity.last_request_time == 0.0
+
+
 def test_guard_pickle_reconstructs_through_stable_factory():
     guarded = guard_model(
         _PickleableChatModel(payload=["pickle"]),
@@ -1442,6 +1579,32 @@ def test_guard_pickle_reconstructs_through_stable_factory():
     assert restored._runtime_metadata is not guarded._runtime_metadata
     assert restored._bridge_registry is not guarded._bridge_registry
     assert restored._retry_controller is None
+    assert restored.invoke("hello").content == "pickleable"
+
+
+def test_guard_pickle_preserves_independent_retry_controller_policy():
+    guarded = guard_model(
+        _PickleableChatModel(payload=["pickle-controller"]),
+        metadata=_fake_metadata(),
+        policy=_policy(0.2),
+    )
+    wrap_model_with_rate_limiting(guarded, controller=_configured_retry_controller())
+    guarded._retry_controller._capacity.token_window.append((1.0, 50))
+    guarded._retry_controller._capacity.last_request_time = 1.0
+
+    restored = pickle.loads(pickle.dumps(guarded))
+
+    original = guarded._retry_controller
+    controller = restored._retry_controller
+    assert controller is not None
+    assert controller is not original
+    assert controller.config.__dict__ == original.config.__dict__
+    assert controller._capacity is not original._capacity
+    assert controller._capacity._lock is not original._capacity._lock
+    assert controller._capacity.safe_tpm == original._capacity.safe_tpm
+    assert controller._capacity.min_interval == original._capacity.min_interval
+    assert controller._capacity.token_window == []
+    assert controller._capacity.last_request_time == 0.0
     assert restored.invoke("hello").content == "pickleable"
 
 
@@ -1632,7 +1795,7 @@ async def test_astream_uses_one_eager_deadline_across_slow_trickle():
 @_async_test
 async def test_bound_astream_operation_context_keeps_one_deadline_across_chunks():
     guarded = _guarded_fake(
-        timeout=0.045,
+        timeout=0.03,
         chunk_delay=0.02,
         chunks=[
             AIMessageChunk(content="a"),
@@ -1712,6 +1875,33 @@ def test_sync_invoke_uses_async_provider_path_and_preserves_message_metadata():
     }
     assert guarded._calls[0]["stop"] == ["stop"]
     assert guarded._calls[0]["kwargs"]["configurable_key"] == "kept"
+
+
+def test_sync_invoke_reuses_real_provider_keep_alive_client_across_calls():
+    with _ollama_compatible_server() as (base_url, requests):
+        guarded = _guarded_local_ollama(base_url)
+        try:
+            replies = [guarded.invoke(f"request-{index}") for index in range(3)]
+        finally:
+            _close_guarded_local_ollama(guarded)
+
+    assert [reply.content for reply in replies] == ["local-reply"] * 3
+    assert len(requests) == 3
+
+
+def test_concurrent_sync_invokes_share_real_provider_bridge_loop_safely():
+    with _ollama_compatible_server() as (base_url, requests):
+        guarded = _guarded_local_ollama(base_url)
+        try:
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                replies = list(
+                    pool.map(guarded.invoke, [f"request-{i}" for i in range(4)])
+                )
+        finally:
+            _close_guarded_local_ollama(guarded)
+
+    assert [reply.content for reply in replies] == ["local-reply"] * 4
+    assert len(requests) == 4
 
 
 def test_sync_bridge_copies_calling_contextvars():
@@ -1822,19 +2012,22 @@ def test_sync_bridge_cleans_or_drains_late_cancel_on_daemon_loop(monkeypatch):
         )
 
     control = controls[0]
-    assert control._thread.daemon
-    assert control._thread.name.startswith("model-call-bridge-late-cleanup")
+    runtime = guard._GLOBAL_BRIDGE_RUNTIME
+    assert runtime._thread.daemon
+    assert runtime._thread.name == "model-call-bridge-runtime"
+    assert runtime._thread.is_alive()
     unregister_deadline = time.monotonic() + 0.1
     while guarded._bridge_registry.active_count("late-cleanup"):
         assert time.monotonic() < unregister_deadline
         time.sleep(0.002)
     assert guarded._bridge_registry.active_count("late-cleanup") == 0
-    if control._thread.is_alive():
-        loop = control._loop
-        assert loop is not None
-        loop.call_soon_threadsafe(guarded._release_invoke.set)
-    control.join(0.2)
-    assert not control._thread.is_alive()
+    assert control._completed.is_set()
+    loop = control._loop
+    assert loop is runtime._loop
+    assert loop is not None
+    loop.call_soon_threadsafe(guarded._release_invoke.set)
+    asyncio.run_coroutine_threadsafe(asyncio.sleep(0.01), loop).result(0.2)
+    assert runtime._thread.is_alive()
 
 
 def test_bind_and_bind_tools_return_eager_guarded_bound_runnables():
@@ -1871,13 +2064,15 @@ async def test_bound_stream_and_astream_preserve_chunk_parity():
 
 
 def test_bound_sync_stream_deadline_includes_bridge_start_delay(monkeypatch):
-    original_start = threading.Thread.start
+    import research_agent.model_call_guard as guard
 
-    def delayed_start(thread: threading.Thread) -> None:
+    original_submit = guard._GLOBAL_BRIDGE_RUNTIME.submit
+
+    def delayed_submit(control) -> None:
         time.sleep(0.05)
-        original_start(thread)
+        original_submit(control)
 
-    monkeypatch.setattr(threading.Thread, "start", delayed_start)
+    monkeypatch.setattr(guard._GLOBAL_BRIDGE_RUNTIME, "submit", delayed_submit)
     guarded = _guarded_fake(
         timeout=0.03,
         chunk_delay=0.1,
@@ -2425,15 +2620,20 @@ def test_known_provider_guard_preserves_identity_fields_profile_and_copy_state(
     }
     if "repr" in guarded_serialized:
         assert guarded_serialized["repr"].startswith(f"{provider_class.__name__}(")
-    timeout_keys = {"timeout", "request_timeout", "default_request_timeout"}
+    runtime_policy_keys = {
+        "timeout",
+        "request_timeout",
+        "default_request_timeout",
+        "max_retries",
+    }
     assert {
         key: value
         for key, value in guarded._identifying_params.items()
-        if key not in timeout_keys
+        if key not in runtime_policy_keys
     } == {
         key: value
         for key, value in raw._identifying_params.items()
-        if key not in timeout_keys
+        if key not in runtime_policy_keys
     }
     assert guarded._runtime_metadata.provider == provider
     assert "environment-must-not-win" not in guarded._runtime_metadata.model_name
@@ -2512,6 +2712,8 @@ def test_known_provider_rebuild_applies_native_timeout_without_env_influence(
         assert guarded.default_request_timeout == 0.2
     else:
         assert guarded.timeout == 0.2
+    if provider != "ollama":
+        assert guarded.max_retries == 0
 
 
 def _openai_provider_cases():

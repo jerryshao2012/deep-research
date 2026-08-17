@@ -311,6 +311,13 @@ def _build_configured_model():
         )
         return wrap_model_with_rate_limiting(guarded)
 
+    def optional_url(*names: str) -> str | None:
+        for name in names:
+            value = os.getenv(name)
+            if value is not None and value.strip():
+                return value.strip()
+        return None
+
     if (
             os.getenv("AWS_BEDROCK_ENDPOINT")
             and os.getenv("AWS_BEARER_TOKEN_BEDROCK")
@@ -327,6 +334,7 @@ def _build_configured_model():
                 "base_url": endpoint,
                 "api_key": SecretStr(os.environ["AWS_BEARER_TOKEN_BEDROCK"]),
                 "model": model_name,
+                "max_retries": 0,
                 "request_timeout": policy.timeout_seconds,
                 "http_client": http_client,
                 "http_async_client": http_async_client,
@@ -358,6 +366,7 @@ def _build_configured_model():
                 "azure_endpoint": endpoint,
                 "azure_deployment": deployment,
                 "api_version": os.environ["AZURE_OPENAI_API_VERSION"],
+                "max_retries": 0,
                 "request_timeout": policy.timeout_seconds,
                 "http_client": http_client,
                 "http_async_client": http_async_client,
@@ -388,6 +397,7 @@ def _build_configured_model():
                 "base_url": endpoint,
                 "api_key": SecretStr(os.environ["AZURE_OPENAI_API_KEY"]),
                 "model": deployment,
+                "max_retries": 0,
                 "request_timeout": policy.timeout_seconds,
                 "http_client": http_client,
                 "http_async_client": http_async_client,
@@ -415,6 +425,7 @@ def _build_configured_model():
                 "api_key": SecretStr(os.environ["GOOGLE_API_KEY"]),
                 "temperature": 0.0,
                 "streaming": True,
+                "max_retries": 0,
                 "request_timeout": policy.timeout_seconds,
                 "client_args": native_client_args,
             },
@@ -425,15 +436,16 @@ def _build_configured_model():
         from langchain_anthropic import ChatAnthropic
 
         model_name = os.environ["MODEL_NAME"]
-        endpoint = os.getenv("ANTHROPIC_API_URL") or os.getenv("ANTHROPIC_BASE_URL")
+        endpoint = optional_url("ANTHROPIC_API_URL", "ANTHROPIC_BASE_URL")
         return finalize(
             ChatAnthropic,
             {
                 "model_name": model_name,
                 "api_key": SecretStr(os.environ["ANTHROPIC_API_KEY"]),
                 "temperature": 0.0,
+                "max_retries": 0,
                 "timeout": policy.timeout_seconds,
-                **({"base_url": endpoint} if endpoint else {}),
+                "base_url": endpoint or "https://api.anthropic.com",
             },
             ModelRuntimeMetadata(
                 provider="anthropic",
@@ -472,18 +484,19 @@ def _build_configured_model():
         from langchain_openai import ChatOpenAI
 
         model_name = os.environ["MODEL_NAME"]
-        endpoint = os.getenv("OPENAI_BASE_URL")
+        endpoint = optional_url("OPENAI_BASE_URL")
         http_client, http_async_client = openai_clients()
         return finalize(
             ChatOpenAI,
             {
                 "api_key": SecretStr(os.environ["OPENAI_API_KEY"]),
                 "model": model_name,
+                "max_retries": 0,
                 "request_timeout": policy.timeout_seconds,
                 "http_client": http_client,
                 "http_async_client": http_async_client,
                 "stream_usage": True,
-                **({"base_url": endpoint} if endpoint else {}),
+                "base_url": endpoint or "https://api.openai.com/v1",
             },
             ModelRuntimeMetadata(
                 provider="openai",
