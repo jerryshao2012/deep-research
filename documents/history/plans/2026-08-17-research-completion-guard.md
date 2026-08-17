@@ -27,15 +27,16 @@
 - Modify: `tests/test_agent_contracts.py`
 - Modify: `tests/test_tools.py`
 
-- [ ] **Step 1: Record the existing scoped diff before new edits**
+- [ ] **Step 1: Record the existing scoped diff and user-owned index before new edits**
 
 Run:
 
 ```bash
 git diff -- research_agent/agent.py tests/test_agent_contracts.py tests/test_tools.py
+git diff --cached --name-status
 ```
 
-Expected: only previously approved Ollama request-scoped configuration, document-context gating, and explicit `TodoListMiddleware(system_prompt="")` changes. Do not include documentation moves, `uv.lock`, or duplicate `* 2.py` files.
+Expected: scoped diff contains only previously approved Ollama request-scoped configuration, document-context gating, and explicit `TodoListMiddleware(system_prompt="")` changes. Record the existing staged documentation moves; do not unstage, modify, or include them, `uv.lock`, or duplicate `* 2.py` files.
 
 - [ ] **Step 2: Verify the prerequisite regressions**
 
@@ -47,14 +48,28 @@ uv run pytest tests/test_agent_contracts.py tests/test_tools.py -q
 
 Expected: PASS, including compiled `write_todos` registration and strict Ollama system-message ordering.
 
-- [ ] **Step 3: Commit only the prerequisite runtime files**
+- [ ] **Step 3: Commit only the prerequisite runtime files with path-scoped commit semantics**
 
 ```bash
 git add research_agent/agent.py tests/test_agent_contracts.py tests/test_tools.py
-git commit -m "fix: preserve Ollama research tool contracts"
+git commit --only research_agent/agent.py tests/test_agent_contracts.py tests/test_tools.py -m "fix: preserve Ollama research tool contracts"
+git show --name-only --format= HEAD
+git diff --cached --name-status
 ```
 
-Expected: unrelated staged documentation moves, `uv.lock`, and duplicate files remain outside the commit.
+Expected: commit contains exactly the three named runtime/test paths. Previously staged documentation moves remain staged and unchanged; `uv.lock` and duplicate files remain outside the commit.
+
+- [ ] **Step 4: Create a clean implementation worktree and immutable range base**
+
+Run from the original worktree:
+
+```bash
+git branch codex/research-completion-guard-base
+git worktree add .worktrees/research-completion-guard-impl -b codex/research-completion-guard-impl codex/research-completion-guard-base
+git -C .worktrees/research-completion-guard-impl status --short
+```
+
+Expected: implementation worktree is clean. All remaining tasks run from `.worktrees/research-completion-guard-impl`; original worktree and its user-owned index remain untouched.
 
 ### Task 2: Add Pure Completion Policy
 
@@ -124,7 +139,7 @@ Expected: PASS for pure policy cases.
 
 ```bash
 git add research_agent/completion_guard.py tests/test_completion_guard.py
-git commit -m "feat: define bounded research completion policy"
+git commit --only research_agent/completion_guard.py tests/test_completion_guard.py -m "feat: define bounded research completion policy"
 ```
 
 ### Task 3: Add Request Generation and Tool-Result Ownership
@@ -156,7 +171,21 @@ Expected: FAIL because lifecycle hooks/state are absent.
 
 Define `CompletionState(FilesystemState)` fields for run ID, generation, attempts, plan/report ownership, report baseline, verification ownership, and exhaustion metadata. Implement `CompletionGuardMiddleware.before_agent` using top-level `get_config().get("run_id")` with UUID-to-string normalization and UUID fallback.
 
-- [ ] **Step 4: Write failing correlated tool-result tests**
+Store the resolved `completion_attempt_limit` once per visible run. Same-run model jumps retain it even if environment changes.
+
+Also assert ordinary repeated-text generations clear verification round/feedback, verified and accepted-at-limit ownership, `_eval_logged`, and `_streamed_files`. Add the full A-complete → B-no-report → explicit-resume-B sequence and assert B never adopts A's report owner.
+
+- [ ] **Step 4: Run lifecycle tests and confirm GREEN**
+
+Run:
+
+```bash
+uv run pytest tests/test_completion_guard.py -q -k "generation or resume or exhaustion or attempt_limit"
+```
+
+Expected: PASS, including an environment change between same-run continuations that does not alter the stored limit.
+
+- [ ] **Step 5: Write failing correlated tool-result tests**
 
 Use real `AIMessage.tool_calls` and `ToolMessage` objects. Cover:
 
@@ -165,7 +194,7 @@ Use real `AIMessage.tool_calls` and `ToolMessage` objects. Cover:
 - `write_file` with omitted path or `/final_report.md` activates ownership only after matching success, changed `modified_at`, valid data, and non-empty content;
 - failed, mismatched, malformed, stale timestamp, and non-final paths do not activate.
 
-- [ ] **Step 5: Run correlation tests and confirm RED**
+- [ ] **Step 6: Run correlation tests and confirm RED**
 
 Run:
 
@@ -175,11 +204,11 @@ uv run pytest tests/test_completion_guard.py -q -k "write_todos or write_file"
 
 Expected: FAIL because `before_model`/`abefore_model` activation is absent.
 
-- [ ] **Step 6: Implement minimal sync/async activation hooks**
+- [ ] **Step 7: Implement minimal sync/async activation hooks**
 
-Implement one pure correlator used by both hooks. Match `AIMessage.tool_calls[*]["id"]` to `ToolMessage.tool_call_id`, require `status != "error"`, then validate resulting state. Content-only `write_file` resolves to `/final_report.md`.
+Implement one pure correlator used by both hooks. Strictly validate message types and IDs, match `AIMessage.tool_calls[*]["id"]` to `ToolMessage.tool_call_id`, require exact `ToolMessage.status == "success"`, then validate resulting state. Missing, unknown, or malformed status is not success. Content-only `write_file` resolves to `/final_report.md`.
 
-- [ ] **Step 7: Run lifecycle/correlation tests and confirm GREEN**
+- [ ] **Step 8: Run lifecycle/correlation tests and confirm GREEN**
 
 Run:
 
@@ -189,11 +218,11 @@ uv run pytest tests/test_completion_guard.py -q
 
 Expected: PASS.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 9: Commit only task files**
 
 ```bash
 git add research_agent/completion_guard.py tests/test_completion_guard.py
-git commit -m "feat: scope completion artifacts to each run"
+git commit --only research_agent/completion_guard.py tests/test_completion_guard.py -m "feat: scope completion artifacts to each run"
 ```
 
 ### Task 4: Add Automatic Continuation and Safe Exhaustion
@@ -209,6 +238,7 @@ Assert terminal `AIMessage` plus active incomplete plan:
 - increments attempts and returns `jump_to: "model"`;
 - tags message with `response_metadata.resume_intermediate=True` without losing ID, content blocks, usage, or tool metadata;
 - injects attempt/reason guidance only through `ModelRequest.system_message`;
+- covers both `wrap_model_call` and `awrap_model_call` with valid Ollama role ordering;
 - preserves files/todos/messages;
 - ignores model responses containing tool calls;
 - consumes exactly configured limits `1`, `2`, and `3`.
@@ -233,11 +263,21 @@ Decorate sync/async hooks with:
 
 Return a tagged replacement message, incremented attempt state, and `jump_to="model"` while below limit. Add model-request wrapper that appends ephemeral `<CompletionGuard>` guidance to the leading system message.
 
-- [ ] **Step 4: Write failing exhaustion tests**
+- [ ] **Step 4: Run continuation tests and confirm GREEN**
+
+Run:
+
+```bash
+uv run pytest tests/test_completion_guard.py -q -k "continue or attempt or guidance"
+```
+
+Expected: PASS for sync and async hooks/wrappers before exhaustion tests are added.
+
+- [ ] **Step 5: Write failing exhaustion tests**
 
 Assert limit exhaustion returns a checkpointable tagged message, current exhausted run ID, safe counts/reason, and `jump_to="end"`. Assert `after_agent` raises only for matching current run ID. Assert `langgraph_api.serde.default()` exposes safe `ResearchIncompleteError` text and no todo labels/research content.
 
-- [ ] **Step 5: Run exhaustion tests and confirm RED**
+- [ ] **Step 6: Run exhaustion tests and confirm RED**
 
 Run:
 
@@ -247,11 +287,11 @@ uv run pytest tests/test_completion_guard.py -q -k "exhaust or serialize"
 
 Expected: FAIL because exhaustion handling is absent.
 
-- [ ] **Step 6: Implement checkpoint-before-error exhaustion**
+- [ ] **Step 7: Implement checkpoint-before-error exhaustion**
 
 Create `ResearchIncompleteError(RuntimeError)`. Persist safe metadata in `after_model`, jump to end, then raise from `after_agent` only when stored and current run IDs match.
 
-- [ ] **Step 7: Run guard tests and confirm GREEN**
+- [ ] **Step 8: Run guard tests and confirm GREEN**
 
 Run:
 
@@ -261,11 +301,11 @@ uv run pytest tests/test_completion_guard.py -q
 
 Expected: PASS.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 9: Commit only task files**
 
 ```bash
 git add research_agent/completion_guard.py tests/test_completion_guard.py
-git commit -m "feat: continue incomplete research within one run"
+git commit --only research_agent/completion_guard.py tests/test_completion_guard.py -m "feat: continue incomplete research within one run"
 ```
 
 ### Task 5: Make Verification Routing Ollama-Safe
@@ -289,6 +329,7 @@ Cover sync and async paths:
 - pass records verified report `modified_at`;
 - final revision-limit verdict records accepted-at-limit without another jump;
 - no completion attempt is consumed.
+- a second verification round uses `research_todos_complete`, which excludes the internal `verification_pass` todo; final readiness still requires all research and verification todos completed.
 
 - [ ] **Step 2: Run verification tests and confirm RED**
 
@@ -302,7 +343,7 @@ Expected: FAIL on missing jump, persisted `SystemMessage`, and absent ownership/
 
 - [ ] **Step 3: Implement minimal verification changes**
 
-Make `ResearchState` inherit `CompletionState`. Gate verification through completion policy. Change both hooks to `can_jump_to=["model", "end"]`. On non-final revision, set `verification_feedback`, tag terminal response, and return `jump_to="model"`; rely on existing `_build_system_instruction` request-time feedback injection. Record verified report timestamp or accepted-at-limit state.
+Make `ResearchState` inherit `CompletionState`. Gate verification with a dedicated `research_todos_complete` predicate that excludes only the internal `verification_pass` item. Change both hooks to `can_jump_to=["model", "end"]`. On non-final revision, set `verification_feedback`, tag terminal response, and return `jump_to="model"`; rely on existing `_build_system_instruction` request-time feedback injection. Record verified report timestamp or accepted-at-limit state tied to the current owned report `modified_at`.
 
 - [ ] **Step 4: Run verification tests and confirm GREEN**
 
@@ -318,7 +359,7 @@ Expected: PASS.
 
 ```bash
 git add research_agent/agent.py tests/test_verification.py tests/test_verification_progress.py
-git commit -m "fix: route report verification explicitly"
+git commit --only research_agent/agent.py tests/test_verification.py tests/test_verification_progress.py -m "fix: route report verification explicitly"
 ```
 
 ### Task 6: Finalize and Stream the Accepted Report Once
@@ -338,6 +379,7 @@ Cover:
 - accepted report emits cited responses, separator, and final report exactly once;
 - subsequent hooks do not duplicate output;
 - edited report invalidates prior verification timestamp;
+- edited report invalidates both passed-verification ownership and accepted-at-limit ownership because both are tied to report `modified_at`;
 - eval logging begins only after the same readiness predicate passes.
 
 - [ ] **Step 2: Run finalization tests and confirm RED**
@@ -368,7 +410,7 @@ Expected: PASS with one final report emission.
 
 ```bash
 git add research_agent/completion_guard.py research_agent/agent.py tests/test_completion_guard.py tests/test_verification.py
-git commit -m "fix: stream only accepted research reports"
+git commit --only research_agent/completion_guard.py research_agent/agent.py tests/test_completion_guard.py tests/test_verification.py -m "fix: stream only accepted research reports"
 ```
 
 ### Task 7: Register Middleware and Prove Full Graph Routing
@@ -385,9 +427,12 @@ Build small sync and async agents with deterministic model responses and real to
 - middleware registration yields after-model order Research → Resume → Completion;
 - inactive plan → real `write_todos` → matching successful tool result → non-empty plan → terminal response → second model call;
 - real content-only `write_file` owns `/final_report.md` only after success;
+- sync and async explicit canonical `/final_report.md` calls also establish ownership;
+- attempt limits `1`, `2`, and `3` produce exactly the configured continuation count;
 - one graph invocation/run ID spans all automatic continuations;
 - files, todos, tool events, and message IDs survive the loop;
 - exhaustion reaches `after_agent` and fails;
+- a checkpointer snapshot after failed `invoke`/`ainvoke` contains the tagged terminal message and matching exhaustion metadata written before `after_agent` raised;
 - accepted plan/report exits normally.
 
 - [ ] **Step 2: Run compiled tests and confirm RED**
@@ -429,7 +474,7 @@ Expected: PASS.
 
 ```bash
 git add research_agent/agent.py tests/test_completion_guard.py tests/test_agent_contracts.py
-git commit -m "feat: enforce research completion in compiled graph"
+git commit --only research_agent/agent.py tests/test_completion_guard.py tests/test_agent_contracts.py -m "feat: enforce research completion in compiled graph"
 ```
 
 ### Task 8: Document, Verify, and Review
@@ -458,10 +503,11 @@ Expected: PASS.
 
 ```bash
 uv run ruff check research_agent/completion_guard.py research_agent/agent.py tests/test_completion_guard.py tests/test_agent_contracts.py tests/test_verification.py tests/test_verification_progress.py
-git diff --check
+git diff --check codex/research-completion-guard-base..HEAD
+git diff --name-status codex/research-completion-guard-base..HEAD
 ```
 
-Expected: PASS with no whitespace errors.
+Expected: PASS with no whitespace errors and only planned feature files in the range.
 
 - [ ] **Step 4: Run broader regression suite**
 
@@ -469,7 +515,7 @@ Expected: PASS with no whitespace errors.
 uv run pytest tests/ -q
 ```
 
-Expected: PASS, or document only verified pre-existing/environmental failures with exact test names and unchanged reproduction on the branch base.
+Expected: PASS. If a failure appears pre-existing/environmental, reproduce it from a separate clean worktree at `codex/research-completion-guard-base` before documenting it.
 
 - [ ] **Step 5: Inspect Threadroot evidence**
 
@@ -483,7 +529,7 @@ Expected: score available if the preflight run recorded successfully; otherwise 
 
 ```bash
 git add .env.example
-git commit -m "docs: configure bounded completion attempts"
+git commit --only .env.example -m "docs: configure bounded completion attempts"
 ```
 
 - [ ] **Step 7: Request final code review**
