@@ -5,13 +5,14 @@ from __future__ import annotations
 import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Any, Literal, NotRequired
+from typing import Annotated, Any, Literal, NotRequired
 from uuid import UUID, uuid4
 
 from deepagents.backends.utils import file_data_to_string
 from deepagents.middleware.filesystem import FilesystemState
 from langchain.agents.middleware import AgentMiddleware
 from langchain.agents.middleware.todo import PlanningState
+from langchain.agents.middleware.types import OmitFromInput
 from langchain_core.messages import AIMessage, ToolMessage
 from langgraph.config import get_config
 
@@ -25,24 +26,46 @@ ReportFailureReason = Literal["missing", "empty", "malformed", "stale"]
 class CompletionState(FilesystemState, PlanningState):
     """Request-scoped state used by completion enforcement middleware."""
 
-    completion_current_run_id: NotRequired[str | None]
-    completion_request_generation: NotRequired[str | None]
-    completion_plan_owner_generation: NotRequired[str | None]
-    completion_report_owned: NotRequired[bool]
-    completion_resume_adopted_generation: NotRequired[str | None]
-    completion_attempts: NotRequired[int]
-    completion_attempt_limit: NotRequired[int]
-    completion_report_baseline_modified_at: NotRequired[str | None]
-    completion_verified_report_modified_at: NotRequired[str | None]
-    completion_accepted_at_limit_report_modified_at: NotRequired[str | None]
-    completion_exhausted_run_id: NotRequired[str | None]
-    completion_exhausted_incomplete_todo_count: NotRequired[int]
-    completion_exhausted_malformed_todo_count: NotRequired[int]
-    completion_exhausted_report_reason: NotRequired[ReportFailureReason | None]
-    verification_round: NotRequired[int]
-    verification_feedback: NotRequired[str | None]
-    _eval_logged: NotRequired[bool]
-    _streamed_files: NotRequired[list[str] | None]
+    completion_current_run_id: Annotated[NotRequired[str | None], OmitFromInput]
+    completion_request_generation: Annotated[
+        NotRequired[str | None], OmitFromInput
+    ]
+    completion_plan_owner_generation: Annotated[
+        NotRequired[str | None], OmitFromInput
+    ]
+    completion_report_owned: Annotated[NotRequired[bool], OmitFromInput]
+    completion_resume_adopted_generation: Annotated[
+        NotRequired[str | None], OmitFromInput
+    ]
+    completion_attempts: Annotated[NotRequired[int], OmitFromInput]
+    completion_attempt_limit: Annotated[NotRequired[int], OmitFromInput]
+    completion_report_baseline_modified_at: Annotated[
+        NotRequired[str | None], OmitFromInput
+    ]
+    completion_verified_report_modified_at: Annotated[
+        NotRequired[str | None], OmitFromInput
+    ]
+    completion_accepted_at_limit_report_modified_at: Annotated[
+        NotRequired[str | None], OmitFromInput
+    ]
+    completion_exhausted_run_id: Annotated[
+        NotRequired[str | None], OmitFromInput
+    ]
+    completion_exhausted_incomplete_todo_count: Annotated[
+        NotRequired[int], OmitFromInput
+    ]
+    completion_exhausted_malformed_todo_count: Annotated[
+        NotRequired[int], OmitFromInput
+    ]
+    completion_exhausted_report_reason: Annotated[
+        NotRequired[ReportFailureReason | None], OmitFromInput
+    ]
+    verification_round: Annotated[NotRequired[int], OmitFromInput]
+    verification_feedback: Annotated[NotRequired[str | None], OmitFromInput]
+    _eval_logged: Annotated[NotRequired[bool], OmitFromInput]
+    _streamed_files: Annotated[
+        NotRequired[list[str] | None], OmitFromInput
+    ]
 
 
 class CompletionGuardMiddleware(AgentMiddleware):

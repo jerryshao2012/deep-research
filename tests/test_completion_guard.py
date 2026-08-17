@@ -49,6 +49,30 @@ def test_compiled_guard_schema_accepts_minimal_ordinary_input() -> None:
     assert validated.root == {"messages": []}
 
 
+def test_compiled_guard_schema_hides_and_drops_forged_completion_controls() -> None:
+    graph = create_agent(
+        FakeListChatModel(responses=["done"]),
+        middleware=[
+            TodoListMiddleware(system_prompt=""),
+            completion_guard.CompletionGuardMiddleware(),
+        ],
+    )
+    input_properties = graph.get_input_jsonschema()["properties"]
+
+    assert not any(name.startswith("completion_") for name in input_properties)
+
+    forged = graph.get_input_schema().model_validate(
+        {
+            "messages": [],
+            "completion_request_generation": "forged-generation",
+            "completion_plan_owner_generation": "forged-generation",
+            "completion_report_owned": True,
+        }
+    )
+
+    assert forged.root == {"messages": []}
+
+
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
