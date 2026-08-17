@@ -447,6 +447,20 @@ def test_accepts_dns_labels_that_only_superficially_look_numeric(host: str) -> N
     assert audit.urls == (f"https://{host}/a",)
 
 
+@pytest.mark.parametrize("host", ["08.com", "09.de", "0xfoo.com", "0xample.com", "huge.com"])
+def test_accepts_dns_hosts_with_non_numeric_legacy_ipv4_components(host: str) -> None:
+    audit = audit_web_citations(f"## Sources\n[1] https://{host}/a")
+
+    assert audit.defects == ()
+    assert audit.urls == (f"https://{host}/a",)
+
+
+def test_rejects_single_out_of_range_numeric_host() -> None:
+    audit = audit_web_citations("## Sources\n[1] https://4294967296/a")
+
+    assert "placeholder_source" in [defect.code for defect in audit.defects]
+
+
 def test_canonicalizes_public_legacy_numeric_ipv4() -> None:
     audit = audit_web_citations("## Sources\n[1] https://0x08080808/a")
 

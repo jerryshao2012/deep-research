@@ -428,18 +428,20 @@ def _parse_legacy_ipv4(host: str) -> tuple[str | None, bool]:
     callers can fail closed rather than treating it as a DNS name.
     """
     components = host.split(".")
+    lexemes = [_legacy_ipv4_component_lexeme(component) for component in components]
+    if any(lexeme is None for lexeme in lexemes):
+        return None, False
+    numeric_lexemes = [lexeme for lexeme in lexemes if lexeme is not None]
+
+    widths_by_parts = ((32,), (8, 24), (8, 8, 16), (8, 8, 8, 8))
+    if not 1 <= len(numeric_lexemes) <= len(widths_by_parts):
+        return None, True
     values: list[int] = []
-    for component in components:
-        value, numeric = _parse_legacy_ipv4_component(component)
-        if not numeric:
-            return None, False
+    for digits, base in numeric_lexemes:
+        value = _parse_legacy_ipv4_value(digits, base)
         if value is None:
             return None, True
         values.append(value)
-
-    widths_by_parts = ((32,), (8, 24), (8, 8, 16), (8, 8, 8, 8))
-    if not 1 <= len(values) <= len(widths_by_parts):
-        return None, True
     widths = widths_by_parts[len(values) - 1]
     if any(value >= 1 << width for value, width in zip(values, widths, strict=True)):
         return None, True
@@ -450,32 +452,33 @@ def _parse_legacy_ipv4(host: str) -> tuple[str | None, bool]:
     return str(ipaddress.IPv4Address(address)), True
 
 
-def _parse_legacy_ipv4_component(component: str) -> tuple[int | None, bool]:
-    """Parse decimal, hexadecimal, or leading-zero octal IPv4 component."""
+def _legacy_ipv4_component_lexeme(component: str) -> tuple[str, int] | None:
+    """Return component digits and base only for valid legacy numeric syntax."""
     if not component.isascii():
-        return None, False
-    base = 10
-    digits = component
+        return None
     if component.lower().startswith("0x"):
-        base = 16
         digits = component[2:]
         if not digits or any(character not in "0123456789abcdefABCDEF" for character in digits):
-            return None, True
-    elif component.isdecimal():
-        if len(component) > 1 and component.startswith("0"):
-            base = 8
-            if any(character not in "01234567" for character in component):
-                return None, True
-    else:
-        return None, False
+            return None
+        return digits, 16
+    if not component.isdecimal():
+        return None
+    if len(component) > 1 and component.startswith("0"):
+        if any(character not in "01234567" for character in component):
+            return None
+        return component, 8
+    return component, 10
 
+
+def _parse_legacy_ipv4_value(digits: str, base: int) -> int | None:
+    """Parse one bounded legacy numeric component without platform helpers."""
     value = 0
     for character in digits:
         digit = int(character, base=base)
         value = value * base + digit
         if value > 0xFFFFFFFF:
-            return None, True
-    return value, True
+            return None
+    return value
 
 
 def _is_source_candidate(
