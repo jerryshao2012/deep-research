@@ -330,6 +330,26 @@ def test_inline_code_masking_scales_for_unmatched_delimiter_runs() -> None:
     assert slow < fast * 12 + 0.1
 
 
+def test_inline_code_pairs_sequentially_without_crossing_delimiters() -> None:
+    report = """Actual [1]. `alpha ``beta` [77] ``
+
+## Sources
+[1] https://source.publisher.org/a
+"""
+
+    assert "unresolved_reference" in [defect.code for defect in audit_web_citations(report).defects]
+
+
+def test_bare_windows_and_bibliographic_prefixes_are_not_uri_tokens() -> None:
+    report = """## Sources
+[1] C:\\docs\\book.pdf
+[2] ISBN:978-1-2345-6789-0
+[3] DOI:10.1234/example
+"""
+
+    assert audit_web_citations(report).defects == (CitationDefect("missing_url", "web"),)
+
+
 @pytest.mark.parametrize("size", [1_024, 16_384])
 def test_numeric_scanner_is_bounded_for_unmatched_brackets(size: int) -> None:
     started = perf_counter()

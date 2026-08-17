@@ -21,6 +21,7 @@ _MAX_MARKER_TOKENS = 32
 _MAX_LINK_LABEL_LENGTH = 512
 _MAX_LINK_DESTINATION_LENGTH = 2_048
 _MAX_LINK_NESTING = 8
+_BARE_NONHIERARCHICAL_SCHEMES = {"data", "file", "javascript", "mailto", "news", "tel", "urn"}
 _SOURCE_HEADINGS = {"sources", "references", "bibliography", "works cited"}
 _PLACEHOLDER_RE = re.compile(
     r"\b(?:conceptual\s+source|placeholder|example\s+source|source\s+needed|"
@@ -578,7 +579,7 @@ def _scan_uri_tokens(text: str) -> tuple[tuple[str, tuple[int, int]], ...]:
                     break
                 parenthesis_depth -= 1
             end += 1
-        if end > content_start:
+        if end > content_start and _is_clear_bare_uri(text[start:index], text[content_start:end]):
             tokens.append((text[start:end], (start, end)))
         index = max(end, content_start)
     return tuple(tokens)
@@ -586,6 +587,15 @@ def _scan_uri_tokens(text: str) -> tuple[tuple[str, tuple[int, int]], ...]:
 
 def _is_scheme_character(character: str) -> bool:
     return character.isalnum() or character in "+.-"
+
+
+def _is_clear_bare_uri(scheme: str, content: str) -> bool:
+    if content.startswith("//"):
+        return len(content) > 2
+    scheme = scheme.lower()
+    if scheme not in _BARE_NONHIERARCHICAL_SCHEMES or not content:
+        return False
+    return content.startswith("/") if scheme == "file" else True
 
 
 def _is_explicit_uri(value: str) -> bool:
@@ -599,7 +609,7 @@ def _is_explicit_uri(value: str) -> bool:
 
 def _mask_inline_code(line: str) -> str:
     changes = [0] * (len(line) + 1)
-    openings: dict[int, int] = {}
+    runs: list[tuple[int, int, int]] = []
     index = 0
     while index < len(line):
         if line[index] != "`":
@@ -608,13 +618,24 @@ def _mask_inline_code(line: str) -> str:
         start = index
         while index < len(line) and line[index] == "`":
             index += 1
-        delimiter_length = index - start
-        opener = openings.pop(delimiter_length, None)
-        if opener is None:
-            openings[delimiter_length] = start
-        else:
-            changes[opener] += 1
-            changes[index] -= 1
+        runs.append((start, index, index - start))
+    next_same: list[int | None] = [None] * len(runs)
+    next_by_length: dict[int, int] = {}
+    for run_index in range(len(runs) - 1, -1, -1):
+        _, _, delimiter_length = runs[run_index]
+        next_same[run_index] = next_by_length.get(delimiter_length)
+        next_by_length[delimiter_length] = run_index
+    run_index = 0
+    while run_index < len(runs):
+        closing_index = next_same[run_index]
+        if closing_index is None:
+            run_index += 1
+            continue
+        opening_start, _, _ = runs[run_index]
+        _, closing_end, _ = runs[closing_index]
+        changes[opening_start] += 1
+        changes[closing_end] -= 1
+        run_index = closing_index + 1
     active = 0
     chars = list(line)
     for index, character in enumerate(chars):
