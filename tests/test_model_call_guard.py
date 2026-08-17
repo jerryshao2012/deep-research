@@ -15,7 +15,8 @@ from dataclasses import FrozenInstanceError
 from functools import wraps
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from math import inf, nan
-from typing import Any
+from types import MethodType
+from typing import Any, ClassVar
 from uuid import uuid4
 
 import httpx
@@ -31,6 +32,8 @@ from langchain_core.messages import AIMessage, AIMessageChunk
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 from langchain_core.runnables import RunnableLambda
 from langchain_core.runnables.config import var_child_runnable_config
+from langchain_core.tracers.context import collect_runs, tracing_v2_callback_var
+from langchain_core.tracers.langchain import LangChainTracer
 from pydantic import PrivateAttr, SecretStr
 
 from research_agent.model_call_guard import (
@@ -41,6 +44,7 @@ from research_agent.model_call_guard import (
     ModelCallGuardMixin,
     ModelCallPolicy,
     ModelCallTimeoutError,
+    ModelRuntimeDescriptor,
     ModelRuntimeMetadata,
     UnsupportedModelOverrideError,
     _maybe_unload_ollama,
@@ -457,6 +461,45 @@ class _AsyncOnlyChatModel(BaseChatModel):
         return self.bind(tools=tools, tool_choice=tool_choice, **kwargs)
 
 
+class _ConcurrentStateChatModel(_AsyncOnlyChatModel):
+    counter: int = 0
+    _started: list[str] = PrivateAttr(default_factory=list)
+    _both_started: asyncio.Event = PrivateAttr(default_factory=asyncio.Event)
+
+    async def _agenerate(self, *args: Any, **kwargs: Any) -> ChatResult:
+        self._started.append("started")
+        if len(self._started) == 2:
+            self._both_started.set()
+        await self._both_started.wait()
+        self.counter += 1
+        return await super()._agenerate(*args, **kwargs)
+
+
+class _NestedCallbackChatModel(_AsyncOnlyChatModel):
+    async def _agenerate(
+        self,
+        *args: Any,
+        run_manager: Any = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        child = AsyncCallbackManager(
+            handlers=list(run_manager.inheritable_handlers),
+            inheritable_handlers=list(run_manager.inheritable_handlers),
+        )
+        await child.on_custom_event("nested-provider-event", {"kept": True})
+        return await super()._agenerate(
+            *args,
+            run_manager=run_manager,
+            **kwargs,
+        )
+
+
+class _NestedRunnableChatModel(_AsyncOnlyChatModel):
+    async def _agenerate(self, *args: Any, **kwargs: Any) -> ChatResult:
+        await RunnableLambda(lambda value: value).ainvoke("nested")
+        return await super()._agenerate(*args, **kwargs)
+
+
 class _IndependentBindToolsChatModel(_AsyncOnlyChatModel):
     """Provider fake whose tool binding is independent from the model runnable."""
 
@@ -492,6 +535,36 @@ class _DetachedBindToolsChatModel(_AsyncOnlyChatModel):
             return AIMessage(content="spawned")
 
         return RunnableLambda(spawn_detached)
+
+
+class _InFlightDetachedBindToolsChatModel(_DetachedBindToolsChatModel):
+    """Provider fake whose detached call queues a callback before outer return."""
+
+    def bind_tools(self, tools: Any, *, tool_choice: str | None = None, **kwargs: Any):
+        del tools, tool_choice, kwargs
+
+        async def spawn_detached(_input: Any) -> AIMessage:
+            self._detached_task = asyncio.create_task(self.ainvoke("detached"))
+            await asyncio.sleep(0)
+            return AIMessage(content="spawned")
+
+        return RunnableLambda(spawn_detached)
+
+
+class _InFlightDetachedStreamChatModel(_DetachedBindToolsChatModel):
+    """Provider fake queues detached callback before exposing a stream item."""
+
+    async def _astream(
+        self,
+        messages: list[Any],
+        stop: list[str] | None = None,
+        run_manager: Any = None,
+        **kwargs: Any,
+    ):
+        del messages, stop, run_manager, kwargs
+        self._detached_task = asyncio.create_task(self.ainvoke("detached"))
+        await asyncio.sleep(0)
+        yield ChatGenerationChunk(message=AIMessageChunk(content="chunk"))
 
 
 class _CleanupDetachedBindToolsChatModel(_DetachedBindToolsChatModel):
@@ -616,6 +689,35 @@ class _RecordingCallback(BaseCallbackHandler):
         self.ends.append((response, kwargs))
 
 
+class _ThreadRecordingCallback(BaseCallbackHandler):
+    run_inline = True
+    raise_error = True
+
+    def __init__(self) -> None:
+        self.events: list[tuple[str, int, Any]] = []
+
+    def _record(self, name: str, payload: Any = None) -> None:
+        self.events.append((name, threading.get_ident(), payload))
+
+    def on_chat_model_start(self, *_args: Any, **_kwargs: Any) -> None:
+        self._record("start")
+
+    def on_llm_new_token(self, token: str, **_kwargs: Any) -> None:
+        self._record("token", token)
+
+    def on_stream_event(self, event: Any, **_kwargs: Any) -> None:
+        self._record("event", event)
+
+    def on_custom_event(self, name: str, data: Any, **_kwargs: Any) -> None:
+        self._record(name, data)
+
+    def on_llm_end(self, _response: Any, **_kwargs: Any) -> None:
+        self._record("end")
+
+    def on_llm_error(self, error: BaseException, **_kwargs: Any) -> None:
+        self._record("error", str(error))
+
+
 class _LoopAffineAsyncCallback(AsyncCallbackHandler):
     raise_error = True
 
@@ -629,6 +731,21 @@ class _LoopAffineAsyncCallback(AsyncCallbackHandler):
         del serialized, messages, kwargs
         self.loops.append(asyncio.get_running_loop())
         await self.gate
+
+
+class _ThreadProbeTracer(LangChainTracer):
+    threads: ClassVar[list[int]] = []
+    copies: ClassVar[int] = 0
+
+    def copy_with_metadata_defaults(self, **kwargs: Any) -> LangChainTracer:
+        type(self).copies += 1
+        return super().copy_with_metadata_defaults(**kwargs)
+
+    def on_chat_model_start(self, *_args: Any, **_kwargs: Any) -> None:
+        type(self).threads.append(threading.get_ident())
+
+    def on_llm_end(self, *_args: Any, **_kwargs: Any) -> None:
+        type(self).threads.append(threading.get_ident())
 
 
 def _policy(timeout: float = 0.03, *, unload: bool = False) -> ModelCallPolicy:
@@ -1396,6 +1513,15 @@ def _fake_metadata() -> ModelRuntimeMetadata:
     return ModelRuntimeMetadata(provider="openai", model_name="fake-model")
 
 
+def test_runtime_descriptor_does_not_require_optional_transport_clone_capability():
+    class MetadataOnlyDescriptor:
+        @property
+        def model_runtime_metadata(self) -> ModelRuntimeMetadata:
+            return _fake_metadata()
+
+    assert isinstance(MetadataOnlyDescriptor(), ModelRuntimeDescriptor)
+
+
 def _guarded_fake(
     *,
     timeout: float = 0.1,
@@ -1583,6 +1709,100 @@ async def test_detached_task_cannot_reuse_stale_completed_operation_context():
 
     assert time.monotonic() - started < 0.14
     assert guarded._cancel_count == 1
+
+
+def test_detached_task_cannot_reuse_completed_sync_callback_pump():
+    import research_agent.model_call_guard as guard
+
+    caller_thread = threading.get_ident()
+    callback = _ThreadRecordingCallback()
+    guarded = guard_model(
+        _DetachedBindToolsChatModel(delay=0, callbacks=[callback]),
+        metadata=_fake_metadata(),
+        policy=_policy(0.08),
+    )
+
+    result = guarded.bind_tools([]).invoke("hello")
+    assert result.content == "spawned"
+    assert guarded._detached_task is not None
+    assert callback.events == []
+
+    loop = guard._GLOBAL_BRIDGE_RUNTIME._loop
+    assert loop is not None
+    loop.call_soon_threadsafe(guarded._release_detached.set)
+
+    async def wait_task() -> AIMessage:
+        assert guarded._detached_task is not None
+        return await guarded._detached_task
+
+    future = asyncio.run_coroutine_threadsafe(wait_task(), loop)
+    nested = future.result(0.5)
+
+    assert nested.content == "complete"
+    assert [name for name, _, _ in callback.events] == ["start", "end"]
+    assert {thread_id for _, thread_id, _ in callback.events} != {caller_thread}
+
+
+def test_in_flight_detached_callback_is_drained_before_sync_pump_retires():
+    import research_agent.model_call_guard as guard
+
+    caller_thread = threading.get_ident()
+    callback = _ThreadRecordingCallback()
+    guarded = guard_model(
+        _InFlightDetachedBindToolsChatModel(delay=0, callbacks=[callback]),
+        metadata=_fake_metadata(),
+        policy=_policy(0.08),
+    )
+
+    result = guarded.bind_tools([]).invoke("hello")
+    assert result.content == "spawned"
+    assert guarded._detached_task is not None
+
+    loop = guard._GLOBAL_BRIDGE_RUNTIME._loop
+    assert loop is not None
+
+    async def wait_task() -> AIMessage:
+        assert guarded._detached_task is not None
+        return await guarded._detached_task
+
+    future = asyncio.run_coroutine_threadsafe(wait_task(), loop)
+    nested = future.result(0.5)
+
+    assert nested.content == "complete"
+    assert [name for name, _, _ in callback.events] == ["start", "end"]
+    assert callback.events[0][1] == caller_thread
+
+
+def test_sync_stream_drains_in_flight_callback_before_item_and_close():
+    import research_agent.model_call_guard as guard
+
+    caller_thread = threading.get_ident()
+    callback = _ThreadRecordingCallback()
+    guarded = guard_model(
+        _InFlightDetachedStreamChatModel(delay=0, callbacks=[callback]),
+        metadata=_fake_metadata(),
+        policy=_policy(0.08),
+    )
+
+    stream = guarded.stream("hello")
+    chunk = next(stream)
+    stream.close()
+    assert chunk.content == "chunk"
+    assert guarded._detached_task is not None
+
+    loop = guard._GLOBAL_BRIDGE_RUNTIME._loop
+    assert loop is not None
+
+    async def wait_task() -> AIMessage:
+        assert guarded._detached_task is not None
+        return await guarded._detached_task
+
+    future = asyncio.run_coroutine_threadsafe(wait_task(), loop)
+    nested = future.result(0.5)
+
+    assert nested.content == "complete"
+    assert callback.events
+    assert any(thread_id == caller_thread for _, thread_id, _ in callback.events)
 
 
 @_async_test
@@ -2592,24 +2812,117 @@ def test_provider_reconstruction_preserves_pre_resolved_environment_proxy(
         closers[provider](guarded)
 
 
-def test_ollama_reconstruction_never_reuses_custom_inherited_transports():
+def test_ollama_reconstruction_fails_closed_for_custom_inherited_transports():
     from langchain_ollama import ChatOllama
 
     import research_agent.model_call_guard as guard
 
     sync_transport = httpx.MockTransport(lambda _request: httpx.Response(200))
     async_transport = httpx.MockTransport(lambda _request: httpx.Response(200))
-    guarded = guard_model(
-        ChatOllama(
-            model="fork-custom-transport-test",
-            sync_client_kwargs={"transport": sync_transport},
-            async_client_kwargs={"transport": async_transport},
-        ),
-        metadata=ModelRuntimeMetadata(
+    guarded = build_guarded_provider_model(
+        ChatOllama,
+        {
+            "model": "fork-custom-transport-test",
+            "sync_client_kwargs": {"transport": sync_transport},
+            "async_client_kwargs": {"transport": async_transport},
+        },
+        ModelRuntimeMetadata(
             provider="ollama",
             model_name="fork-custom-transport-test",
         ),
-        policy=_policy(0.2),
+        _policy(0.2),
+    )
+    guarded._guard_pid = -1
+
+    with pytest.raises(UnsupportedModelOverrideError) as raised:
+        guard._ensure_model_process(guarded)
+    try:
+        assert raised.value.provider == "ollama"
+        assert guarded._client._client._transport is sync_transport
+        assert guarded._async_client._client._transport is async_transport
+    finally:
+        _close_guarded_local_ollama(guarded)
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork")
+def test_forked_child_fails_closed_for_undeclared_custom_transport():
+    from langchain_ollama import ChatOllama
+
+    import research_agent.model_call_guard as guard
+
+    guarded = build_guarded_provider_model(
+        ChatOllama,
+        {
+            "model": "fork-unsupported-transport",
+            "sync_client_kwargs": {
+                "transport": httpx.MockTransport(
+                    lambda _request: httpx.Response(200)
+                )
+            },
+            "async_client_kwargs": {
+                "transport": httpx.MockTransport(
+                    lambda _request: httpx.Response(200)
+                )
+            },
+        },
+        ModelRuntimeMetadata(
+            provider="ollama",
+            model_name="fork-unsupported-transport",
+        ),
+        _policy(0.2),
+    )
+    assert _guarded_fake(timeout=0.2).invoke("initialize-runtime").content == "complete"
+    read_fd, write_fd = os.pipe()
+    child_pid = os.fork()
+    if child_pid == 0:
+        os.close(read_fd)
+        try:
+            guard._ensure_model_process(guarded)
+        except UnsupportedModelOverrideError as exc:
+            payload = f"unsupported:{exc.provider}".encode()
+        except BaseException as exc:
+            payload = f"unsafe:{type(exc).__name__}:{exc}".encode()
+        else:
+            payload = b"silently-replaced"
+        os.write(write_fd, payload)
+        os.close(write_fd)
+        os._exit(0)
+
+    os.close(write_fd)
+    try:
+        completed_pid, status = os.waitpid(child_pid, 0)
+        assert completed_pid == child_pid
+        assert os.waitstatus_to_exitcode(status) == 0
+        assert os.read(read_fd, 4096) == b"unsupported:ollama"
+    finally:
+        os.close(read_fd)
+        _close_guarded_local_ollama(guarded)
+
+
+def test_declared_custom_transport_factory_is_used_during_reconstruction():
+    from langchain_ollama import ChatOllama
+
+    import research_agent.model_call_guard as guard
+
+    class CloneableChatOllama(ChatOllama):
+        def clone_model_http_transport(self, transport, *, asynchronous):
+            del transport, asynchronous
+            return httpx.MockTransport(lambda _request: httpx.Response(200))
+
+    sync_transport = httpx.MockTransport(lambda _request: httpx.Response(200))
+    async_transport = httpx.MockTransport(lambda _request: httpx.Response(200))
+    guarded = build_guarded_provider_model(
+        CloneableChatOllama,
+        {
+            "model": "fork-declared-transport",
+            "sync_client_kwargs": {"transport": sync_transport},
+            "async_client_kwargs": {"transport": async_transport},
+        },
+        ModelRuntimeMetadata(
+            provider="ollama",
+            model_name="fork-declared-transport",
+        ),
+        _policy(0.2),
     )
     guarded._guard_pid = -1
 
@@ -2617,11 +2930,6 @@ def test_ollama_reconstruction_never_reuses_custom_inherited_transports():
     try:
         assert guarded._client._client._transport is not sync_transport
         assert guarded._async_client._client._transport is not async_transport
-        assert isinstance(guarded._client._client._transport, httpx.HTTPTransport)
-        assert isinstance(
-            guarded._async_client._client._transport,
-            httpx.AsyncHTTPTransport,
-        )
     finally:
         _close_guarded_local_ollama(guarded)
 
@@ -2814,6 +3122,221 @@ async def test_async_callbacks_remain_on_caller_loop(
     assert callback.loops == [caller_loop]
 
 
+@pytest.mark.parametrize("method", ["invoke", "stream"])
+def test_sync_callbacks_run_once_on_original_caller_thread(method: str):
+    caller_thread = threading.get_ident()
+    callback = _ThreadRecordingCallback()
+    guarded = guard_model(
+        _AsyncOnlyChatModel(
+            callbacks=[callback],
+            chunks=[AIMessageChunk(content="chunk")],
+        ),
+        metadata=_fake_metadata(),
+        policy=_policy(0.5),
+    )
+
+    if method == "invoke":
+        result = guarded.invoke("hello", config={"callbacks": [callback]})
+        assert result.content == "complete"
+        assert [name for name, _, _ in callback.events] == ["start", "end"]
+    else:
+        chunks = list(guarded.stream("hello", config={"callbacks": [callback]}))
+        assert "".join(str(chunk.content) for chunk in chunks) == "chunk"
+        assert [name for name, _, _ in callback.events] == [
+            "start",
+            "token",
+            "token",
+            "end",
+        ]
+    assert {thread_id for _, thread_id, _ in callback.events} == {caller_thread}
+
+
+@pytest.mark.parametrize("source", ["explicit", "ambient"])
+def test_sync_v2_tracer_callbacks_stay_on_original_caller_thread(source: str):
+    _ThreadProbeTracer.threads = []
+    _ThreadProbeTracer.copies = 0
+    tracer = _ThreadProbeTracer(project_name="guard-probe", client=object())
+    caller_thread = threading.get_ident()
+    config = {"callbacks": [tracer]} if source == "explicit" else None
+    token = tracing_v2_callback_var.set(tracer) if source == "ambient" else None
+    try:
+        result = _guarded_fake(timeout=0.5).invoke("hello", config=config)
+    finally:
+        if token is not None:
+            tracing_v2_callback_var.reset(token)
+
+    assert result.content == "complete"
+    assert _ThreadProbeTracer.copies >= 1
+    assert _ThreadProbeTracer.threads
+    assert set(_ThreadProbeTracer.threads) == {caller_thread}
+
+
+def test_sync_ambient_run_collector_stays_on_original_caller_thread():
+    caller_thread = threading.get_ident()
+    persisted_threads: list[int] = []
+    with collect_runs() as collector:
+        original_persist = collector._persist_run
+
+        def persist_on_probe(self: Any, run: Any) -> None:
+            persisted_threads.append(threading.get_ident())
+            original_persist(run)
+
+        collector._persist_run = MethodType(persist_on_probe, collector)
+        result = _guarded_fake(timeout=0.5).invoke("hello")
+
+    assert result.content == "complete"
+    assert persisted_threads == [caller_thread]
+
+
+def test_sync_ambient_run_collector_preserves_nested_runnable_context():
+    guarded = guard_model(
+        _NestedRunnableChatModel(),
+        metadata=_fake_metadata(),
+        policy=_policy(0.5),
+    )
+
+    with collect_runs() as collector:
+        result = guarded.invoke("hello")
+
+    assert result.content == "complete"
+    assert {run.name for run in collector.traced_runs} >= {
+        "RunnableLambda",
+        "_NestedRunnableChatModel",
+    }
+
+
+@pytest.mark.parametrize("method", ["ainvoke", "astream"])
+@_async_test
+async def test_async_model_and_config_callback_identity_is_deduplicated(method: str):
+    callback = _ThreadRecordingCallback()
+    guarded = guard_model(
+        _AsyncOnlyChatModel(
+            callbacks=[callback],
+            chunks=[AIMessageChunk(content="chunk")],
+        ),
+        metadata=_fake_metadata(),
+        policy=_policy(0.5),
+    )
+
+    if method == "ainvoke":
+        result = await guarded.ainvoke("hello", config={"callbacks": [callback]})
+        assert result.content == "complete"
+        assert [name for name, _, _ in callback.events] == ["start", "end"]
+    else:
+        chunks = [
+            chunk
+            async for chunk in guarded.astream(
+                "hello",
+                config={"callbacks": [callback]},
+            )
+        ]
+        assert "".join(str(chunk.content) for chunk in chunks) == "chunk"
+        assert [name for name, _, _ in callback.events] == [
+            "start",
+            "token",
+            "token",
+            "end",
+        ]
+
+
+@_async_test
+async def test_concurrent_callback_calls_mutate_one_provider_instance():
+    callback = _RecordingCallback()
+    guarded = guard_model(
+        _ConcurrentStateChatModel(callbacks=[callback]),
+        metadata=_fake_metadata(),
+        policy=_policy(0.5),
+    )
+
+    results = await asyncio.gather(
+        guarded.ainvoke("first"),
+        guarded.ainvoke("second"),
+    )
+
+    assert [result.content for result in results] == ["complete", "complete"]
+    assert guarded.counter == 2
+    assert len(callback.starts) == 2
+
+
+def test_sync_error_callback_runs_once_on_original_caller_thread():
+    caller_thread = threading.get_ident()
+    callback = _ThreadRecordingCallback()
+    guarded = guard_model(
+        _AsyncOnlyChatModel(callbacks=[callback], failures_before_success=1),
+        metadata=_fake_metadata(),
+        policy=_policy(0.5),
+    )
+
+    with pytest.raises(RuntimeError, match="retryable provider failure"):
+        guarded.invoke("hello", config={"callbacks": [callback]})
+
+    assert [name for name, _, _ in callback.events] == ["start", "error"]
+    assert {thread_id for _, thread_id, _ in callback.events} == {caller_thread}
+
+
+def test_sync_callback_can_invoke_another_guarded_model_without_deadlock():
+    caller_thread = threading.get_ident()
+    inner = _guarded_fake(timeout=0.5)
+
+    class NestedInvokeCallback(_ThreadRecordingCallback):
+        def on_chat_model_start(self, *_args: Any, **_kwargs: Any) -> None:
+            self._record("start")
+            nested = inner.invoke("nested")
+            assert nested.content == "complete"
+
+    callback = NestedInvokeCallback()
+    outer = _guarded_fake(timeout=0.5)
+
+    result = outer.invoke("outer", config={"callbacks": [callback]})
+
+    assert result.content == "complete"
+    assert [name for name, _, _ in callback.events] == ["start", "end"]
+    assert {thread_id for _, thread_id, _ in callback.events} == {caller_thread}
+    assert len(inner._calls) == 1
+
+
+@pytest.mark.parametrize("method", ["invoke", "stream"])
+def test_bound_sync_model_callbacks_stay_on_original_caller_thread(method: str):
+    caller_thread = threading.get_ident()
+    callback = _ThreadRecordingCallback()
+    guarded = guard_model(
+        _AsyncOnlyChatModel(chunks=[AIMessageChunk(content="chunk")]),
+        metadata=_fake_metadata(),
+        policy=_policy(0.5),
+    ).bind(bound_flag="kept")
+
+    if method == "invoke":
+        result = guarded.invoke("hello", config={"callbacks": [callback]})
+        assert result.content == "complete"
+    else:
+        chunks = list(guarded.stream("hello", config={"callbacks": [callback]}))
+        assert "".join(str(chunk.content) for chunk in chunks) == "chunk"
+
+    assert callback.events
+    assert {thread_id for _, thread_id, _ in callback.events} == {caller_thread}
+
+
+def test_inherited_only_config_callback_runs_nested_event_on_sync_caller_thread():
+    caller_thread = threading.get_ident()
+    callback = _ThreadRecordingCallback()
+    callback_manager = AsyncCallbackManager(
+        handlers=[],
+        inheritable_handlers=[callback],
+    )
+    guarded = guard_model(
+        _NestedCallbackChatModel(),
+        metadata=_fake_metadata(),
+        policy=_policy(0.5),
+    )
+
+    result = guarded.invoke("hello", config={"callbacks": callback_manager})
+
+    assert result.content == "complete"
+    assert callback.events == [
+        ("nested-provider-event", caller_thread, {"kept": True})
+    ]
+
+
 @_async_test
 async def test_model_callback_manager_context_survives_caller_loop_proxy():
     import research_agent.model_call_guard as guard
@@ -2822,7 +3345,7 @@ async def test_model_callback_manager_context_survives_caller_loop_proxy():
     inherited = _RecordingCallback()
     parent_run_id = uuid4()
     callback_manager = AsyncCallbackManager(
-        handlers=[callback, inherited],
+        handlers=[callback],
         inheritable_handlers=[inherited],
         parent_run_id=parent_run_id,
         tags=["local-tag"],
@@ -2847,14 +3370,13 @@ async def test_model_callback_manager_context_survives_caller_loop_proxy():
     assert provider_view.callbacks.inheritable_tags == ["inherited-tag"]
     assert provider_view.callbacks.metadata == {"local": "value"}
     assert provider_view.callbacks.inheritable_metadata == {"inherited": "value"}
-    assert [proxy._handler for proxy in provider_view.callbacks.handlers] == [
-        callback,
-        inherited,
-    ]
+    assert [proxy._handler for proxy in provider_view.callbacks.handlers] == [callback]
     assert [
         proxy._handler for proxy in provider_view.callbacks.inheritable_handlers
     ] == [inherited]
-    assert guarded.callbacks is callback_manager
+    assert guarded.callbacks is not callback_manager
+    assert callback_manager.handlers == [callback]
+    assert callback_manager.inheritable_handlers == [inherited]
 
 
 def test_sync_stream_close_cancels_async_provider_and_cleans_bridge():
@@ -3707,51 +4229,26 @@ def test_openai_provider_rebuilds_distinct_clients_with_all_timeouts_bounded(
     _openai_provider_cases(),
     ids=lambda value: value.__name__ if isinstance(value, type) else None,
 )
-def test_openai_provider_rebuilds_explicit_http_clients_without_owning_transport(
+def test_openai_provider_rejects_unclonable_explicit_http_transports(
     provider_class, constructor
 ):
-    sync_requests: list[httpx.Request] = []
-    async_requests: list[httpx.Request] = []
-
     class SyncTransport(httpx.BaseTransport):
-        closed = False
-
         def handle_request(self, request: httpx.Request) -> httpx.Response:
-            sync_requests.append(request)
             return httpx.Response(200, request=request)
-
-        def close(self) -> None:
-            self.closed = True
 
     class AsyncTransport(httpx.AsyncBaseTransport):
-        closed = False
-
         async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-            async_requests.append(request)
             return httpx.Response(200, request=request)
-
-        async def aclose(self) -> None:
-            self.closed = True
 
     sync_transport = SyncTransport()
     async_transport = AsyncTransport()
-    sync_mount_transport = SyncTransport()
-    async_mount_transport = AsyncTransport()
     sync_client = httpx.Client(
         timeout=17,
         transport=sync_transport,
-        mounts={
-            "all://*bypass.test": None,
-            "https://mounted.test": sync_mount_transport,
-        },
     )
     async_client = httpx.AsyncClient(
         timeout=17,
         transport=async_transport,
-        mounts={
-            "all://*bypass.test": None,
-            "https://mounted.test": async_mount_transport,
-        },
     )
     raw = provider_class(
         **constructor,
@@ -3760,65 +4257,183 @@ def test_openai_provider_rebuilds_explicit_http_clients_without_owning_transport
         http_async_client=async_client,
     )
 
+    try:
+        with pytest.raises(UnsupportedModelOverrideError) as raised:
+            adapt_model_override(raw, policy=_policy(0.2))
+
+        assert raised.value.provider in {"openai", "azure_openai"}
+        assert sync_client.get("https://example.test/raw").status_code == 200
+        assert (
+            asyncio.run(async_client.get("https://example.test/raw")).status_code
+            == 200
+        )
+    finally:
+        sync_client.close()
+        asyncio.run(async_client.aclose())
+
+
+@pytest.mark.parametrize(
+    ("provider_class", "constructor"),
+    _openai_provider_cases(),
+    ids=lambda value: value.__name__ if isinstance(value, type) else None,
+)
+def test_openai_provider_rejects_undeclared_standard_transport_subclasses(
+    provider_class, constructor
+):
+    class CustomSyncTransport(httpx.HTTPTransport):
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, request=request)
+
+    class CustomAsyncTransport(httpx.AsyncHTTPTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, request=request)
+
+    sync_client = httpx.Client(transport=CustomSyncTransport())
+    async_client = httpx.AsyncClient(transport=CustomAsyncTransport())
+    raw = provider_class(
+        **constructor,
+        http_client=sync_client,
+        http_async_client=async_client,
+    )
+
+    try:
+        with pytest.raises(UnsupportedModelOverrideError) as raised:
+            adapt_model_override(raw, policy=_policy(0.2))
+        assert raised.value.provider in {"openai", "azure_openai"}
+    finally:
+        sync_client.close()
+        asyncio.run(async_client.aclose())
+
+
+@pytest.mark.parametrize(
+    ("provider_class", "constructor"),
+    _openai_provider_cases(),
+    ids=lambda value: value.__name__ if isinstance(value, type) else None,
+)
+def test_openai_provider_clones_recognized_explicit_clients_without_sharing(
+    provider_class, constructor
+):
+    sync_client = httpx.Client(timeout=17, trust_env=False)
+    async_client = httpx.AsyncClient(timeout=17, trust_env=False)
+    raw = provider_class(
+        **constructor,
+        timeout=17,
+        http_client=sync_client,
+        http_async_client=async_client,
+    )
+
     guarded = adapt_model_override(raw, policy=_policy(0.2))
+    try:
+        assert guarded.http_client is not sync_client
+        assert guarded.http_async_client is not async_client
+        assert guarded.http_client._transport is not sync_client._transport
+        assert guarded.http_async_client._transport is not async_client._transport
+        assert not sync_client.is_closed
+        assert not async_client.is_closed
+    finally:
+        guarded.root_client.close()
+        asyncio.run(guarded.root_async_client.close())
+        assert not sync_client.is_closed
+        assert not async_client.is_closed
+        sync_client.close()
+        asyncio.run(async_client.aclose())
 
-    assert guarded.http_client is not sync_client
-    assert guarded.http_async_client is not async_client
-    assert guarded.root_client._client is guarded.http_client
-    assert guarded.root_async_client._client is guarded.http_async_client
-    assert max(_timeout_components(guarded.http_client.timeout)) <= 0.2
-    assert max(_timeout_components(guarded.http_async_client.timeout)) <= 0.2
-    assert {pattern.pattern for pattern in guarded.http_client._mounts} == {
-        pattern.pattern for pattern in sync_client._mounts
-    }
-    assert {pattern.pattern for pattern in guarded.http_async_client._mounts} == {
-        pattern.pattern for pattern in async_client._mounts
-    }
-    assert (
-        next(
-            transport
-            for pattern, transport in guarded.http_client._mounts.items()
-            if pattern.pattern == "all://*bypass.test"
-        )
-        is None
-    )
-    assert (
-        next(
-            transport
-            for pattern, transport in guarded.http_async_client._mounts.items()
-            if pattern.pattern == "all://*bypass.test"
-        )
-        is None
-    )
-    assert guarded.http_client.get("https://example.test/sync").status_code == 200
-    assert guarded.http_client.get("https://mounted.test/sync").status_code == 200
-    assert (
-        asyncio.run(
-            guarded.http_async_client.get("https://example.test/async")
-        ).status_code
-        == 200
-    )
-    assert (
-        asyncio.run(
-            guarded.http_async_client.get("https://mounted.test/async")
-        ).status_code
-        == 200
+
+def test_openai_provider_uses_declared_custom_transport_clone_capability():
+    from langchain_openai import ChatOpenAI
+
+    sync_requests: list[str] = []
+    async_requests: list[str] = []
+
+    class SyncTransport(httpx.BaseTransport):
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            sync_requests.append(str(request.url))
+            return httpx.Response(200, request=request)
+
+    class AsyncTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            async_requests.append(str(request.url))
+            return httpx.Response(200, request=request)
+
+    class CloneableChatOpenAI(ChatOpenAI):
+        def clone_model_http_transport(self, transport, *, asynchronous):
+            del transport
+            return AsyncTransport() if asynchronous else SyncTransport()
+
+    sync_transport = SyncTransport()
+    async_transport = AsyncTransport()
+    raw_sync_client = httpx.Client(transport=sync_transport)
+    raw_async_client = httpx.AsyncClient(transport=async_transport)
+    raw = CloneableChatOpenAI(
+        model="cloneable-openai",
+        api_key="sk-test",
+        http_client=raw_sync_client,
+        http_async_client=raw_async_client,
     )
 
-    guarded.root_client.close()
-    asyncio.run(guarded.root_async_client.close())
-    assert not sync_transport.closed
-    assert not async_transport.closed
-    assert not sync_mount_transport.closed
-    assert not async_mount_transport.closed
-    assert sync_client.get("https://example.test/raw").status_code == 200
-    assert sync_client.get("https://mounted.test/raw").status_code == 200
-    assert asyncio.run(async_client.get("https://example.test/raw")).status_code == 200
-    assert asyncio.run(async_client.get("https://mounted.test/raw")).status_code == 200
-    assert len(sync_requests) == 4
-    assert len(async_requests) == 4
-    sync_client.close()
-    asyncio.run(async_client.aclose())
+    guarded = adapt_model_override(raw, policy=_policy(0.2))
+    try:
+        assert guarded.http_client._transport is not sync_transport
+        assert guarded.http_async_client._transport is not async_transport
+        assert guarded.http_client.get("https://example.test/guarded").status_code == 200
+        assert (
+            asyncio.run(guarded.http_async_client.get("https://example.test/guarded"))
+            .status_code
+            == 200
+        )
+        assert raw_sync_client.get("https://example.test/raw").status_code == 200
+        assert (
+            asyncio.run(raw_async_client.get("https://example.test/raw")).status_code
+            == 200
+        )
+        assert len(sync_requests) == 2
+        assert len(async_requests) == 2
+    finally:
+        guarded.root_client.close()
+        asyncio.run(guarded.root_async_client.close())
+        raw_sync_client.close()
+        asyncio.run(raw_async_client.aclose())
+
+
+def test_used_raw_openai_default_client_stays_on_caller_loop_after_adaptation():
+    from langchain_openai import ChatOpenAI
+
+    guarded: BaseChatModel | None = None
+    raw: BaseChatModel | None = None
+
+    with _ollama_compatible_server() as (base_url, requests):
+
+        async def exercise() -> None:
+            nonlocal guarded, raw
+            raw = ChatOpenAI(
+                model="raw-caller-loop",
+                api_key=SecretStr("test-key"),
+                base_url=f"{base_url}/v1",
+                max_retries=0,
+                http_socket_options=(),
+            )
+            first = await raw.ainvoke("raw-before")
+            guarded = adapt_model_override(raw, policy=_policy(1.0))
+
+            assert (
+                raw.root_async_client._client._transport
+                is not guarded.root_async_client._client._transport
+            )
+            guarded_reply = await guarded.ainvoke("guarded")
+            final = await raw.ainvoke("raw-after")
+
+            assert first.content == guarded_reply.content == final.content
+            await raw.root_async_client.close()
+            raw.root_client.close()
+
+        asyncio.run(exercise())
+        assert [request["messages"][0]["content"] for request in requests] == [
+            "raw-before",
+            "guarded",
+            "raw-after",
+        ]
+    assert guarded is not None
+    _close_guarded_default_openai(guarded)
 
 
 def test_guarded_provider_keeps_langchain_provider_strategy_identity():

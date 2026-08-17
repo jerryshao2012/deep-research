@@ -17,6 +17,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
 from concurrent.futures import Future as ConcurrentFuture
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Literal, Mapping, Protocol, runtime_checkable
 from urllib.parse import urlsplit, urlunsplit
@@ -52,6 +53,27 @@ _ACTIVE_DEADLINE: contextvars.ContextVar[float | None] = contextvars.ContextVar(
 _ACTIVE_SCOPE_ID: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "model_call_scope_id", default=None
 )
+_DYNAMIC_CALLBACK_TARGET = object()
+
+
+class _CallbackTargetRoute:
+    """Revocable callback destination copied safely into child task contexts."""
+
+    def __init__(self, target: Any) -> None:
+        self._target = target
+        self._active = threading.Event()
+        self._active.set()
+
+    def resolve(self) -> Any | None:
+        return self._target if self._active.is_set() else None
+
+    def close(self) -> None:
+        self._active.clear()
+
+
+_ACTIVE_CALLBACK_TARGET: contextvars.ContextVar[
+    _CallbackTargetRoute | None
+] = contextvars.ContextVar("model_call_callback_target", default=None)
 
 
 @dataclass
@@ -481,6 +503,19 @@ class ModelRuntimeDescriptor(Protocol):
         """Return non-secret provider metadata used by cancellation policy."""
 
 
+@runtime_checkable
+class ModelHTTPTransportCloner(Protocol):
+    """Optional capability for independently cloning custom HTTP transports."""
+
+    def clone_model_http_transport(
+        self,
+        transport: httpx.BaseTransport | httpx.AsyncBaseTransport,
+        *,
+        asynchronous: bool,
+    ) -> httpx.BaseTransport | httpx.AsyncBaseTransport:
+        """Return an independent transport preserving custom routing semantics."""
+
+
 class BridgeRegistry:
     """Thread-safe collection of synchronous bridges grouped by run scope."""
 
@@ -851,6 +886,49 @@ async def _bounded_async_iterator_close(iterator: AsyncIterator[Any]) -> None:
     task.add_done_callback(_consume_task_exception)
 
 
+async def _run_with_callback_target[ResultT](
+    factory: Callable[[], Awaitable[ResultT]],
+    target: Any,
+) -> ResultT:
+    """Expose caller callback routing to nested guarded model boundaries."""
+    route = _CallbackTargetRoute(target)
+    token = _ACTIVE_CALLBACK_TARGET.set(route)
+    try:
+        return await factory()
+    finally:
+        route.close()
+        _ACTIVE_CALLBACK_TARGET.reset(token)
+
+
+async def _stream_with_callback_target[OutputT](
+    factory: Callable[[], AsyncIterator[OutputT]],
+    target: Any,
+) -> AsyncIterator[OutputT]:
+    """Keep callback routing active through every nested stream pull."""
+    iterator = factory()
+    try:
+        while True:
+            if isinstance(target, _CallbackTargetRoute):
+                try:
+                    item = await anext(iterator)
+                except StopAsyncIteration:
+                    return
+                yield item
+                continue
+            route = _CallbackTargetRoute(target)
+            token = _ACTIVE_CALLBACK_TARGET.set(route)
+            try:
+                item = await anext(iterator)
+            except StopAsyncIteration:
+                return
+            finally:
+                route.close()
+                _ACTIVE_CALLBACK_TARGET.reset(token)
+            yield item
+    finally:
+        await _bounded_async_iterator_close(iterator)
+
+
 def _start_bridge[ResultT](
     factory: Callable[[], Awaitable[ResultT]],
     *,
@@ -868,13 +946,20 @@ def _bridge_result[ResultT](
     *,
     policy: ModelCallPolicy,
     metadata: ModelRuntimeMetadata,
+    callback_pump: _SyncCallerCallbackPump | None = None,
 ) -> ResultT:
     """Wait for one bridge result while retaining bounded interrupt cleanup."""
     try:
         wait = max(0.0, deadline - time.monotonic()) + MODEL_CANCEL_GRACE_SECONDS
         if policy.force_ollama_unload and metadata.provider == "ollama":
             wait += OLLAMA_UNLOAD_TIMEOUT_SECONDS
-        kind, value = control.results.get(timeout=wait)
+        kind, value = _sync_wait_queue(
+            control.results,
+            wait,
+            callback_pump=callback_pump,
+        )
+        if callback_pump is not None:
+            callback_pump.drain()
     except KeyboardInterrupt:
         control.cancel()
         control.join(MODEL_CANCEL_GRACE_SECONDS)
@@ -1059,11 +1144,13 @@ class _SyncStreamIterator[OutputT](Iterator[OutputT]):
         registry: BridgeRegistry,
         policy: ModelCallPolicy,
         metadata: ModelRuntimeMetadata,
+        callback_pump: _SyncCallerCallbackPump | None = None,
     ) -> None:
         self._deadline = deadline
         self._closed = False
         self._policy = policy
         self._metadata = metadata
+        self._callback_pump = callback_pump
 
         async def pump() -> None:
             try:
@@ -1090,7 +1177,13 @@ class _SyncStreamIterator[OutputT](Iterator[OutputT]):
                 and self._metadata.provider == "ollama"
             ):
                 wait += OLLAMA_UNLOAD_TIMEOUT_SECONDS
-            kind, value = self._control.results.get(timeout=wait)
+            kind, value = _sync_wait_queue(
+                self._control.results,
+                wait,
+                callback_pump=self._callback_pump,
+            )
+            if self._callback_pump is not None:
+                self._callback_pump.drain()
         except KeyboardInterrupt:
             self.close()
             raise
@@ -1112,6 +1205,8 @@ class _SyncStreamIterator[OutputT](Iterator[OutputT]):
         self._closed = True
         self._control.cancel()
         self._control.join(MODEL_CANCEL_GRACE_SECONDS)
+        if self._callback_pump is not None:
+            self._callback_pump.drain()
 
     def __del__(self) -> None:
         self.close()
@@ -1130,16 +1225,104 @@ class _AttemptVisibility:
         return not self._visible.is_set()
 
 
+@dataclass
+class _SyncCallbackRecord:
+    """One callback invocation waiting for its original sync caller thread."""
+
+    callback: Callable[[], Any]
+    context: contextvars.Context
+    future: ConcurrentFuture[Any]
+
+
+class _SyncCallerCallbackPump:
+    """Move bridge callbacks onto the thread blocked on a synchronous API."""
+
+    def __init__(self) -> None:
+        self._records: queue.Queue[_SyncCallbackRecord] = queue.Queue()
+
+    async def dispatch(
+        self,
+        event: Callable[..., Any],
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        """Queue callback and suspend bridge work until caller executes it."""
+        future: ConcurrentFuture[Any] = ConcurrentFuture()
+        self._records.put(
+            _SyncCallbackRecord(
+                callback=functools.partial(event, *args, **kwargs),
+                context=contextvars.copy_context(),
+                future=future,
+            )
+        )
+        try:
+            return await asyncio.wrap_future(future)
+        except asyncio.CancelledError:
+            future.cancel()
+            raise
+
+    def run_one(self, timeout: float = 0.0) -> bool:
+        """Execute at most one queued callback on the current caller thread."""
+        try:
+            record = self._records.get(timeout=max(0.0, timeout))
+        except queue.Empty:
+            return False
+        if record.future.cancelled():
+            return True
+
+        def invoke() -> Any:
+            result = record.callback()
+            return asyncio.run(result) if inspect.isawaitable(result) else result
+
+        try:
+            result = record.context.run(invoke)
+        except BaseException as exc:
+            if not record.future.done():
+                record.future.set_exception(exc)
+        else:
+            if not record.future.done():
+                record.future.set_result(result)
+        return True
+
+    def drain(self) -> None:
+        """Execute all callbacks already visible to the caller."""
+        while self.run_one():
+            pass
+
+
+def _sync_wait_queue(
+    results: queue.Queue[tuple[str, Any]],
+    timeout: float,
+    *,
+    callback_pump: _SyncCallerCallbackPump | None,
+) -> tuple[str, Any]:
+    """Wait for bridge output while servicing sync-thread callback records."""
+    if callback_pump is None:
+        return results.get(timeout=timeout)
+    wait_deadline = time.monotonic() + timeout
+    while True:
+        callback_pump.drain()
+        remaining = wait_deadline - time.monotonic()
+        if remaining <= 0:
+            raise queue.Empty
+        try:
+            return results.get(timeout=min(remaining, 0.002))
+        except queue.Empty:
+            if time.monotonic() >= wait_deadline:
+                raise
+
+
 class _CallerLoopCallbackProxy(BaseCallbackHandler):
-    """Dispatch a callback on the async caller loop, not the transport loop."""
+    """Dispatch a callback on its async loop or synchronous caller thread."""
 
     def __init__(
         self,
         handler: BaseCallbackHandler,
-        loop: asyncio.AbstractEventLoop,
+        target: asyncio.AbstractEventLoop | _SyncCallerCallbackPump | object,
     ) -> None:
         self._handler = handler
-        self._loop = loop
+        self._target = target
+        self._loop = target if isinstance(target, asyncio.AbstractEventLoop) else None
 
     @property
     def __class__(self) -> type[BaseCallbackHandler]:
@@ -1182,13 +1365,39 @@ class _CallerLoopCallbackProxy(BaseCallbackHandler):
     def ignore_custom_event(self) -> bool:
         return self._handler.ignore_custom_event
 
+    def copy_with_metadata_defaults(
+        self,
+        *,
+        metadata: Mapping[str, str] | None = None,
+        tags: list[str] | None = None,
+    ) -> BaseCallbackHandler:
+        """Keep caller routing when LangChain clones a V2 tracing handler."""
+        copied = self._handler.copy_with_metadata_defaults(
+            metadata=metadata,
+            tags=tags,
+        )
+        return _CallerLoopCallbackProxy(copied, self._target)
+
     def __getattribute__(self, name: str) -> Any:
         if name.startswith("on_"):
             handler = object.__getattribute__(self, "_handler")
-            loop = object.__getattribute__(self, "_loop")
+            target = object.__getattribute__(self, "_target")
             event = getattr(handler, name)
 
             async def dispatch(*args: Any, **kwargs: Any) -> Any:
+                resolved_target = (
+                    _ACTIVE_CALLBACK_TARGET.get()
+                    if target is _DYNAMIC_CALLBACK_TARGET
+                    else target
+                )
+                while isinstance(resolved_target, _CallbackTargetRoute):
+                    resolved_target = resolved_target.resolve()
+                if isinstance(resolved_target, _SyncCallerCallbackPump):
+                    return await resolved_target.dispatch(event, *args, **kwargs)
+                if resolved_target is None:
+                    result = event(*args, **kwargs)
+                    return await result if inspect.isawaitable(result) else result
+
                 async def invoke_on_caller_loop() -> Any:
                     if inspect.iscoroutinefunction(event):
                         return await event(*args, **kwargs)
@@ -1196,13 +1405,17 @@ class _CallerLoopCallbackProxy(BaseCallbackHandler):
                         return event(*args, **kwargs)
                     callback = functools.partial(event, *args, **kwargs)
                     context = contextvars.copy_context()
-                    return await loop.run_in_executor(None, context.run, callback)
+                    return await resolved_target.run_in_executor(
+                        None,
+                        context.run,
+                        callback,
+                    )
 
                 callback_coroutine = invoke_on_caller_loop()
                 try:
                     future = asyncio.run_coroutine_threadsafe(
                         callback_coroutine,
-                        loop,
+                        resolved_target,
                     )
                 except BaseException:
                     callback_coroutine.close()
@@ -1223,14 +1436,14 @@ class _CallerLoopCallbackProxy(BaseCallbackHandler):
 
 def _callback_proxy(
     handler: BaseCallbackHandler,
-    loop: asyncio.AbstractEventLoop,
+    target: asyncio.AbstractEventLoop | _SyncCallerCallbackPump | object,
 ) -> BaseCallbackHandler:
-    """Create one loop-specific proxy, unwrapping an existing bridge proxy."""
+    """Create one caller-specific proxy, unwrapping an existing bridge proxy."""
     if isinstance(handler, _CallerLoopCallbackProxy):
-        if handler._loop is loop:
+        if handler._target is target:
             return handler
         handler = handler._handler
-    return _CallerLoopCallbackProxy(handler, loop)
+    return _CallerLoopCallbackProxy(handler, target)
 
 
 def _callback_manager_on_caller_loop(
@@ -1246,19 +1459,60 @@ def _callback_manager_on_caller_loop(
 
 def _proxy_callback_manager(
     manager: Any,
-    loop: asyncio.AbstractEventLoop,
+    target: asyncio.AbstractEventLoop | _SyncCallerCallbackPump | object,
+    *,
+    proxies: dict[int, BaseCallbackHandler] | None = None,
+    excluded: set[int] | None = None,
 ) -> AsyncCallbackManager:
     """Copy callback manager context while proxying each unique handler."""
-    proxies: dict[int, BaseCallbackHandler] = {}
+    proxy_cache = proxies if proxies is not None else {}
+    excluded_ids = excluded or set()
+    included_ids: set[int] = set()
 
     def proxy(handler: BaseCallbackHandler) -> BaseCallbackHandler:
-        return proxies.setdefault(id(handler), _callback_proxy(handler, loop))
+        original = (
+            handler._handler
+            if isinstance(handler, _CallerLoopCallbackProxy)
+            else handler
+        )
+        identity = id(original)
+        existing = proxy_cache.get(identity)
+        if existing is not None:
+            return existing
+        created = _callback_proxy(original, target)
+        proxy_cache[identity] = created
+        return created
+
+    handlers: list[BaseCallbackHandler] = []
+    for handler in manager.handlers:
+        original = (
+            handler._handler
+            if isinstance(handler, _CallerLoopCallbackProxy)
+            else handler
+        )
+        identity = id(original)
+        if identity in excluded_ids or identity in included_ids:
+            continue
+        included_ids.add(identity)
+        handlers.append(proxy(original))
+
+    inheritable: list[BaseCallbackHandler] = []
+    inherited_ids: set[int] = set()
+    for handler in manager.inheritable_handlers:
+        original = (
+            handler._handler
+            if isinstance(handler, _CallerLoopCallbackProxy)
+            else handler
+        )
+        identity = id(original)
+        if identity in excluded_ids or identity in inherited_ids:
+            continue
+        inherited_ids.add(identity)
+        inheritable.append(proxy(original))
 
     return AsyncCallbackManager(
-        handlers=[proxy(handler) for handler in manager.handlers],
-        inheritable_handlers=[
-            proxy(handler) for handler in manager.inheritable_handlers
-        ],
+        handlers=handlers,
+        inheritable_handlers=inheritable,
         parent_run_id=manager.parent_run_id,
         tags=manager.tags.copy(),
         inheritable_tags=manager.inheritable_tags.copy(),
@@ -1296,6 +1550,93 @@ def _provider_on_caller_callback_loop(
         update={"callbacks": proxied_callbacks},
         deep=False,
     )
+
+
+def _provider_callbacks_on_caller(
+    model: BaseChatModel,
+    config: RunnableConfig | None,
+    target: asyncio.AbstractEventLoop | _SyncCallerCallbackPump,
+) -> tuple[BaseChatModel, RunnableConfig]:
+    """Proxy and identity-dedupe config/model callbacks as one ordered set."""
+    del target
+    resolved = ensure_config(config)
+    proxy_cache = _ensure_model_callback_proxies(model)
+    config_manager = AsyncCallbackManager.configure(resolved.get("callbacks"))
+    proxied_config = _proxy_callback_manager(
+        config_manager,
+        _DYNAMIC_CALLBACK_TARGET,
+        proxies=proxy_cache,
+    )
+    if proxied_config.handlers or proxied_config.inheritable_handlers:
+        resolved["callbacks"] = proxied_config
+    return model, resolved
+
+
+@contextmanager
+def _without_duplicate_ambient_callback_hooks(
+    callbacks: Any,
+) -> Iterator[None]:
+    """Hide ambient hooks already represented by bridge callback proxies."""
+    from langchain_core.tracers.context import _configure_hooks  # noqa: PLC0415
+
+    handlers = (
+        [*callbacks.handlers, *callbacks.inheritable_handlers]
+        if hasattr(callbacks, "handlers")
+        and hasattr(callbacks, "inheritable_handlers")
+        else list(callbacks or [])
+    )
+    represented: dict[int, BaseCallbackHandler] = {}
+    for handler in handlers:
+        original = (
+            handler._handler
+            if isinstance(handler, _CallerLoopCallbackProxy)
+            else handler
+        )
+        represented.setdefault(id(original), handler)
+    tokens: list[tuple[contextvars.ContextVar[Any], contextvars.Token[Any]]] = []
+    try:
+        for variable, _inheritable, handler_class, _env_var in _configure_hooks:
+            ambient = variable.get()
+            replacement = represented.get(id(ambient)) if ambient is not None else None
+            if (
+                handler_class is None
+                and replacement is not None
+                and replacement is not ambient
+            ):
+                tokens.append((variable, variable.set(replacement)))
+        yield
+    finally:
+        for variable, token in reversed(tokens):
+            variable.reset(token)
+
+
+def _ensure_model_callback_proxies(
+    model: BaseChatModel,
+) -> dict[int, BaseCallbackHandler]:
+    """Install loop-neutral callback proxies once on the real provider instance."""
+    callbacks = getattr(model, "callbacks", None)
+    if not callbacks:
+        return {}
+    manager = (
+        AsyncCallbackManager(handlers=list(callbacks))
+        if isinstance(callbacks, list)
+        else callbacks
+    )
+    proxy_cache = {
+        id(handler._handler): handler
+        for handler in [*manager.handlers, *manager.inheritable_handlers]
+        if isinstance(handler, _CallerLoopCallbackProxy)
+        and handler._target is _DYNAMIC_CALLBACK_TARGET
+    }
+    proxied = _proxy_callback_manager(
+        manager,
+        _DYNAMIC_CALLBACK_TARGET,
+        proxies=proxy_cache,
+    )
+    model.__dict__["callbacks"] = (
+        proxied.handlers if isinstance(callbacks, list) else proxied
+    )
+    return proxy_cache
 
 
 class _VisibilityCallbackHandler(BaseCallbackHandler):
@@ -1383,13 +1724,17 @@ class _GuardedBoundRunnable[InputT, OutputT](Runnable[InputT, OutputT]):
     ) -> OutputT:
         deadline = _capture_deadline(self._owner._model_call_policy)
         scope_id = _scope_id_from_config(config, self._boundary_config)
+        callback_pump = _SyncCallerCallbackPump()
         control = _start_bridge(
-            lambda: _run_with_absolute_deadline(
-                lambda: self.bound.ainvoke(input, config=config, **kwargs),
-                deadline=deadline,
-                scope_id=scope_id,
-                policy=self._owner._model_call_policy,
-                metadata=self._owner._runtime_metadata,
+            lambda: _run_with_callback_target(
+                lambda: _run_with_absolute_deadline(
+                    lambda: self.bound.ainvoke(input, config=config, **kwargs),
+                    deadline=deadline,
+                    scope_id=scope_id,
+                    policy=self._owner._model_call_policy,
+                    metadata=self._owner._runtime_metadata,
+                ),
+                callback_pump,
             ),
             scope_id=scope_id,
             registry=self._owner._bridge_registry,
@@ -1399,6 +1744,7 @@ class _GuardedBoundRunnable[InputT, OutputT](Runnable[InputT, OutputT]):
             deadline,
             policy=self._owner._model_call_policy,
             metadata=self._owner._runtime_metadata,
+            callback_pump=callback_pump,
         )
 
     def ainvoke(
@@ -1423,19 +1769,24 @@ class _GuardedBoundRunnable[InputT, OutputT](Runnable[InputT, OutputT]):
     ) -> Iterator[OutputT]:
         deadline = _capture_deadline(self._owner._model_call_policy)
         scope_id = _scope_id_from_config(config, self._boundary_config)
+        callback_pump = _SyncCallerCallbackPump()
         return _SyncStreamIterator(
-            lambda: self._astream_with_deadline(
-                input,
-                config=config,
-                deadline=deadline,
-                scope_id=scope_id,
-                **kwargs,
+            lambda: _stream_with_callback_target(
+                lambda: self._astream_with_deadline(
+                    input,
+                    config=config,
+                    deadline=deadline,
+                    scope_id=scope_id,
+                    **kwargs,
+                ),
+                callback_pump,
             ),
             deadline=deadline,
             scope_id=scope_id,
             registry=self._owner._bridge_registry,
             policy=self._owner._model_call_policy,
             metadata=self._owner._runtime_metadata,
+            callback_pump=callback_pump,
         )
 
     def astream(
@@ -1583,15 +1934,19 @@ class ModelCallGuardMixin:
         policy = self._model_call_policy
         deadline = _capture_deadline(policy)
         scope_id = _scope_id_from_config(config)
+        callback_pump = _SyncCallerCallbackPump()
         control = _start_bridge(
-            lambda: self._guarded_ainvoke(
-                input,
-                config=config,
-                stop=stop,
-                deadline=deadline,
-                scope_id=scope_id,
-                callback_loop=None,
-                **kwargs,
+            lambda: _run_with_callback_target(
+                lambda: self._guarded_ainvoke(
+                    input,
+                    config=config,
+                    stop=stop,
+                    deadline=deadline,
+                    scope_id=scope_id,
+                    callback_target=callback_pump,
+                    **kwargs,
+                ),
+                callback_pump,
             ),
             scope_id=scope_id,
             registry=self._bridge_registry,
@@ -1601,6 +1956,7 @@ class ModelCallGuardMixin:
             deadline,
             policy=self._model_call_policy,
             metadata=self._runtime_metadata,
+            callback_pump=callback_pump,
         )
 
     def ainvoke(
@@ -1625,18 +1981,21 @@ class ModelCallGuardMixin:
                     stop=stop,
                     deadline=deadline,
                     scope_id=scope_id,
-                    callback_loop=None,
+                    callback_target=_ACTIVE_CALLBACK_TARGET.get(),
                     **kwargs,
                 )
             control = _start_bridge(
-                lambda: self._guarded_ainvoke(
-                    input,
-                    config=config,
-                    stop=stop,
-                    deadline=deadline,
-                    scope_id=scope_id,
-                    callback_loop=caller_loop,
-                    **kwargs,
+                lambda: _run_with_callback_target(
+                    lambda: self._guarded_ainvoke(
+                        input,
+                        config=config,
+                        stop=stop,
+                        deadline=deadline,
+                        scope_id=scope_id,
+                        callback_target=caller_loop,
+                        **kwargs,
+                    ),
+                    caller_loop,
                 ),
                 scope_id=scope_id,
                 registry=self._bridge_registry,
@@ -1658,14 +2017,17 @@ class ModelCallGuardMixin:
         stop: list[str] | None,
         deadline: float,
         scope_id: str,
-        callback_loop: asyncio.AbstractEventLoop | None,
+        callback_target: asyncio.AbstractEventLoop | _SyncCallerCallbackPump | None,
         **kwargs: Any,
     ) -> Any:
         provider_model = self
         provider_config = ensure_config(config)
-        if callback_loop is not None:
-            provider_model = _provider_on_caller_callback_loop(self, callback_loop)
-            provider_config = _config_on_caller_callback_loop(config, callback_loop)
+        if callback_target is not None:
+            provider_model, provider_config = _provider_callbacks_on_caller(
+                self,
+                config,
+                callback_target,
+            )
         controller = self._retry_controller
         visibility = _AttemptVisibility() if controller is not None else None
         if visibility is not None:
@@ -1676,9 +2038,12 @@ class ModelCallGuardMixin:
             )
 
         async def provider_call() -> Any:
-            return await super(ModelCallGuardMixin, provider_model).ainvoke(
-                input, config=provider_config, stop=stop, **kwargs
-            )
+            with _without_duplicate_ambient_callback_hooks(
+                provider_config.get("callbacks")
+            ):
+                return await super(ModelCallGuardMixin, provider_model).ainvoke(
+                    input, config=provider_config, stop=stop, **kwargs
+                )
 
         if controller is None:
             operation = provider_call
@@ -1713,21 +2078,26 @@ class ModelCallGuardMixin:
         _ensure_model_process(self)
         deadline = _capture_deadline(self._model_call_policy)
         scope_id = _scope_id_from_config(config)
+        callback_pump = _SyncCallerCallbackPump()
         return _SyncStreamIterator(
-            lambda: self._guarded_astream(
-                input,
-                config=config,
-                stop=stop,
-                deadline=deadline,
-                scope_id=scope_id,
-                callback_loop=None,
-                **kwargs,
+            lambda: _stream_with_callback_target(
+                lambda: self._guarded_astream(
+                    input,
+                    config=config,
+                    stop=stop,
+                    deadline=deadline,
+                    scope_id=scope_id,
+                    callback_target=callback_pump,
+                    **kwargs,
+                ),
+                callback_pump,
             ),
             deadline=deadline,
             scope_id=scope_id,
             registry=self._bridge_registry,
             policy=self._model_call_policy,
             metadata=self._runtime_metadata,
+            callback_pump=callback_pump,
         )
 
     def astream(
@@ -1744,20 +2114,23 @@ class ModelCallGuardMixin:
         scope_id = _scope_id_from_config(config)
 
         def provider_stream(
-            callback_loop: asyncio.AbstractEventLoop | None,
+            callback_target: asyncio.AbstractEventLoop | None,
         ) -> AsyncIterator[Any]:
-            return self._guarded_astream(
-                input,
-                config=config,
-                stop=stop,
-                deadline=deadline,
-                scope_id=scope_id,
-                callback_loop=callback_loop,
-                **kwargs,
+            return _stream_with_callback_target(
+                lambda: self._guarded_astream(
+                    input,
+                    config=config,
+                    stop=stop,
+                    deadline=deadline,
+                    scope_id=scope_id,
+                    callback_target=callback_target,
+                    **kwargs,
+                ),
+                callback_target,
             )
 
         if _GLOBAL_BRIDGE_RUNTIME.owns_current_loop():
-            return provider_stream(None)
+            return provider_stream(_ACTIVE_CALLBACK_TARGET.get())
         return _AsyncBridgeStreamIterator(
             provider_stream,
             deadline=deadline,
@@ -1775,22 +2148,36 @@ class ModelCallGuardMixin:
         stop: list[str] | None,
         deadline: float,
         scope_id: str,
-        callback_loop: asyncio.AbstractEventLoop | None,
+        callback_target: asyncio.AbstractEventLoop | _SyncCallerCallbackPump | None,
         **kwargs: Any,
     ) -> AsyncIterator[Any]:
         provider_model = self
         provider_config = ensure_config(config)
-        if callback_loop is not None:
-            provider_model = _provider_on_caller_callback_loop(self, callback_loop)
-            provider_config = _config_on_caller_callback_loop(config, callback_loop)
+        if callback_target is not None:
+            provider_model, provider_config = _provider_callbacks_on_caller(
+                self,
+                config,
+                callback_target,
+            )
+
+        async def base_provider_stream() -> AsyncIterator[Any]:
+            with _without_duplicate_ambient_callback_hooks(
+                provider_config.get("callbacks")
+            ):
+                async for item in super(
+                    ModelCallGuardMixin,
+                    provider_model,
+                ).astream(
+                    input,
+                    config=provider_config,
+                    stop=stop,
+                    **kwargs,
+                ):
+                    yield item
+
         controller = self._retry_controller
         if controller is None:
-            iterator = super(ModelCallGuardMixin, provider_model).astream(
-                input,
-                config=provider_config,
-                stop=stop,
-                **kwargs,
-            )
+            iterator = base_provider_stream()
         else:
             visibility = _AttemptVisibility()
             provider_config = _config_with_visibility_callback(
@@ -1799,16 +2186,8 @@ class ModelCallGuardMixin:
                 local_callbacks=getattr(provider_model, "callbacks", None),
             )
 
-            def provider_stream() -> AsyncIterator[Any]:
-                return super(ModelCallGuardMixin, provider_model).astream(
-                    input,
-                    config=provider_config,
-                    stop=stop,
-                    **kwargs,
-                )
-
             iterator = controller.astream(
-                provider_stream,
+                base_provider_stream,
                 deadline=deadline,
                 input=input,
                 max_tokens=kwargs.get("max_tokens", 1000) or 1000,
@@ -2135,6 +2514,7 @@ def _initialize_guard_state(
     model._bridge_registry = BridgeRegistry()
     model._retry_controller = None
     model._guard_pid = os.getpid()
+    _ensure_model_callback_proxies(model)
     _snapshot_lazy_provider_clients(model, metadata)
 
 
@@ -2284,90 +2664,12 @@ def _bounded_native_timeout(current: Any, policy: ModelCallPolicy) -> Any:
     return policy.timeout_seconds
 
 
-class _BorrowedSyncTransport(httpx.BaseTransport):
-    """Delegate requests without taking ownership of a caller's transport."""
-
-    def __init__(self, transport: httpx.BaseTransport) -> None:
-        self._transport = transport
-
-    def handle_request(self, request: httpx.Request) -> httpx.Response:
-        return self._transport.handle_request(request)
-
-    def close(self) -> None:
-        pass
-
-
-class _BorrowedAsyncTransport(httpx.AsyncBaseTransport):
-    """Delegate requests without taking ownership of a caller's async transport."""
-
-    def __init__(self, transport: httpx.AsyncBaseTransport) -> None:
-        self._transport = transport
-
-    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        return await self._transport.handle_async_request(request)
-
-    async def aclose(self) -> None:
-        pass
-
-
-def _bounded_httpx_client(
-    client: httpx.Client, policy: ModelCallPolicy
-) -> httpx.Client:
-    mounts = {
-        pattern.pattern: (
-            None if transport is None else _BorrowedSyncTransport(transport)
-        )
-        for pattern, transport in client._mounts.items()
-    }
-    return httpx.Client(
-        auth=client._auth,
-        params=client.params,
-        headers=client.headers,
-        cookies=client.cookies,
-        trust_env=client._trust_env,
-        mounts=mounts,
-        timeout=_bounded_native_timeout(client.timeout, policy),
-        follow_redirects=client.follow_redirects,
-        max_redirects=client.max_redirects,
-        event_hooks={name: list(hooks) for name, hooks in client.event_hooks.items()},
-        base_url=client.base_url,
-        transport=_BorrowedSyncTransport(client._transport),
-        default_encoding=client._default_encoding,
-    )
-
-
-def _bounded_httpx_async_client(
-    client: httpx.AsyncClient, policy: ModelCallPolicy
-) -> httpx.AsyncClient:
-    mounts = {
-        pattern.pattern: (
-            None if transport is None else _BorrowedAsyncTransport(transport)
-        )
-        for pattern, transport in client._mounts.items()
-    }
-    return httpx.AsyncClient(
-        auth=client._auth,
-        params=client.params,
-        headers=client.headers,
-        cookies=client.cookies,
-        trust_env=client._trust_env,
-        mounts=mounts,
-        timeout=_bounded_native_timeout(client.timeout, policy),
-        follow_redirects=client.follow_redirects,
-        max_redirects=client.max_redirects,
-        event_hooks={name: list(hooks) for name, hooks in client.event_hooks.items()},
-        base_url=client.base_url,
-        transport=_BorrowedAsyncTransport(client._transport),
-        default_encoding=client._default_encoding,
-    )
-
-
 def _validated_provider_fields(
     model: BaseChatModel,
     metadata: ModelRuntimeMetadata,
     policy: ModelCallPolicy,
     *,
-    borrow_http_transports: bool = True,
+    clone_http_transports: bool = True,
 ) -> dict[str, Any]:
     fields = {
         name: getattr(model, name)
@@ -2387,6 +2689,8 @@ def _validated_provider_fields(
             native = dict(fields.get(name) or {})
             native["timeout"] = _bounded_native_timeout(native.get("timeout"), policy)
             fields[name] = native
+        if clone_http_transports:
+            _install_fresh_ollama_transport_fields(model, fields, metadata, policy)
     elif metadata.provider in {"aws_bedrock", "openai", "azure_openai"}:
         fields["request_timeout"] = _bounded_native_timeout(
             fields.get("request_timeout"), policy
@@ -2402,12 +2706,35 @@ def _validated_provider_fields(
             fields.pop(name, None)
         http_client = getattr(model, "http_client", None)
         http_async_client = getattr(model, "http_async_client", None)
-        if borrow_http_transports and isinstance(http_client, httpx.Client):
-            fields["http_client"] = _bounded_httpx_client(http_client, policy)
-        if borrow_http_transports and isinstance(http_async_client, httpx.AsyncClient):
-            fields["http_async_client"] = _bounded_httpx_async_client(
-                http_async_client, policy
+        if not isinstance(http_client, httpx.Client):
+            http_client = getattr(getattr(model, "root_client", None), "_client", None)
+        if not isinstance(http_async_client, httpx.AsyncClient):
+            http_async_client = getattr(
+                getattr(model, "root_async_client", None),
+                "_client",
+                None,
             )
+        fresh_http_client: httpx.Client | None = None
+        if clone_http_transports and isinstance(http_client, httpx.Client):
+            fresh_http_client = _fresh_httpx_client_after_fork(
+                http_client,
+                policy,
+                owner=model,
+                metadata=metadata,
+            )
+            fields["http_client"] = fresh_http_client
+        if clone_http_transports and isinstance(http_async_client, httpx.AsyncClient):
+            try:
+                fields["http_async_client"] = _fresh_httpx_async_client_after_fork(
+                    http_async_client,
+                    policy,
+                    owner=model,
+                    metadata=metadata,
+                )
+            except BaseException:
+                if fresh_http_client is not None:
+                    fresh_http_client.close()
+                raise
     elif metadata.provider == "anthropic":
         fields["default_request_timeout"] = _bounded_native_timeout(
             fields.get("default_request_timeout"), policy
@@ -2420,16 +2747,12 @@ def _validated_provider_fields(
 def _httpx_transport_ssl_context(client: Any) -> Any:
     """Recover safe TLS configuration without reusing a live transport pool."""
     transport = getattr(client, "_transport", None)
-    while isinstance(transport, (_BorrowedSyncTransport, _BorrowedAsyncTransport)):
-        transport = transport._transport
     pool = getattr(transport, "_pool", None)
     return getattr(pool, "_ssl_context", True)
 
 
 def _unwrapped_httpx_transport(transport: Any) -> Any:
-    """Return provider transport beneath non-owning guard wrappers."""
-    while isinstance(transport, (_BorrowedSyncTransport, _BorrowedAsyncTransport)):
-        transport = transport._transport
+    """Return provider transport without borrowing caller-owned wrappers."""
     return transport
 
 
@@ -2469,25 +2792,42 @@ def _fresh_httpx_transport_after_fork(
     transport: Any,
     *,
     asynchronous: bool,
+    owner: BaseChatModel | None = None,
+    metadata: ModelRuntimeMetadata | None = None,
 ) -> Any:
-    """Recreate standard HTTPX transport settings around fresh pool state."""
+    """Recreate standard transports or use an explicit model clone capability."""
     transport = _unwrapped_httpx_transport(transport)
     expected_type = httpx.AsyncHTTPTransport if asynchronous else httpx.HTTPTransport
-    if not isinstance(transport, expected_type):
-        return None
-    pool = transport._pool
-    transport_class = httpx.AsyncHTTPTransport if asynchronous else httpx.HTTPTransport
-    return transport_class(
-        verify=getattr(pool, "_ssl_context", True),
-        trust_env=False,
-        http1=getattr(pool, "_http1", True),
-        http2=getattr(pool, "_http2", False),
-        limits=_httpx_limits_from_pool(pool),
-        proxy=_resolved_httpx_proxy(pool),
-        uds=getattr(pool, "_uds", None),
-        local_address=getattr(pool, "_local_address", None),
-        retries=getattr(pool, "_retries", 0),
-        socket_options=getattr(pool, "_socket_options", None),
+    if type(transport) is expected_type:
+        pool = transport._pool
+        transport_class = (
+            httpx.AsyncHTTPTransport if asynchronous else httpx.HTTPTransport
+        )
+        return transport_class(
+            verify=getattr(pool, "_ssl_context", True),
+            trust_env=False,
+            http1=getattr(pool, "_http1", True),
+            http2=getattr(pool, "_http2", False),
+            limits=_httpx_limits_from_pool(pool),
+            proxy=_resolved_httpx_proxy(pool),
+            uds=getattr(pool, "_uds", None),
+            local_address=getattr(pool, "_local_address", None),
+            retries=getattr(pool, "_retries", 0),
+            socket_options=getattr(pool, "_socket_options", None),
+        )
+    clone = getattr(owner, "clone_model_http_transport", None)
+    if callable(clone):
+        try:
+            fresh = clone(transport, asynchronous=asynchronous)
+        except Exception:
+            raise UnsupportedModelOverrideError(
+                provider=(metadata.provider if metadata is not None else "unknown")
+            ) from None
+        valid_type = httpx.AsyncBaseTransport if asynchronous else httpx.BaseTransport
+        if isinstance(fresh, valid_type) and fresh is not transport:
+            return fresh
+    raise UnsupportedModelOverrideError(
+        provider=(metadata.provider if metadata is not None else "unknown")
     )
 
 
@@ -2495,6 +2835,8 @@ def _fresh_httpx_mounts_after_fork(
     client: Any,
     *,
     asynchronous: bool,
+    owner: BaseChatModel | None = None,
+    metadata: ModelRuntimeMetadata | None = None,
 ) -> dict[str, Any]:
     """Clone resolved proxy/no-proxy mounts without inherited transports."""
     mounts: dict[str, Any] = {}
@@ -2505,20 +2847,26 @@ def _fresh_httpx_mounts_after_fork(
         fresh_transport = _fresh_httpx_transport_after_fork(
             transport,
             asynchronous=asynchronous,
+            owner=owner,
+            metadata=metadata,
         )
-        if fresh_transport is not None:
-            mounts[pattern.pattern] = fresh_transport
+        mounts[pattern.pattern] = fresh_transport
     return mounts
 
 
 def _fresh_httpx_client_after_fork(
     client: httpx.Client,
     policy: ModelCallPolicy,
+    *,
+    owner: BaseChatModel | None = None,
+    metadata: ModelRuntimeMetadata | None = None,
 ) -> httpx.Client:
     """Clone stable client settings around a new process-local transport."""
     transport = _fresh_httpx_transport_after_fork(
         client._transport,
         asynchronous=False,
+        owner=owner,
+        metadata=metadata,
     )
     return httpx.Client(
         auth=client._auth,
@@ -2528,7 +2876,12 @@ def _fresh_httpx_client_after_fork(
         verify=_httpx_transport_ssl_context(client),
         # macOS system proxy discovery is not safe after a multithreaded fork.
         trust_env=False,
-        mounts=_fresh_httpx_mounts_after_fork(client, asynchronous=False),
+        mounts=_fresh_httpx_mounts_after_fork(
+            client,
+            asynchronous=False,
+            owner=owner,
+            metadata=metadata,
+        ),
         timeout=_bounded_native_timeout(client.timeout, policy),
         follow_redirects=client.follow_redirects,
         max_redirects=client.max_redirects,
@@ -2542,11 +2895,16 @@ def _fresh_httpx_client_after_fork(
 def _fresh_httpx_async_client_after_fork(
     client: httpx.AsyncClient,
     policy: ModelCallPolicy,
+    *,
+    owner: BaseChatModel | None = None,
+    metadata: ModelRuntimeMetadata | None = None,
 ) -> httpx.AsyncClient:
     """Clone stable async settings around a new process-local transport."""
     transport = _fresh_httpx_transport_after_fork(
         client._transport,
         asynchronous=True,
+        owner=owner,
+        metadata=metadata,
     )
     return httpx.AsyncClient(
         auth=client._auth,
@@ -2556,7 +2914,12 @@ def _fresh_httpx_async_client_after_fork(
         verify=_httpx_transport_ssl_context(client),
         # macOS system proxy discovery is not safe after a multithreaded fork.
         trust_env=False,
-        mounts=_fresh_httpx_mounts_after_fork(client, asynchronous=True),
+        mounts=_fresh_httpx_mounts_after_fork(
+            client,
+            asynchronous=True,
+            owner=owner,
+            metadata=metadata,
+        ),
         timeout=_bounded_native_timeout(client.timeout, policy),
         follow_redirects=client.follow_redirects,
         max_redirects=client.max_redirects,
@@ -2567,6 +2930,50 @@ def _fresh_httpx_async_client_after_fork(
     )
 
 
+def _install_fresh_ollama_transport_fields(
+    model: BaseChatModel,
+    fields: dict[str, Any],
+    metadata: ModelRuntimeMetadata,
+    policy: ModelCallPolicy,
+) -> None:
+    """Clone Ollama HTTP settings without sharing caller-owned loop state."""
+    del policy
+    for name in ("client_kwargs", "sync_client_kwargs", "async_client_kwargs"):
+        client_kwargs = dict(fields.get(name) or {})
+        client_kwargs["trust_env"] = False
+        client_kwargs.pop("mounts", None)
+        client_kwargs.pop("transport", None)
+        fields[name] = client_kwargs
+    clients = (
+        (
+            "sync_client_kwargs",
+            getattr(getattr(model, "_client", None), "_client", None),
+            False,
+        ),
+        (
+            "async_client_kwargs",
+            getattr(getattr(model, "_async_client", None), "_client", None),
+            True,
+        ),
+    )
+    for field_name, client, asynchronous in clients:
+        expected_client_type = httpx.AsyncClient if asynchronous else httpx.Client
+        if not isinstance(client, expected_client_type):
+            continue
+        fields[field_name]["mounts"] = _fresh_httpx_mounts_after_fork(
+            client,
+            asynchronous=asynchronous,
+            owner=model,
+            metadata=metadata,
+        )
+        fields[field_name]["transport"] = _fresh_httpx_transport_after_fork(
+            client._transport,
+            asynchronous=asynchronous,
+            owner=model,
+            metadata=metadata,
+        )
+
+
 def _provider_fields_after_fork(model: BaseChatModel) -> dict[str, Any]:
     """Build constructor fields without inherited loop-bound SDK clients."""
     metadata = model._runtime_metadata
@@ -2575,7 +2982,7 @@ def _provider_fields_after_fork(model: BaseChatModel) -> dict[str, Any]:
         model,
         metadata,
         policy,
-        borrow_http_transports=False,
+        clone_http_transports=False,
     )
     if metadata.provider == "ollama":
         for name in ("client_kwargs", "sync_client_kwargs", "async_client_kwargs"):
@@ -2595,44 +3002,65 @@ def _provider_fields_after_fork(model: BaseChatModel) -> dict[str, Any]:
                 _fresh_httpx_mounts_after_fork(
                     sync_client,
                     asynchronous=False,
+                    owner=model,
+                    metadata=metadata,
                 )
             )
             sync_transport = _fresh_httpx_transport_after_fork(
                 sync_client._transport,
                 asynchronous=False,
+                owner=model,
+                metadata=metadata,
             )
-            if sync_transport is not None:
-                fields["sync_client_kwargs"]["transport"] = sync_transport
+            fields["sync_client_kwargs"]["transport"] = sync_transport
         if isinstance(async_client, httpx.AsyncClient):
             fields["async_client_kwargs"]["mounts"] = (
                 _fresh_httpx_mounts_after_fork(
                     async_client,
                     asynchronous=True,
+                    owner=model,
+                    metadata=metadata,
                 )
             )
             async_transport = _fresh_httpx_transport_after_fork(
                 async_client._transport,
                 asynchronous=True,
+                owner=model,
+                metadata=metadata,
             )
-            if async_transport is not None:
-                fields["async_client_kwargs"]["transport"] = async_transport
+            fields["async_client_kwargs"]["transport"] = async_transport
     elif metadata.provider in {"aws_bedrock", "openai", "azure_openai"}:
         model_fields = type(model).model_fields
-        sync_client = getattr(model, "http_client", None)
-        async_client = getattr(model, "http_async_client", None)
-        if not isinstance(sync_client, httpx.Client):
-            sync_client = getattr(getattr(model, "root_client", None), "_client", None)
-        if not isinstance(async_client, httpx.AsyncClient):
-            async_client = getattr(
-                getattr(model, "root_async_client", None),
-                "_client",
-                None,
-            )
+        root_sync_client = getattr(
+            getattr(model, "root_client", None),
+            "_client",
+            None,
+        )
+        root_async_client = getattr(
+            getattr(model, "root_async_client", None),
+            "_client",
+            None,
+        )
+        sync_client = (
+            root_sync_client
+            if isinstance(root_sync_client, httpx.Client)
+            else getattr(model, "http_client", None)
+        )
+        async_client = (
+            root_async_client
+            if isinstance(root_async_client, httpx.AsyncClient)
+            else getattr(model, "http_async_client", None)
+        )
         fields.pop("http_client", None)
         fields.pop("http_async_client", None)
         if "http_client" in model_fields:
             fields["http_client"] = (
-                _fresh_httpx_client_after_fork(sync_client, policy)
+                _fresh_httpx_client_after_fork(
+                    sync_client,
+                    policy,
+                    owner=model,
+                    metadata=metadata,
+                )
                 if isinstance(sync_client, httpx.Client)
                 else httpx.Client(
                     timeout=policy.timeout_seconds,
@@ -2641,7 +3069,12 @@ def _provider_fields_after_fork(model: BaseChatModel) -> dict[str, Any]:
             )
         if "http_async_client" in model_fields:
             fields["http_async_client"] = (
-                _fresh_httpx_async_client_after_fork(async_client, policy)
+                _fresh_httpx_async_client_after_fork(
+                    async_client,
+                    policy,
+                    owner=model,
+                    metadata=metadata,
+                )
                 if isinstance(async_client, httpx.AsyncClient)
                 else httpx.AsyncClient(
                     timeout=policy.timeout_seconds,
@@ -2680,12 +3113,22 @@ def _install_fork_safe_anthropic_clients(
     source_http_client = getattr(source_client, "_client", None)
     source_http_async_client = getattr(source_async_client, "_client", None)
     http_client = (
-        _fresh_httpx_client_after_fork(source_http_client, policy)
+        _fresh_httpx_client_after_fork(
+            source_http_client,
+            policy,
+            owner=source,
+            metadata=source._runtime_metadata,
+        )
         if isinstance(source_http_client, httpx.Client)
         else httpx.Client(**http_client_params)
     )
     http_async_client = (
-        _fresh_httpx_async_client_after_fork(source_http_async_client, policy)
+        _fresh_httpx_async_client_after_fork(
+            source_http_async_client,
+            policy,
+            owner=source,
+            metadata=source._runtime_metadata,
+        )
         if isinstance(source_http_async_client, httpx.AsyncClient)
         else httpx.AsyncClient(**http_client_params)
     )
@@ -2712,10 +3155,14 @@ def _install_fork_safe_google_clients(
     target_api_client._httpx_client = _fresh_httpx_client_after_fork(
         source_http_client,
         policy,
+        owner=source,
+        metadata=source._runtime_metadata,
     )
     target_api_client._async_httpx_client = _fresh_httpx_async_client_after_fork(
         source_http_async_client,
         policy,
+        owner=source,
+        metadata=source._runtime_metadata,
     )
 
 

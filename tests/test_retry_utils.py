@@ -71,9 +71,17 @@ class _TokenRecorder(BaseCallbackHandler):
 class _StreamEventRecorder(BaseCallbackHandler):
     def __init__(self) -> None:
         self.events: list[Any] = []
+        self.starts = 0
+        self.ends = 0
+
+    def on_chat_model_start(self, *_args: Any, **_kwargs: Any) -> None:
+        self.starts += 1
 
     def on_stream_event(self, event: Any, **_kwargs: Any) -> None:
         self.events.append(event)
+
+    def on_llm_end(self, *_args: Any, **_kwargs: Any) -> None:
+        self.ends += 1
 
 
 class _FailingStreamEventRecorder(_StreamEventRecorder):
@@ -591,6 +599,34 @@ def test_failure_before_stream_event_can_retry_without_duplicate_event(
         {"type": "content-block-delta", "delta": {"text": "partial"}}
     ]
     assert clock.sleeps == [0.0]
+
+
+@pytest.mark.parametrize("method", ["invoke", "ainvoke"])
+def test_v2_callback_shared_by_model_and_config_runs_once_per_event(method: str) -> None:
+    clock = _FakeClock()
+    callback = _StreamEventRecorder()
+    model = _guarded_retry_model(
+        _StreamEventThenRateLimitedModel(
+            callbacks=[callback],
+            emit_before_failure=False,
+            attempts=1,
+        ),
+        clock,
+    )
+
+    if method == "invoke":
+        result = model.invoke("hello", config={"callbacks": [callback]})
+    else:
+        result = asyncio.run(
+            model.ainvoke("hello", config={"callbacks": [callback]})
+        )
+
+    assert result.content == "recovered"
+    assert callback.starts == 1
+    assert callback.events == [
+        {"type": "content-block-delta", "delta": {"text": "partial"}}
+    ]
+    assert callback.ends == 1
 
 
 @pytest.mark.parametrize("method", ["invoke", "ainvoke"])
