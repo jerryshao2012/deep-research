@@ -12,14 +12,14 @@
 
 ## File Structure
 
-- Modify `research_agent/research_subagent/tools.py`: define the optional `file_path` default and document when omission is valid.
-- Modify `tests/test_write_file.py`: cover generated schema, content-only execution, and explicit-path compatibility at the decorated tool boundary.
+- Modify `../../../research_agent/research_subagent/tools.py`: define the optional `file_path` default and document when omission is valid.
+- Modify `../../../tests/test_write_file.py`: cover generated schema, content-only execution, and explicit-path compatibility at the decorated tool boundary.
 
 ### Task 1: Lock the `write_file` Tool Contract with Failing Tests
 
 **Files:**
-- Modify: `tests/test_write_file.py`
-- Test: `tests/test_write_file.py`
+- Modify: `../../../tests/test_write_file.py`
+- Test: `../../../tests/test_write_file.py`
 
 - [ ] **Step 1: Import the decorated tool module**
 
@@ -94,7 +94,7 @@ git commit -m "test: reproduce missing final report path"
 
 **Files:**
 - Modify: `research_agent/research_subagent/tools.py:223-247`
-- Test: `tests/test_write_file.py`
+- Test: `../../../tests/test_write_file.py`
 
 - [ ] **Step 1: Change the function contract**
 
@@ -164,8 +164,8 @@ git commit -m "fix: default missing report path"
 ### Task 3: Final Regression Verification
 
 **Files:**
-- Verify: `research_agent/research_subagent/tools.py`
-- Verify: `tests/test_write_file.py`
+- Verify: `../../../research_agent/research_subagent/tools.py`
+- Verify: `../../../tests/test_write_file.py`
 
 - [ ] **Step 1: Run focused adjacent tool coverage**
 
@@ -190,7 +190,7 @@ git diff main...HEAD --check
 ```
 
 Expected: only the approved spec, this plan, `tools.py`, and
-`tests/test_write_file.py` appear; diff check is clean.
+`../../../tests/test_write_file.py` appear; diff check is clean.
 
 - [ ] **Step 3: Record verification evidence**
 

@@ -45,7 +45,7 @@ The 7z MIME list deliberately includes the IANA-style browser value, the establi
 
 ## Backend Design
 
-Generalize `webapp/markdown_images.py` archive detection into format-specific validators behind one asset validator:
+Generalize `../../../webapp/markdown_images.py` archive detection into format-specific validators behind one asset validator:
 
 - ZIP continues using Python `zipfile` and drains each `ZipInfo` directly.
 - TAR uses Python `tarfile`; inspect members and drain each regular-file payload through a global counting reader without calling extraction APIs. Reject when declared totals or actual bytes cross the limit.

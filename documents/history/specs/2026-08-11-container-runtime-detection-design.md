@@ -2,7 +2,7 @@
 
 ## Context
 
-`build.sh` and `build-aws.sh` currently call Apple's `container` CLI directly for runtime startup, image builds, registry login, tagging, and pushing. Operators with Podman or Docker installed cannot use the build scripts without rewriting those commands.
+`../../../build.sh` and `../../../build-aws.sh` currently call Apple's `container` CLI directly for runtime startup, image builds, registry login, tagging, and pushing. Operators with Podman or Docker installed cannot use the build scripts without rewriting those commands.
 
 ## Goals
 
@@ -22,7 +22,7 @@
 
 ## Design
 
-Add `scripts/container_runtime.sh` as the single adapter used by both build scripts. It exposes a small shell API:
+Add `../../../scripts/container_runtime.sh` as the single adapter used by both build scripts. It exposes a small shell API:
 
 - `select_container_runtime` validates an explicit override when present. Without an override, it checks `container`, `podman`, then `docker` with `command -v`. It stores only an allowlisted runtime name. Missing or invalid commands produce an actionable error.
 - `ensure_container_runtime_ready` preserves `container system status` and `container system start --disable-kernel-install` behavior for Apple's runtime. Podman runs `podman info` as a daemonless usability check and never starts a service. Docker runs `docker info`; failure tells the operator to start the Docker daemon. The script does not attempt platform-specific Docker startup.

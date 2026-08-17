@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make `build.sh` and `build-aws.sh` select Apple `container`, daemonless Podman, or Docker automatically and use the selected CLI for build, registry login, tag, and push operations.
+**Goal:** Make `../../../build.sh` and `../../../build-aws.sh` select Apple `container`, daemonless Podman, or Docker automatically and use the selected CLI for build, registry login, tag, and push operations.
 
 **Architecture:** Add one source-only Bash adapter that owns runtime selection, readiness checks, and CLI-specific subcommand mappings. Both cloud build scripts load environment configuration before selection, source the adapter through an absolute script-relative path, and retain their existing registry, build-context, image, and version behavior.
 
@@ -12,13 +12,13 @@
 
 ## File Map
 
-- Create `scripts/container_runtime.sh`: runtime allowlist, selection order, readiness checks, and build/login/tag/push wrappers.
-- Create `tests/test_container_runtime_scripts.py`: isolated adapter tests with temporary executable stubs plus build-script and documentation contracts.
-- Modify `build.sh`: load adapter, select runtime after environment files, and replace direct Apple `container` calls.
-- Modify `build-aws.sh`: load adapter, select runtime after `env-aws.sh`, and replace direct Apple `container` calls.
-- Modify `tests/test_azure_persistence_scripts.py`: preserve staged-context contract while expecting the runtime-neutral build wrapper.
-- Modify `documents/deployment/azure/README.md`: supported runtimes, priority, override, and readiness guidance.
-- Modify `documents/deployment/aws.md`: same runtime guidance for the ECR build path.
+- Create `../../../scripts/container_runtime.sh`: runtime allowlist, selection order, readiness checks, and build/login/tag/push wrappers.
+- Create `../../../tests/test_container_runtime_scripts.py`: isolated adapter tests with temporary executable stubs plus build-script and documentation contracts.
+- Modify `../../../build.sh`: load adapter, select runtime after environment files, and replace direct Apple `container` calls.
+- Modify `../../../build-aws.sh`: load adapter, select runtime after `../../../env-aws.sh`, and replace direct Apple `container` calls.
+- Modify `../../../tests/test_azure_persistence_scripts.py`: preserve staged-context contract while expecting the runtime-neutral build wrapper.
+- Modify `../../deployment/azure/README.md`: supported runtimes, priority, override, and readiness guidance.
+- Modify `../../deployment/aws.md`: same runtime guidance for the ECR build path.
 
 ## Runtime Contract
 
@@ -31,8 +31,8 @@
 ### Task 1: Runtime Selection and Readiness
 
 **Files:**
-- Create: `tests/test_container_runtime_scripts.py`
-- Create: `scripts/container_runtime.sh`
+- Create: `../../../tests/test_container_runtime_scripts.py`
+- Create: `../../../scripts/container_runtime.sh`
 
 - [ ] **Step 1: Write failing selection tests**
 
@@ -147,7 +147,7 @@ Run:
 uv run pytest tests/test_container_runtime_scripts.py -q
 ```
 
-Expected: FAIL because `scripts/container_runtime.sh` does not exist.
+Expected: FAIL because `../../../scripts/container_runtime.sh` does not exist.
 
 - [ ] **Step 3: Implement runtime selection**
 
@@ -344,8 +344,8 @@ git commit -m "feat: detect supported container runtimes"
 ### Task 2: Runtime Command Wrappers
 
 **Files:**
-- Modify: `tests/test_container_runtime_scripts.py`
-- Modify: `scripts/container_runtime.sh`
+- Modify: `../../../tests/test_container_runtime_scripts.py`
+- Modify: `../../../scripts/container_runtime.sh`
 
 - [ ] **Step 1: Write failing command-mapping tests**
 
@@ -502,7 +502,7 @@ git commit -m "feat: map container runtime commands"
 ### Task 3: Integrate Both Build Scripts
 
 **Files:**
-- Modify: `tests/test_container_runtime_scripts.py`
+- Modify: `../../../tests/test_container_runtime_scripts.py`
 - Modify: `tests/test_azure_persistence_scripts.py:13-26`
 - Modify: `build.sh:5-8,46-59,85-100,112-151`
 - Modify: `build-aws.sh:4-41,72-110`
@@ -601,7 +601,7 @@ container_runtime_tag "$FULL_IMAGE_NAME" "$VERSIONED_IMAGE_NAME"
 container_runtime_push "$VERSIONED_IMAGE_NAME"
 ```
 
-Keep `git ls-files`, tar staging, explicit `.env.docker` copy, cleanup trap, and immediate post-build cleanup unchanged.
+Keep `git ls-files`, tar staging, explicit `../../../.env.docker` copy, cleanup trap, and immediate post-build cleanup unchanged.
 
 - [ ] **Step 5: Replace AWS runtime calls**
 
@@ -654,7 +654,7 @@ git commit -m "feat: use detected runtime in build scripts"
 ### Task 4: Document Runtime Choice
 
 **Files:**
-- Modify: `tests/test_container_runtime_scripts.py`
+- Modify: `../../../tests/test_container_runtime_scripts.py`
 - Modify: `documents/deployment/azure/README.md:28-49,95-101`
 - Modify: `documents/deployment/aws.md:21-39,83-89`
 
@@ -706,7 +706,7 @@ Explain after the build command that Podman runs without a service, Docker must 
 
 - [ ] **Step 4: Update AWS deployment guidance**
 
-Apply the same prerequisite and check wording to `build-aws.sh`. Include override examples using `./build-aws.sh`. Do not change AWS authentication or ECR instructions.
+Apply the same prerequisite and check wording to `../../../build-aws.sh`. Include override examples using `./build-aws.sh`. Do not change AWS authentication or ECR instructions.
 
 - [ ] **Step 5: Run documentation tests and verify GREEN**
 
@@ -780,4 +780,4 @@ Expected: no whitespace errors and no uncommitted task files.
 
 - [ ] **Step 5: Record durable code areas**
 
-Record `scripts/container_runtime.sh`, `build.sh`, and `build-aws.sh` with concise descriptions in Code Context Engine after verification.
+Record `../../../scripts/container_runtime.sh`, `../../../build.sh`, and `../../../build-aws.sh` with concise descriptions in Code Context Engine after verification.

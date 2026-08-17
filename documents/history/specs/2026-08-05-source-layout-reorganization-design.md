@@ -31,7 +31,7 @@ will not remain available through compatibility shims.
 
 ## Ownership Boundary
 
-`research_agent/` owns application composition and shared runtime services:
+`../../../research_agent` owns application composition and shared runtime services:
 
 ```text
 research_agent/
@@ -59,9 +59,9 @@ research_agent/
     └── utils/
 ```
 
-Top-level `webapp/` remains HTTP/upload application. Top-level `thread_wiki/`
+Top-level `../../../webapp` remains HTTP/upload application. Top-level `../../../thread_wiki`
 remains independent document and code knowledge subsystem. Root maintenance
-scripts `increment_version.py` and `migrate_sqlite_to_cosmos.py` remain
+scripts `../../../increment_version.py` and `../../../migrate_sqlite_to_cosmos.py` remain
 standalone because they are not imported by application runtime.
 
 New `research_agent/__init__.py` stays lightweight. It must not eagerly construct
@@ -71,20 +71,20 @@ graph, models, database clients, or other environment-dependent objects.
 
 | Current path | New path |
 | --- | --- |
-| `agent.py` | `research_agent/agent.py` |
-| `auth.py` | `research_agent/auth.py` |
-| `azure_storage.py` | `research_agent/azure_storage.py` |
-| `db.py` | `research_agent/db.py` |
-| `db_sql.py` | `research_agent/db_sql.py` |
-| `langgraph_snapshot.py` | `research_agent/langgraph_snapshot.py` |
-| `logger_utils.py` | `research_agent/logger_utils.py` |
-| `model_factory.py` | `research_agent/model_factory.py` |
-| `research_agent_cli.py` | `research_agent/cli.py` |
-| `retry_utils.py` | `research_agent/retry_utils.py` |
-| `run.py` | `research_agent/run.py` |
-| `s3_storage.py` | `research_agent/s3_storage.py` |
-| `server.py` | `research_agent/server.py` |
-| `utils.py` | `research_agent/cli_utils.py` |
+| `agent.py` | `../../../research_agent/agent.py` |
+| `auth.py` | `../../../research_agent/auth.py` |
+| `azure_storage.py` | `../../../research_agent/azure_storage.py` |
+| `db.py` | `../../../research_agent/db.py` |
+| `db_sql.py` | `../../../research_agent/db_sql.py` |
+| `langgraph_snapshot.py` | `../../../research_agent/langgraph_snapshot.py` |
+| `logger_utils.py` | `../../../research_agent/logger_utils.py` |
+| `model_factory.py` | `../../../research_agent/model_factory.py` |
+| `research_agent_cli.py` | `../../../research_agent/cli.py` |
+| `retry_utils.py` | `../../../research_agent/retry_utils.py` |
+| `run.py` | `../../../research_agent/run.py` |
+| `s3_storage.py` | `../../../research_agent/s3_storage.py` |
+| `server.py` | `../../../research_agent/server.py` |
+| `utils.py` | `../../../research_agent/cli_utils.py` |
 | `research_agent/**` | `research_agent/research_subagent/**` |
 
 Moves should retain Git rename history. Content changes during relocation are
@@ -114,8 +114,8 @@ module paths. It does not retain exports from old `research_agent` namespace.
 
 ## Entry Points and Execution Flow
 
-`langgraph.json` points graph and auth entries into packaged files under
-`research_agent/`; web application entry remains under `webapp/`.
+`../../../langgraph.json` points graph and auth entries into packaged files under
+`../../../research_agent`; web application entry remains under `../../../webapp`.
 
 CLI invocation becomes:
 
@@ -148,10 +148,10 @@ No request, state, checkpoint, database, output, or skill data shape changes.
 ## Filesystem and Resource Resolution
 
 Any path derived from `__file__` must be recalculated for extra package depth.
-Repository resources such as `.deepagents/skills`, `documents`, output folders,
+Repository resources such as `../../../.deepagents/skills`, `documents`, output folders,
 configuration files, and local databases retain current repository-relative or
 environment-configured locations. Tests must cover path-sensitive behavior so
-package relocation does not silently point inside `research_agent/`.
+package relocation does not silently point inside `../../../research_agent`.
 
 ## Migration Sequence
 
@@ -180,7 +180,7 @@ TDD starts with layout contracts that demonstrate requested breaking change:
 - researcher modules exist under `research_agent.research_subagent`;
 - application-owned root modules are absent;
 - old `research_agent.tools`-style paths are absent;
-- `langgraph.json` points to packaged graph and auth modules;
+- `../../../langgraph.json` points to packaged graph and auth modules;
 - package discovery includes nested researcher packages;
 - new CLI module invocation is importable without path hacks.
 
@@ -205,7 +205,7 @@ their existing prerequisites and skip behavior.
 ## Acceptance Criteria
 
 - No application runtime `.py` module remains at repository root.
-- `increment_version.py` and `migrate_sqlite_to_cosmos.py` are only allowed
+- `../../../increment_version.py` and `../../../migrate_sqlite_to_cosmos.py` are only allowed
   root Python scripts.
 - `research_agent.agent:agent` is canonical graph composition object.
 - `research_agent.research_subagent.tools` is canonical researcher tools module.

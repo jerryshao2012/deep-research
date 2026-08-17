@@ -38,8 +38,8 @@ research_agent/
     └── utils/
 ```
 
-Only `increment_version.py` and `migrate_sqlite_to_cosmos.py` remain as root
-Python scripts. `webapp/` and `thread_wiki/` remain independent top-level
+Only `../../../increment_version.py` and `../../../migrate_sqlite_to_cosmos.py` remain as root
+Python scripts. `../../../webapp` and `../../../thread_wiki` remain independent top-level
 packages.
 
 ## Canonical Import Mapping
@@ -61,19 +61,19 @@ packages.
 | root `utils` | `research_agent.cli_utils` |
 | old `research_agent.*` researcher modules | `research_agent.research_subagent.*` |
 
-Historical documents under `documents/history/` are records and are not
+Historical documents under `..` are records and are not
 rewritten. Generated/cache/worktree copies are not migration targets.
 
 ### Task 1: Nest Researcher Implementation
 
 **Files:**
-- Create: `tests/test_source_layout.py`
+- Create: `../../../tests/test_source_layout.py`
 - Create: `research_agent/__init__.py`
-- Move: `research_agent/prompts.py` → `research_agent/research_subagent/prompts.py`
-- Move: `research_agent/tools.py` → `research_agent/research_subagent/tools.py`
-- Move: `research_agent/clarification/` → `research_agent/research_subagent/clarification/`
-- Move: `research_agent/resume/` → `research_agent/research_subagent/resume/`
-- Move: `research_agent/utils/` → `research_agent/research_subagent/utils/`
+- Move: `research_agent/prompts.py` → `../../../research_agent/research_subagent/prompts.py`
+- Move: `research_agent/tools.py` → `../../../research_agent/research_subagent/tools.py`
+- Move: `research_agent/clarification/` → `../../../research_agent/research_subagent/clarification`
+- Move: `research_agent/resume/` → `../../../research_agent/research_subagent/resume`
+- Move: `research_agent/utils/` → `../../../research_agent/research_subagent/utils`
 - Move: `research_agent/__init__.py` → `research_agent/research_subagent/__init__.py`
 - Modify: `agent.py:41-70`
 - Modify: `research_agent_cli.py:22-24`
@@ -82,25 +82,25 @@ rewritten. Generated/cache/worktree copies are not migration targets.
 - Modify: `thread_wiki/routes.py:25`
 - Modify: `thread_wiki/service.py:38-41`
 - Modify: `research_agent.ipynb:66,114,321`
-- Modify: `tests/test_citations.py`
-- Modify: `tests/test_clarification.py`
-- Modify: `tests/test_eval_tracking.py`
-- Modify: `tests/test_learning.py`
-- Modify: `tests/test_prompts_validation.py`
-- Modify: `tests/test_research_agent_cli.py`
-- Modify: `tests/test_resume.py`
-- Modify: `tests/test_retrieval.py`
-- Modify: `tests/test_skill_contracts.py`
-- Modify: `tests/test_skill_registry.py`
-- Modify: `tests/test_tools.py`
-- Modify: `tests/test_validation.py`
-- Modify: `tests/test_verification.py`
-- Modify: `tests/test_web_search.py`
-- Modify: `tests/test_write_file.py`
+- Modify: `../../../tests/test_citations.py`
+- Modify: `../../../tests/test_clarification.py`
+- Modify: `../../../tests/test_eval_tracking.py`
+- Modify: `../../../tests/test_learning.py`
+- Modify: `../../../tests/test_prompts_validation.py`
+- Modify: `../../../tests/test_research_agent_cli.py`
+- Modify: `../../../tests/test_resume.py`
+- Modify: `../../../tests/test_retrieval.py`
+- Modify: `../../../tests/test_skill_contracts.py`
+- Modify: `../../../tests/test_skill_registry.py`
+- Modify: `../../../tests/test_tools.py`
+- Modify: `../../../tests/test_validation.py`
+- Modify: `../../../tests/test_verification.py`
+- Modify: `../../../tests/test_web_search.py`
+- Modify: `../../../tests/test_write_file.py`
 
 - [ ] **Step 1: Write failing researcher-boundary tests**
 
-Create `tests/test_source_layout.py`:
+Create `../../../tests/test_source_layout.py`:
 
 ```python
 from __future__ import annotations
@@ -167,7 +167,7 @@ Run:
 uv run pytest tests/test_source_layout.py -v
 ```
 
-Expected: failures because `research_agent/research_subagent/` does not exist and
+Expected: failures because `../../../research_agent/research_subagent` does not exist and
 legacy researcher paths still resolve.
 
 - [ ] **Step 3: Move researcher files with Git history**
@@ -272,49 +272,49 @@ git commit -m "refactor: nest research subagent package"
 ### Task 2: Move Application Modules into `research_agent`
 
 **Files:**
-- Modify: `tests/test_source_layout.py`
-- Move: `agent.py` → `research_agent/agent.py`
-- Move: `auth.py` → `research_agent/auth.py`
-- Move: `azure_storage.py` → `research_agent/azure_storage.py`
-- Move: `db.py` → `research_agent/db.py`
-- Move: `db_sql.py` → `research_agent/db_sql.py`
-- Move: `langgraph_snapshot.py` → `research_agent/langgraph_snapshot.py`
-- Move: `logger_utils.py` → `research_agent/logger_utils.py`
-- Move: `model_factory.py` → `research_agent/model_factory.py`
-- Move: `research_agent_cli.py` → `research_agent/cli.py`
-- Move: `retry_utils.py` → `research_agent/retry_utils.py`
-- Move: `run.py` → `research_agent/run.py`
-- Move: `s3_storage.py` → `research_agent/s3_storage.py`
-- Move: `server.py` → `research_agent/server.py`
-- Move: `utils.py` → `research_agent/cli_utils.py`
-- Modify: `research_agent/research_subagent/tools.py`
-- Modify: `research_agent/research_subagent/utils/citation_validator.py`
-- Modify: `research_agent/research_subagent/utils/content_extractors.py`
-- Modify: `research_agent/research_subagent/utils/eval_tracking.py`
-- Modify: `research_agent/research_subagent/utils/knowledge_filesystem.py`
-- Modify: `research_agent/research_subagent/utils/skill_registry.py`
-- Modify: `research_agent/research_subagent/utils/text_search.py`
-- Modify: `research_agent/research_subagent/utils/verification.py`
-- Modify: `research_agent/research_subagent/utils/web_search.py`
-- Modify: `.deepagents/skills/golden-dataset/scripts/skill_model_factory.py`
-- Modify: `thread_wiki/routes.py`
-- Modify: `thread_wiki/service.py`
-- Modify: `tests/logger_example.py`
-- Modify: `tests/test_agent_contracts.py`
-- Modify: `tests/test_aws_persistence_scripts.py`
-- Modify: `tests/test_azure_persistence_scripts.py`
-- Modify: `tests/test_clarification.py`
-- Modify: `tests/test_frontend_api_contract.py`
-- Modify: `tests/test_langgraph_snapshot.py`
-- Modify: `tests/test_research_agent_cli_e2e.py`
-- Modify: `tests/test_research_agent_cli_helpers.py`
-- Modify: `tests/test_retry_utils.py`
-- Modify: `tests/test_server.py`
-- Modify: `tests/test_tools.py`
+- Modify: `../../../tests/test_source_layout.py`
+- Move: `agent.py` → `../../../research_agent/agent.py`
+- Move: `auth.py` → `../../../research_agent/auth.py`
+- Move: `azure_storage.py` → `../../../research_agent/azure_storage.py`
+- Move: `db.py` → `../../../research_agent/db.py`
+- Move: `db_sql.py` → `../../../research_agent/db_sql.py`
+- Move: `langgraph_snapshot.py` → `../../../research_agent/langgraph_snapshot.py`
+- Move: `logger_utils.py` → `../../../research_agent/logger_utils.py`
+- Move: `model_factory.py` → `../../../research_agent/model_factory.py`
+- Move: `research_agent_cli.py` → `../../../research_agent/cli.py`
+- Move: `retry_utils.py` → `../../../research_agent/retry_utils.py`
+- Move: `run.py` → `../../../research_agent/run.py`
+- Move: `s3_storage.py` → `../../../research_agent/s3_storage.py`
+- Move: `server.py` → `../../../research_agent/server.py`
+- Move: `utils.py` → `../../../research_agent/cli_utils.py`
+- Modify: `../../../research_agent/research_subagent/tools.py`
+- Modify: `../../../research_agent/research_subagent/utils/citation_validator.py`
+- Modify: `../../../research_agent/research_subagent/utils/content_extractors.py`
+- Modify: `../../../research_agent/research_subagent/utils/eval_tracking.py`
+- Modify: `../../../research_agent/research_subagent/utils/knowledge_filesystem.py`
+- Modify: `../../../research_agent/research_subagent/utils/skill_registry.py`
+- Modify: `../../../research_agent/research_subagent/utils/text_search.py`
+- Modify: `../../../research_agent/research_subagent/utils/verification.py`
+- Modify: `../../../research_agent/research_subagent/utils/web_search.py`
+- Modify: `../../../.deepagents/skills/golden-dataset/scripts/skill_model_factory.py`
+- Modify: `../../../thread_wiki/routes.py`
+- Modify: `../../../thread_wiki/service.py`
+- Modify: `../../../tests/logger_example.py`
+- Modify: `../../../tests/test_agent_contracts.py`
+- Modify: `../../../tests/test_aws_persistence_scripts.py`
+- Modify: `../../../tests/test_azure_persistence_scripts.py`
+- Modify: `../../../tests/test_clarification.py`
+- Modify: `../../../tests/test_frontend_api_contract.py`
+- Modify: `../../../tests/test_langgraph_snapshot.py`
+- Modify: `../../../tests/test_research_agent_cli_e2e.py`
+- Modify: `../../../tests/test_research_agent_cli_helpers.py`
+- Modify: `../../../tests/test_retry_utils.py`
+- Modify: `../../../tests/test_server.py`
+- Modify: `../../../tests/test_tools.py`
 
 - [ ] **Step 1: Extend layout tests for application ownership and paths**
 
-Add to `tests/test_source_layout.py`:
+Add to `../../../tests/test_source_layout.py`:
 
 ```python
 APPLICATION_FILES = {
@@ -501,15 +501,15 @@ git commit -m "refactor: package research application modules"
 ### Task 3: Update Runtime and Packaging Entry Points
 
 **Files:**
-- Modify: `tests/test_source_layout.py`
-- Modify: `tests/test_packaging.py`
-- Modify: `langgraph.json`
-- Modify: `.github/workflows/eval-regression.yml`
-- Possibly regenerate: `deep_research_example.egg-info/SOURCES.txt`
+- Modify: `../../../tests/test_source_layout.py`
+- Modify: `../../../tests/test_packaging.py`
+- Modify: `../../../langgraph.json`
+- Modify: `../../../.github/workflows/eval-regression.yml`
+- Possibly regenerate: `../../../deep_research_example.egg-info/SOURCES.txt`
 
 - [ ] **Step 1: Add failing entry-point contracts**
 
-Add to `tests/test_source_layout.py`:
+Add to `../../../tests/test_source_layout.py`:
 
 ```python
 import json
@@ -537,7 +537,7 @@ def test_eval_workflow_watches_packaged_agent() -> None:
     assert "from research_agent.utils" not in workflow
 ```
 
-Extend `tests/test_packaging.py`:
+Extend `../../../tests/test_packaging.py`:
 
 ```python
 def test_nested_research_subagent_is_discoverable() -> None:
@@ -574,7 +574,7 @@ Keep `./webapp/__init__.py:app` unchanged.
 
 - [ ] **Step 4: Update CI path filter**
 
-Update every executable reference in `.github/workflows/eval-regression.yml`:
+Update every executable reference in `../../../.github/workflows/eval-regression.yml`:
 
 ```text
 "agent.py"                                      -> "research_agent/agent.py"
@@ -591,7 +591,7 @@ Run:
 uv sync --frozen
 ```
 
-If tracked `deep_research_example.egg-info/SOURCES.txt` changes, include generated
+If tracked `../../../deep_research_example.egg-info/SOURCES.txt` changes, include generated
 path updates; do not hand-edit metadata.
 
 - [ ] **Step 6: Verify package and entry-point contracts**
@@ -619,13 +619,13 @@ Omit generated metadata path from `git add` when it did not change.
 ### Task 4: Remove Remaining Stale Code and Notebook References
 
 **Files:**
-- Modify: `tests/test_source_layout.py`
+- Modify: `../../../tests/test_source_layout.py`
 - Modify: every remaining `.py` file reported by failing contract
-- Modify: `../../../documents/research_agent.ipynb`
+- Modify: `../../research_agent.ipynb`
 
 - [ ] **Step 1: Add failing AST import contract**
 
-Add to `tests/test_source_layout.py`:
+Add to `../../../tests/test_source_layout.py`:
 
 ```python
 import ast
@@ -707,7 +707,7 @@ modules, or root wrappers.
 
 - [ ] **Step 4: Update notebook code cells**
 
-In `../../../documents/research_agent.ipynb`, change only code-cell source strings:
+In `../../research_agent.ipynb`, change only code-cell source strings:
 
 ```python
 from research_agent.research_subagent.tools import tavily_search, think_tool
@@ -738,24 +738,24 @@ git commit -m "test: enforce canonical source imports"
 ### Task 5: Update Maintained Documentation and Repository Guidance
 
 **Files:**
-- Modify: `tests/test_documentation.py`
-- Modify: `README.md`
-- Modify: `AGENTS.md`
-- Modify: `documents/api/upload.md`
-- Modify: `documents/architecture/clean-architecture.md`
-- Modify: `documents/architecture/overview.md`
-- Modify: `documents/development/extending-the-agent.md`
-- Modify: `documents/development/testing.md`
-- Modify: `documents/getting-started/installation.md`
-- Modify: `documents/getting-started/local-development.md`
-- Modify: `documents/getting-started/usage.md`
-- Modify: `documents/guides/configuration.md`
-- Modify: `documents/guides/evaluation.md`
-- Modify: `documents/guides/reliability.md`
+- Modify: `../../../tests/test_documentation.py`
+- Modify: `../../../README.md`
+- Modify: `../../../AGENTS.md`
+- Modify: `../../api/upload.md`
+- Modify: `../../architecture/clean-architecture.md`
+- Modify: `../../architecture/overview.md`
+- Modify: `../../development/extending-the-agent.md`
+- Modify: `../../development/testing.md`
+- Modify: `../../getting-started/installation.md`
+- Modify: `../../getting-started/local-development.md`
+- Modify: `../../getting-started/usage.md`
+- Modify: `../../guides/configuration.md`
+- Modify: `../../guides/evaluation.md`
+- Modify: `../../guides/reliability.md`
 
 - [ ] **Step 1: Add failing maintained-documentation contract**
 
-Add to `tests/test_documentation.py`:
+Add to `../../../tests/test_documentation.py`:
 
 ```python
 MAINTAINED_SOURCE_DOCS = (
@@ -819,7 +819,7 @@ research_agent/research_subagent/utils/...
 ```
 
 Update relative Markdown links according to each document's directory depth.
-Keep `documents/history/` unchanged.
+Keep `..` unchanged.
 
 - [ ] **Step 4: Update architecture descriptions**
 

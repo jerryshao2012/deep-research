@@ -4,33 +4,33 @@
 
 **Goal:** Extend existing synchronized Markdown asset endpoints for validated `.7z`, `.tar`, `.tar.gz`, and `.tgz` archives plus opaque card-only Microsoft Office attachments alongside images and ZIPs.
 
-**Architecture:** Move archive recognition and bounded in-memory validation into `webapp/markdown_archive_validation.py`, and isolate extension-only Office classification in `webapp/markdown_office_formats.py`; keep existing routes and storage namespace in `webapp/markdown_images.py`. Upload requests containing archives acquire one bounded batch slot before any persistence and run decompression in worker threads, while Office bytes remain opaque. One upload-only gate controls all post-ZIP formats; read/download compatibility stays enabled for stored assets.
+**Architecture:** Move archive recognition and bounded in-memory validation into `../../../webapp/markdown_archive_validation.py`, and isolate extension-only Office classification in `../../../webapp/markdown_office_formats.py`; keep existing routes and storage namespace in `../../../webapp/markdown_images.py`. Upload requests containing archives acquire one bounded batch slot before any persistence and run decompression in worker threads, while Office bytes remain opaque. One upload-only gate controls all post-ZIP formats; read/download compatibility stays enabled for stored assets.
 
 **Tech Stack:** Python 3.12–3.13, FastAPI/Starlette, stdlib `zipfile`/`tarfile`/`gzip`, `py7zr`, pytest, Ruff, uv.
 
 **Design specs:**
 
-- `docs/superpowers/specs/2026-08-13-markdown-archive-attachments-design.md`
-- `docs/superpowers/specs/2026-08-13-markdown-office-attachments-design.md`
+- `../specs/2026-08-13-markdown-archive-attachments-design.md`
+- `../specs/2026-08-13-markdown-office-attachments-design.md`
 
 ---
 
 ## File map
 
-- Create `webapp/markdown_archive_validation.py`: archive format table, candidate detection, normalized types, bounded ZIP/TAR/gzip/7z validators, discard-only 7z writer.
-- Create `webapp/markdown_office_formats.py`: authoritative Office extension/family catalog and opaque stored-type helpers.
-- Create `tests/test_markdown_archive_validation.py`: focused unit tests for signatures, MIME agreement, integrity, encryption, member count, and actual expanded-byte limits.
-- Create `tests/test_markdown_office_formats.py`: complete Office catalog, case matching, misleading suffix, and MIME-independence tests.
-- Modify `webapp/markdown_images.py`: delegate archive validation, add upload feature gate, batch limiter, worker-thread dispatch, generalized stored-archive download behavior.
-- Modify `tests/test_markdown_image_api.py`: end-to-end mixed upload, normalized metadata, overload atomicity, download, corruption, and cleanup tests for all formats.
-- Modify `pyproject.toml` and `uv.lock`: lock `py7zr` runtime support.
-- Modify `.env.example`: document `MARKDOWN_EXTENDED_ATTACHMENT_UPLOADS_ENABLED`.
+- Create `../../../webapp/markdown_archive_validation.py`: archive format table, candidate detection, normalized types, bounded ZIP/TAR/gzip/7z validators, discard-only 7z writer.
+- Create `../../../webapp/markdown_office_formats.py`: authoritative Office extension/family catalog and opaque stored-type helpers.
+- Create `../../../tests/test_markdown_archive_validation.py`: focused unit tests for signatures, MIME agreement, integrity, encryption, member count, and actual expanded-byte limits.
+- Create `../../../tests/test_markdown_office_formats.py`: complete Office catalog, case matching, misleading suffix, and MIME-independence tests.
+- Modify `../../../webapp/markdown_images.py`: delegate archive validation, add upload feature gate, batch limiter, worker-thread dispatch, generalized stored-archive download behavior.
+- Modify `../../../tests/test_markdown_image_api.py`: end-to-end mixed upload, normalized metadata, overload atomicity, download, corruption, and cleanup tests for all formats.
+- Modify `../../../pyproject.toml` and `../../../uv.lock`: lock `py7zr` runtime support.
+- Modify `../../../.env.example`: document `MARKDOWN_EXTENDED_ATTACHMENT_UPLOADS_ENABLED`.
 
 ### Task 1: Lock 7z runtime support
 
 **Files:**
 - Modify: `pyproject.toml:6-67`
-- Modify: `uv.lock`
+- Modify: `../../../uv.lock`
 
 - [ ] **Step 1: Add the bounded dependency range**
 
@@ -40,7 +40,7 @@ Run:
 uv add "py7zr>=1.1.3,<2"
 ```
 
-Expected: `pyproject.toml` contains `py7zr>=1.1.3,<2`; `uv.lock` resolves `py7zr` and codec dependencies for Python 3.12/3.13.
+Expected: `../../../pyproject.toml` contains `py7zr>=1.1.3,<2`; `../../../uv.lock` resolves `py7zr` and codec dependencies for Python 3.12/3.13.
 
 - [ ] **Step 2: Verify supported in-memory APIs**
 
@@ -72,8 +72,8 @@ git commit -m "build: add 7z validation dependency"
 ### Task 2: Define archive classification and preserve ZIP behavior
 
 **Files:**
-- Create: `webapp/markdown_archive_validation.py`
-- Create: `tests/test_markdown_archive_validation.py`
+- Create: `../../../webapp/markdown_archive_validation.py`
+- Create: `../../../tests/test_markdown_archive_validation.py`
 - Modify: `webapp/markdown_images.py:12-52,111-152`
 
 - [ ] **Step 1: Write failing classification and ZIP regression tests**
@@ -169,7 +169,7 @@ Move existing `ZipFile(BytesIO(data))` member-count, declared-size, encryption, 
 
 - [ ] **Step 5: Delegate `_validate_asset` and `_is_archive_upload`**
 
-In `webapp/markdown_images.py`, retain image validation and replace ZIP branches with:
+In `../../../webapp/markdown_images.py`, retain image validation and replace ZIP branches with:
 
 ```python
 def _validate_asset(filename: str, content_type: str | None, data: bytes) -> str:
@@ -200,8 +200,8 @@ git commit -m "refactor: centralize markdown archive validation"
 ### Task 3: Add bounded TAR and gzip-TAR validation
 
 **Files:**
-- Modify: `webapp/markdown_archive_validation.py`
-- Modify: `tests/test_markdown_archive_validation.py`
+- Modify: `../../../webapp/markdown_archive_validation.py`
+- Modify: `../../../tests/test_markdown_archive_validation.py`
 
 - [ ] **Step 1: Add real TAR and gzip-TAR fixtures**
 
@@ -285,8 +285,8 @@ git commit -m "feat: validate tar markdown attachments"
 ### Task 4: Add discard-only bounded 7z validation
 
 **Files:**
-- Modify: `webapp/markdown_archive_validation.py`
-- Modify: `tests/test_markdown_archive_validation.py`
+- Modify: `../../../webapp/markdown_archive_validation.py`
+- Modify: `../../../tests/test_markdown_archive_validation.py`
 
 - [ ] **Step 1: Add in-memory 7z fixtures**
 
@@ -367,8 +367,8 @@ git commit -m "feat: validate 7z markdown attachments"
 ### Task 5: Add opaque Microsoft Office format classification
 
 **Files:**
-- Create: `webapp/markdown_office_formats.py`
-- Create: `tests/test_markdown_office_formats.py`
+- Create: `../../../webapp/markdown_office_formats.py`
+- Create: `../../../tests/test_markdown_office_formats.py`
 
 - [ ] **Step 1: Write the failing complete-catalog test**
 
@@ -425,8 +425,8 @@ git commit -m "feat: classify opaque Office attachments"
 
 **Files:**
 - Modify: `webapp/markdown_images.py:247-358`
-- Modify: `tests/test_markdown_image_api.py`
-- Modify: `.env.example`
+- Modify: `../../../tests/test_markdown_image_api.py`
+- Modify: `../../../.env.example`
 
 - [ ] **Step 1: Write failing mixed-format API tests**
 
@@ -459,7 +459,7 @@ Expected: new tests fail.
 
 - [ ] **Step 5: Add runtime upload gate**
 
-Implement a strict false-value parser for `MARKDOWN_EXTENDED_ATTACHMENT_UPLOADS_ENABLED` (default enabled). Apply it to post-ZIP archives and Office uploads only; never apply while loading stored assets. Document rollout/rollback use in `.env.example`.
+Implement a strict false-value parser for `MARKDOWN_EXTENDED_ATTACHMENT_UPLOADS_ENABLED` (default enabled). Apply it to post-ZIP archives and Office uploads only; never apply while loading stored assets. Document rollout/rollback use in `../../../.env.example`.
 
 - [ ] **Step 6: Acquire one archive slot before any batch write**
 
@@ -504,7 +504,7 @@ git commit -m "feat: upload extended markdown archives"
 
 **Files:**
 - Modify: `webapp/markdown_images.py:200-235,360-422`
-- Modify: `tests/test_markdown_image_api.py`
+- Modify: `../../../tests/test_markdown_image_api.py`
 
 - [ ] **Step 1: Write failing retrieval tests for every new format**
 
