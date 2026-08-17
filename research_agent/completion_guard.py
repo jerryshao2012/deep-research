@@ -480,6 +480,9 @@ def _inspect_state_completion(
         report_baseline_modified_at=state.get(
             "completion_report_baseline_modified_at"
         ),
+        report_baseline_fingerprint=state.get(
+            "completion_report_baseline_fingerprint"
+        ),
     )
     if inspection.report_reason is not None:
         return inspection
@@ -758,6 +761,8 @@ def _changed_final_report_fingerprint(
     baseline_fingerprint = state.get("completion_report_baseline_fingerprint")
     if isinstance(baseline_fingerprint, str):
         return fingerprint if fingerprint != baseline_fingerprint else None
+    if baseline_fingerprint is not None:
+        return None
     if (
         _inspect_report(
             state.get("files"),
@@ -779,6 +784,7 @@ def inspect_completion(
     plan_active: bool,
     report_owned: bool,
     report_baseline_modified_at: str | None,
+    report_baseline_fingerprint: object = None,
 ) -> CompletionInspection:
     """Inspect current-request completion without mutating graph state."""
     incomplete_count, malformed_count = _inspect_todos(todos)
@@ -786,6 +792,7 @@ def inspect_completion(
         files,
         report_owned=report_owned,
         baseline_modified_at=report_baseline_modified_at,
+        baseline_fingerprint=report_baseline_fingerprint,
     )
     return CompletionInspection(
         plan_active=plan_active,
@@ -829,6 +836,7 @@ def _inspect_report(
     *,
     report_owned: bool,
     baseline_modified_at: str | None,
+    baseline_fingerprint: object = None,
 ) -> ReportFailureReason | None:
     if not isinstance(files, Mapping):
         return "malformed"
@@ -848,7 +856,14 @@ def _inspect_report(
         return "malformed"
     if not content.strip():
         return "empty"
-    if not report_owned or modified_at == baseline_modified_at:
+    if not report_owned:
+        return "stale"
+    if isinstance(baseline_fingerprint, str):
+        if artifact_fingerprint(file_data) == baseline_fingerprint:
+            return "stale"
+    elif baseline_fingerprint is not None:
+        return "stale"
+    elif modified_at == baseline_modified_at:
         return "stale"
     return None
 

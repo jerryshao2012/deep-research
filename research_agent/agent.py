@@ -10,6 +10,7 @@ import concurrent.futures
 import hashlib
 import os
 import re
+import threading
 import time
 import traceback
 from collections.abc import Awaitable, Callable, Mapping
@@ -112,6 +113,7 @@ EVAL_HISTORY_FILE = os.environ.get(
     "EVAL_HISTORY_FILE", "./output/eval_history/server_runs.jsonl"
 )
 EVAL_LOG_QUESTIONS = str2bool(os.environ.get("EVAL_LOG_QUESTIONS"), False)
+SYNC_EVAL_LOG_TIMEOUT_SECONDS = 2.0
 
 # Verification loop — post-generation quality review with iterative revision.
 # MAX_VERIFICATION_ROUNDS / ENABLE_VERIFICATION are defined in
@@ -355,8 +357,10 @@ def _merge_finalization_update(
 
 def _run_async_from_sync(
     coroutine_factory: Callable[[], Awaitable[Any]],
+    *,
+    timeout_seconds: float,
 ) -> Any:
-    """Run one coroutine to completion from either sync-loop context."""
+    """Run a coroutine from sync code without blocking an active event loop."""
     try:
         current_loop = asyncio.get_running_loop()
     except RuntimeError:
@@ -364,10 +368,68 @@ def _run_async_from_sync(
     if current_loop is None or not current_loop.is_running():
         return asyncio.run(coroutine_factory())
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        return pool.submit(
-            lambda: asyncio.run(coroutine_factory())
-        ).result(timeout=120)
+    result: concurrent.futures.Future[Any] = concurrent.futures.Future()
+    ready = threading.Event()
+    cancellation_requested = threading.Event()
+    control_lock = threading.Lock()
+    control: dict[str, Any] = {}
+
+    def run_in_thread() -> None:
+        loop = asyncio.new_event_loop()
+        task: asyncio.Task[Any] | None = None
+        try:
+            asyncio.set_event_loop(loop)
+            if cancellation_requested.is_set():
+                result.set_result(None)
+                return
+            task = loop.create_task(coroutine_factory())
+            with control_lock:
+                control["loop"] = loop
+                control["task"] = task
+            ready.set()
+            if cancellation_requested.is_set():
+                task.cancel()
+            try:
+                value = loop.run_until_complete(task)
+            except asyncio.CancelledError:
+                value = None
+            if not result.done():
+                result.set_result(value)
+        except BaseException as exc:
+            if not result.done():
+                result.set_exception(exc)
+        finally:
+            ready.set()
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    loop.run_until_complete(task)
+                except asyncio.CancelledError:
+                    pass
+            asyncio.set_event_loop(None)
+            loop.close()
+
+    worker = threading.Thread(
+        target=run_in_thread,
+        name="research-eval-logger",
+        daemon=True,
+    )
+    worker.start()
+    deadline = time.monotonic() + max(timeout_seconds, 0.0)
+    ready.wait(timeout=max(deadline - time.monotonic(), 0.0))
+    try:
+        return result.result(timeout=max(deadline - time.monotonic(), 0.0))
+    except concurrent.futures.TimeoutError:
+        cancellation_requested.set()
+        with control_lock:
+            loop = control.get("loop")
+            task = control.get("task")
+        if isinstance(loop, asyncio.AbstractEventLoop) and isinstance(
+            task, asyncio.Task
+        ):
+            loop.call_soon_threadsafe(task.cancel)
+        worker.join(timeout=min(max(timeout_seconds, 0.0), 0.05))
+        return None
 
 
 # Get current date
@@ -795,8 +857,8 @@ class ResearchStateMiddleware(AgentMiddleware):
                 }
 
                 try:
-                    async def _log_metrics() -> None:
-                        await log_server_metrics(
+                    async def _log_metrics() -> dict[str, Any] | None:
+                        return await log_server_metrics(
                             messages=messages,
                             files=files,
                             runtime_seconds=runtime_seconds,
@@ -805,10 +867,16 @@ class ResearchStateMiddleware(AgentMiddleware):
                             history_file=EVAL_HISTORY_FILE,
                         )
 
-                    _run_async_from_sync(_log_metrics)
+                    log_result = _run_async_from_sync(
+                        _log_metrics,
+                        timeout_seconds=SYNC_EVAL_LOG_TIMEOUT_SECONDS,
+                    )
                 except Exception as e:
                     logger.error(f"⚠️  Failed metrics logging: {e}")
                 else:
+                    if log_result is None:
+                        logger.error("⚠️  Metrics logging returned no success result")
+                        return updates if updates else None
                     updates["_eval_logged"] = True
                     logger.info("✅ Metrics logging completed")
 
@@ -955,7 +1023,7 @@ class ResearchStateMiddleware(AgentMiddleware):
                 }
 
                 try:
-                    await log_server_metrics(
+                    log_result = await log_server_metrics(
                         messages=messages,
                         files=files,
                         runtime_seconds=runtime_seconds,
@@ -967,7 +1035,10 @@ class ResearchStateMiddleware(AgentMiddleware):
                 except Exception as e:
                     logger.error(f"⚠️  Failed metrics logging: {e}")
                 else:
-                    updates["_eval_logged"] = True
+                    if log_result is None:
+                        logger.error("⚠️  Metrics logging returned no success result")
+                    else:
+                        updates["_eval_logged"] = True
 
         return updates if updates else None
 

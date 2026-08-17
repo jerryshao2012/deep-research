@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import threading
+import time
 from typing import Any
 
 import pytest
@@ -741,8 +743,9 @@ def test_eval_logging_uses_same_accepted_report_readiness(
 ) -> None:
     logged_reports: list[dict[str, Any]] = []
 
-    async def fake_log_server_metrics(**kwargs: Any) -> None:
+    async def fake_log_server_metrics(**kwargs: Any) -> dict[str, bool]:
         logged_reports.append(kwargs["files"])
+        return {"logged": True}
 
     monkeypatch.setattr(agent_module, "ENABLE_VERIFICATION", False)
     monkeypatch.setattr(agent_module, "ENABLE_EVAL_TRACKING", True)
@@ -912,19 +915,22 @@ def test_same_timestamp_report_edit_blocks_streaming_and_eval(
 
 
 @pytest.mark.parametrize("async_", [False, True])
-@pytest.mark.parametrize("should_fail", [False, True])
+@pytest.mark.parametrize("result_kind", ["success", "none", "raise"])
 def test_eval_logged_only_after_sync_and_async_logger_success(
     monkeypatch: pytest.MonkeyPatch,
     async_: bool,
-    should_fail: bool,
+    result_kind: str,
 ) -> None:
     calls = 0
 
-    async def fake_log_server_metrics(**kwargs: Any) -> None:
+    async def fake_log_server_metrics(**kwargs: Any) -> dict[str, bool] | None:
         nonlocal calls
         calls += 1
-        if should_fail:
+        if result_kind == "raise":
             raise RuntimeError("metrics unavailable")
+        if result_kind == "none":
+            return None
+        return {"logged": True}
 
     monkeypatch.setattr(agent_module, "ENABLE_VERIFICATION", False)
     monkeypatch.setattr(agent_module, "ENABLE_EVAL_TRACKING", True)
@@ -938,17 +944,20 @@ def test_eval_logged_only_after_sync_and_async_logger_success(
 
     assert calls == 1
     assert result is not None
-    assert result.get("_eval_logged", False) is (not should_fail)
+    assert result.get("_eval_logged", False) is (result_kind == "success")
 
 
-def test_sync_eval_logging_works_inside_running_event_loop(
+@pytest.mark.parametrize("returns_success", [True, False])
+def test_sync_eval_logging_uses_result_inside_running_event_loop(
     monkeypatch: pytest.MonkeyPatch,
+    returns_success: bool,
 ) -> None:
     calls = 0
 
-    async def fake_log_server_metrics(**kwargs: Any) -> None:
+    async def fake_log_server_metrics(**kwargs: Any) -> dict[str, bool] | None:
         nonlocal calls
         calls += 1
+        return {"logged": True} if returns_success else None
 
     monkeypatch.setattr(agent_module, "ENABLE_VERIFICATION", False)
     monkeypatch.setattr(agent_module, "ENABLE_EVAL_TRACKING", True)
@@ -962,7 +971,49 @@ def test_sync_eval_logging_works_inside_running_event_loop(
 
     assert calls == 1
     assert result is not None
-    assert result["_eval_logged"] is True
+    assert result.get("_eval_logged", False) is returns_success
+
+
+def test_sync_eval_timeout_inside_running_loop_returns_promptly_and_cleans_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = threading.Event()
+    cleaned_up = threading.Event()
+
+    async def stalled_log_server_metrics(**kwargs: Any) -> dict[str, bool]:
+        started.set()
+        try:
+            await asyncio.sleep(60)
+        finally:
+            cleaned_up.set()
+        return {"logged": True}
+
+    monkeypatch.setattr(agent_module, "ENABLE_VERIFICATION", False)
+    monkeypatch.setattr(agent_module, "ENABLE_EVAL_TRACKING", True)
+    monkeypatch.setattr(
+        agent_module,
+        "SYNC_EVAL_LOG_TIMEOUT_SECONDS",
+        0.02,
+    )
+    monkeypatch.setattr(
+        agent_module,
+        "log_server_metrics",
+        stalled_log_server_metrics,
+    )
+    middleware = agent_module.ResearchStateMiddleware()
+
+    async def invoke_sync_hook() -> tuple[dict[str, Any] | None, float]:
+        started_at = time.monotonic()
+        result = middleware.after_model(_streamable_state(), runtime=None)
+        return result, time.monotonic() - started_at
+
+    result, elapsed = asyncio.run(invoke_sync_hook())
+
+    assert started.wait(timeout=0.5)
+    assert elapsed < 0.5
+    assert result is not None
+    assert result.get("_eval_logged", False) is False
+    assert cleaned_up.wait(timeout=1.0)
 
 
 def test_research_state_extends_completion_state() -> None:

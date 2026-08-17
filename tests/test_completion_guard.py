@@ -346,6 +346,46 @@ def test_same_timestamp_report_replacement_invalidates_accepted_content(
     )
 
 
+def test_same_timestamp_changed_report_is_current_when_baseline_fingerprint_differs() -> None:
+    baseline = _file("Prior report", modified_at="same-timestamp")
+    current = _file("Current report", modified_at="same-timestamp")
+    state = {
+        "todos": [{"content": "Research", "status": "completed"}],
+        "files": {"/final_report.md": current},
+        "completion_request_generation": "generation-v1",
+        "completion_plan_owner_generation": "generation-v1",
+        "completion_report_owned": True,
+        "completion_report_baseline_modified_at": "same-timestamp",
+        "completion_report_baseline_fingerprint": _fingerprint(baseline),
+        "completion_report_owned_fingerprint": _fingerprint(current),
+    }
+
+    assert completion_guard.completion_ready_for_finalization(
+        state,
+        verification_enabled=False,
+    )
+
+
+def test_unchanged_baseline_fingerprint_remains_stale() -> None:
+    baseline = _file("Prior report", modified_at="same-timestamp")
+    fingerprint = _fingerprint(baseline)
+    state = {
+        "todos": [{"content": "Research", "status": "completed"}],
+        "files": {"/final_report.md": baseline},
+        "completion_request_generation": "generation-v1",
+        "completion_plan_owner_generation": "generation-v1",
+        "completion_report_owned": True,
+        "completion_report_baseline_modified_at": "same-timestamp",
+        "completion_report_baseline_fingerprint": fingerprint,
+        "completion_report_owned_fingerprint": fingerprint,
+    }
+
+    assert not completion_guard.completion_ready_for_finalization(
+        state,
+        verification_enabled=False,
+    )
+
+
 @pytest.mark.parametrize(
     "malformed",
     [{"unhashable": True}, ["unhashable"], {"nested": []}],
@@ -871,6 +911,24 @@ def test_write_file_owns_changed_nonempty_final_report_after_matching_success(
     }
     assert sync_update == expected
     assert async_update == expected
+
+
+def test_write_file_owns_same_timestamp_report_when_content_fingerprint_changes() -> None:
+    baseline = _file("Prior report", modified_at="same-timestamp")
+    current = _file("Current report", modified_at="same-timestamp")
+    state = _activation_state(
+        _tool_exchange(name="write_file", args={"content": "Current report"}),
+        files={"/final_report.md": current},
+    )
+    state["completion_report_baseline_modified_at"] = "same-timestamp"
+    state["completion_report_baseline_fingerprint"] = _fingerprint(baseline)
+
+    update = _middleware(run_id="run-b").before_model(state, runtime=None)
+
+    assert update == {
+        "completion_report_owned": True,
+        "completion_report_owned_fingerprint": _fingerprint(current),
+    }
 
 
 @pytest.mark.parametrize(
