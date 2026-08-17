@@ -2,6 +2,7 @@ import asyncio
 import contextvars
 import logging
 import pickle
+import subprocess
 import sys
 import threading
 import time
@@ -52,6 +53,7 @@ class _AsyncOnlyChatModel(BaseChatModel):
     model_runtime_metadata: Any = None
     suppress_invoke_cancel: bool = False
     suppress_stream_cancel: bool = False
+    failures_before_success: int = 0
     _cancelled: threading.Event = PrivateAttr(default_factory=threading.Event)
     _cancel_count: int = PrivateAttr(default=0)
     _calls: list[dict[str, Any]] = PrivateAttr(default_factory=list)
@@ -59,6 +61,7 @@ class _AsyncOnlyChatModel(BaseChatModel):
     _release_invoke: asyncio.Event = PrivateAttr(default_factory=asyncio.Event)
     _stream_started: threading.Event = PrivateAttr(default_factory=threading.Event)
     _context_values: list[str] = PrivateAttr(default_factory=list)
+    _failure_count: int = PrivateAttr(default=0)
 
     @property
     def _llm_type(self) -> str:
@@ -76,6 +79,9 @@ class _AsyncOnlyChatModel(BaseChatModel):
     ) -> ChatResult:
         self._calls.append({"messages": messages, "stop": stop, "kwargs": kwargs})
         self._context_values.append(_TEST_CONTEXT.get())
+        if self._failure_count < self.failures_before_success:
+            self._failure_count += 1
+            raise RuntimeError("retryable provider failure")
         try:
             await asyncio.sleep(self.delay)
         except (asyncio.CancelledError, GeneratorExit):
@@ -119,6 +125,65 @@ class _AsyncOnlyChatModel(BaseChatModel):
         return self.bind(tools=tools, tool_choice=tool_choice, **kwargs)
 
 
+class _IndependentBindToolsChatModel(_AsyncOnlyChatModel):
+    """Provider fake whose tool binding is independent from the model runnable."""
+
+    def bind_tools(self, tools: Any, *, tool_choice: str | None = None, **kwargs: Any):
+        del tools, tool_choice, kwargs
+
+        async def slow_tool_runnable(_input: Any) -> AIMessage:
+            await asyncio.sleep(0.08)
+            return AIMessage(content="independent")
+
+        return RunnableLambda(slow_tool_runnable)
+
+
+class _DetachedBindToolsChatModel(_AsyncOnlyChatModel):
+    """Provider fake that starts independent work from a guarded operation."""
+
+    _detached_task: asyncio.Task[Any] | None = PrivateAttr(default=None)
+    _release_detached: asyncio.Event = PrivateAttr(default_factory=asyncio.Event)
+
+    def bind_tools(self, tools: Any, *, tool_choice: str | None = None, **kwargs: Any):
+        del tools, tool_choice, kwargs
+
+        async def spawn_detached(_input: Any) -> AIMessage:
+            async def invoke_later() -> AIMessage:
+                await self._release_detached.wait()
+                return await self.ainvoke("detached")
+
+            self._detached_task = asyncio.create_task(invoke_later())
+            return AIMessage(content="spawned")
+
+        return RunnableLambda(spawn_detached)
+
+
+class _CleanupDetachedBindToolsChatModel(_DetachedBindToolsChatModel):
+    """Provider fake retaining owner cleanup while detached work wakes."""
+
+    _cleanup_started: threading.Event = PrivateAttr(default_factory=threading.Event)
+    _finish_cleanup: asyncio.Event = PrivateAttr(default_factory=asyncio.Event)
+
+    def bind_tools(self, tools: Any, *, tool_choice: str | None = None, **kwargs: Any):
+        del tools, tool_choice, kwargs
+
+        async def block_with_detached(_input: Any) -> AIMessage:
+            async def invoke_later() -> AIMessage:
+                await self._release_detached.wait()
+                return await self.ainvoke("detached")
+
+            self._detached_task = asyncio.create_task(invoke_later())
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self._cleanup_started.set()
+                await self._finish_cleanup.wait()
+                raise
+            return AIMessage(content="unreachable")
+
+        return RunnableLambda(block_with_detached)
+
+
 class _PickleableChatModel(BaseChatModel):
     """Minimal provider whose native instances support deep copy and pickle."""
 
@@ -139,6 +204,50 @@ class _PickleableChatModel(BaseChatModel):
         return ChatResult(
             generations=[ChatGeneration(message=AIMessage(content="pickleable"))]
         )
+
+
+def _rebuild_native_reduction_model(
+    payload: list[str],
+) -> "_NativeReductionChatModel":
+    return _NativeReductionChatModel(payload=payload, native_state="pending")
+
+
+class _NativeReductionChatModel(_PickleableChatModel):
+    """Provider whose valid native pickle contract does not use dict state."""
+
+    native_state: str
+
+    def __getstate__(self) -> str:
+        return self.native_state
+
+    def __setstate__(self, state: str) -> None:
+        self.native_state = state
+
+    def __reduce_ex__(self, protocol: int) -> tuple[Any, ...]:
+        del protocol
+        return (
+            _rebuild_native_reduction_model,
+            (self.payload,),
+            self.__getstate__(),
+        )
+
+
+def _rebuild_slot_reduction_model(
+    payload: list[str], native_slot: str
+) -> "_SlotReductionChatModel":
+    model = _SlotReductionChatModel(payload=payload)
+    object.__setattr__(model, "native_slot", native_slot)
+    return model
+
+
+class _SlotReductionChatModel(_PickleableChatModel):
+    """Provider whose native reconstruction reads non-Pydantic slot state."""
+
+    __slots__ = ("native_slot",)
+
+    def __reduce_ex__(self, protocol: int) -> tuple[Any, ...]:
+        del protocol
+        return (_rebuild_slot_reduction_model, (self.payload, self.native_slot))
 
 
 class _RecordingCallback(BaseCallbackHandler):
@@ -990,6 +1099,182 @@ def test_logical_guarded_operation_attempts_ollama_unload_once(
     assert guarded._cancel_count == 1
 
 
+@pytest.mark.parametrize("method", ["invoke", "ainvoke"])
+def test_guarded_retry_backoff_is_inside_outer_total_deadline(
+    monkeypatch,
+    method,
+):
+    import research_agent.model_call_guard as guard
+
+    unload_calls = 0
+
+    async def count_unload(**_kwargs: Any) -> None:
+        nonlocal unload_calls
+        unload_calls += 1
+
+    monkeypatch.setattr(guard, "_maybe_unload_ollama", count_unload)
+    guarded = guard_model(
+        _AsyncOnlyChatModel(failures_before_success=1),
+        metadata=_ollama_metadata(),
+        policy=_policy(0.02, unload=True),
+    )
+    runnable = guarded.with_retry(
+        exponential_jitter_params={
+            "initial": 0.05,
+            "max": 0.05,
+            "jitter": 0.0,
+        },
+        stop_after_attempt=2,
+    )
+
+    started = time.monotonic()
+    with pytest.raises(ModelCallTimeoutError):
+        if method == "invoke":
+            runnable.invoke("hello")
+        else:
+            asyncio.run(runnable.ainvoke("hello"))
+
+    assert time.monotonic() - started < 0.05
+    assert unload_calls == 1
+    assert guarded._failure_count == 1
+
+
+@pytest.mark.parametrize("method", ["invoke", "ainvoke", "stream", "astream"])
+def test_independent_bind_tools_runnable_is_inside_outer_total_deadline(
+    monkeypatch,
+    method,
+):
+    import research_agent.model_call_guard as guard
+
+    unload_calls = 0
+
+    async def count_unload(**_kwargs: Any) -> None:
+        nonlocal unload_calls
+        unload_calls += 1
+
+    monkeypatch.setattr(guard, "_maybe_unload_ollama", count_unload)
+    guarded = guard_model(
+        _IndependentBindToolsChatModel(),
+        metadata=_ollama_metadata(),
+        policy=_policy(0.02, unload=True),
+    )
+    runnable = guarded.bind_tools([])
+
+    started = time.monotonic()
+    with pytest.raises(ModelCallTimeoutError):
+        if method == "invoke":
+            runnable.invoke("hello")
+        elif method == "ainvoke":
+            asyncio.run(runnable.ainvoke("hello"))
+        elif method == "stream":
+            next(runnable.stream("hello"))
+        else:
+
+            async def consume() -> None:
+                await anext(runnable.astream("hello"))
+
+            asyncio.run(consume())
+
+    assert time.monotonic() - started < 0.06
+    assert unload_calls == 1
+
+
+@_async_test
+async def test_outer_operation_context_resets_after_timeout():
+    import research_agent.model_call_guard as guard
+
+    guarded = guard_model(
+        _IndependentBindToolsChatModel(),
+        metadata=_fake_metadata(),
+        policy=_policy(0.02),
+    )
+
+    with pytest.raises(ModelCallTimeoutError):
+        await guarded.bind_tools([]).ainvoke("hello")
+
+    assert guard._ACTIVE_OPERATION.get() is None
+    assert guard._ACTIVE_DEADLINE.get() is None
+    assert guard._ACTIVE_SCOPE_ID.get() is None
+
+
+@_async_test
+async def test_detached_task_cannot_reuse_stale_completed_operation_context():
+    guarded = guard_model(
+        _DetachedBindToolsChatModel(delay=0.2),
+        metadata=_fake_metadata(),
+        policy=_policy(0.08),
+    )
+
+    result = await guarded.bind_tools([]).ainvoke("hello")
+    assert result.content == "spawned"
+    assert guarded._detached_task is not None
+
+    guarded._release_detached.set()
+    started = time.monotonic()
+    with pytest.raises(ModelCallTimeoutError):
+        await guarded._detached_task
+
+    assert time.monotonic() - started < 0.14
+    assert guarded._cancel_count == 1
+
+
+@_async_test
+async def test_detached_task_cannot_reuse_operation_during_post_deadline_cleanup(
+    monkeypatch,
+):
+    import research_agent.model_call_guard as guard
+
+    monkeypatch.setattr(guard, "MODEL_CANCEL_GRACE_SECONDS", 0.3)
+    guarded = guard_model(
+        _CleanupDetachedBindToolsChatModel(delay=0.2),
+        metadata=_fake_metadata(),
+        policy=_policy(0.02),
+    )
+    caller = asyncio.create_task(guarded.bind_tools([]).ainvoke("hello"))
+    while not guarded._cleanup_started.is_set():
+        await asyncio.sleep(0)
+    assert guarded._detached_task is not None
+
+    try:
+        guarded._release_detached.set()
+        with pytest.raises(ModelCallTimeoutError):
+            await guarded._detached_task
+    finally:
+        guarded._finish_cleanup.set()
+        with pytest.raises(ModelCallTimeoutError):
+            await caller
+
+
+@_async_test
+async def test_detached_task_cannot_reuse_operation_during_cancel_cleanup(
+    monkeypatch,
+):
+    import research_agent.model_call_guard as guard
+
+    monkeypatch.setattr(guard, "MODEL_CANCEL_GRACE_SECONDS", 0.3)
+    guarded = guard_model(
+        _CleanupDetachedBindToolsChatModel(delay=0.2),
+        metadata=_fake_metadata(),
+        policy=_policy(0.08),
+    )
+    caller = asyncio.create_task(guarded.bind_tools([]).ainvoke("hello"))
+    while guarded._detached_task is None:
+        await asyncio.sleep(0)
+    caller.cancel("caller")
+    while not guarded._cleanup_started.is_set():
+        await asyncio.sleep(0)
+
+    try:
+        guarded._release_detached.set()
+        with pytest.raises(ModelCallTimeoutError):
+            await guarded._detached_task
+    finally:
+        guarded._finish_cleanup.set()
+        with pytest.raises(asyncio.CancelledError) as raised:
+            await caller
+        assert raised.value.args == ("caller",)
+
+
 @_async_test
 async def test_bound_external_cancellation_owns_cleanup_once(monkeypatch):
     import research_agent.model_call_guard as guard
@@ -1084,7 +1369,7 @@ def test_guarded_model_deep_copy_excludes_registry_lock_and_reinitializes_state(
     assert copied._retry_controller is None
 
 
-def test_generated_guarded_class_is_module_addressable_and_pickleable():
+def test_guard_pickle_reconstructs_through_stable_factory():
     guarded = guard_model(
         _PickleableChatModel(payload=["pickle"]),
         metadata=_fake_metadata(),
@@ -1092,9 +1377,6 @@ def test_generated_guarded_class_is_module_addressable_and_pickleable():
     )
     guarded_class = type(guarded)
 
-    assert getattr(sys.modules[guarded_class.__module__], guarded_class.__name__) is (
-        guarded_class
-    )
     restored = pickle.loads(pickle.dumps(guarded))
 
     assert type(restored) is guarded_class
@@ -1110,26 +1392,105 @@ def test_generated_guarded_class_is_module_addressable_and_pickleable():
     assert restored.invoke("hello").content == "pickleable"
 
 
-def test_generated_guarded_class_names_avoid_provider_module_collisions():
-    import research_agent.model_call_guard as guard
+def test_guard_pickle_preserves_provider_native_custom_reduction():
+    raw = _NativeReductionChatModel(payload=["native"], native_state="non-dict")
+    guarded = guard_model(raw, metadata=_fake_metadata(), policy=_policy(0.2))
 
+    raw_restored = pickle.loads(pickle.dumps(raw))
+    restored = pickle.loads(pickle.dumps(guarded))
+
+    assert raw_restored.payload == ["native"]
+    assert raw_restored.native_state == "non-dict"
+    assert isinstance(restored, _NativeReductionChatModel)
+    assert isinstance(restored, ModelCallGuardMixin)
+    assert restored.payload == raw_restored.payload
+    assert restored.native_state == raw_restored.native_state
+    assert restored._bridge_registry is not guarded._bridge_registry
+
+
+def test_guard_pickle_preserves_provider_native_slot_state():
+    raw = _SlotReductionChatModel(payload=["slot"])
+    object.__setattr__(raw, "native_slot", "provider-slot")
+    guarded = guard_model(raw, metadata=_fake_metadata(), policy=_policy(0.2))
+    object.__setattr__(guarded, "native_slot", raw.native_slot)
+
+    raw_restored = pickle.loads(pickle.dumps(raw))
+    restored = pickle.loads(pickle.dumps(guarded))
+
+    assert raw_restored.native_slot == "provider-slot"
+    assert isinstance(restored, _SlotReductionChatModel)
+    assert isinstance(restored, ModelCallGuardMixin)
+    assert restored.native_slot == raw_restored.native_slot
+
+
+def test_pickle_first_guard_survives_distinct_provider_with_same_import_identity():
+    collision_name = "_SameIdentityPickleProvider"
     first_provider = type(
-        "CollisionProvider",
+        collision_name,
         (_PickleableChatModel,),
-        {"__module__": "providers.one"},
+        {"__module__": __name__, "__qualname__": collision_name},
     )
     second_provider = type(
-        "CollisionProvider",
+        collision_name,
         (_PickleableChatModel,),
-        {"__module__": "providers.two"},
+        {"__module__": __name__, "__qualname__": collision_name},
+    )
+    module = sys.modules[__name__]
+    setattr(module, collision_name, first_provider)
+    try:
+        first = guard_model(
+            first_provider(payload=["first"]),
+            metadata=_fake_metadata(),
+            policy=_policy(0.2),
+        )
+        second = guard_model(
+            second_provider(payload=["second"]),
+            metadata=_fake_metadata(),
+            policy=_policy(0.2),
+        )
+
+        assert type(first) is not type(second)
+        restored = pickle.loads(pickle.dumps(first))
+    finally:
+        delattr(module, collision_name)
+
+    assert isinstance(restored, first_provider)
+    assert restored.payload == ["first"]
+    assert restored.invoke("hello").content == "pickleable"
+
+
+def test_guard_pickle_reconstructs_in_fresh_python_process(tmp_path):
+    guarded = guard_model(
+        _PickleableChatModel(payload=["subprocess"]),
+        metadata=_fake_metadata(),
+        policy=_policy(0.2),
+    )
+    payload_path = tmp_path / "guarded-model.pkl"
+    payload_path.write_bytes(pickle.dumps(guarded))
+    code = """
+import pickle
+import sys
+sys.path.insert(0, "tests")
+from test_model_call_guard import _PickleableChatModel
+from research_agent.model_call_guard import ModelCallGuardMixin
+
+with open(sys.argv[1], "rb") as payload:
+    restored = pickle.load(payload)
+assert isinstance(restored, _PickleableChatModel)
+assert isinstance(restored, ModelCallGuardMixin)
+assert restored.payload == ["subprocess"]
+assert restored._bridge_registry.active_count("unused") == 0
+assert restored.invoke("hello").content == "pickleable"
+"""
+
+    completed = subprocess.run(
+        [sys.executable, "-c", code, str(payload_path)],
+        check=False,
+        capture_output=True,
+        text=True,
     )
 
-    first_guard = guard._guarded_provider_class(first_provider)
-    second_guard = guard._guarded_provider_class(second_provider)
-
-    assert first_guard.__name__ != second_guard.__name__
-    assert getattr(sys.modules[guard.__name__], first_guard.__name__) is first_guard
-    assert getattr(sys.modules[guard.__name__], second_guard.__name__) is second_guard
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_guard_pickle_preserves_native_nonpickleable_provider_failure():

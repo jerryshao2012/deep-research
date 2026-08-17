@@ -10,7 +10,6 @@ import logging
 import math
 import os
 import queue
-import sys
 import threading
 import time
 import uuid
@@ -48,6 +47,34 @@ _ACTIVE_DEADLINE: contextvars.ContextVar[float | None] = contextvars.ContextVar(
 _ACTIVE_SCOPE_ID: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "model_call_scope_id", default=None
 )
+
+
+@dataclass
+class _ModelCallOperation:
+    """Identity shared by one outer deadline owner and its nested model calls."""
+
+    deadline: float
+    scope_id: str
+    active: bool = True
+
+
+_ACTIVE_OPERATION: contextvars.ContextVar[_ModelCallOperation | None] = (
+    contextvars.ContextVar("model_call_operation", default=None)
+)
+
+
+def _active_operation() -> _ModelCallOperation | None:
+    """Return operation until its owner finishes bounded cleanup."""
+    operation = _ACTIVE_OPERATION.get()
+    return operation if operation is not None and operation.active else None
+
+
+def _owned_active_operation() -> _ModelCallOperation | None:
+    """Return operation only during its callable absolute deadline."""
+    operation = _active_operation()
+    if operation is None or time.monotonic() >= operation.deadline:
+        return None
+    return operation
 
 
 def _safe_provider(provider: str) -> ModelProvider:
@@ -338,6 +365,7 @@ async def _run_with_deadline[Result](
     policy: ModelCallPolicy,
     metadata: ModelRuntimeMetadata,
     unload: Callable[[], Awaitable[Any]] | None,
+    on_cancel: Callable[[], None] | None = None,
 ) -> Result:
     """Run a model request under a total deadline and bounded cancellation cleanup."""
     task = asyncio.create_task(factory())
@@ -356,6 +384,8 @@ async def _run_with_deadline[Result](
         if done:
             return task.result()
 
+        if on_cancel is not None:
+            on_cancel()
         task.cancel()
         await _bounded_task_cleanup(task)
         await attempt_unload()
@@ -366,6 +396,8 @@ async def _run_with_deadline[Result](
             and metadata.provider == "ollama",
         )
     except asyncio.CancelledError as original_cancel:
+        if on_cancel is not None:
+            on_cancel()
         if not task.done():
             task.cancel()
         try:
@@ -589,31 +621,15 @@ def _scope_id_from_config(
     )
     if requested is not None and str(requested).strip():
         return str(requested)
-    active = _ACTIVE_SCOPE_ID.get()
-    return active or f"private-{uuid.uuid4().hex}"
+    operation = _active_operation()
+    return operation.scope_id if operation is not None else f"private-{uuid.uuid4().hex}"
 
 
 def _capture_deadline(policy: ModelCallPolicy) -> float:
-    active = _ACTIVE_DEADLINE.get()
-    if active is not None:
-        return active
+    operation = _active_operation()
+    if operation is not None:
+        return operation.deadline
     return time.monotonic() + policy.timeout_seconds
-
-
-async def _run_in_operation_context[ResultT](
-    factory: Callable[[], Awaitable[ResultT]],
-    *,
-    deadline: float,
-    scope_id: str,
-) -> ResultT:
-    """Expose one eager operation identity without owning cancellation."""
-    deadline_token = _ACTIVE_DEADLINE.set(deadline)
-    scope_token = _ACTIVE_SCOPE_ID.set(scope_id)
-    try:
-        return await factory()
-    finally:
-        _ACTIVE_SCOPE_ID.reset(scope_token)
-        _ACTIVE_DEADLINE.reset(deadline_token)
 
 
 def _timeout_error(
@@ -634,7 +650,10 @@ async def _run_with_absolute_deadline[ResultT](
     policy: ModelCallPolicy,
     metadata: ModelRuntimeMetadata,
 ) -> ResultT:
-    """Run one provider operation within an already-captured total deadline."""
+    """Run only the outermost logical model operation as deadline owner."""
+    if _owned_active_operation() is not None:
+        return await factory()
+
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         raise _timeout_error(policy, metadata)
@@ -642,20 +661,29 @@ async def _run_with_absolute_deadline[ResultT](
         timeout_seconds=remaining,
         force_ollama_unload=policy.force_ollama_unload,
     )
+    operation = _ModelCallOperation(deadline=deadline, scope_id=scope_id)
+    operation_token = _ACTIVE_OPERATION.set(operation)
     deadline_token = _ACTIVE_DEADLINE.set(deadline)
     scope_token = _ACTIVE_SCOPE_ID.set(scope_id)
+
+    def close_operation() -> None:
+        operation.active = False
+
     try:
         return await _run_with_deadline(
             factory,
             policy=deadline_policy,
             metadata=metadata,
             unload=None,
+            on_cancel=close_operation,
         )
     except ModelCallTimeoutError:
         raise _timeout_error(policy, metadata) from None
     finally:
+        operation.active = False
         _ACTIVE_SCOPE_ID.reset(scope_token)
         _ACTIVE_DEADLINE.reset(deadline_token)
+        _ACTIVE_OPERATION.reset(operation_token)
 
 
 async def _bounded_async_iterator_close(iterator: AsyncIterator[Any]) -> None:
@@ -694,6 +722,8 @@ def _bridge_result[ResultT](
     """Wait for one bridge result while retaining bounded interrupt cleanup."""
     try:
         wait = max(0.0, deadline - time.monotonic()) + MODEL_CANCEL_GRACE_SECONDS
+        if policy.force_ollama_unload and metadata.provider == "ollama":
+            wait += OLLAMA_UNLOAD_TIMEOUT_SECONDS
         kind, value = control.results.get(timeout=wait)
     except KeyboardInterrupt:
         control.cancel()
@@ -748,6 +778,11 @@ class _SyncStreamIterator[OutputT](Iterator[OutputT]):
             wait = (
                 max(0.0, self._deadline - time.monotonic()) + MODEL_CANCEL_GRACE_SECONDS
             )
+            if (
+                self._policy.force_ollama_unload
+                and self._metadata.provider == "ollama"
+            ):
+                wait += OLLAMA_UNLOAD_TIMEOUT_SECONDS
             kind, value = self._control.results.get(timeout=wait)
         except KeyboardInterrupt:
             self.close()
@@ -825,10 +860,12 @@ class _GuardedBoundRunnable[InputT, OutputT](Runnable[InputT, OutputT]):
         deadline = _capture_deadline(self._owner._model_call_policy)
         scope_id = _scope_id_from_config(config, self._boundary_config)
         control = _start_bridge(
-            lambda: _run_in_operation_context(
+            lambda: _run_with_absolute_deadline(
                 lambda: self.bound.ainvoke(input, config=config, **kwargs),
                 deadline=deadline,
                 scope_id=scope_id,
+                policy=self._owner._model_call_policy,
+                metadata=self._owner._runtime_metadata,
             ),
             scope_id=scope_id,
             registry=self._owner._bridge_registry,
@@ -847,10 +884,12 @@ class _GuardedBoundRunnable[InputT, OutputT](Runnable[InputT, OutputT]):
         scope_id = _scope_id_from_config(config, self._boundary_config)
 
         async def run() -> OutputT:
-            return await _run_in_operation_context(
+            return await _run_with_absolute_deadline(
                 lambda: self.bound.ainvoke(input, config=config, **kwargs),
                 deadline=deadline,
                 scope_id=scope_id,
+                policy=self._owner._model_call_policy,
+                metadata=self._owner._runtime_metadata,
             )
 
         return run()
@@ -901,28 +940,28 @@ class _GuardedBoundRunnable[InputT, OutputT](Runnable[InputT, OutputT]):
             async def create_iterator() -> AsyncIterator[OutputT]:
                 return self.bound.astream(input, config=config, **kwargs)
 
-            iterator = await _run_in_operation_context(
+            iterator = await _run_with_absolute_deadline(
                 create_iterator,
                 deadline=deadline,
                 scope_id=scope_id,
+                policy=self._owner._model_call_policy,
+                metadata=self._owner._runtime_metadata,
             )
             try:
                 while True:
                     try:
-                        item = await _run_in_operation_context(
+                        item = await _run_with_absolute_deadline(
                             lambda: anext(iterator),
                             deadline=deadline,
                             scope_id=scope_id,
+                            policy=self._owner._model_call_policy,
+                            metadata=self._owner._runtime_metadata,
                         )
                     except StopAsyncIteration:
                         return
                     yield item
             finally:
-                await _run_in_operation_context(
-                    lambda: _bounded_async_iterator_close(iterator),
-                    deadline=deadline,
-                    scope_id=scope_id,
-                )
+                await _bounded_async_iterator_close(iterator)
 
         return iterate()
 
@@ -1266,6 +1305,18 @@ class ModelCallGuardMixin:
             metadata=self._runtime_metadata,
         )
 
+    def __reduce_ex__(self: BaseChatModel, protocol: int) -> tuple[Any, tuple[Any, ...]]:
+        """Pickle through provider-native state, never a generated class global."""
+        del protocol
+        return (
+            rebuild_guarded_model,
+            (
+                _provider_native_pickle_view(self),
+                self._runtime_metadata,
+                self._model_call_policy,
+            ),
+        )
+
     def model_copy(
         self: BaseChatModel,
         *,
@@ -1301,6 +1352,61 @@ _GUARD_PRIVATE_ATTR_NAMES = (
 )
 _GUARDED_PROVIDER_CLASSES: dict[type[BaseChatModel], type[BaseChatModel]] = {}
 _GUARDED_PROVIDER_CLASSES_LOCK = threading.Lock()
+
+
+def _copy_provider_slots(
+    source: BaseChatModel,
+    target: BaseChatModel,
+    provider_class: type[BaseChatModel],
+) -> None:
+    """Copy provider-declared slot storage without guard runtime attributes."""
+    excluded_slots = {
+        "__dict__",
+        "__weakref__",
+        "__pydantic_fields_set__",
+        "__pydantic_extra__",
+        "__pydantic_private__",
+        *_GUARD_PRIVATE_ATTR_NAMES,
+    }
+    for owner in provider_class.__mro__:
+        declared_slots = owner.__dict__.get("__slots__", ())
+        slots = (declared_slots,) if isinstance(declared_slots, str) else declared_slots
+        for slot in slots:
+            if slot in excluded_slots:
+                continue
+            storage_name = slot
+            if slot.startswith("__") and not slot.endswith("__"):
+                storage_name = f"_{owner.__name__.lstrip('_')}{slot}"
+            try:
+                value = object.__getattribute__(source, storage_name)
+            except AttributeError:
+                continue
+            object.__setattr__(target, storage_name, value)
+
+
+def _provider_native_pickle_view(model: BaseChatModel) -> BaseChatModel:
+    """Create raw provider storage whose own pickle protocol remains authoritative."""
+    provider_class = type(model).__mro__[2]
+    provider = object.__new__(provider_class)
+    provider_dict = {
+        name: value
+        for name, value in model.__dict__.items()
+        if name not in _GUARD_PRIVATE_ATTR_NAMES
+    }
+    provider_private = dict(model.__pydantic_private__ or {})
+    for name in _GUARD_PRIVATE_ATTR_NAMES:
+        provider_private.pop(name, None)
+
+    object.__setattr__(provider, "__dict__", provider_dict)
+    object.__setattr__(
+        provider,
+        "__pydantic_fields_set__",
+        set(model.__pydantic_fields_set__),
+    )
+    object.__setattr__(provider, "__pydantic_extra__", model.__pydantic_extra__)
+    object.__setattr__(provider, "__pydantic_private__", provider_private or None)
+    _copy_provider_slots(model, provider, provider_class)
+    return provider
 
 
 def _guarded_provider_class(provider_class: type[BaseChatModel]) -> type[BaseChatModel]:
@@ -1347,7 +1453,6 @@ def _guarded_provider_class(provider_class: type[BaseChatModel]) -> type[BaseCha
             (ModelCallGuardMixin, provider_class),
             namespace,
         )
-        setattr(sys.modules[__name__], generated_name, guarded)
         _GUARDED_PROVIDER_CLASSES[provider_class] = guarded
         return guarded
 
@@ -1362,6 +1467,31 @@ def _initialize_guard_state(
     model._runtime_metadata = metadata
     model._bridge_registry = BridgeRegistry()
     model._retry_controller = None
+
+
+def rebuild_guarded_model(
+    provider: BaseChatModel,
+    metadata: ModelRuntimeMetadata,
+    policy: ModelCallPolicy,
+) -> BaseChatModel:
+    """Reconstruct a guarded model from one natively serialized provider."""
+    guarded = guard_model(provider, metadata=metadata, policy=policy)
+    guard_private = {
+        name: getattr(guarded, name) for name in _GUARD_PRIVATE_ATTR_NAMES
+    }
+    provider_private = dict(provider.__pydantic_private__ or {})
+    provider_private.update(guard_private)
+
+    object.__setattr__(guarded, "__dict__", dict(provider.__dict__))
+    object.__setattr__(
+        guarded,
+        "__pydantic_fields_set__",
+        set(provider.__pydantic_fields_set__),
+    )
+    object.__setattr__(guarded, "__pydantic_extra__", provider.__pydantic_extra__)
+    object.__setattr__(guarded, "__pydantic_private__", provider_private)
+    _copy_provider_slots(provider, guarded, type(provider))
+    return guarded
 
 
 def _known_provider_metadata(model: BaseChatModel) -> ModelRuntimeMetadata | None:
