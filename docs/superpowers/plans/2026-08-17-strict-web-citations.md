@@ -8,6 +8,8 @@
 
 **Tech Stack:** Python 3.12+, LangGraph state channels/middleware, LangChain messages, `urllib.parse`, dataclasses, pytest/pytest-asyncio.
 
+**Dependency:** Execute `2026-08-17-model-call-timeout.md` first. This plan extends the verifier/CLI control-error branches introduced there and must not reintroduce blocking executor or fail-open timeout behavior.
+
 ---
 
 ## File map
@@ -17,17 +19,20 @@
 - Create `research_agent/citation_failure.py` — checkpoint-safe failure state, fingerprint/run correlation, safe error, and transition helpers.
 - Modify `research_agent/agent.py:89-95,125-168,311-379,459-478,532-610,693-1066,1068-1115,1255-1274` — ephemeral raw `no_web`, effective per-generation mode, strict verification flow, two-phase failure hooks, and finalization gating.
 - Modify `research_agent/completion_guard.py:344-390` — refuse finalization while a matching citation failure is pending.
+- Modify `research_agent/cli.py:457-568` — propagate hard citation failures without fallback invoke/finalization retry.
 - Create `tests/test_citation_policy.py` — deterministic grammar matrix.
 - Modify `tests/test_verification.py` — early gate, zero-round behavior, sync/async revision/failure transitions, and non-streaming.
 - Modify `tests/test_completion_guard.py` — pending citation failure blocks finalization.
 - Modify `tests/test_agent_contracts.py` — ephemeral channel and hook registration.
 - Modify `tests/test_citations.py` — compatibility with existing citation validation.
+- Modify `tests/test_research_agent_cli_e2e.py` — hard citation failure exits once without fallback.
 - Modify `documents/guides/reliability.md` and `documents/guides/evaluation.md` — strict acceptance behavior and exemptions.
 
 ### Task 1: Pure citation grammar and defect model
 
 **Files:**
 - Create: `research_agent/research_subagent/utils/citation_policy.py`
+- Create: `research_agent/citation_failure.py`
 - Create: `tests/test_citation_policy.py`
 
 - [ ] **Step 1: Write RED tests for accepted URL forms**
@@ -75,6 +80,9 @@ class CitationAudit:
     defects: tuple[CitationDefect, ...]
 
 def audit_web_citations(report: str) -> CitationAudit: ...
+
+class ReportCitationError(RuntimeError):
+    """Safe terminal error for structurally invalid web citations."""
 ```
 
 Implementation order:
@@ -100,7 +108,7 @@ Expected: pass.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add research_agent/research_subagent/utils/citation_policy.py tests/test_citation_policy.py
+git add research_agent/research_subagent/utils/citation_policy.py research_agent/citation_failure.py tests/test_citation_policy.py
 git commit -m "feat: audit report citation structure"
 ```
 
@@ -123,7 +131,7 @@ assert adversarial_model_calls == 0
 assert grounding_network_calls == 0
 ```
 
-Also prove a valid strict report proceeds to existing grounding/sufficiency/adversarial checks, while `strict_web_citations=False` preserves current behavior for no-web/document-only content.
+Also prove a valid strict report proceeds to existing grounding/sufficiency/adversarial checks, while `strict_web_citations=False` preserves current behavior for no-web/document-only content. Every URL form accepted by `CitationAudit` must be converted to `SourceCitation(kind="web", url=url)` and passed to `validate_web_citations`; the old narrow numbered-entry extractor must not be the source of truth.
 
 - [ ] **Step 2: Run preflight slice and confirm RED**
 
@@ -149,6 +157,9 @@ async def verify_report(..., strict_web_citations: bool = False):
                 citation_blocking=True,
                 citation_defects=audit.defects,
             )
+        citations = [SourceCitation(kind="web", url=url) for url in audit.urls]
+    else:
+        citations = _extract_citations_from_report(report)
     ...
 ```
 
@@ -156,7 +167,7 @@ Update `format_feedback()` to render bounded exact messages: missing concrete HT
 
 - [ ] **Step 4: Preserve control exceptions**
 
-Explicitly re-raise `ModelCallTimeoutError`, `ReportCitationError`, and `asyncio.CancelledError` in direct judge and composite verification exception paths. Ordinary judge/parser errors retain existing fallback behavior.
+Retain the timeout plan's async judge calls and explicit `ModelCallTimeoutError`/`asyncio.CancelledError` pass-through. Import the now-existing `ReportCitationError` and explicitly re-raise it in composite verification paths. Ordinary judge/parser errors retain existing fallback behavior.
 
 - [ ] **Step 5: Run verification/citation suites and confirm GREEN**
 
@@ -185,7 +196,9 @@ Compile a minimal graph with `InMemorySaver` and the production state/middleware
 1. input `no_web=true` → effective no-web true → strict citations false;
 2. next input omits `no_web` → raw channel absent → effective no-web false → strict citations true;
 3. false→true and true→false overwrite correctly; and
-4. completion/verification internal `jump_to: model` retains the current effective value.
+4. prior `no_web=true` followed by a visible explicit-resume run with omission resets to false;
+5. natural-language `no web` and `with web` directives still work when raw input is omitted; and
+6. completion/verification internal `jump_to: model` retains the current effective value.
 
 Also prove document context + effective no-web true is exempt, while document context + effective no-web false remains strict.
 
@@ -207,7 +220,7 @@ class ResearchState(CompletionState):
     web_mode_run_id: Annotated[NotRequired[str | None], OmitFromInput]
 ```
 
-In each visible `before_agent`, read only ephemeral `state.get("no_web")`, default absence to false, and overwrite all three effective fields. Resume/internal model jumps keep effective fields because `before_agent` is not rerun for internal jumps. Replace prompt, tool eligibility, verification, and metrics reads of raw `no_web` with `effective_no_web`.
+In every visible `before_agent`, including explicit incomplete-todo resume, resolve web mode with this precedence: supplied ephemeral `no_web` value; current user message's `_extract_no_web()` directive; public default false. Overwrite all three effective fields before the existing resume branch. `_extract_parameters_from_user_input()` must stop writing raw `no_web`; it may return the textual value to the resolver only. Internal model jumps do not rerun `before_agent`, so they retain current effective fields. Replace prompt, tool eligibility, verification, and metrics reads of raw `no_web` with `effective_no_web`.
 
 - [ ] **Step 4: Run checkpointed transition tests and confirm GREEN**
 
@@ -225,11 +238,13 @@ git commit -m "fix: scope web mode to request generation"
 ### Task 4: Checkpoint-safe final citation failure
 
 **Files:**
-- Create: `research_agent/citation_failure.py`
+- Modify: `research_agent/citation_failure.py`
 - Modify: `research_agent/agent.py:89-95,311-379,459-478,693-1066`
 - Modify: `research_agent/completion_guard.py:344-390`
+- Modify: `research_agent/cli.py:457-568`
 - Modify: `tests/test_verification.py`
 - Modify: `tests/test_completion_guard.py`
+- Modify: `tests/test_research_agent_cli_e2e.py`
 
 - [ ] **Step 1: Write RED pure transition tests**
 
@@ -240,6 +255,7 @@ class CitationFailureState(TypedDict, total=False):
     citation_failure_run_id: Annotated[NotRequired[str | None], OmitFromInput]
     citation_failure_report_fingerprint: Annotated[NotRequired[str | None], OmitFromInput]
     citation_failure_defects: Annotated[NotRequired[tuple[dict[str, str], ...]], OmitFromInput]
+    citation_accepted_report_fingerprint: Annotated[NotRequired[str | None], OmitFromInput]
 ```
 
 Test current run/fingerprint match raises `ReportCitationError`; stale run, changed report, malformed defects, or explicit new run clears/ignores failure. Error text contains only bounded defect codes/reference numbers.
@@ -250,6 +266,8 @@ For sync and async compiled graphs with a checkpointer:
 
 - final correction attempt returns `jump_to: end` and checkpoints failure metadata plus intermediate terminal tag;
 - report is not streamed, `_streamed_files` remains unchanged, verified/accepted-at-limit fingerprints remain unset;
+- first invalid report cannot stream or log metrics even when optional verification is disabled;
+- valid structural audit stores current report fingerprint before finalization;
 - `after_agent`/`aafter_agent` raises `ReportCitationError` only after the checkpoint exists;
 - history restore exposes safe failure state; and
 - next explicit run clears stale state and can succeed with a corrected report.
@@ -267,24 +285,27 @@ def build_citation_failure_update(*, run_id, fingerprint, defects, terminal): ..
 def clear_stale_citation_failure(state, current_run_id): ...
 def raise_if_current_citation_failure(state, current_run_id): ...
 def citation_failure_blocks_finalization(state) -> bool: ...
+def citation_acceptance_ready(state, *, required: bool) -> bool: ...
 ```
 
 Use runtime `execution_info.run_id` as authoritative, then top-level configured run ID, matching completion-guard resolution. Store only serialized bounded defects and fingerprint, never report text.
 
 - [ ] **Step 5: Wire two-phase hooks and finalization block**
 
-In `_apply_verification_verdict`, citation-blocking final attempt must not populate accepted-at-limit fields. It writes failure update, tags terminal intermediate, and jumps to end. Add `after_agent`/`aafter_agent` hooks that call the pure raise helper. `finalize_accepted_report` returns `None` whenever a matching citation failure is pending.
+On a clean strict audit, store `citation_accepted_report_fingerprint` for the current owned report. On any invalid or changed report, the marker is absent/mismatched. In `_apply_verification_verdict`, citation-blocking final attempt must not populate accepted-at-limit fields; it writes failure update, tags terminal intermediate, and jumps to end. Add `after_agent`/`aafter_agent` hooks that call the pure raise helper. Both `completion_ready_for_finalization` and `finalize_accepted_report` require a matching structural-acceptance fingerprint whenever strict citations apply, and return false/`None` for pending citation failure. Use this same gate for metrics logging.
+
+In CLI stream handling, catch `ReportCitationError` before generic `Exception`, stop the spinner, and re-raise/exit with its safe message. Do not call fallback `agent.invoke`, `should_retry_with_invoke`, title generation, or file save after this error. Add verbose and non-verbose tests asserting one graph attempt.
 
 - [ ] **Step 6: Run failure/finalization tests and confirm GREEN**
 
-Run: `uv run pytest tests/test_verification.py tests/test_completion_guard.py -q -k 'citation or finalization or stream'`
+Run: `uv run pytest tests/test_verification.py tests/test_completion_guard.py tests/test_research_agent_cli_e2e.py -q -k 'citation or finalization or stream'`
 
 Expected: pass.
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add research_agent/citation_failure.py research_agent/agent.py research_agent/completion_guard.py tests/test_verification.py tests/test_completion_guard.py
+git add research_agent/citation_failure.py research_agent/agent.py research_agent/completion_guard.py research_agent/cli.py tests/test_verification.py tests/test_completion_guard.py tests/test_research_agent_cli_e2e.py
 git commit -m "fix: fail closed on unresolved web citations"
 ```
 
@@ -300,9 +321,8 @@ git commit -m "fix: fail closed on unresolved web citations"
 Parameterize `ENABLE_VERIFICATION` true/false and `MAX_VERIFICATION_ROUNDS` 0/1/2. For strict web runs:
 
 - valid report finalizes immediately when optional LLM verification is off;
-- invalid report gets exactly one structural correction opportunity when off/zero;
-- unchanged invalid report then checkpoints and raises `ReportCitationError`;
-- with positive rounds, configured count bounds correction attempts;
+- invalid report gets initial check → exactly one structural correction request when off/zero → second check/failure if still invalid;
+- with positive rounds, `MAX_VERIFICATION_ROUNDS` counts allowed structural corrections, followed by one final check/failure;
 - non-structural judge `needs_revision` may retain accepted-at-limit behavior;
 - no-web/document-only runs retain current zero-round finalization.
 
@@ -317,11 +337,13 @@ Create helpers:
 ```python
 def _structural_citation_required(state) -> bool: ...
 def _optional_llm_verification_enabled() -> bool: ...
-def _effective_citation_attempt_limit() -> int:
+def _citation_correction_limit() -> int:
     return max(MAX_VERIFICATION_ROUNDS, 1)
 ```
 
-Run strict preflight whenever owned report is ready and not already structurally accepted for its fingerprint. Invoke judges only when optional verification is enabled. Progress labels must distinguish `Citation check 1/1` from `Verification n/N` and never claim verified on blocking failure.
+Track `citation_corrections_used` separately from `verification_round`. On invalid audit, if `used < limit`, increment `used`, inject feedback, tag terminal intermediate, and jump to model. If `used == limit`, checkpoint terminal citation failure. Thus zero/disabled mode performs two checks around one correction, while configured value `2` permits two corrections and fails only on the third invalid check. Reset the counter for each visible request generation and after structural acceptance of a changed report.
+
+Run strict preflight whenever owned report is ready and its structural-acceptance fingerprint does not match. Invoke judges only when optional verification is enabled. Progress labels must distinguish `Citation correction 1/1 requested` from `Verification n/N` and never claim verified on blocking failure.
 
 - [ ] **Step 4: Run matrix and adjacent regressions**
 
@@ -373,7 +395,8 @@ uv run pytest \
   tests/test_verification.py \
   tests/test_verification_progress.py \
   tests/test_completion_guard.py \
-  tests/test_agent_contracts.py -q
+  tests/test_agent_contracts.py \
+  tests/test_research_agent_cli_e2e.py -q
 ```
 
 Expected: all pass.

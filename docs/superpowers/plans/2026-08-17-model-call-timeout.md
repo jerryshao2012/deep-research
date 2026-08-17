@@ -4,7 +4,7 @@
 
 **Goal:** Bound every application-owned model call by a total wall-clock deadline, cancel active requests, and optionally unload an Ollama model without affecting cloud providers.
 
-**Architecture:** Add a focused guarded-runnable module that owns timeout parsing, immutable provider metadata, async cancellation, sync-to-async bridging, binding/streaming preservation, override adaptation, and Ollama unload. Model factory returns guarded models after existing retry/rate shaping; one lightweight middleware fails closed on late raw model overrides. Root, inherited subagents, verification judges, and CLI therefore use one deadline contract.
+**Architecture:** Add a focused `BaseChatModel`-compatible guard module that owns timeout parsing, immutable provider metadata, async cancellation, sync-to-async bridging, bound-runnable streaming preservation, override adaptation, and Ollama unload. Model factory returns guarded models after existing retry/rate shaping; request-boundary middleware is installed in root, explicit research, and explicit general-purpose subagents. Verification judges become truly async and CLI sync entrypoints use the guarded bridge.
 
 **Tech Stack:** Python 3.12+, asyncio, threading, httpx, LangChain Runnable/BaseChatModel APIs, LangGraph middleware, pytest/pytest-asyncio.
 
@@ -12,10 +12,11 @@
 
 ## File map
 
-- Create `research_agent/model_call_guard.py` — timeout configuration, runtime metadata, guarded runnable, sync bridge, override registry, unload helper, and safe errors.
+- Create `research_agent/model_call_guard.py` — timeout configuration, runtime metadata, `BaseChatModel` proxy, guarded bound runnable, sync bridge, override registry, unload helper, and safe errors.
 - Modify `research_agent/model_factory.py:272-384` — construct provider metadata/native HTTP deadlines and guard the selected model after retry wrapping.
-- Modify `research_agent/agent.py:54,1361-1433` — register request-boundary guard and make coverage explicit for root/inherited subagents.
+- Modify `research_agent/agent.py:54,693-1066,1361-1433` — propagate control errors and register request-boundary guards for root/explicit/general-purpose agents.
 - Modify `research_agent/research_subagent/utils/verification.py:117-235` — propagate timeout/cancellation from direct sufficiency and adversarial judge calls.
+- Modify `.deepagents/skills/golden-dataset/scripts/skill_model_factory.py` — reuse the shared guarded factory for active skill judge calls.
 - Modify `research_agent/cli.py:107-131,388-568` — preserve model-control failures and cancel active bridge on CLI interruption.
 - Create `tests/test_model_call_guard.py` — unit/integration coverage for deadlines, cancellation, unload, binding, streaming, and overrides.
 - Create `tests/test_model_factory_timeout.py` — provider precedence, metadata, and native client deadline contracts.
@@ -23,7 +24,7 @@
 - Modify `tests/test_verification.py` — direct judge timeout/cancellation pass-through.
 - Modify `tests/test_research_agent_cli_e2e.py` — CLI interruption and timeout behavior.
 - Modify `.env.example`, `documents/guides/configuration.md`, and `documents/guides/reliability.md` — public configuration and operator guidance.
-- Modify `scripts/render_azure_containerapp_config.py:97-136`, `tests/test_azure_persistence_scripts.py`, `deploy-aws.sh`, and `tests/test_aws_deployment.py` — deployment defaults.
+- Modify `scripts/render_azure_containerapp_config.py:97-136`, `tests/test_azure_persistence_scripts.py`, `deploy-aws.sh`, and `tests/test_aws_persistence_scripts.py` — deployment defaults.
 
 ### Task 1: Configuration, metadata, and safe errors
 
@@ -178,7 +179,7 @@ git add research_agent/model_call_guard.py tests/test_model_call_guard.py
 git commit -m "feat: cancel timed out model requests"
 ```
 
-### Task 3: Guarded runnable, tool binding, streaming, and sync bridge
+### Task 3: BaseChatModel proxy, tool binding, streaming, and sync bridge
 
 **Files:**
 - Modify: `research_agent/model_call_guard.py`
@@ -189,6 +190,7 @@ git commit -m "feat: cancel timed out model requests"
 Cover `invoke`, `ainvoke`, `stream`, `astream`, `bind`, and `bind_tools`. A fake runnable emits `AIMessageChunk` tool-call chunks and usage metadata. Assert:
 
 ```python
+assert isinstance(guarded, BaseChatModel)
 bound = guarded.bind_tools([fake_tool])
 assert is_guarded_model(bound)
 assert bound.runtime_metadata == guarded.runtime_metadata
@@ -202,23 +204,37 @@ Callbacks, tags, configurable values, response metadata, message IDs, tool-call 
 
 Run an async stream in which each chunk arrives faster than the native inactivity timeout but total duration exceeds the guard deadline. Assert sync `stream()`/`invoke()` raises `ModelCallTimeoutError`, local server sees disconnect, elapsed time is bounded, and the named bridge daemon exits for supported fakes.
 
-- [ ] **Step 3: Implement `GuardedRunnable` and sync bridge**
+- [ ] **Step 3: Implement `GuardedChatModel`, bound-runnable guard, and sync bridge**
 
 Required public surface:
 
 ```python
-class GuardedRunnable(Runnable):
+class GuardedChatModel(BaseChatModel):
+    inner: BaseChatModel
     runtime_metadata: ModelRuntimeMetadata
     policy: ModelCallPolicy
+    @property
+    def _llm_type(self) -> str: return f"guarded-{self.inner._llm_type}"
+    @property
+    def profile(self): return self.inner.profile
+    async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs): ...
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs): ...
+    async def _astream(self, messages, stop=None, run_manager=None, **kwargs): ...
+    def _stream(self, messages, stop=None, run_manager=None, **kwargs): ...
+    def bind(self, **kwargs): return GuardedBoundRunnable(self.inner.bind(**kwargs), ...)
+    def bind_tools(self, tools, **kwargs): return GuardedBoundRunnable(self.inner.bind_tools(tools, **kwargs), ...)
+
+class GuardedBoundRunnable(Runnable):
     def invoke(self, input, config=None, **kwargs): ...
     async def ainvoke(self, input, config=None, **kwargs): ...
     def stream(self, input, config=None, **kwargs): ...
     async def astream(self, input, config=None, **kwargs): ...
-    def bind(self, **kwargs): return guard_model(self.inner.bind(**kwargs), ...)
-    def bind_tools(self, tools, **kwargs): return guard_model(self.inner.bind_tools(tools, **kwargs), ...)
+    def bind(self, **kwargs): ...
 ```
 
-The sync bridge must copy `contextvars.copy_context()`, create one daemon thread/event loop, expose loop/task handles through a thread-safe control object, cancel on timeout/`KeyboardInterrupt`/generator close, join only for cleanup grace, consume late exceptions, and never create a `ThreadPoolExecutor`.
+`GuardedChatModel` must remain a real `BaseChatModel` so DeepAgents `resolve_model()` accepts it. Delegate identifying params, profile, name, callbacks/cache configuration, and model metadata required by LangChain. `bind_tools()` may return `GuardedBoundRunnable` only after model resolution.
+
+The sync bridge must copy `contextvars.copy_context()`, create one daemon thread/event loop, expose loop/task handles through a thread-safe control object, cancel on timeout/`KeyboardInterrupt`/generator close, join only for cleanup grace, consume late exceptions, and never create a `ThreadPoolExecutor`. Capture a stream deadline before returning the iterator, not at first iteration; test delayed first consumption.
 
 - [ ] **Step 4: Add RED override-adapter tests**
 
@@ -227,8 +243,8 @@ Test already guarded passthrough; known ChatOllama/OpenAI/Azure/Anthropic/Google
 - [ ] **Step 5: Implement idempotent adapter registry and middleware**
 
 ```python
-def guard_model(model, *, metadata=None, policy=None) -> GuardedRunnable: ...
-def adapt_model_override(model) -> GuardedRunnable: ...
+def guard_model(model: BaseChatModel, *, metadata=None, policy=None) -> GuardedChatModel: ...
+def adapt_model_override(model) -> GuardedChatModel: ...
 
 class ModelCallGuardMiddleware(AgentMiddleware):
     def wrap_model_call(self, request, handler):
@@ -256,6 +272,7 @@ git commit -m "feat: preserve guarded model runnable behavior"
 **Files:**
 - Modify: `research_agent/model_factory.py:272-384`
 - Modify: `research_agent/agent.py:54,1361-1433`
+- Modify: `.deepagents/skills/golden-dataset/scripts/skill_model_factory.py`
 - Create: `tests/test_model_factory_timeout.py`
 - Modify: `tests/test_agent_contracts.py`
 
@@ -279,15 +296,23 @@ def _finalize_model(model, metadata, policy):
     return guard_model(retry_model, metadata=metadata, policy=policy)
 ```
 
-Set provider-native timeout/client kwargs per actual SDK constructor. Keep provider precedence and model cache behavior unchanged; cached object includes resolved policy and therefore requires restart/config-cache clear after env changes.
+Use installed provider APIs exactly:
+
+- `ChatOpenAI`/`AzureChatOpenAI`: `request_timeout=timeout`, `http_client=httpx.Client(timeout=timeout, verify=verify_ssl)`, and `http_async_client=httpx.AsyncClient(timeout=timeout, verify=verify_ssl)`;
+- `ChatAnthropic`: `timeout=timeout` (stored as `default_request_timeout`); preserve current CA behavior through existing environment/SDK configuration;
+- `ChatGoogleGenerativeAI`: `timeout=timeout` plus current custom client when non-default SSL is configured;
+- `ChatOllama`: `client_kwargs={"timeout": timeout}`, `sync_client_kwargs={"timeout": timeout}`, and `async_client_kwargs={"timeout": timeout}`; and
+- Bedrock-compatible/Azure OpenAI constructors retain selected endpoint/deployment metadata from their winning branch.
+
+Keep provider precedence and model cache behavior unchanged; cached object includes resolved policy and therefore requires restart/config-cache clear after env changes. Route the golden-dataset skill factory through `research_agent.model_factory.get_configured_model(bypass_cache=True)` so it cannot construct an unguarded active judge.
 
 - [ ] **Step 4: Write RED compiled graph contract tests**
 
-Compile root with fake guarded model and a tool-calling response. Assert root tool call executes, explicit `research-agent` and inherited `general-purpose` use guarded model, live subgraph updates include nested tool calls, and no response chunk/metadata changes. Add late override success/fail-closed cases.
+Compile root with fake guarded model and a tool-calling response. Assert root tool call executes; explicit `research-agent` and an explicitly supplied `general-purpose` spec both use guarded model plus `ModelCallGuardMiddleware`; live subgraph updates include nested tool calls; and no response chunk/metadata changes. Force a known and unknown late raw override inside each of the three compiled graphs and assert guarded success/fail-closed behavior.
 
 - [ ] **Step 5: Register `ModelCallGuardMiddleware`**
 
-Import it in `research_agent/agent.py` and add it at the request boundary without changing Todo/Clarification/Completion/Resume/Research after-hook order. Contract tests must prove one guard application after tool binding.
+Import it in `research_agent/agent.py` and add it at the root request boundary without changing Todo/Clarification/Completion/Resume/Research after-hook order. Add `model` and `middleware=[ModelCallGuardMiddleware()]` to `research-agent`. Define a local explicit `general-purpose` `SubAgent` with the documented general-purpose role, guarded root model, and same middleware; omit its `tools` key so DeepAgents inherits root tools. Its name suppresses automatic GP creation. Contract tests must prove exactly one guard application after tool binding in every graph.
 
 - [ ] **Step 6: Run factory/graph tests and confirm GREEN**
 
@@ -298,13 +323,14 @@ Expected: pass.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add research_agent/model_factory.py research_agent/agent.py tests/test_model_factory_timeout.py tests/test_agent_contracts.py
+git add research_agent/model_factory.py research_agent/agent.py .deepagents/skills/golden-dataset/scripts/skill_model_factory.py tests/test_model_factory_timeout.py tests/test_agent_contracts.py
 git commit -m "feat: guard every research model path"
 ```
 
 ### Task 5: Judge and CLI control-flow propagation
 
 **Files:**
+- Modify: `research_agent/agent.py:693-1066`
 - Modify: `research_agent/research_subagent/utils/verification.py:117-235`
 - Modify: `research_agent/cli.py:107-131,388-568`
 - Modify: `tests/test_verification.py`
@@ -312,7 +338,7 @@ git commit -m "feat: guard every research model path"
 
 - [ ] **Step 1: Write RED judge pass-through tests**
 
-For sufficiency and adversarial helpers, sync and async paths must re-raise `ModelCallTimeoutError` and `asyncio.CancelledError` rather than return neutral scores/gaps. Ordinary parse/provider failures retain current fallback.
+Convert sufficiency and adversarial helpers to async functions that call `await model.ainvoke()`. Tests must re-raise `ModelCallTimeoutError` and `asyncio.CancelledError` rather than return neutral scores/gaps. Ordinary parse/provider failures retain current fallback.
 
 - [ ] **Step 2: Write RED CLI interruption tests**
 
@@ -324,7 +350,7 @@ Run: `uv run pytest tests/test_verification.py tests/test_research_agent_cli_e2e
 
 - [ ] **Step 4: Implement explicit control-exception branches**
 
-Catch `ModelCallTimeoutError` separately and re-raise. Never catch `CancelledError` under broad fallback. In CLI, use `except KeyboardInterrupt: spinner.stop(); cancel_active_sync_bridge(); raise` before stream fallback logic. Timeout is a run failure and must not call `agent.invoke` fallback or completion continuation.
+Remove `ThreadPoolExecutor.result(timeout=60)` from both judge helpers. Make `verify_report()` await them directly. In synchronous `ResearchStateMiddleware.after_model`, run the async verifier through the shared cancellable sync bridge without a second competing 120-second executor timeout; in `aafter_model`, await it normally. Both hooks catch `ModelCallTimeoutError` only to re-raise, and never catch `CancelledError` under generic fail-open fallback. In CLI, use `except KeyboardInterrupt: spinner.stop(); cancel_active_sync_bridge(); raise` before stream fallback logic. Timeout is a run failure and must not call `agent.invoke` fallback or completion continuation.
 
 - [ ] **Step 5: Run judge/CLI and completion regressions**
 
@@ -335,7 +361,7 @@ Expected: pass; completion-attempt counters unchanged on model timeout.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add research_agent/research_subagent/utils/verification.py research_agent/cli.py tests/test_verification.py tests/test_research_agent_cli_e2e.py
+git add research_agent/agent.py research_agent/research_subagent/utils/verification.py research_agent/cli.py tests/test_verification.py tests/test_research_agent_cli_e2e.py
 git commit -m "fix: propagate model timeout and cancellation"
 ```
 
@@ -348,7 +374,7 @@ git commit -m "fix: propagate model timeout and cancellation"
 - Modify: `scripts/render_azure_containerapp_config.py:97-136`
 - Modify: `tests/test_azure_persistence_scripts.py`
 - Modify: `deploy-aws.sh`
-- Modify: `tests/test_aws_deployment.py`
+- Modify: `tests/test_aws_persistence_scripts.py`
 
 - [ ] **Step 1: Write RED deployment contract tests**
 
@@ -371,14 +397,14 @@ export OLLAMA_FORCE_UNLOAD_ON_CANCEL=true
 
 - [ ] **Step 3: Run deployment/document checks**
 
-Run: `uv run pytest tests/test_azure_persistence_scripts.py tests/test_aws_deployment.py -q`
+Run: `uv run pytest tests/test_azure_persistence_scripts.py tests/test_aws_persistence_scripts.py -q`
 
 Expected: pass.
 
 - [ ] **Step 4: Commit**
 
 ```bash
-git add .env.example documents/guides/configuration.md documents/guides/reliability.md scripts/render_azure_containerapp_config.py tests/test_azure_persistence_scripts.py deploy-aws.sh tests/test_aws_deployment.py
+git add .env.example documents/guides/configuration.md documents/guides/reliability.md scripts/render_azure_containerapp_config.py tests/test_azure_persistence_scripts.py deploy-aws.sh tests/test_aws_persistence_scripts.py
 git commit -m "docs: configure model call deadlines"
 ```
 
@@ -400,7 +426,7 @@ uv run pytest \
   tests/test_research_agent_cli_e2e.py \
   tests/test_completion_guard.py \
   tests/test_azure_persistence_scripts.py \
-  tests/test_aws_deployment.py -q
+  tests/test_aws_persistence_scripts.py -q
 ```
 
 Expected: all pass.
