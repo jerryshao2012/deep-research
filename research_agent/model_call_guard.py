@@ -14,7 +14,7 @@ import threading
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal, Mapping, Protocol, runtime_checkable
 from urllib.parse import urlsplit, urlunsplit
 
@@ -55,7 +55,57 @@ class _ModelCallOperation:
 
     deadline: float
     scope_id: str
+    cancellation: _OperationCancellationCoordinator
+    owner_task_id: int | None = None
     active: bool = True
+    _lock: threading.Lock = field(
+        default_factory=threading.Lock,
+        repr=False,
+        compare=False,
+    )
+
+    def set_owner(self, task: asyncio.Task[Any]) -> None:
+        """Associate bypass rights with the exact deadline worker task."""
+        with self._lock:
+            self.owner_task_id = id(task)
+
+    def close(self) -> None:
+        """Stop all inherited contexts from bypassing a new guard."""
+        with self._lock:
+            self.active = False
+
+    def is_active(self) -> bool:
+        """Return whether the owner still accepts inherited deadlines."""
+        with self._lock:
+            return self.active
+
+    def is_owned_by(self, task: asyncio.Task[Any] | None) -> bool:
+        """Return whether task is the sole deadline worker for this operation."""
+        if task is None:
+            return False
+        with self._lock:
+            return self.active and self.owner_task_id == id(task)
+
+
+class _OperationCancellationCoordinator:
+    """Coordinate one optional unload across same-deadline watchdogs."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._unload_claimed = False
+
+    async def unload(
+        self,
+        *,
+        metadata: ModelRuntimeMetadata,
+        policy: ModelCallPolicy,
+    ) -> None:
+        """Run the logical operation's optional unload at most once."""
+        with self._lock:
+            if self._unload_claimed:
+                return
+            self._unload_claimed = True
+        await _maybe_unload_ollama(metadata=metadata, policy=policy)
 
 
 _ACTIVE_OPERATION: contextvars.ContextVar[_ModelCallOperation | None] = (
@@ -66,7 +116,7 @@ _ACTIVE_OPERATION: contextvars.ContextVar[_ModelCallOperation | None] = (
 def _active_operation() -> _ModelCallOperation | None:
     """Return operation until its owner finishes bounded cleanup."""
     operation = _ACTIVE_OPERATION.get()
-    return operation if operation is not None and operation.active else None
+    return operation if operation is not None and operation.is_active() else None
 
 
 def _owned_active_operation() -> _ModelCallOperation | None:
@@ -74,7 +124,11 @@ def _owned_active_operation() -> _ModelCallOperation | None:
     operation = _active_operation()
     if operation is None or time.monotonic() >= operation.deadline:
         return None
-    return operation
+    try:
+        current_task = asyncio.current_task()
+    except RuntimeError:
+        return None
+    return operation if operation.is_owned_by(current_task) else None
 
 
 def _safe_provider(provider: str) -> ModelProvider:
@@ -366,9 +420,12 @@ async def _run_with_deadline[Result](
     metadata: ModelRuntimeMetadata,
     unload: Callable[[], Awaitable[Any]] | None,
     on_cancel: Callable[[], None] | None = None,
+    on_task_created: Callable[[asyncio.Task[Any]], None] | None = None,
 ) -> Result:
     """Run a model request under a total deadline and bounded cancellation cleanup."""
     task = asyncio.create_task(factory())
+    if on_task_created is not None:
+        on_task_created(task)
     unload_attempted = False
 
     async def attempt_unload() -> None:
@@ -654,33 +711,53 @@ async def _run_with_absolute_deadline[ResultT](
     if _owned_active_operation() is not None:
         return await factory()
 
+    inherited = _ACTIVE_OPERATION.get()
+    cancellation = (
+        inherited.cancellation
+        if inherited is not None and inherited.deadline == deadline
+        else _OperationCancellationCoordinator()
+    )
+
+    async def unload_once() -> None:
+        await cancellation.unload(metadata=metadata, policy=policy)
+
     remaining = deadline - time.monotonic()
     if remaining <= 0:
+        await _run_optional_unload(
+            metadata=metadata,
+            policy=policy,
+            unload=unload_once,
+        )
         raise _timeout_error(policy, metadata)
     deadline_policy = ModelCallPolicy(
         timeout_seconds=remaining,
         force_ollama_unload=policy.force_ollama_unload,
     )
-    operation = _ModelCallOperation(deadline=deadline, scope_id=scope_id)
+    operation = _ModelCallOperation(
+        deadline=deadline,
+        scope_id=scope_id,
+        cancellation=cancellation,
+    )
     operation_token = _ACTIVE_OPERATION.set(operation)
     deadline_token = _ACTIVE_DEADLINE.set(deadline)
     scope_token = _ACTIVE_SCOPE_ID.set(scope_id)
 
     def close_operation() -> None:
-        operation.active = False
+        operation.close()
 
     try:
         return await _run_with_deadline(
             factory,
             policy=deadline_policy,
             metadata=metadata,
-            unload=None,
+            unload=unload_once,
             on_cancel=close_operation,
+            on_task_created=operation.set_owner,
         )
     except ModelCallTimeoutError:
         raise _timeout_error(policy, metadata) from None
     finally:
-        operation.active = False
+        operation.close()
         _ACTIVE_SCOPE_ID.reset(scope_token)
         _ACTIVE_DEADLINE.reset(deadline_token)
         _ACTIVE_OPERATION.reset(operation_token)

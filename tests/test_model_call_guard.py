@@ -184,6 +184,22 @@ class _CleanupDetachedBindToolsChatModel(_DetachedBindToolsChatModel):
         return RunnableLambda(block_with_detached)
 
 
+class _ConcurrentDetachedBindToolsChatModel(_DetachedBindToolsChatModel):
+    """Provider fake starting detached guarded work before outer timeout."""
+
+    def bind_tools(self, tools: Any, *, tool_choice: str | None = None, **kwargs: Any):
+        del tools, tool_choice, kwargs
+
+        async def block_after_detaching(_input: Any) -> AIMessage:
+            self._detached_task = asyncio.create_task(self.ainvoke("detached"))
+            while not self._calls:
+                await asyncio.sleep(0)
+            await asyncio.Event().wait()
+            return AIMessage(content="unreachable")
+
+        return RunnableLambda(block_after_detaching)
+
+
 class _PickleableChatModel(BaseChatModel):
     """Minimal provider whose native instances support deep copy and pickle."""
 
@@ -1216,6 +1232,43 @@ async def test_detached_task_cannot_reuse_stale_completed_operation_context():
 
     assert time.monotonic() - started < 0.14
     assert guarded._cancel_count == 1
+
+
+@_async_test
+async def test_concurrent_detached_task_keeps_shared_absolute_deadline(monkeypatch):
+    import research_agent.model_call_guard as guard
+
+    unload_calls = 0
+
+    async def count_unload(**_kwargs: Any) -> None:
+        nonlocal unload_calls
+        unload_calls += 1
+
+    monkeypatch.setattr(guard, "_maybe_unload_ollama", count_unload)
+    guarded = guard_model(
+        _ConcurrentDetachedBindToolsChatModel(delay=0.15),
+        metadata=_ollama_metadata(),
+        policy=_policy(0.02, unload=True),
+    )
+    scope_id = "concurrent-detached"
+
+    with pytest.raises(ModelCallTimeoutError):
+        await guarded.bind_tools([]).ainvoke(
+            "hello",
+            config={"configurable": {"model_call_scope_id": scope_id}},
+        )
+    assert guarded._detached_task is not None
+
+    with pytest.raises(ModelCallTimeoutError):
+        await guarded._detached_task
+
+    assert guarded._calls
+    assert guarded._cancel_count == 1
+    assert unload_calls == 1
+    assert guarded._bridge_registry.active_count(scope_id) == 0
+    assert guard._ACTIVE_OPERATION.get() is None
+    assert guard._ACTIVE_DEADLINE.get() is None
+    assert guard._ACTIVE_SCOPE_ID.get() is None
 
 
 @_async_test
