@@ -2,20 +2,27 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
+from pathlib import Path
 
 import httpx
+import numpy as np
 from azure.identity import ManagedIdentityCredential, get_bearer_token_provider
-from dotenv import load_dotenv, dotenv_values
-from langchain.chat_models import init_chat_model
+from dotenv import dotenv_values, load_dotenv
 from langchain.embeddings import init_embeddings
+from langchain_core.embeddings import Embeddings
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph_checkpoint_cosmosdb import CosmosDBSaver
-from pathlib import Path
 from pydantic import SecretStr
 
 from research_agent.cli_utils import get_ssl_verify_config
 from research_agent.logger_utils import setup_logger
+from research_agent.model_call_guard import (
+    ModelCallPolicy,
+    ModelRuntimeMetadata,
+    build_guarded_provider_model,
+)
 from research_agent.retry_utils import wrap_model_with_rate_limiting
 
 logger = setup_logger(__name__)
@@ -71,11 +78,6 @@ def get_openai_auth_kwargs() -> dict:
         # default: os.getenv("AZURE_AUTH_TYPE") == "api_key"
         logger.info("Using API Key for Azure OpenAI authentication.")
         return {"api_key": SecretStr(os.getenv("AZURE_OPENAI_API_KEY", ""))}
-
-
-from langchain_core.embeddings import Embeddings
-import hashlib
-import numpy as np
 
 
 class SimpleLocalEmbeddings(Embeddings):
@@ -292,6 +294,22 @@ def get_configured_model(bypass_cache: bool = False):
 def _build_configured_model():
     """Build the first matching chat model from the environment configuration with rate limit retry."""
     verify_ssl = get_ssl_verify_config()
+    policy = ModelCallPolicy.from_env()
+
+    def openai_clients() -> tuple[httpx.Client, httpx.AsyncClient]:
+        return (
+            httpx.Client(verify=verify_ssl, timeout=policy.timeout_seconds),
+            httpx.AsyncClient(verify=verify_ssl, timeout=policy.timeout_seconds),
+        )
+
+    def finalize(provider_class, kwargs, metadata):
+        guarded = build_guarded_provider_model(
+            provider_class,
+            kwargs,
+            metadata,
+            policy,
+        )
+        return wrap_model_with_rate_limiting(guarded)
 
     if (
             os.getenv("AWS_BEDROCK_ENDPOINT")
@@ -300,14 +318,26 @@ def _build_configured_model():
     ):
         from langchain_openai import ChatOpenAI
 
-        model = ChatOpenAI(
-            base_url=os.getenv("AWS_BEDROCK_ENDPOINT"),
-            api_key=SecretStr(os.getenv("AWS_BEARER_TOKEN_BEDROCK", "")),
-            model=os.getenv("MODEL_NAME", ""),
-            http_client=httpx.Client(verify=verify_ssl),
-            stream_usage=True,
+        endpoint = os.environ["AWS_BEDROCK_ENDPOINT"]
+        model_name = os.environ["MODEL_NAME"]
+        http_client, http_async_client = openai_clients()
+        return finalize(
+            ChatOpenAI,
+            {
+                "base_url": endpoint,
+                "api_key": SecretStr(os.environ["AWS_BEARER_TOKEN_BEDROCK"]),
+                "model": model_name,
+                "request_timeout": policy.timeout_seconds,
+                "http_client": http_client,
+                "http_async_client": http_async_client,
+                "stream_usage": True,
+            },
+            ModelRuntimeMetadata(
+                provider="aws_bedrock",
+                model_name=model_name,
+                base_url=endpoint,
+            ),
         )
-        return wrap_model_with_rate_limiting(model)
 
     # Legacy Azure OpenAI configuration (with explicit API version)
     if (
@@ -319,15 +349,27 @@ def _build_configured_model():
     ):
         from langchain_openai import AzureChatOpenAI
 
-        model = AzureChatOpenAI(
-            azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
-            azure_deployment=os.getenv("AZURE_OPENAI_DEPLOYMENT"),
-            api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
-            http_client=httpx.Client(verify=verify_ssl),
-            stream_usage=True,
-            **get_openai_auth_kwargs(),
+        endpoint = os.environ["AZURE_OPENAI_ENDPOINT"]
+        deployment = os.environ["AZURE_OPENAI_DEPLOYMENT"]
+        http_client, http_async_client = openai_clients()
+        return finalize(
+            AzureChatOpenAI,
+            {
+                "azure_endpoint": endpoint,
+                "azure_deployment": deployment,
+                "api_version": os.environ["AZURE_OPENAI_API_VERSION"],
+                "request_timeout": policy.timeout_seconds,
+                "http_client": http_client,
+                "http_async_client": http_async_client,
+                "stream_usage": True,
+                **get_openai_auth_kwargs(),
+            },
+            ModelRuntimeMetadata(
+                provider="azure_openai",
+                model_name=deployment,
+                base_url=endpoint,
+            ),
         )
-        return wrap_model_with_rate_limiting(model)
 
     # New Azure OpenAI configuration (without explicit API version)
     if (
@@ -337,48 +379,117 @@ def _build_configured_model():
     ):
         from langchain_openai import ChatOpenAI
 
-        model = ChatOpenAI(
-            base_url=os.getenv("AZURE_OPENAI_ENDPOINT"),
-            api_key=SecretStr(os.getenv("AZURE_OPENAI_API_KEY", "")),
-            model=os.getenv("AZURE_OPENAI_DEPLOYMENT", ""),
-            http_client=httpx.Client(verify=verify_ssl),
-            stream_usage=True,
+        endpoint = os.environ["AZURE_OPENAI_ENDPOINT"]
+        deployment = os.environ["AZURE_OPENAI_DEPLOYMENT"]
+        http_client, http_async_client = openai_clients()
+        return finalize(
+            ChatOpenAI,
+            {
+                "base_url": endpoint,
+                "api_key": SecretStr(os.environ["AZURE_OPENAI_API_KEY"]),
+                "model": deployment,
+                "request_timeout": policy.timeout_seconds,
+                "http_client": http_client,
+                "http_async_client": http_async_client,
+                "stream_usage": True,
+            },
+            ModelRuntimeMetadata(
+                provider="azure_openai",
+                model_name=deployment,
+                base_url=endpoint,
+            ),
         )
-        return wrap_model_with_rate_limiting(model)
+
+    if os.getenv("OPENAI_API_KEY") and os.getenv("MODEL_NAME"):
+        from langchain_openai import ChatOpenAI
+
+        model_name = os.environ["MODEL_NAME"]
+        endpoint = os.getenv("OPENAI_BASE_URL")
+        http_client, http_async_client = openai_clients()
+        return finalize(
+            ChatOpenAI,
+            {
+                "api_key": SecretStr(os.environ["OPENAI_API_KEY"]),
+                "model": model_name,
+                "request_timeout": policy.timeout_seconds,
+                "http_client": http_client,
+                "http_async_client": http_async_client,
+                "stream_usage": True,
+                **({"base_url": endpoint} if endpoint else {}),
+            },
+            ModelRuntimeMetadata(
+                provider="openai",
+                model_name=model_name,
+                base_url=endpoint,
+            ),
+        )
 
     if os.getenv("GOOGLE_API_KEY") and os.getenv("MODEL_NAME"):
         from langchain_google_genai import ChatGoogleGenerativeAI
 
-        kwargs = {
-            "model": os.getenv("MODEL_NAME", "gemini-2.5-pro"),
-            "temperature": 0.0,
-            "streaming": True,
+        model_name = os.environ["MODEL_NAME"]
+        native_client_args = {
+            "timeout": policy.timeout_seconds,
+            "verify": verify_ssl,
         }
-
-        if verify_ssl is not True:
-            from google import genai
-            kwargs["client"] = genai.Client(
-                api_key=os.getenv("GOOGLE_API_KEY"),
-                http_options={"httpx_client": httpx.Client(verify=verify_ssl)},
-            )
-
-        model = ChatGoogleGenerativeAI(**kwargs)
-        return wrap_model_with_rate_limiting(model)
+        return finalize(
+            ChatGoogleGenerativeAI,
+            {
+                "model": model_name,
+                "api_key": SecretStr(os.environ["GOOGLE_API_KEY"]),
+                "temperature": 0.0,
+                "streaming": True,
+                "request_timeout": policy.timeout_seconds,
+                "client_args": native_client_args,
+            },
+            ModelRuntimeMetadata(provider="google", model_name=model_name),
+        )
 
     if os.getenv("ANTHROPIC_API_KEY") and os.getenv("MODEL_NAME"):
-        model = init_chat_model(
-            model=f"anthropic:{os.getenv("MODEL_NAME", "claude-sonnet-4-5-20250929")}",
-            temperature=0.0,
-            http_client=httpx.Client(verify=verify_ssl),
+        from langchain_anthropic import ChatAnthropic
+
+        model_name = os.environ["MODEL_NAME"]
+        endpoint = os.getenv("ANTHROPIC_API_URL") or os.getenv("ANTHROPIC_BASE_URL")
+        return finalize(
+            ChatAnthropic,
+            {
+                "model_name": model_name,
+                "api_key": SecretStr(os.environ["ANTHROPIC_API_KEY"]),
+                "temperature": 0.0,
+                "timeout": policy.timeout_seconds,
+                **({"base_url": endpoint} if endpoint else {}),
+            },
+            ModelRuntimeMetadata(
+                provider="anthropic",
+                model_name=model_name,
+                base_url=endpoint,
+            ),
         )
-        return wrap_model_with_rate_limiting(model)
 
     if os.getenv("OLLAMA_API_BASE") and os.getenv("MODEL_NAME"):
-        model = init_chat_model(
-            model=f"ollama:{os.getenv('MODEL_NAME')}",
-            base_url=os.getenv("OLLAMA_API_BASE"),
-            temperature=0.0,
+        from langchain_ollama import ChatOllama
+
+        model_name = os.environ["MODEL_NAME"]
+        endpoint = os.environ["OLLAMA_API_BASE"]
+        native_client_kwargs = {
+            "timeout": policy.timeout_seconds,
+            "verify": verify_ssl,
+        }
+        return finalize(
+            ChatOllama,
+            {
+                "model": model_name,
+                "base_url": endpoint,
+                "temperature": 0.0,
+                "client_kwargs": dict(native_client_kwargs),
+                "sync_client_kwargs": dict(native_client_kwargs),
+                "async_client_kwargs": dict(native_client_kwargs),
+            },
+            ModelRuntimeMetadata(
+                provider="ollama",
+                model_name=model_name,
+                base_url=endpoint,
+            ),
         )
-        return wrap_model_with_rate_limiting(model)
 
     raise ValueError("No model found. Please set up a model")

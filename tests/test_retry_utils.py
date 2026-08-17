@@ -1,15 +1,91 @@
 """Tests for rate limit retry utilities."""
 
+# ruff: noqa: T201
+
+from __future__ import annotations
+
+import asyncio
+import time
 from unittest.mock import patch
 
 import pytest
+from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
+from langchain_core.messages import AIMessage
 
+from research_agent import retry_utils
+from research_agent.model_call_guard import (
+    ModelCallGuardMixin,
+    ModelCallPolicy,
+    ModelCallTimeoutError,
+    ModelRuntimeMetadata,
+    guard_model,
+)
 from research_agent.retry_utils import (
     RetryConfig,
     calculate_backoff,
     is_rate_limit_error,
     retry_on_rate_limit,
+    wrap_model_with_rate_limiting,
 )
+
+
+class _FakeClock:
+    def __init__(self) -> None:
+        self.now = time.monotonic()
+        self.sleeps: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+    async def async_sleep(self, seconds: float) -> None:
+        self.sleep(seconds)
+        await asyncio.sleep(0)
+
+
+class _RateLimitedFakeModel(FakeMessagesListChatModel):
+    attempts: int = 0
+
+    async def _agenerate(self, *args, **kwargs):
+        self.attempts += 1
+        if self.attempts == 1:
+            raise RuntimeError("429 rate limit")
+        return await super()._agenerate(*args, **kwargs)
+
+
+def _guarded_ollama_for_retry():
+    from langchain_ollama import ChatOllama
+
+    return guard_model(
+        ChatOllama(model="retry-test", base_url="http://localhost:11434"),
+        metadata=ModelRuntimeMetadata(
+            provider="ollama",
+            model_name="retry-test",
+            base_url="http://localhost:11434",
+        ),
+        policy=ModelCallPolicy(timeout_seconds=1.0, force_ollama_unload=False),
+    )
+
+
+def _retry_controller(clock: _FakeClock):
+    controller_class = getattr(retry_utils, "ModelRetryController")
+    return controller_class(
+        config=RetryConfig(
+            max_retries=2,
+            initial_backoff=2.0,
+            max_backoff=2.0,
+            backoff_multiplier=1.0,
+            jitter=False,
+        ),
+        tpm=0,
+        rpm=0,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+        async_sleep=clock.async_sleep,
+    )
 
 
 class TestIsRateLimitError:
@@ -168,6 +244,143 @@ class TestRetryConfig:
         assert config.max_retries == 8
         assert config.initial_backoff == 3.0
         assert config.jitter is False
+
+
+def test_wrapper_attaches_controller_without_replacing_guarded_model_methods() -> None:
+    model = _guarded_ollama_for_retry()
+    invoke_owner = model.invoke.__func__
+    ainvoke_owner = model.ainvoke.__func__
+    stream_owner = model.stream.__func__
+    astream_owner = model.astream.__func__
+
+    wrapped = wrap_model_with_rate_limiting(
+        model,
+        controller=_retry_controller(_FakeClock()),
+    )
+
+    assert wrapped is model
+    assert isinstance(wrapped, ModelCallGuardMixin)
+    assert wrapped.invoke.__func__ is invoke_owner is ModelCallGuardMixin.invoke
+    assert wrapped.ainvoke.__func__ is ainvoke_owner is ModelCallGuardMixin.ainvoke
+    assert wrapped.stream.__func__ is stream_owner is ModelCallGuardMixin.stream
+    assert wrapped.astream.__func__ is astream_owner is ModelCallGuardMixin.astream
+    assert "invoke" not in wrapped.__dict__
+    assert "ainvoke" not in wrapped.__dict__
+    assert wrapped._retry_controller is not None
+
+
+def test_sync_retry_backoff_expires_at_original_deadline_without_later_attempt() -> None:
+    clock = _FakeClock()
+    model = _guarded_ollama_for_retry()
+    wrap_model_with_rate_limiting(model, controller=_retry_controller(clock))
+    attempts = 0
+
+    def rate_limited() -> str:
+        nonlocal attempts
+        attempts += 1
+        raise RuntimeError("429 rate limit")
+
+    with pytest.raises(ModelCallTimeoutError) as raised:
+        model._retry_controller.invoke(
+            rate_limited,
+            deadline=clock.monotonic() + 1.0,
+            input="must-not-appear",
+        )
+
+    assert attempts == 1
+    assert clock.sleeps == [1.0]
+    assert clock.monotonic() == pytest.approx(clock.now)
+    assert raised.value.timeout_seconds == 1.0
+    assert "must-not-appear" not in str(raised.value)
+
+
+@pytest.mark.anyio
+async def test_async_retry_backoff_expires_at_original_deadline_without_later_attempt() -> None:
+    clock = _FakeClock()
+    model = _guarded_ollama_for_retry()
+    wrap_model_with_rate_limiting(model, controller=_retry_controller(clock))
+    attempts = 0
+
+    async def rate_limited() -> str:
+        nonlocal attempts
+        attempts += 1
+        raise RuntimeError("429 rate limit")
+
+    with pytest.raises(ModelCallTimeoutError) as raised:
+        await model._retry_controller.ainvoke(
+            rate_limited,
+            deadline=clock.monotonic() + 1.0,
+            input="must-not-appear",
+        )
+
+    assert attempts == 1
+    assert clock.sleeps == [1.0]
+    assert raised.value.timeout_seconds == 1.0
+    assert "must-not-appear" not in str(raised.value)
+
+
+def test_proactive_rate_shaping_waits_only_for_binding_constraint() -> None:
+    clock = _FakeClock()
+    controller = retry_utils.ModelRetryController(
+        config=RetryConfig(max_retries=0),
+        tpm=100_000,
+        rpm=60,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+        async_sleep=clock.async_sleep,
+    )
+    model = _guarded_ollama_for_retry()
+    wrap_model_with_rate_limiting(model, controller=controller)
+
+    assert controller.invoke(
+        lambda: "first",
+        deadline=clock.monotonic() + 10,
+        input="small",
+        max_tokens=1,
+    ) == "first"
+    assert controller.invoke(
+        lambda: "second",
+        deadline=clock.monotonic() + 10,
+        input="small",
+        max_tokens=1,
+    ) == "second"
+
+    assert clock.sleeps == [pytest.approx(1.25)]
+
+
+@pytest.mark.parametrize("method", ["invoke", "ainvoke"])
+def test_guard_executes_retry_controller_inside_one_public_deadline(method: str) -> None:
+    clock = _FakeClock()
+    raw = _RateLimitedFakeModel(responses=[AIMessage(content="retried")])
+    model = guard_model(
+        raw,
+        metadata=ModelRuntimeMetadata(provider="openai", model_name="retry-hook"),
+        policy=ModelCallPolicy(timeout_seconds=1.0, force_ollama_unload=False),
+    )
+    controller = retry_utils.ModelRetryController(
+        config=RetryConfig(
+            max_retries=1,
+            initial_backoff=0.1,
+            max_backoff=0.1,
+            backoff_multiplier=1.0,
+            jitter=False,
+        ),
+        tpm=0,
+        rpm=0,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+        async_sleep=clock.async_sleep,
+    )
+    wrap_model_with_rate_limiting(model, controller=controller)
+
+    if method == "invoke":
+        result = model.invoke("hello")
+    else:
+        result = asyncio.run(model.ainvoke("hello"))
+
+    assert result.content == "retried"
+    assert model.attempts == 2
+    assert clock.sleeps == [0.1]
 
 
 def run_verification():

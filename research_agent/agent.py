@@ -23,6 +23,7 @@ from deepagents.backends.utils import (
     create_file_data,
     file_data_to_string,
 )
+from deepagents.middleware.subagents import GENERAL_PURPOSE_SUBAGENT
 from dotenv import load_dotenv
 from langchain.agents.middleware import (
     AgentMiddleware,
@@ -51,6 +52,7 @@ from research_agent.document_context import (
     has_document_context,
 )
 from research_agent.logger_utils import setup_logger
+from research_agent.model_call_guard import ModelCallGuardMiddleware
 from research_agent.model_factory import create_memory_saver, get_configured_model
 from research_agent.research_subagent import (
     RESEARCH_WORKFLOW_INSTRUCTIONS,
@@ -1358,21 +1360,6 @@ INSTRUCTIONS = (
 )
 )
 
-# Create research subagent
-# The sub-agent is intentionally web-only to keep delegation focused and avoid
-# filesystem/state write confusion inside isolated sub-agent contexts.
-research_sub_agent: SubAgent = {
-    "name": "research-agent",
-    "description": RESEARCHER_DESCRIPTION,
-    "system_prompt": RESEARCHER_INSTRUCTIONS.format(
-        date=current_date,
-    ),
-    "tools": [
-        tavily_search,
-        fetch_webpage_content,
-        think_tool,
-    ],
-}
 try:
     model = get_configured_model()
 except Exception as e:
@@ -1385,6 +1372,32 @@ except Exception as e:
         15
     )  # Give App Runner 15 seconds to flush the logs to CloudWatch before exiting
     raise
+
+# Create explicit guarded subagents. Research stays web-only; general purpose
+# inherits the root tools by intentionally omitting its ``tools`` key.
+research_sub_agent: SubAgent = {
+    "name": "research-agent",
+    "description": RESEARCHER_DESCRIPTION,
+    "system_prompt": RESEARCHER_INSTRUCTIONS.format(
+        date=current_date,
+    ),
+    "tools": [
+        tavily_search,
+        fetch_webpage_content,
+        think_tool,
+    ],
+    "model": model,
+    "middleware": [
+        ModelCallGuardMiddleware(policy=model._model_call_policy),
+    ],
+}
+general_purpose_sub_agent: SubAgent = {
+    **GENERAL_PURPOSE_SUBAGENT,
+    "model": model,
+    "middleware": [
+        ModelCallGuardMiddleware(policy=model._model_call_policy),
+    ],
+}
 # Recursion limit - configurable via environment variable (applied at graph compile time)
 RECURSION_LIMIT = int(os.environ.get("GRAPH_RECURSION_LIMIT", "200"))
 
@@ -1411,13 +1424,14 @@ _agent_kwargs: dict[str, Any] = dict(
         llm_wiki_query,
     ],
     system_prompt=INSTRUCTIONS,
-    subagents=[research_sub_agent],
+    subagents=[research_sub_agent, general_purpose_sub_agent],
     middleware=[
         TodoListMiddleware(system_prompt=""),
         ClarificationMiddleware(),
         CompletionGuardMiddleware(),
         ResumeMiddleware(),
         ResearchStateMiddleware(),
+        ModelCallGuardMiddleware(policy=model._model_call_policy),
     ],
     skills=[
         ".deepagents/skills/",

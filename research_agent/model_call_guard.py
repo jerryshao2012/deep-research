@@ -1184,10 +1184,25 @@ class ModelCallGuardMixin:
         scope_id: str,
         **kwargs: Any,
     ) -> Any:
-        return await _run_with_absolute_deadline(
-            lambda: super(ModelCallGuardMixin, self).ainvoke(
+        async def provider_call() -> Any:
+            return await super(ModelCallGuardMixin, self).ainvoke(
                 input, config=config, stop=stop, **kwargs
-            ),
+            )
+
+        controller = self._retry_controller
+        if controller is None:
+            operation = provider_call
+        else:
+
+            async def operation() -> Any:
+                return await controller.ainvoke(
+                    provider_call,
+                    deadline=deadline,
+                    input=input,
+                    max_tokens=kwargs.get("max_tokens", 1000) or 1000,
+                )
+        return await _run_with_absolute_deadline(
+            operation,
             deadline=deadline,
             scope_id=scope_id,
             policy=self._model_call_policy,
@@ -1820,6 +1835,26 @@ def guard_model(
         guarded,
         policy=resolved_policy,
         metadata=resolved_metadata,
+    )
+    return guarded
+
+
+def build_guarded_provider_model(
+    provider_class: type[BaseChatModel],
+    provider_kwargs: Mapping[str, Any],
+    metadata: ModelRuntimeMetadata,
+    policy: ModelCallPolicy | None = None,
+) -> BaseChatModel:
+    """Construct a provider-native guarded model without a raw public interval."""
+    if not issubclass(provider_class, BaseChatModel):
+        raise TypeError("provider_class must inherit BaseChatModel")
+    resolved_policy = policy or ModelCallPolicy.from_env()
+    guarded_class = _guarded_provider_class(provider_class)
+    guarded = guarded_class(**dict(provider_kwargs))
+    _initialize_guard_state(
+        guarded,
+        policy=resolved_policy,
+        metadata=metadata,
     )
     return guarded
 

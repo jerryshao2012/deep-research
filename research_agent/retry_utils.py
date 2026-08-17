@@ -8,9 +8,10 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
 import time
 from functools import wraps
-from typing import Any, Callable, TypeVar, List, Tuple
+from typing import Any, Awaitable, Callable, List, Tuple, TypeVar
 
 import tiktoken
 from dotenv import load_dotenv
@@ -77,7 +78,7 @@ def calculate_backoff(attempt: int, initial: float, max_wait: float, multiplier:
     return backoff
 
 
-def retry_on_rate_limit(
+def retry_on_rate_limit(  # noqa: UP047
         func: Callable[..., T] | None = None,
         *,
         max_retries: int | None = None,
@@ -86,8 +87,7 @@ def retry_on_rate_limit(
         backoff_multiplier: float | None = None,
         jitter: bool | None = None,
 ) -> Callable[..., T]:
-    """
-    Decorator to retry function calls on rate limit errors with exponential backoff.
+    """Retry calls on rate limit errors with exponential backoff.
     
     Args:
         func: Function to wrap (used when decorator is applied without arguments)
@@ -193,33 +193,23 @@ def retry_on_rate_limit(
     return decorator
 
 
-def wrap_model_with_rate_limiting(model: Any) -> Any:
-    """Apply both proactive rate shaping and reactive retries to a model."""
-    # 1. Reactive Retries (Decorator)
-    # Wrap invoke methods with retry logic using object.__setattr__ to bypass Pydantic validation
-    retry_wrapped_invoke = retry_on_rate_limit(model.invoke)
-    retry_wrapped_ainvoke = retry_on_rate_limit(model.ainvoke)
+def wrap_model_with_rate_limiting(
+    model: Any,
+    *,
+    controller: ModelRetryController | None = None,
+) -> Any:
+    """Attach retry/rate shaping inside an existing guarded model boundary."""
+    from research_agent.model_call_guard import ModelCallGuardMixin
 
-    object.__setattr__(model, 'invoke', retry_wrapped_invoke)
-    object.__setattr__(model, 'ainvoke', retry_wrapped_ainvoke)
-
-    # 2. Proactive Rate Shaping (if limits are configured)
-    if MODEL_TPM > 0 and MODEL_RPM > 0:
-        rate_limiter = AsyncRateLimiter(tpm=MODEL_TPM, rpm=MODEL_RPM)
-        original_ainvoke = model.ainvoke
-
-        async def ainvoke_with_shaping(*args, **kwargs):
-            # Extract prompt from messages/input to estimate tokens
-            # This is a simplification; LangChain inputs vary
-            prompt_str = str(args[0]) if args else str(kwargs.get("input", ""))
-            max_tokens = kwargs.get("max_tokens", 1000) or 1000
-
-            tokens = rate_limiter.estimate_tokens(prompt_str, max_tokens)
-            await rate_limiter.wait_for_capacity(tokens)
-            return await original_ainvoke(*args, **kwargs)
-
-        object.__setattr__(model, 'ainvoke', ainvoke_with_shaping)
-
+    if not isinstance(model, ModelCallGuardMixin):
+        raise TypeError("rate limiting requires a guarded provider model")
+    resolved = controller or ModelRetryController(
+        config=RetryConfig.from_env(),
+        tpm=int(os.getenv("MODEL_TPM", str(MODEL_TPM))),
+        rpm=int(os.getenv("MODEL_RPM", str(MODEL_RPM))),
+    )
+    resolved.bind(model)
+    model._retry_controller = resolved
     return model
 
 
@@ -290,6 +280,73 @@ class AsyncRateLimiter:
                 await asyncio.sleep(sleep_time)
 
 
+class _RateCapacity:
+    """Shared non-blocking capacity accounting for sync and async callers."""
+
+    def __init__(
+        self,
+        *,
+        tpm: int,
+        rpm: int,
+        monotonic: Callable[[], float],
+        safe_margin: float = 0.8,
+    ) -> None:
+        self.safe_tpm = int(tpm * safe_margin)
+        self.min_interval = 60.0 / (rpm * safe_margin)
+        self.window_seconds = 60.0
+        self.token_window: List[Tuple[float, int]] = []
+        self.last_request_time = 0.0
+        self._monotonic = monotonic
+        self._lock = threading.Lock()
+        try:
+            self.tokenizer = tiktoken.get_encoding("cl100k_base")
+        except Exception:
+            self.tokenizer = None
+
+    def estimate_tokens(self, prompt: str, max_tokens: int) -> int:
+        """Estimate prompt and completion tokens without retaining input."""
+        prompt_tokens = (
+            len(self.tokenizer.encode(prompt))
+            if self.tokenizer is not None
+            else int(len(prompt) / 4)
+        )
+        return prompt_tokens + max_tokens
+
+    def reserve(self, estimated_tokens: int) -> float | None:
+        """Reserve capacity or return seconds before caller should retry."""
+        with self._lock:
+            now = self._monotonic()
+            self.token_window = [
+                (recorded, tokens)
+                for recorded, tokens in self.token_window
+                if now - recorded < self.window_seconds
+            ]
+            used_tokens = sum(tokens for _, tokens in self.token_window)
+            elapsed = now - self.last_request_time
+            token_constrained = used_tokens + estimated_tokens > self.safe_tpm
+            request_constrained = (
+                self.last_request_time != 0.0 and elapsed < self.min_interval
+            )
+            if not token_constrained and not request_constrained:
+                self.token_window.append((now, estimated_tokens))
+                self.last_request_time = now
+                return None
+            waits = [0.1]
+            if token_constrained:
+                waits.append(
+                    max(
+                        0.0,
+                        self.window_seconds
+                        - (now - self.token_window[0][0]),
+                    )
+                    if self.token_window
+                    else self.window_seconds
+                )
+            if request_constrained:
+                waits.append(self.min_interval - elapsed)
+            return max(waits)
+
+
 class RetryConfig:
     """Configuration class for retry behavior.
 
@@ -325,7 +382,7 @@ class RetryConfig:
         self.jitter = jitter
 
     @classmethod
-    def from_env(cls) -> "RetryConfig":
+    def from_env(cls) -> RetryConfig:
         """Create config from environment variables."""
         return cls(
             max_retries=int(os.getenv("MODEL_MAX_RETRIES", "5")),
@@ -345,3 +402,156 @@ class RetryConfig:
             backoff_multiplier=self.backoff_multiplier,
             jitter=self.jitter,
         )
+
+
+class ModelRetryController:
+    """Compose proactive shaping and reactive retries under one deadline."""
+
+    def __init__(
+        self,
+        *,
+        config: RetryConfig | None = None,
+        tpm: int = MODEL_TPM,
+        rpm: int = MODEL_RPM,
+        monotonic: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+        async_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    ) -> None:
+        """Initialize retry, clock, sleep, and optional capacity settings."""
+        self.config = config or RetryConfig.from_env()
+        self._monotonic = monotonic
+        self._sleep = sleep
+        self._async_sleep = async_sleep
+        self._metadata: Any = None
+        self._policy: Any = None
+        self._capacity = (
+            _RateCapacity(
+                tpm=tpm,
+                rpm=rpm,
+                monotonic=monotonic,
+            )
+            if tpm > 0 and rpm > 0
+            else None
+        )
+
+    def bind(self, model: Any) -> ModelRetryController:
+        """Bind safe timeout metadata from one guarded provider model."""
+        self._metadata = model._runtime_metadata
+        self._policy = model._model_call_policy
+        return self
+
+    def _timeout_error(self) -> Exception:
+        from research_agent.model_call_guard import ModelCallTimeoutError
+
+        if self._metadata is None or self._policy is None:
+            return TimeoutError("model retry deadline exceeded")
+        return ModelCallTimeoutError(
+            provider=self._metadata.provider,
+            timeout_seconds=self._policy.timeout_seconds,
+            unload_requested=(
+                self._policy.force_ollama_unload
+                and self._metadata.provider == "ollama"
+            ),
+        )
+
+    def _remaining(self, deadline: float) -> float:
+        return max(0.0, deadline - self._monotonic())
+
+    def _sync_wait(self, requested: float, deadline: float) -> None:
+        remaining = self._remaining(deadline)
+        if remaining <= 0:
+            raise self._timeout_error()
+        wait = min(requested, remaining)
+        self._sleep(wait)
+        if wait < requested or self._remaining(deadline) <= 0:
+            raise self._timeout_error()
+
+    async def _async_wait(self, requested: float, deadline: float) -> None:
+        remaining = self._remaining(deadline)
+        if remaining <= 0:
+            raise self._timeout_error()
+        wait = min(requested, remaining)
+        await self._async_sleep(wait)
+        if wait < requested or self._remaining(deadline) <= 0:
+            raise self._timeout_error()
+
+    def _sync_shape(self, input: Any, max_tokens: int, deadline: float) -> None:
+        if self._capacity is None:
+            return
+        estimated = self._capacity.estimate_tokens(str(input), max_tokens)
+        while (wait := self._capacity.reserve(estimated)) is not None:
+            self._sync_wait(wait, deadline)
+
+    async def _async_shape(
+        self,
+        input: Any,
+        max_tokens: int,
+        deadline: float,
+    ) -> None:
+        if self._capacity is None:
+            return
+        estimated = self._capacity.estimate_tokens(str(input), max_tokens)
+        while (wait := self._capacity.reserve(estimated)) is not None:
+            await self._async_wait(wait, deadline)
+
+    def invoke(
+        self,
+        operation: Callable[[], T],
+        *,
+        deadline: float,
+        input: Any = "",
+        max_tokens: int = 1000,
+    ) -> T:
+        """Run sync attempts and backoff without extending absolute deadline."""
+        for attempt in range(self.config.max_retries + 1):
+            self._sync_shape(input, max_tokens, deadline)
+            try:
+                return operation()
+            except Exception as error:
+                if not is_rate_limit_error(error) or attempt >= self.config.max_retries:
+                    raise
+                backoff = calculate_backoff(
+                    attempt,
+                    self.config.initial_backoff,
+                    self.config.max_backoff,
+                    self.config.backoff_multiplier,
+                    self.config.jitter,
+                )
+                logger.warning(
+                    "Model provider rate limited attempt %s/%s; bounded retry scheduled",
+                    attempt + 1,
+                    self.config.max_retries + 1,
+                )
+                self._sync_wait(backoff, deadline)
+        raise RuntimeError("unreachable retry state")
+
+    async def ainvoke(
+        self,
+        operation: Callable[[], Awaitable[T]],
+        *,
+        deadline: float,
+        input: Any = "",
+        max_tokens: int = 1000,
+    ) -> T:
+        """Run async attempts and cancellable backoff under absolute deadline."""
+        for attempt in range(self.config.max_retries + 1):
+            await self._async_shape(input, max_tokens, deadline)
+            try:
+                return await operation()
+            except Exception as error:
+                if not is_rate_limit_error(error) or attempt >= self.config.max_retries:
+                    raise
+                backoff = calculate_backoff(
+                    attempt,
+                    self.config.initial_backoff,
+                    self.config.max_backoff,
+                    self.config.backoff_multiplier,
+                    self.config.jitter,
+                )
+                logger.warning(
+                    "Model provider rate limited attempt %s/%s; bounded retry scheduled",
+                    attempt + 1,
+                    self.config.max_retries + 1,
+                )
+                await self._async_wait(backoff, deadline)
+        raise RuntimeError("unreachable retry state")

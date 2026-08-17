@@ -1,0 +1,271 @@
+"""Contracts for guarded, deadline-aware model construction."""
+
+from __future__ import annotations
+
+import importlib.util
+from pathlib import Path
+from typing import Any
+
+import httpx
+import pytest
+
+from research_agent import model_factory, retry_utils
+from research_agent.model_call_guard import (
+    ModelCallGuardMixin,
+    ModelRuntimeMetadata,
+)
+
+
+class _MissingRetryController:
+    """Sentinel used only while the new controller contract is RED."""
+
+
+ModelRetryController = getattr(
+    retry_utils, "ModelRetryController", _MissingRetryController
+)
+
+
+_PROVIDER_ENV = {
+    "AWS_BEDROCK_ENDPOINT",
+    "AWS_BEARER_TOKEN_BEDROCK",
+    "AZURE_OPENAI_ENDPOINT",
+    "AZURE_OPENAI_DEPLOYMENT",
+    "AZURE_OPENAI_API_KEY",
+    "AZURE_OPENAI_API_VERSION",
+    "AZURE_AUTH_TYPE",
+    "AZURE_CLIENT_ID",
+    "AZURE_OPENAI_SCOPE",
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "GOOGLE_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_API_URL",
+    "ANTHROPIC_BASE_URL",
+    "OLLAMA_API_BASE",
+    "MODEL_NAME",
+}
+
+
+@pytest.fixture(autouse=True)
+def isolated_model_environment(monkeypatch: pytest.MonkeyPatch):
+    """Keep provider selection and cache independent from developer env."""
+    for name in _PROVIDER_ENV:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("MODEL_CALL_TIMEOUT_SECONDS", "0.2")
+    monkeypatch.setenv("MODEL_TPM", "0")
+    monkeypatch.setenv("MODEL_RPM", "0")
+    monkeypatch.setattr(model_factory, "get_ssl_verify_config", lambda: True)
+    model_factory.clear_model_cache()
+    yield
+    model_factory.clear_model_cache()
+
+
+def _timeout_values(value: Any) -> list[float]:
+    if isinstance(value, httpx.Timeout):
+        return [value.connect, value.read, value.write, value.pool]
+    if isinstance(value, tuple):
+        return [float(item) for item in value]
+    return [float(value)]
+
+
+def _assert_common_model_contract(model: Any, expected: ModelRuntimeMetadata) -> None:
+    assert isinstance(model, ModelCallGuardMixin)
+    assert model._runtime_metadata == expected
+    assert model._model_call_policy.timeout_seconds == 0.2
+    assert isinstance(model._retry_controller, ModelRetryController)
+    assert "secret-test-value" not in repr(model.model_dump())
+
+
+@pytest.mark.parametrize(
+    ("environment", "provider_class", "metadata", "native_kind"),
+    [
+        (
+            {
+                "AWS_BEDROCK_ENDPOINT": "https://bedrock.example.test/v1",
+                "AWS_BEARER_TOKEN_BEDROCK": "secret-test-value",
+                "MODEL_NAME": "bedrock-model",
+            },
+            "ChatOpenAI",
+            ModelRuntimeMetadata(
+                provider="aws_bedrock",
+                model_name="bedrock-model",
+                base_url="https://bedrock.example.test/v1",
+            ),
+            "openai",
+        ),
+        (
+            {
+                "AZURE_OPENAI_ENDPOINT": "https://legacy.openai.azure.test",
+                "AZURE_OPENAI_DEPLOYMENT": "legacy-deployment",
+                "AZURE_OPENAI_API_KEY": "secret-test-value",
+                "AZURE_OPENAI_API_VERSION": "2024-10-21",
+            },
+            "AzureChatOpenAI",
+            ModelRuntimeMetadata(
+                provider="azure_openai",
+                model_name="legacy-deployment",
+                base_url="https://legacy.openai.azure.test",
+            ),
+            "openai",
+        ),
+        (
+            {
+                "AZURE_OPENAI_ENDPOINT": "https://current.openai.azure.test/v1",
+                "AZURE_OPENAI_DEPLOYMENT": "current-deployment",
+                "AZURE_OPENAI_API_KEY": "secret-test-value",
+            },
+            "ChatOpenAI",
+            ModelRuntimeMetadata(
+                provider="azure_openai",
+                model_name="current-deployment",
+                base_url="https://current.openai.azure.test/v1",
+            ),
+            "openai",
+        ),
+        (
+            {
+                "OPENAI_API_KEY": "secret-test-value",
+                "OPENAI_BASE_URL": "https://openai.example.test/v1",
+                "MODEL_NAME": "openai-model",
+            },
+            "ChatOpenAI",
+            ModelRuntimeMetadata(
+                provider="openai",
+                model_name="openai-model",
+                base_url="https://openai.example.test/v1",
+            ),
+            "openai",
+        ),
+        (
+            {
+                "GOOGLE_API_KEY": "secret-test-value",
+                "MODEL_NAME": "gemini-test",
+            },
+            "ChatGoogleGenerativeAI",
+            ModelRuntimeMetadata(provider="google", model_name="gemini-test"),
+            "google",
+        ),
+        (
+            {
+                "ANTHROPIC_API_KEY": "secret-test-value",
+                "MODEL_NAME": "claude-test",
+            },
+            "ChatAnthropic",
+            ModelRuntimeMetadata(provider="anthropic", model_name="claude-test"),
+            "anthropic",
+        ),
+        (
+            {
+                "OLLAMA_API_BASE": "http://ollama.example.test:11434",
+                "MODEL_NAME": "ollama-test:latest",
+            },
+            "ChatOllama",
+            ModelRuntimeMetadata(
+                provider="ollama",
+                model_name="ollama-test:latest",
+                base_url="http://ollama.example.test:11434",
+            ),
+            "ollama",
+        ),
+    ],
+)
+def test_factory_builds_provider_identifiable_guard_with_native_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    environment: dict[str, str],
+    provider_class: str,
+    metadata: ModelRuntimeMetadata,
+    native_kind: str,
+) -> None:
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+
+    model = model_factory.get_configured_model(bypass_cache=True)
+
+    assert any(cls.__name__ == provider_class for cls in type(model).__mro__)
+    _assert_common_model_contract(model, metadata)
+    if native_kind == "openai":
+        assert max(_timeout_values(model.request_timeout)) <= 0.2
+        assert max(_timeout_values(model.http_client.timeout)) <= 0.2
+        assert max(_timeout_values(model.http_async_client.timeout)) <= 0.2
+    elif native_kind == "google":
+        assert model.timeout == 0.2
+        assert model.client is not None
+        http_options = model.client._api_client._http_options
+        assert http_options.client_args["timeout"] == 0.2
+        assert http_options.client_args["verify"] is True
+        assert http_options.async_client_args["timeout"] == 0.2
+        assert http_options.async_client_args["verify"] is True
+    elif native_kind == "anthropic":
+        assert model.default_request_timeout == 0.2
+    else:
+        assert model.client_kwargs["timeout"] == 0.2
+        assert model.sync_client_kwargs["timeout"] == 0.2
+        assert model.async_client_kwargs["timeout"] == 0.2
+
+
+def test_factory_preserves_provider_precedence_with_mixed_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mixed = {
+        "AWS_BEDROCK_ENDPOINT": "https://bedrock-first.example.test/v1",
+        "AWS_BEARER_TOKEN_BEDROCK": "secret-test-value",
+        "AZURE_OPENAI_ENDPOINT": "https://azure-second.example.test",
+        "AZURE_OPENAI_DEPLOYMENT": "azure-model",
+        "AZURE_OPENAI_API_KEY": "secret-test-value",
+        "AZURE_OPENAI_API_VERSION": "2024-10-21",
+        "OPENAI_API_KEY": "secret-test-value",
+        "GOOGLE_API_KEY": "secret-test-value",
+        "ANTHROPIC_API_KEY": "secret-test-value",
+        "OLLAMA_API_BASE": "http://ollama-last.example.test:11434",
+        "MODEL_NAME": "first-model",
+    }
+    for name, value in mixed.items():
+        monkeypatch.setenv(name, value)
+
+    model = model_factory.get_configured_model(bypass_cache=True)
+
+    assert model._runtime_metadata == ModelRuntimeMetadata(
+        provider="aws_bedrock",
+        model_name="first-model",
+        base_url="https://bedrock-first.example.test/v1",
+    )
+
+
+def test_cached_model_keeps_construction_policy_until_cache_is_cleared(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OLLAMA_API_BASE", "http://localhost:11434")
+    monkeypatch.setenv("MODEL_NAME", "cached-model")
+
+    first = model_factory.get_configured_model()
+    monkeypatch.setenv("MODEL_CALL_TIMEOUT_SECONDS", "0.01")
+    cached = model_factory.get_configured_model()
+    bypassed = model_factory.get_configured_model(bypass_cache=True)
+
+    assert cached is first
+    assert cached._model_call_policy.timeout_seconds == 0.2
+    assert bypassed is not first
+    assert bypassed._model_call_policy.timeout_seconds == 0.01
+
+
+def test_skill_factory_delegates_to_shared_uncached_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sentinel = object()
+    calls: list[bool] = []
+
+    def shared_factory(*, bypass_cache: bool = False) -> object:
+        calls.append(bypass_cache)
+        return sentinel
+
+    monkeypatch.setattr(model_factory, "get_configured_model", shared_factory)
+    skill_path = Path(
+        ".deepagents/skills/golden-dataset/scripts/skill_model_factory.py"
+    )
+    spec = importlib.util.spec_from_file_location("golden_skill_model_factory", skill_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    assert module.get_configured_model() is sentinel
+    assert calls == [True]
