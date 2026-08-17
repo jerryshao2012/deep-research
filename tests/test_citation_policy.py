@@ -177,6 +177,59 @@ def test_normalizes_deduplicates_and_caps_defects_without_hiding_codes() -> None
     assert CitationDefect("missing_url", "web") < CitationDefect("unresolved_reference", "source:1")
 
 
+@pytest.mark.parametrize("marker", [f"[1, {'nope ' * 80}]", "[1," + "2," * 80 + "3]"])
+def test_rejects_oversized_numeric_groups_without_fail_open(marker: str) -> None:
+    report = f"""Claim {marker}.
+
+## Sources
+[1] https://source.publisher.org/a
+"""
+
+    audit = audit_web_citations(report)
+
+    assert "malformed_reference" in [defect.code for defect in audit.defects]
+    assert audit.urls == ("https://source.publisher.org/a",)
+
+
+@pytest.mark.parametrize("label", ["0", "1000", "12345678901234567890"])
+@pytest.mark.parametrize("destination", ["https://valid.publisher.org/a", "mailto:author@publisher.org"])
+def test_rejects_out_of_range_numeric_link_labels(label: str, destination: str) -> None:
+    audit = audit_web_citations(f"Claim [{label}]({destination}).")
+
+    assert "malformed_reference" in [defect.code for defect in audit.defects]
+
+
+def test_rejects_very_long_numeric_link_label_without_parsing_it_as_an_int() -> None:
+    audit = audit_web_citations(f"Claim [{'9' * 5_000}](https://valid.publisher.org/a).")
+
+    assert "malformed_reference" in [defect.code for defect in audit.defects]
+
+
+def test_preserves_balanced_parentheses_in_bare_and_markdown_urls() -> None:
+    report = """See https://publisher.org/Foo_(bar)).
+
+## Sources
+[1] [Source](https://publisher.org/Foo_(bar)).
+"""
+
+    assert audit_web_citations(report).urls == ("https://publisher.org/Foo_(bar)",)
+
+
+def test_fenced_code_requires_a_valid_closing_fence() -> None:
+    report = """```
+[99]
+```not-a-close
+[88]
+```
+Actual [1].
+
+## Sources
+[1] https://source.publisher.org/a
+"""
+
+    assert audit_web_citations(report).defects == ()
+
+
 def test_reports_unresolved_single_group_and_descending_markers() -> None:
     report = """Missing [1, 3; 5] and malformed [5-2].
 

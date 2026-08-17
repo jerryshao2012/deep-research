@@ -16,6 +16,8 @@ CitationDefectCode = Literal[
 
 _MAX_DEFECTS = 16
 _MAX_DETAIL_NUMBER = 999
+_MAX_MARKER_BODY_LENGTH = 256
+_MAX_MARKER_TOKENS = 32
 _SOURCE_HEADINGS = {"sources", "references", "bibliography", "works cited"}
 _PLACEHOLDER_RE = re.compile(
     r"\b(?:conceptual\s+source|placeholder|example\s+source|source\s+needed|"
@@ -29,8 +31,8 @@ _LINK_RE = re.compile(
     r"(?<!\\)\[(?P<label>(?:[^\[\]\\\n]|\\.|\[[^\[\]\\\n]*\])*)\]"
     r"\([ \t]*(?P<url><[^>\s]+>|(?:[^()\s]+|\([^()\s]*\))+)(?:[ \t]+[^)]*)?\)",
 )
-_ANY_SCHEME_URL_RE = re.compile(r"(?<![\w+.-])(?P<url>[A-Za-z][A-Za-z0-9+.-]*://[^\s<>()\[\]{}\"']*)")
-_NUMERIC_MARKER_RE = re.compile(r"(?<!\\)\[(?P<body>[^\]\n]{1,80})\]")
+_ANY_SCHEME_URL_RE = re.compile(r"(?<![\w+.-])(?P<url>[A-Za-z][A-Za-z0-9+.-]*://[^\s<>\[\]{}\"']*)")
+_NUMERIC_MARKER_RE = re.compile(r"(?<!\\)\[(?P<body>[^\]\n]*)\]")
 
 
 @dataclass(frozen=True, order=True, slots=True)
@@ -73,6 +75,9 @@ def audit_web_citations(report: str) -> CitationAudit:
         if _PLACEHOLDER_RE.search(link.group("label")):
             add("placeholder_source", "link")
             invalid_link_spans.add(link.span())
+        numeric_label = _numeric_link_label(link.group("label"))
+        if numeric_label is not None and not 1 <= numeric_label <= _MAX_DETAIL_NUMBER:
+            add("malformed_reference", "number")
 
     candidates: list[tuple[str, tuple[int, int]]] = []
     for link in links:
@@ -125,7 +130,12 @@ def _mask_fenced_and_inline_code(text: str) -> str:
         match = re.match(r"^[ \t]*(`{3,}|~{3,})", line)
         if fence is not None:
             masked.append(_blank(line))
-            if match and match.group(1)[0] == fence[0] and len(match.group(1)) >= len(fence):
+            if (
+                match
+                and match.group(1)[0] == fence[0]
+                and len(match.group(1)) >= len(fence)
+                and re.fullmatch(r"[ \t]*(?:\r?\n)?", line[match.end() :])
+            ):
                 fence = None
             continue
         if match:
@@ -185,7 +195,13 @@ def _audit_numeric_marker(
 ) -> None:
     if not re.match(r"\s*\d", body):
         return
+    if len(body) > _MAX_MARKER_BODY_LENGTH:
+        add_defect("malformed_reference", "marker")
+        return
     parts = re.split(r"[;,]", body)
+    if len(parts) > _MAX_MARKER_TOKENS:
+        add_defect("malformed_reference", "marker")
+        return
     for part in parts:
         value = part.strip()
         if not value:
@@ -270,10 +286,15 @@ def _is_citation_link(
 ) -> bool:
     if _is_source_candidate(span, source_ranges, entries):
         return True
-    return any(
-        link.span() == span and re.fullmatch(r"\s*\d{1,3}\s*", link.group("label"))
-        for link in links
-    )
+    return any(link.span() == span and _numeric_link_label(link.group("label")) is not None for link in links)
+
+
+def _numeric_link_label(label: str) -> int | None:
+    match = re.fullmatch(r"\s*(\d+)\s*", label)
+    if not match:
+        return None
+    digits = match.group(1).lstrip("0") or "0"
+    return _MAX_DETAIL_NUMBER + 1 if len(digits) > 3 else int(digits)
 
 
 def _span_is_contained(span: tuple[int, int], containers: set[tuple[int, int]]) -> bool:
