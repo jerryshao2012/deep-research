@@ -50,14 +50,20 @@ Add a dedicated `CompletionGuardMiddleware` and persist its small amount of cont
 - current LangGraph run identifier;
 - automatic continuation-attempt count;
 - current request's plan owner;
-- whether an explicit resume adopted the previous plan/report; and
+- current request's report-ownership flag;
+- whether an explicit resume adopted the previous request generation; and
 - the ordinary request's baseline `/final_report.md` `modified_at` value.
 
-`before_agent` runs once for each visible LangGraph run. It uses `configurable.run_id` as request identity, with a generated invocation token only for direct graph calls that do not provide a run ID. This avoids content-hash ambiguity when a user submits identical text twice. Automatic `jump_to: "model"` continuations bypass `before_agent`, so they retain the same counter.
+`before_agent` runs once for each visible LangGraph run. It uses top-level `get_config()["run_id"]`, normalized to a string, as request identity, with a generated invocation token only for direct graph calls that do not provide a run ID. This matches LangGraph API-shaped configuration and avoids content-hash ambiguity when a user submits identical text twice. Automatic `jump_to: "model"` continuations bypass `before_agent`, so they retain the same counter.
 
-Every visible run receives a fresh three-attempt budget, including an explicit resume after a previous exhausted run. An ordinary new research run clears stale todos, marks its plan inactive, records the prior report's `modified_at` baseline, and resets streamed-file ownership. An explicit `resume_incomplete_todos` run preserves and adopts the prior plan and report while resetting only the automatic-attempt budget.
+Every visible run receives a fresh three-attempt budget, including an explicit resume after a previous exhausted run. An ordinary new research run clears stale todos, marks its plan and report unowned, records the prior report's `modified_at` baseline, and resets streamed-file ownership. An explicit `resume_incomplete_todos` run preserves the prior plan, baseline, and report-ownership flag while resetting only the automatic-attempt budget. Resume never promotes a report to owned merely because a non-empty canonical report exists; request B therefore cannot adopt request A's stale report.
 
-For an ordinary run, the guard observes the tool result on the following model-loop entry: a successful `write_todos` call plus a resulting non-empty todo list activates the plan for the current run. Failed or malformed calls do not activate it. Report ownership is current only when `/final_report.md` is valid and its `modified_at` differs from the recorded baseline. An explicit resume may use the adopted non-empty report. These rules prevent a new request from passing with a prior completed plan/report or looping on a prior incomplete plan.
+`CompletionGuardMiddleware.before_model` and `abefore_model` activate artifacts after the tools node. They correlate the latest `AIMessage` tool-call IDs with successful `ToolMessage.tool_call_id` values:
+
+- successful `write_todos` plus a resulting non-empty todo list activates the plan for the current request;
+- successful `write_file` targeting canonical `/final_report.md` plus valid file data, non-empty content, and a `modified_at` value different from the ordinary-run baseline marks the report owned.
+
+Content-only `write_file` calls use the tool's existing default `/final_report.md` path. Failed, missing, mismatched, or malformed tool results activate nothing. Explicit resume retains only ownership already established by the request it resumes. These rules prevent a new request from passing with a prior completed plan/report or looping on a prior incomplete plan.
 
 Completion assessment runs only after an `AIMessage` with no tool calls. Tool-producing model responses continue through the ordinary tools loop without consuming a completion attempt.
 
@@ -98,11 +104,13 @@ LangChain executes `after_model` hooks in reverse registration order. This produ
 
 ### Interaction with verification
 
-Existing report verification remains authoritative once the current request owns `/final_report.md`. `ResearchStateMiddleware.after_model` and `aafter_model` declare `can_jump_to=["model", "end"]`. A `needs_revision` verdict stores `verification_feedback` in state and explicitly returns `jump_to: "model"`; it no longer persists a mid-history `SystemMessage`.
+Report streaming, verification, evaluation logging, and final completion are gated on current request ownership. Existing report verification runs only after the current plan is valid and every research todo is complete. `ResearchStateMiddleware.after_model` and `aafter_model` declare `can_jump_to=["model", "end"]`. A non-final `needs_revision` verdict stores `verification_feedback`, tags its triggering terminal `AIMessage` as `resume_intermediate`, and explicitly returns `jump_to: "model"`; it no longer persists a mid-history `SystemMessage`. A pass records the verified report's `modified_at`. A final-round `needs_revision` retains existing revision-limit behavior and records an accepted-at-limit state without another model jump.
 
 `ResearchStateMiddleware.configure_request` already derives its leading system prompt from state. It injects `verification_feedback` there alongside completion guidance, keeping Ollama message roles valid. A verification-owned model jump occurs before `ResumeMiddleware` and `CompletionGuardMiddleware`, so it does not consume completion budget.
 
-The guard evaluates the effective state produced by the hook, including todo updates from verification. A report is not considered fully complete while any research or verification todo remains incomplete.
+Move cited-response and final-report streaming out of the beginning of `ResearchStateMiddleware.after_model` and into completion finalization after verification acceptance. Completion finalization occurs only when the current plan is complete, the current report is owned and non-empty, and verification is either disabled, passed for the report's current `modified_at`, or accepted at the configured verification limit. It emits cited responses and `/final_report.md` exactly once, then marks `_streamed_files`. A provisional report with pending todos or a revision verdict is never streamed or marked streamed. Evaluation logging uses the same readiness gate.
+
+The guard evaluates state produced by earlier middleware nodes, including verification todo updates. A report is not considered fully complete while any research or verification todo remains incomplete.
 
 ### Retry exhaustion
 
@@ -112,7 +120,9 @@ On the fourth incomplete terminal response—the initial stop plus three automat
 - count of incomplete or malformed todos; and
 - whether the current request's `/final_report.md` is stale, missing, malformed, or empty.
 
-`ResearchIncompleteError` subclasses `RuntimeError`. LangGraph marks the run failed, and the installed LangGraph API serializer exposes `RuntimeError` text instead of replacing it with “An internal error occurred.” The message is deliberately safe and contains counts, not todo labels or research text. Existing task state retains the remaining labels for the UI. No separate hidden run is created, and no partial terminal model message is treated as the final answer.
+`CompletionGuardMiddleware.after_model` does not raise immediately on exhaustion. It first tags the exhausted terminal `AIMessage` as `resume_intermediate`, stores safe exhaustion metadata, and returns `jump_to: "end"`. That node update is checkpointed before `CompletionGuardMiddleware.after_agent` raises `ResearchIncompleteError`. This ensures live and restored history suppress the partial terminal response while LangGraph still marks the run failed.
+
+`ResearchIncompleteError` subclasses `RuntimeError`, and the installed LangGraph API serializer exposes `RuntimeError` text instead of replacing it with “An internal error occurred.” The message is deliberately safe and contains counts, not todo labels or research text. Existing task state retains the remaining labels for the UI. No separate hidden run is created.
 
 ## Testing
 
@@ -128,15 +138,20 @@ Required cases:
 - report present plus unfinished todo continues;
 - stale completed plan/report from a prior ordinary request cannot satisfy a new request;
 - stale incomplete plan cannot activate a new ordinary request;
+- request B followed by explicit resume cannot adopt request A's stale report when B never owned a report;
 - explicit resume adopts prior plan/report but receives a fresh retry budget;
 - repeated identical user messages receive distinct request generations;
 - malformed todo entries, unknown statuses, malformed file data, and file-conversion failures cannot pass;
 - verification revision explicitly jumps to model, injects feedback ephemerally, preserves Ollama role order, and consumes no completion attempt;
+- pending-todo report continues without streaming, then emits the accepted report exactly once after completion;
+- verification revision does not stream or mark a provisional report and tags its triggering terminal response;
 - third automatic continuation remains allowed;
-- next incomplete terminal response raises `ResearchIncompleteError`;
+- next incomplete terminal response persists intermediate/exhaustion state before `after_agent` raises `ResearchIncompleteError`;
 - LangGraph API serialization preserves the safe incomplete error message;
 - incomplete terminal messages are tagged as intermediate;
 - compiled sync and async graph executions make the second model call after a completion jump;
+- compiled sync and async activation starts inactive, calls real `write_todos`, correlates its successful tool result, observes non-empty todo state, and then guards the next incomplete terminal response;
+- failed, mismatched, and malformed `write_todos` tool results do not activate a plan;
 - graph integration keeps one run ID and preserves files, todos, and tool events across continuations;
 - explicit resume behavior and registered `write_todos` tool remain unchanged.
 
