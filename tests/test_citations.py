@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import ssl
+import threading
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -61,6 +62,33 @@ class _FakeAsyncClient:
 
 
 class TestCitationValidatorSafeFetch:
+    def test_stalled_dns_is_bounded_and_does_not_use_default_executor(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        release = threading.Event()
+        monkeypatch.setattr(citation_validator, "_DNS_TIMEOUT_SECONDS", 0.01)
+        monkeypatch.setattr(
+            citation_validator,
+            "_resolve_host_addresses",
+            lambda host, port: (release.wait(), ("93.184.216.34",))[1],
+        )
+
+        async def probes() -> tuple[list[tuple[bool, str]], bool]:
+            results = await asyncio.gather(*[
+                citation_validator._safe_fetch_url(f"https://host{index}.publisher.org")
+                for index in range(16)
+            ])
+            default_executor_works = await asyncio.to_thread(lambda: True)
+            return results, default_executor_works
+
+        results, default_executor_works = asyncio.run(probes())
+        stats = citation_validator._resolver_runtime_stats()
+        release.set()
+
+        assert all(result[0] is False for result in results)
+        assert default_executor_works is True
+        assert stats["workers"] <= citation_validator._RESOLVER_WORKERS
+        assert stats["outstanding"] <= citation_validator._RESOLVER_WORKERS + citation_validator._RESOLVER_QUEUE_SIZE
     def test_dns_resolution_is_cached_per_redirect_target(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

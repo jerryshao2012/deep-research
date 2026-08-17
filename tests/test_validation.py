@@ -108,4 +108,5 @@ async def test_cached_content_cannot_override_failed_reachability() -> None:
         )
 
     assert results[0].reachable is False
-    assert results[0].grounded is True
+    assert results[0].grounded is False
+    assert results[0].category.value == "unreachable"

@@ -8,9 +8,12 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import os
+import queue
 import re
 import socket
 import ssl
+import threading
 from dataclasses import dataclass
 from enum import StrEnum
 from urllib.parse import urljoin, urlsplit
@@ -66,8 +69,14 @@ _STOP_WORDS = {
 
 _MAX_REDIRECTS = 3
 _DNS_TIMEOUT_SECONDS = 1.0
+_RESOLVER_WORKERS = 4
+_RESOLVER_QUEUE_SIZE = 4
 _REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 _INVALID_REDIRECT_TARGET = object()
+_resolver_lock = threading.Lock()
+_resolver_pid: int | None = None
+_resolver_queue: queue.Queue | None = None
+_resolver_threads: list[threading.Thread] = []
 
 
 def _extract_claim_for_citation(text: str, cite_index: int) -> str | None:
@@ -219,6 +228,56 @@ def _resolve_host_addresses(host: str, port: int | None) -> tuple[str, ...]:
     return tuple(sorted(addresses))
 
 
+def _resolver_worker(work_queue: queue.Queue) -> None:
+    while True:
+        host, port, loop, future = work_queue.get()
+        try:
+            result = _resolve_host_addresses(host, port)
+        except BaseException as error:
+            result = error
+        try:
+            loop.call_soon_threadsafe(_deliver_resolution, future, result)
+        except RuntimeError:
+            pass
+        finally:
+            work_queue.task_done()
+
+
+def _deliver_resolution(future: asyncio.Future, result: object) -> None:
+    if future.done() or future.cancelled():
+        return
+    if isinstance(result, BaseException):
+        future.set_exception(result)
+    else:
+        future.set_result(result)
+
+
+def _resolver_runtime() -> queue.Queue:
+    global _resolver_pid, _resolver_queue, _resolver_threads
+    with _resolver_lock:
+        if _resolver_pid != os.getpid() or _resolver_queue is None:
+            _resolver_pid = os.getpid()
+            _resolver_queue = queue.Queue(maxsize=_RESOLVER_QUEUE_SIZE)
+            _resolver_threads = [threading.Thread(target=_resolver_worker, args=(_resolver_queue,), daemon=True) for _ in range(_RESOLVER_WORKERS)]
+            for worker in _resolver_threads:
+                worker.start()
+        return _resolver_queue
+
+
+def _resolver_runtime_stats() -> dict[str, int]:
+    work_queue = _resolver_runtime()
+    return {"workers": len(_resolver_threads), "outstanding": work_queue.qsize() + sum(worker.is_alive() for worker in _resolver_threads)}
+
+
+def _submit_resolution(host: str, port: int) -> asyncio.Future | None:
+    future = asyncio.get_running_loop().create_future()
+    try:
+        _resolver_runtime().put_nowait((host, port, asyncio.get_running_loop(), future))
+    except queue.Full:
+        return None
+    return future
+
+
 def _static_url_parts(
     url: str,
 ) -> tuple[str, str | None, str | None, str | None, int | None] | None:
@@ -282,10 +341,10 @@ async def _safe_fetch_url(
     if resolution_cache and key in resolution_cache:
         return resolution_cache[key]
     try:
-        addresses = await asyncio.wait_for(
-            asyncio.to_thread(_resolve_host_addresses, host or "", port),
-            timeout=_DNS_TIMEOUT_SECONDS,
-        )
+        future = _submit_resolution(host or "", port)
+        if future is None:
+            raise TimeoutError
+        addresses = await asyncio.wait_for(future, timeout=_DNS_TIMEOUT_SECONDS)
     except (OSError, ValueError, TimeoutError):
         result = (False, "DNS resolution failed")
         if resolution_cache is not None:
@@ -432,6 +491,9 @@ async def validate_web_citations(
             continue
 
         reachable, _ = await _check_url_reachable(url)
+        if not reachable:
+            results.append(ValidationResult(citation_index=citation_index, reachable=False, grounded=False, category=CitationValidationCategory.UNREACHABLE))
+            continue
 
         content = None
         if fetched_contents and url in fetched_contents:
@@ -440,20 +502,12 @@ async def validate_web_citations(
             content = get_cached_webpage(url)
 
         if not content:
-            if not reachable:
-                results.append(ValidationResult(
-                    citation_index=citation_index,
-                    reachable=False,
-                    grounded=False,
-                    category=CitationValidationCategory.UNREACHABLE,
-                ))
-            else:
-                results.append(ValidationResult(
-                    citation_index=citation_index,
-                    reachable=True,
-                    grounded=False,
-                    category=CitationValidationCategory.GROUNDING_UNAVAILABLE,
-                ))
+            results.append(ValidationResult(
+                citation_index=citation_index,
+                reachable=True,
+                grounded=False,
+                category=CitationValidationCategory.GROUNDING_UNAVAILABLE,
+            ))
             continue
 
         claim = None
