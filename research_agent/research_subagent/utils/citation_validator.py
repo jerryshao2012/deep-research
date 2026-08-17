@@ -6,8 +6,11 @@ are actually grounded in the fetched source texts by comparing keywords and sent
 
 from __future__ import annotations
 
+import ipaddress
 import re
+import socket
 from dataclasses import dataclass
+from urllib.parse import urljoin, urlsplit
 
 import httpx
 
@@ -41,6 +44,9 @@ _STOP_WORDS = {
     'very', 's', 't', 'can', 'will', 'just', 'should', 'now', 'i', 'you', 'he', 'she', 'it', 'they', 'them',
     'my', 'your', 'his', 'her', 'its', 'their', 'this', 'that', 'these', 'those'
 }
+
+_MAX_REDIRECTS = 3
+_REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 
 
 def _extract_claim_for_citation(text: str, cite_index: int) -> str | None:
@@ -182,8 +188,73 @@ def _is_claim_grounded(claim: str, fetched_text: str) -> bool:
     return False
 
 
+def _resolve_host_addresses(host: str, port: int | None) -> tuple[str, ...]:
+    """Resolve a hostname for safe fetch checks; patch this boundary in tests."""
+    service = port or 443
+    addresses = {
+        info[4][0]
+        for info in socket.getaddrinfo(host, service, type=socket.SOCK_STREAM)
+    }
+    return tuple(sorted(addresses))
+
+
+def _unsafe_static_url(url: str) -> bool:
+    parsed = urlsplit(url)
+    host = parsed.hostname
+    if parsed.scheme.lower() not in {"http", "https"} or not host:
+        return True
+    normalized = host.lower().rstrip(".")
+    if normalized == "localhost" or normalized.endswith(".localhost"):
+        return True
+    try:
+        address = ipaddress.ip_address(normalized)
+    except ValueError:
+        return False
+    return not address.is_global
+
+
+def _safe_fetch_url(url: str) -> tuple[bool, str]:
+    """Reject static and DNS-resolved non-global targets before each request.
+
+    DNS is checked immediately before every request, including redirects.  A
+    resolver can still rebind between this check and connect because httpx does
+    not expose address pinning; callers must treat this as defense in depth.
+    """
+    if _unsafe_static_url(url):
+        return False, "Unsafe URL target"
+
+    parsed = urlsplit(url)
+    try:
+        port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
+        addresses = _resolve_host_addresses(parsed.hostname or "", port)
+    except (OSError, ValueError) as exc:
+        return False, f"DNS resolution failed: {exc}"
+    if not addresses:
+        return False, "DNS resolution returned no addresses"
+
+    for raw_address in addresses:
+        try:
+            address = ipaddress.ip_address(raw_address)
+        except ValueError:
+            return False, "DNS resolution returned an invalid address"
+        if not address.is_global:
+            return False, "Unsafe DNS target"
+    return True, "Safe target"
+
+
+def _redirect_target(url: str, response: httpx.Response) -> str | None:
+    if response.status_code not in _REDIRECT_STATUSES:
+        return None
+    location = response.headers.get("location")
+    return urljoin(url, location) if location else ""
+
+
 async def _check_url_reachable(url: str, timeout: float = 3.0) -> tuple[bool, str]:
-    """Lightweight async URL reachability check."""
+    """Check reachability without proxies and with DNS screening per hop."""
+    safe, reason = _safe_fetch_url(url)
+    if not safe:
+        return False, reason
+
     verify_ssl = get_ssl_verify_config()
     headers = {
         "User-Agent": (
@@ -192,19 +263,48 @@ async def _check_url_reachable(url: str, timeout: float = 3.0) -> tuple[bool, st
         )
     }
     try:
-        async with httpx.AsyncClient(verify=verify_ssl, headers=headers, timeout=timeout) as client:
-            try:
-                resp = await client.head(url)
-                if resp.status_code < 400:
-                    return True, "Reachable"
-            except Exception:
-                pass
+        async with httpx.AsyncClient(
+            verify=verify_ssl,
+            headers=headers,
+            timeout=timeout,
+            trust_env=False,
+            follow_redirects=False,
+        ) as client:
+            current_url = url
+            for redirect_count in range(_MAX_REDIRECTS + 1):
+                safe, reason = _safe_fetch_url(current_url)
+                if not safe:
+                    return False, reason
 
-            resp = await client.get(url)
-            if resp.status_code < 400:
-                return True, "Reachable"
-            else:
-                return False, f"HTTP {resp.status_code}"
+                try:
+                    response = await client.head(current_url)
+                except Exception:
+                    response = None
+
+                if response is not None:
+                    target = _redirect_target(current_url, response)
+                    if target is not None:
+                        if not target:
+                            return False, "Redirect missing location"
+                        if redirect_count == _MAX_REDIRECTS:
+                            return False, "Too many redirects"
+                        current_url = target
+                        continue
+                    if response.status_code < 400:
+                        return True, "Reachable"
+
+                response = await client.get(current_url)
+                target = _redirect_target(current_url, response)
+                if target is not None:
+                    if not target:
+                        return False, "Redirect missing location"
+                    if redirect_count == _MAX_REDIRECTS:
+                        return False, "Too many redirects"
+                    current_url = target
+                    continue
+                if response.status_code < 400:
+                    return True, "Reachable"
+                return False, f"HTTP {response.status_code}"
     except Exception as e:
         return False, str(e)
 

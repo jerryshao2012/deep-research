@@ -2,14 +2,129 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
+from research_agent.research_subagent.utils import citation_validator
 from research_agent.research_subagent.utils.content_extractors import _render_page_chunk
 from thread_wiki.models import SourceCitation, WikiQueryResult
 from thread_wiki.service import _extract_citations
+
+# ── Citation validator safe fetch boundary ────────────────────────────────
+
+
+class _FakeHttpResponse:
+    def __init__(self, status_code: int, headers: dict[str, str] | None = None) -> None:
+        self.status_code = status_code
+        self.headers = headers or {}
+
+
+class _FakeAsyncClient:
+    def __init__(self, responses: list[_FakeHttpResponse], **kwargs: object) -> None:
+        self.responses = responses
+        self.kwargs = kwargs
+        self.requests: list[tuple[str, str]] = []
+
+    async def __aenter__(self) -> _FakeAsyncClient:
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        return None
+
+    async def head(self, url: str) -> _FakeHttpResponse:
+        self.requests.append(("HEAD", url))
+        return self.responses.pop(0)
+
+    async def get(self, url: str) -> _FakeHttpResponse:
+        self.requests.append(("GET", url))
+        return self.responses.pop(0)
+
+
+class TestCitationValidatorSafeFetch:
+    def test_private_or_loopback_literal_is_rejected_before_dns_or_fetch(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def resolver(*args: object) -> tuple[str, ...]:
+            raise AssertionError("static unsafe hosts must not resolve")
+
+        def client(*args: object, **kwargs: object) -> _FakeAsyncClient:
+            raise AssertionError("static unsafe hosts must not fetch")
+
+        monkeypatch.setattr(citation_validator, "_resolve_host_addresses", resolver)
+        monkeypatch.setattr(citation_validator.httpx, "AsyncClient", client)
+
+        for url in ("http://127.0.0.1/internal", "http://[::1]/internal"):
+            reachable, reason = asyncio.run(citation_validator._check_url_reachable(url))
+            assert reachable is False
+            assert "unsafe" in reason.lower()
+
+    def test_dns_private_result_is_rejected_before_fetch(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def resolver(host: str, port: int | None) -> tuple[str, ...]:
+            assert host == "public.publisher.org"
+            return ("10.0.0.8",)
+
+        def client(*args: object, **kwargs: object) -> _FakeAsyncClient:
+            raise AssertionError("private DNS result must not fetch")
+
+        monkeypatch.setattr(citation_validator, "_resolve_host_addresses", resolver)
+        monkeypatch.setattr(citation_validator.httpx, "AsyncClient", client)
+
+        reachable, reason = asyncio.run(
+            citation_validator._check_url_reachable("https://public.publisher.org/report")
+        )
+
+        assert reachable is False
+        assert "unsafe" in reason.lower()
+
+    def test_redirect_to_private_address_is_rejected_before_redirect_fetch(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake_client = _FakeAsyncClient(
+            [_FakeHttpResponse(302, {"location": "http://127.0.0.1/private"})]
+        )
+
+        def resolver(host: str, port: int | None) -> tuple[str, ...]:
+            return ("93.184.216.34",) if host == "public.publisher.org" else ("127.0.0.1",)
+
+        monkeypatch.setattr(citation_validator, "_resolve_host_addresses", resolver)
+        monkeypatch.setattr(citation_validator.httpx, "AsyncClient", lambda **kwargs: fake_client)
+
+        reachable, reason = asyncio.run(
+            citation_validator._check_url_reachable("https://public.publisher.org/start")
+        )
+
+        assert reachable is False
+        assert "unsafe" in reason.lower()
+        assert fake_client.requests == [("HEAD", "https://public.publisher.org/start")]
+
+    def test_public_dns_result_fetches_with_environment_disabled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake_client = _FakeAsyncClient([_FakeHttpResponse(200)])
+        monkeypatch.setattr(
+            citation_validator,
+            "_resolve_host_addresses",
+            lambda host, port: ("93.184.216.34",),
+        )
+
+        def client(**kwargs: object) -> _FakeAsyncClient:
+            fake_client.kwargs = kwargs
+            return fake_client
+
+        monkeypatch.setattr(citation_validator.httpx, "AsyncClient", client)
+
+        reachable, reason = asyncio.run(
+            citation_validator._check_url_reachable("https://public.publisher.org/report")
+        )
+
+        assert (reachable, reason) == (True, "Reachable")
+        assert fake_client.kwargs["trust_env"] is False
+        assert fake_client.kwargs["follow_redirects"] is False
 
 # ── _render_page_chunk ─────────────────────────────────────────────────────
 

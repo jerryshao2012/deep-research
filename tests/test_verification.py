@@ -15,9 +15,14 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from research_agent import agent as agent_module
 from research_agent import completion_guard
+from research_agent.citation_failure import ReportCitationError
 from research_agent.completion_guard import CompletionState
 from research_agent.model_call_guard import ModelCallTimeoutError
 from research_agent.research_subagent.utils import verification as verification_module
+from research_agent.research_subagent.utils.citation_policy import (
+    CitationAudit,
+    CitationDefect,
+)
 from research_agent.research_subagent.utils.verification import (
     VerificationVerdict,
     _adversarial_gap_analysis,
@@ -25,7 +30,9 @@ from research_agent.research_subagent.utils.verification import (
     _extract_citations_from_report,
     format_feedback,
     make_verdict,
+    verify_report,
 )
+from thread_wiki.models import SourceCitation
 
 
 class _FakeJudgeModel:
@@ -140,6 +147,174 @@ class TestFormatFeedback:
         )
         text = format_feedback(verdict)
         assert "Gaps and missing perspectives" not in text
+
+    def test_citation_preflight_feedback_is_safe_and_bounded(self) -> None:
+        secret = "https://private.example.invalid/token=do-not-echo"
+        verdict = VerificationVerdict(
+            status="needs_revision",
+            sufficiency_score=0.0,
+            citation_blocking=True,
+            citation_defects=(
+                CitationDefect("missing_url", secret),
+                CitationDefect("placeholder_source", "placeholder label"),
+                CitationDefect("unresolved_reference", "[777]"),
+                CitationDefect("malformed_reference", "[1-secret]"),
+            ),
+            adversarial_gaps=["Report prose must not be echoed: token=do-not-echo"],
+        )
+
+        text = format_feedback(verdict)
+
+        assert "Add at least one concrete HTTP(S) web citation." in text
+        assert "Replace placeholder source labels or code" in text
+        assert "Resolve every numbered citation reference." in text
+        assert "Repair malformed citation groups or ranges." in text
+        assert secret not in text
+        assert "[777]" not in text
+        assert "token=do-not-echo" not in text
+
+
+# ---------------------------------------------------------------------------
+# strict citation preflight
+# ---------------------------------------------------------------------------
+
+
+class TestStrictCitationPreflight:
+    def test_invalid_audit_short_circuits_grounding_and_judges(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls = {"grounding": 0, "sufficiency": 0, "adversarial": 0}
+        defect = CitationDefect("missing_url", "web")
+        monkeypatch.setattr(
+            verification_module,
+            "audit_web_citations",
+            lambda report: CitationAudit(urls=(), defects=(defect,)),
+        )
+
+        async def grounding(**kwargs: object) -> list[object]:
+            calls["grounding"] += 1
+            return []
+
+        async def sufficiency(*args: object) -> tuple[float, str]:
+            calls["sufficiency"] += 1
+            return 1.0, "complete"
+
+        async def adversarial(*args: object) -> list[str]:
+            calls["adversarial"] += 1
+            return []
+
+        monkeypatch.setattr(verification_module, "validate_web_citations", grounding)
+        monkeypatch.setattr(verification_module, "_check_report_sufficiency", sufficiency)
+        monkeypatch.setattr(verification_module, "_adversarial_gap_analysis", adversarial)
+
+        verdict = asyncio.run(
+            verify_report("Question", "Report with no usable web citation", strict_web_citations=True)
+        )
+
+        assert verdict.status == "needs_revision"
+        assert verdict.sufficiency_score == 0.0
+        assert verdict.citation_blocking is True
+        assert verdict.citation_defects == (defect,)
+        assert "citation" in verdict.sufficiency_reason.lower()
+        assert calls == {"grounding": 0, "sufficiency": 0, "adversarial": 0}
+
+    def test_valid_audit_urls_are_exact_grounding_sources(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        urls = (
+            "http://public.publisher.org/path?x=1#part",
+            "https://[2606:4700:4700::1111]/dns-query",
+            "https://news.publisher.org/markdown-link",
+            "https://public.publisher.org/bare-url",
+            "https://public.publisher.org/reference-definition",
+            "https://public.publisher.org/source-entry",
+        )
+        received: list[SourceCitation] = []
+        monkeypatch.setattr(
+            verification_module,
+            "audit_web_citations",
+            lambda report: CitationAudit(urls=urls, defects=()),
+        )
+
+        async def grounding(**kwargs: object) -> list[object]:
+            received.extend(kwargs["citations"])  # type: ignore[arg-type]
+            return []
+
+        async def sufficiency(*args: object) -> tuple[float, str]:
+            return 1.0, "complete"
+
+        async def adversarial(*args: object) -> list[str]:
+            return []
+
+        monkeypatch.setattr(verification_module, "validate_web_citations", grounding)
+        monkeypatch.setattr(verification_module, "_check_report_sufficiency", sufficiency)
+        monkeypatch.setattr(verification_module, "_adversarial_gap_analysis", adversarial)
+
+        verdict = asyncio.run(
+            verify_report("Question", "Different legacy source format", strict_web_citations=True)
+        )
+
+        assert verdict.status == "complete"
+        assert received == [SourceCitation(kind="web", url=url) for url in urls]
+
+    def test_non_strict_preserves_legacy_no_web_behavior(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls = {"audit": 0, "grounding": 0, "sufficiency": 0, "adversarial": 0}
+
+        def audit(report: str) -> CitationAudit:
+            calls["audit"] += 1
+            return CitationAudit(urls=(), defects=())
+
+        async def grounding(**kwargs: object) -> list[object]:
+            calls["grounding"] += 1
+            return []
+
+        async def sufficiency(*args: object) -> tuple[float, str]:
+            calls["sufficiency"] += 1
+            return 1.0, "complete"
+
+        async def adversarial(*args: object) -> list[str]:
+            calls["adversarial"] += 1
+            return []
+
+        monkeypatch.setattr(verification_module, "audit_web_citations", audit)
+        monkeypatch.setattr(verification_module, "validate_web_citations", grounding)
+        monkeypatch.setattr(verification_module, "_check_report_sufficiency", sufficiency)
+        monkeypatch.setattr(verification_module, "_adversarial_gap_analysis", adversarial)
+
+        verdict = asyncio.run(verify_report("Question", "Document-only report"))
+
+        assert verdict.status == "complete"
+        assert verdict.citation_blocking is False
+        assert verdict.citation_defects == ()
+        assert calls == {"audit": 0, "grounding": 0, "sufficiency": 1, "adversarial": 1}
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            ModelCallTimeoutError("ollama", 1.0, False),
+            asyncio.CancelledError(),
+            ReportCitationError("citation policy violation"),
+        ],
+    )
+    def test_control_errors_propagate_from_grounding(
+        self, monkeypatch: pytest.MonkeyPatch, error: BaseException
+    ) -> None:
+        monkeypatch.setattr(
+            verification_module,
+            "audit_web_citations",
+            lambda report: CitationAudit(urls=("https://public.publisher.org",), defects=()),
+        )
+
+        async def grounding(**kwargs: object) -> list[object]:
+            raise error
+
+        monkeypatch.setattr(verification_module, "validate_web_citations", grounding)
+
+        with pytest.raises(type(error)) as raised:
+            asyncio.run(verify_report("Question", "Report", strict_web_citations=True))
+        assert raised.value is error
 
 
 # ---------------------------------------------------------------------------

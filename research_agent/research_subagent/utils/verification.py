@@ -16,8 +16,13 @@ from dataclasses import dataclass, field
 
 from langchain_core.messages import HumanMessage
 
+from research_agent.citation_failure import ReportCitationError
 from research_agent.model_call_guard import ModelCallTimeoutError
 from research_agent.model_factory import get_configured_model
+from research_agent.research_subagent.utils.citation_policy import (
+    CitationDefect,
+    audit_web_citations,
+)
 from research_agent.research_subagent.utils.citation_validator import (
     ValidationResult,
     validate_web_citations,
@@ -75,6 +80,8 @@ class VerificationVerdict:
     adversarial_gaps: list[str] = field(default_factory=list)
     sufficiency_reason: str = ""
     error_message: str = ""
+    citation_blocking: bool = False
+    citation_defects: tuple[CitationDefect, ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -154,7 +161,7 @@ async def _check_report_sufficiency(question: str, report: str) -> tuple[float, 
         # Clamp to valid range.
         score = max(0.0, min(1.0, score))
         return score, reason
-    except (ModelCallTimeoutError, asyncio.CancelledError):
+    except (ModelCallTimeoutError, asyncio.CancelledError, ReportCitationError):
         raise
     except Exception as exc:
         logger.warning("Sufficiency check failed: %s. Defaulting to neutral.", exc)
@@ -206,7 +213,7 @@ async def _adversarial_gap_analysis(question: str, report: str) -> list[str]:
         if not isinstance(gaps, list):
             gaps = []
         return [str(g) for g in gaps[:5]]  # Cap at 5 gaps.
-    except (ModelCallTimeoutError, asyncio.CancelledError):
+    except (ModelCallTimeoutError, asyncio.CancelledError, ReportCitationError):
         raise
     except Exception as exc:
         logger.warning("Adversarial analysis failed: %s", exc)
@@ -250,7 +257,19 @@ def format_feedback(verdict: VerificationVerdict) -> str:
         f"Sufficiency score: {verdict.sufficiency_score:.2f} / 1.0",
     ]
 
-    if verdict.grounding_results:
+    if verdict.citation_defects:
+        lines.extend(("", "Citation preflight issues:"))
+        defect_messages = {
+            "missing_url": "Add at least one concrete HTTP(S) web citation.",
+            "placeholder_source": "Replace placeholder source labels or code with concrete HTTP(S) citations.",
+            "unresolved_reference": "Resolve every numbered citation reference.",
+            "malformed_reference": "Repair malformed citation groups or ranges.",
+        }
+        for code in ("missing_url", "placeholder_source", "unresolved_reference", "malformed_reference"):
+            if any(defect.code == code for defect in verdict.citation_defects):
+                lines.append(f"  - {defect_messages[code]}")
+
+    if verdict.grounding_results and not verdict.citation_defects:
         failed = [
             r for r in verdict.grounding_results
             if not r.grounded or not r.reachable
@@ -261,7 +280,7 @@ def format_feedback(verdict: VerificationVerdict) -> str:
             for r in failed:
                 lines.append(f"  - [{r.url}] {r.reason}")
 
-    if verdict.adversarial_gaps:
+    if verdict.adversarial_gaps and not verdict.citation_defects:
         lines.append("")
         lines.append("Gaps and missing perspectives:")
         for i, gap in enumerate(verdict.adversarial_gaps, 1):
@@ -281,6 +300,7 @@ async def verify_report(
         question: str,
         report: str,
         fetched_contents: dict[str, str] | None = None,
+        strict_web_citations: bool = False,
 ) -> VerificationVerdict:
     """Run all verification checks against a final report.
 
@@ -293,18 +313,31 @@ async def verify_report(
         question: The original user question.
         report: The full text of ``/final_report.md``.
         fetched_contents: Optional pre-fetched URL → content mapping.
+        strict_web_citations: Require a valid deterministic web-citation audit.
 
     Returns:
         A ``VerificationVerdict`` with the composite status and all sub-results.
     """
     # ── 1. Citation grounding ──────────────────────────────────────────
-    citations = _extract_citations_from_report(report)
+    if strict_web_citations:
+        audit = audit_web_citations(report)
+        if audit.defects:
+            return VerificationVerdict(
+                status="needs_revision",
+                sufficiency_score=0.0,
+                sufficiency_reason="Citation preflight requires revision.",
+                citation_blocking=True,
+                citation_defects=audit.defects,
+            )
+        citations = [SourceCitation(kind="web", url=url) for url in audit.urls]
+    else:
+        citations = _extract_citations_from_report(report)
     grounding_results: list[ValidationResult] = []
 
     if citations:
         # Spot-check: when there are many citations, validate a random subset
         # to keep verification latency reasonable.
-        if len(citations) > _MAX_CITATION_SPOT_CHECKS:
+        if not strict_web_citations and len(citations) > _MAX_CITATION_SPOT_CHECKS:
             import random
             citations = random.sample(citations, _MAX_CITATION_SPOT_CHECKS)
 
@@ -314,7 +347,7 @@ async def verify_report(
                 text_content=report,
                 fetched_contents=fetched_contents,
             )
-        except (ModelCallTimeoutError, asyncio.CancelledError):
+        except (ModelCallTimeoutError, asyncio.CancelledError, ReportCitationError):
             raise
         except Exception as exc:
             logger.warning("Citation grounding failed: %s", exc)
