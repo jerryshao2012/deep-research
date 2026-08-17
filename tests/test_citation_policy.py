@@ -94,7 +94,87 @@ def test_rejects_non_web_or_authorityless_urls(value: str) -> None:
 def test_placeholder_link_does_not_count_as_concrete_source() -> None:
     audit = audit_web_citations("[Example Source](https://valid.publisher.org/a)")
 
-    assert [defect.code for defect in audit.defects] == ["placeholder_source", "missing_url"]
+    assert [defect.code for defect in audit.defects] == ["missing_url", "placeholder_source"]
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://EXAMPLE.com./a",
+        "https://sub.example.org./a",
+        "https://host.test./a",
+    ],
+)
+def test_rejects_terminal_dot_reserved_hosts(url: str) -> None:
+    audit = audit_web_citations(f"## Sources\n[1] {url}")
+
+    assert "placeholder_source" in [defect.code for defect in audit.defects]
+    assert audit.urls == ()
+
+
+@pytest.mark.parametrize(
+    "destination",
+    [
+        "mailto:author@publisher.org",
+        "file:///tmp/source",
+        "ftp://publisher.org/a",
+        "javascript:void",
+        "javascript:alert(1)",
+    ],
+)
+def test_rejects_non_web_citation_links_even_with_valid_source(destination: str) -> None:
+    report = f"""Claim [1](https://valid.publisher.org/a) and [2]({destination}).
+
+## Sources
+[1] https://valid.publisher.org/a
+"""
+
+    assert "malformed_reference" in [defect.code for defect in audit_web_citations(report).defects]
+
+
+@pytest.mark.parametrize("marker", ["[1, nope]", "[1,,2]", "[1;]", "[1--2]"])
+def test_marks_mixed_or_malformed_numeric_groups(marker: str) -> None:
+    report = f"""Claims {marker}.
+
+## Sources
+[1] https://one.publisher.org/a
+[2] https://two.publisher.org/a
+"""
+
+    assert "malformed_reference" in [defect.code for defect in audit_web_citations(report).defects]
+
+
+def test_keeps_prose_bare_urls_when_sources_heading_exists() -> None:
+    report = """See https://prose.publisher.org/a.
+
+## Sources
+[1] https://source.publisher.org/a
+"""
+
+    assert audit_web_citations(report).urls == (
+        "https://prose.publisher.org/a",
+        "https://source.publisher.org/a",
+    )
+
+
+def test_masks_variable_length_inline_code_spans() -> None:
+    report = """Actual [1]. ``[88]`` and ```[77]```.
+
+## Sources
+[1] https://source.publisher.org/a
+"""
+
+    assert audit_web_citations(report).defects == ()
+
+
+def test_normalizes_deduplicates_and_caps_defects_without_hiding_codes() -> None:
+    report = " ".join(f"[{number}]" for number in range(1, 50))
+    audit = audit_web_citations(report)
+
+    assert audit.defects == tuple(sorted(set(audit.defects)))
+    assert len(audit.defects) <= 16
+    assert {defect.code for defect in audit.defects} == {"missing_url", "unresolved_reference"}
+    assert CitationDefect("missing_url", "web") < CitationDefect("unresolved_reference", "source:1")
 
 
 def test_reports_unresolved_single_group_and_descending_markers() -> None:
@@ -105,9 +185,9 @@ def test_reports_unresolved_single_group_and_descending_markers() -> None:
 """
 
     assert codes(report) == [
-        "unresolved_reference",
-        "unresolved_reference",
         "malformed_reference",
+        "unresolved_reference",
+        "unresolved_reference",
     ]
 
 

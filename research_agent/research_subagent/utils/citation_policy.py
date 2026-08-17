@@ -27,13 +27,13 @@ _ENTRY_RE = re.compile(r"^[ \t]*(?:\[(?P<bracket>\d{1,4})\][ \t]*:?|(?P<dot>\d{1
 _DEFINITION_RE = re.compile(r"^[ \t]*\[\d{1,4}\][ \t]*:")
 _LINK_RE = re.compile(
     r"(?<!\\)\[(?P<label>(?:[^\[\]\\\n]|\\.|\[[^\[\]\\\n]*\])*)\]"
-    r"\([ \t]*(?P<url>[^()\s]+)(?:[ \t]+[^)]*)?\)",
+    r"\([ \t]*(?P<url><[^>\s]+>|(?:[^()\s]+|\([^()\s]*\))+)(?:[ \t]+[^)]*)?\)",
 )
 _ANY_SCHEME_URL_RE = re.compile(r"(?<![\w+.-])(?P<url>[A-Za-z][A-Za-z0-9+.-]*://[^\s<>()\[\]{}\"']*)")
 _NUMERIC_MARKER_RE = re.compile(r"(?<!\\)\[(?P<body>[^\]\n]{1,80})\]")
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, order=True, slots=True)
 class CitationDefect:
     """One bounded, report-safe structural citation failure."""
 
@@ -59,8 +59,7 @@ def audit_web_citations(report: str) -> CitationAudit:
     valid_urls: set[str] = set()
 
     def add(code: CitationDefectCode, detail: str) -> None:
-        if len(defects) < _MAX_DEFECTS:
-            defects.append(CitationDefect(code, detail))
+        defects.append(CitationDefect(code, detail))
 
     invalid_entry_spans: set[tuple[int, int]] = set()
     source_urls: dict[int, str] = {}
@@ -75,26 +74,24 @@ def audit_web_citations(report: str) -> CitationAudit:
             add("placeholder_source", "link")
             invalid_link_spans.add(link.span())
 
-    candidates: list[tuple[str, tuple[int, int] | None, int | None]] = []
+    candidates: list[tuple[str, tuple[int, int]]] = []
     for link in links:
-        candidates.append((link.group("url"), link.span(), None))
+        candidates.append((link.group("url"), link.span()))
     for match in _ANY_SCHEME_URL_RE.finditer(visible):
-        if not source_ranges or _is_source_candidate(match.span(), source_ranges, entry_spans):
-            candidates.append((match.group("url"), match.span(), None))
+        candidates.append((match.group("url"), match.span()))
 
     seen_candidates: set[tuple[int, int]] = set()
-    for raw_url, span, _ in candidates:
-        if span is not None and span in seen_candidates:
+    for raw_url, span in candidates:
+        if span in seen_candidates:
             continue
-        if span is not None:
-            seen_candidates.add(span)
-        if span is not None and _span_is_contained(
-            span, invalid_link_spans | invalid_entry_spans
-        ):
+        seen_candidates.add(span)
+        if _span_is_contained(span, invalid_link_spans | invalid_entry_spans):
             continue
         normalized = _normalise_web_url(raw_url)
         if normalized is None:
-            if _is_source_candidate(span, source_ranges, entry_spans) or raw_url.lower().startswith(("http", "ftp")):
+            if _is_citation_link(span, links, source_ranges, entry_spans) or _is_source_candidate(
+                span, source_ranges, entry_spans
+            ) or raw_url.lower().startswith(("http", "ftp")):
                 add("malformed_reference", "url")
             continue
         if _is_reserved_host(normalized):
@@ -117,7 +114,7 @@ def audit_web_citations(report: str) -> CitationAudit:
 
     if not valid_urls:
         add("missing_url", "web")
-    return CitationAudit(tuple(sorted(valid_urls)), tuple(defects))
+    return CitationAudit(tuple(sorted(valid_urls)), _normalise_defects(defects))
 
 
 def _mask_fenced_and_inline_code(text: str) -> str:
@@ -135,7 +132,7 @@ def _mask_fenced_and_inline_code(text: str) -> str:
             fence = match.group(1)
             masked.append(_blank(line))
         else:
-            masked.append(re.sub(r"`[^`\n]*`", _blank_match, line))
+            masked.append(_mask_inline_code(line))
     return "".join(masked)
 
 
@@ -186,12 +183,14 @@ def _audit_numeric_marker(
     source_urls: dict[int, str],
     add_defect: Callable[[CitationDefectCode, str], None],
 ) -> None:
-    parts = re.split(r"[;,]", body)
-    if not parts or any(not part.strip() for part in parts):
-        add_defect("malformed_reference", "marker")
+    if not re.match(r"\s*\d", body):
         return
+    parts = re.split(r"[;,]", body)
     for part in parts:
         value = part.strip()
+        if not value:
+            add_defect("malformed_reference", "marker")
+            continue
         single = re.fullmatch(r"\d{1,4}", value)
         range_match = re.fullmatch(r"(\d{1,4})\s*-\s*(\d{1,4})", value)
         if single:
@@ -203,7 +202,7 @@ def _audit_numeric_marker(
             else:
                 for number in range(first, last + 1):
                     _check_reference(number, source_urls, add_defect)
-        elif re.match(r"\d", value):
+        else:
             add_defect("malformed_reference", "marker")
 
 
@@ -235,7 +234,9 @@ def _normalise_web_url(raw_url: str) -> str | None:
         return None
     if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
         return None
-    host = parsed.hostname.lower()
+    host = parsed.hostname.lower().rstrip(".")
+    if not host:
+        return None
     if ":" in host and not host.startswith("["):
         host = f"[{host}]"
     netloc = host if port is None else f"{host}:{port}"
@@ -243,7 +244,7 @@ def _normalise_web_url(raw_url: str) -> str | None:
 
 
 def _is_reserved_host(url: str) -> bool:
-    host = urlsplit(url).hostname or ""
+    host = (urlsplit(url).hostname or "").lower().rstrip(".")
     return host == "localhost" or host.endswith(".localhost") or host.endswith((".example", ".invalid", ".test")) or any(
         host == root or host.endswith(f".{root}") for root in ("example.com", "example.org", "example.net")
     )
@@ -258,6 +259,20 @@ def _is_source_candidate(
         return False
     return any(start <= span[0] < end for start, end in source_ranges) or any(
         start <= span[0] < end for (start, end), _, _ in entries
+    )
+
+
+def _is_citation_link(
+    span: tuple[int, int],
+    links: tuple[re.Match[str], ...],
+    source_ranges: list[tuple[int, int]],
+    entries: list[tuple[tuple[int, int], int, str]],
+) -> bool:
+    if _is_source_candidate(span, source_ranges, entries):
+        return True
+    return any(
+        link.span() == span and re.fullmatch(r"\s*\d{1,3}\s*", link.group("label"))
+        for link in links
     )
 
 
@@ -282,8 +297,49 @@ def _blank(value: str) -> str:
     return "".join("\n" if char == "\n" else " " for char in value)
 
 
-def _blank_match(match: re.Match[str]) -> str:
-    return _blank(match.group(0))
+def _mask_inline_code(line: str) -> str:
+    chars = list(line)
+    index = 0
+    while (start := line.find("`", index)) >= 0:
+        delimiter_end = start
+        while delimiter_end < len(line) and line[delimiter_end] == "`":
+            delimiter_end += 1
+        delimiter = line[start:delimiter_end]
+        close = _find_inline_code_close(line, delimiter, delimiter_end)
+        if close is None:
+            index = delimiter_end
+            continue
+        for position in range(start, close + len(delimiter)):
+            if chars[position] != "\n":
+                chars[position] = " "
+        index = close + len(delimiter)
+    return "".join(chars)
+
+
+def _find_inline_code_close(line: str, delimiter: str, start: int) -> int | None:
+    index = start
+    while (candidate := line.find("`", index)) >= 0:
+        candidate_end = candidate
+        while candidate_end < len(line) and line[candidate_end] == "`":
+            candidate_end += 1
+        if candidate_end - candidate == len(delimiter):
+            return candidate
+        index = candidate_end
+    return None
+
+
+def _normalise_defects(defects: list[CitationDefect]) -> tuple[CitationDefect, ...]:
+    unique = sorted(set(defects))
+    representatives = [
+        next(defect for defect in unique if defect.code == code)
+        for code in sorted({defect.code for defect in unique})
+    ]
+    selected = set(representatives)
+    for defect in unique:
+        if len(selected) >= _MAX_DEFECTS:
+            break
+        selected.add(defect)
+    return tuple(sorted(selected))
 
 
 def _source_detail(number: int) -> str:
