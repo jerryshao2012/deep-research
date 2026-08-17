@@ -12,6 +12,7 @@ from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from research_agent import agent as agent_module
+from research_agent import completion_guard
 from research_agent.completion_guard import CompletionState
 from research_agent.research_subagent.utils import verification as verification_module
 from research_agent.research_subagent.utils.verification import (
@@ -535,6 +536,229 @@ def test_final_revision_limit_accepts_only_current_owned_report_without_jump(
     assert result["completion_verified_report_modified_at"] is None
     assert "jump_to" not in result
     assert "completion_attempts" not in result
+
+
+def _streamable_state(
+    *,
+    todos: list[dict[str, str]] | None = None,
+    report_modified_at: str = "report-v1",
+) -> dict[str, Any]:
+    state = _verification_state(
+        todos=todos,
+        report_modified_at=report_modified_at,
+    )
+    state["files"].update(
+        {
+            "/cited_response_2.md": _report(
+                "Second finding", modified_at="citation-v2"
+            ),
+            "/cited_response.md": _report(
+                "First finding", modified_at="citation-v1"
+            ),
+        }
+    )
+    state["_streamed_files"] = []
+    return state
+
+
+def _message_texts(update: dict[str, Any] | None) -> list[str]:
+    if update is None:
+        return []
+    return [
+        str(message.content)
+        for message in update.get("messages", [])
+        if isinstance(message, AIMessage)
+    ]
+
+
+@pytest.mark.parametrize("async_", [False, True])
+def test_pending_todo_report_continues_without_streaming_report_messages(
+    monkeypatch: pytest.MonkeyPatch,
+    async_: bool,
+) -> None:
+    monkeypatch.setattr(agent_module, "ENABLE_VERIFICATION", False)
+    monkeypatch.setattr(agent_module, "ENABLE_EVAL_TRACKING", False)
+    state = _streamable_state(
+        todos=[
+            {
+                "id": "research",
+                "content": "Research graph engineering",
+                "status": "in_progress",
+            }
+        ]
+    )
+
+    research_update = _run_after_model(
+        agent_module.ResearchStateMiddleware(), state, async_=async_
+    )
+    completion_update = _run_after_model(
+        completion_guard.CompletionGuardMiddleware(
+            config_getter=lambda: {"run_id": "run-v1"}
+        ),
+        {**state, **(research_update or {})},
+        async_=async_,
+    )
+
+    assert not any(
+        text.startswith(("**LLM Wiki Query Findings:**", "**Final Report:**"))
+        or text == "---"
+        for text in _message_texts(research_update)
+    )
+    assert research_update is None or "_streamed_files" not in research_update
+    assert completion_update is not None
+    assert completion_update["jump_to"] == "model"
+
+
+@pytest.mark.parametrize("async_", [False, True])
+def test_verification_revision_does_not_stream_provisional_report(
+    monkeypatch: pytest.MonkeyPatch,
+    async_: bool,
+) -> None:
+    async def fake_verify_report(*, question: str, report: str) -> VerificationVerdict:
+        return _needs_revision_verdict()
+
+    monkeypatch.setattr(agent_module, "ENABLE_VERIFICATION", True)
+    monkeypatch.setattr(agent_module, "ENABLE_EVAL_TRACKING", False)
+    monkeypatch.setattr(agent_module, "MAX_VERIFICATION_ROUNDS", 2)
+    monkeypatch.setattr(agent_module, "verify_report", fake_verify_report)
+
+    result = _run_after_model(
+        agent_module.ResearchStateMiddleware(),
+        _streamable_state(),
+        async_=async_,
+    )
+
+    assert result is not None
+    assert result["jump_to"] == "model"
+    assert not any(
+        text.startswith(("**LLM Wiki Query Findings:**", "**Final Report:**"))
+        or text == "---"
+        for text in _message_texts(result)
+    )
+    assert "_streamed_files" not in result
+
+
+@pytest.mark.parametrize("async_", [False, True])
+def test_accepted_report_streams_ordered_output_exactly_once(
+    monkeypatch: pytest.MonkeyPatch,
+    async_: bool,
+) -> None:
+    async def fake_verify_report(*, question: str, report: str) -> VerificationVerdict:
+        return VerificationVerdict(status="complete", sufficiency_score=1.0)
+
+    monkeypatch.setattr(agent_module, "ENABLE_VERIFICATION", True)
+    monkeypatch.setattr(agent_module, "ENABLE_EVAL_TRACKING", False)
+    monkeypatch.setattr(agent_module, "verify_report", fake_verify_report)
+    middleware = agent_module.ResearchStateMiddleware()
+    state = _streamable_state()
+
+    first = _run_after_model(middleware, state, async_=async_)
+
+    assert first is not None
+    assert _message_texts(first) == [
+        "**LLM Wiki Query Findings:**\n\nFirst finding",
+        "**LLM Wiki Query Findings:**\n\nSecond finding",
+        "---",
+        "**Final Report:**\n\nFinal report",
+    ]
+    assert set(first["_streamed_files"]) == {
+        "/cited_response.md",
+        "/cited_response_2.md",
+        "/final_report.md",
+    }
+
+    repeated_state = {
+        **state,
+        "_streamed_files": first["_streamed_files"],
+        "completion_verified_report_modified_at": first[
+            "completion_verified_report_modified_at"
+        ],
+    }
+    repeated = _run_after_model(middleware, repeated_state, async_=async_)
+
+    assert not _message_texts(repeated)
+    assert repeated is None or "_streamed_files" not in repeated
+
+
+@pytest.mark.parametrize("async_", [False, True])
+@pytest.mark.parametrize(
+    "acceptance_field",
+    [
+        "completion_verified_report_modified_at",
+        "completion_accepted_at_limit_report_modified_at",
+    ],
+)
+def test_edited_report_invalidates_prior_acceptance_and_stays_provisional(
+    monkeypatch: pytest.MonkeyPatch,
+    async_: bool,
+    acceptance_field: str,
+) -> None:
+    calls = 0
+
+    async def fake_verify_report(*, question: str, report: str) -> VerificationVerdict:
+        nonlocal calls
+        calls += 1
+        return _needs_revision_verdict()
+
+    monkeypatch.setattr(agent_module, "ENABLE_VERIFICATION", True)
+    monkeypatch.setattr(agent_module, "ENABLE_EVAL_TRACKING", False)
+    monkeypatch.setattr(agent_module, "MAX_VERIFICATION_ROUNDS", 2)
+    monkeypatch.setattr(agent_module, "verify_report", fake_verify_report)
+    state = _streamable_state(report_modified_at="report-v2")
+    state[acceptance_field] = "report-v1"
+
+    result = _run_after_model(
+        agent_module.ResearchStateMiddleware(), state, async_=async_
+    )
+
+    assert calls == 1
+    assert result is not None
+    assert result["jump_to"] == "model"
+    assert not any(
+        text.startswith(("**LLM Wiki Query Findings:**", "**Final Report:**"))
+        or text == "---"
+        for text in _message_texts(result)
+    )
+    assert "_streamed_files" not in result
+
+
+def test_eval_logging_uses_same_accepted_report_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logged_reports: list[dict[str, Any]] = []
+
+    async def fake_log_server_metrics(**kwargs: Any) -> None:
+        logged_reports.append(kwargs["files"])
+
+    monkeypatch.setattr(agent_module, "ENABLE_VERIFICATION", False)
+    monkeypatch.setattr(agent_module, "ENABLE_EVAL_TRACKING", True)
+    monkeypatch.setattr(agent_module, "log_server_metrics", fake_log_server_metrics)
+    middleware = agent_module.ResearchStateMiddleware()
+    pending = _streamable_state(
+        todos=[
+            {
+                "id": "research",
+                "content": "Research graph engineering",
+                "status": "pending",
+            }
+        ]
+    )
+
+    pending_result = asyncio.run(
+        middleware.aafter_model(state=pending, runtime=None)
+    )
+
+    assert pending_result is None or "_eval_logged" not in pending_result
+    assert logged_reports == []
+
+    accepted = _streamable_state()
+    accepted_result = asyncio.run(
+        middleware.aafter_model(state=accepted, runtime=None)
+    )
+
+    assert accepted_result is not None
+    assert accepted_result["_eval_logged"] is True
+    assert logged_reports == [accepted["files"]]
 
 
 def test_research_state_extends_completion_state() -> None:

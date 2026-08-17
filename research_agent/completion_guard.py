@@ -81,6 +81,7 @@ class CompletionGuardMiddleware(AgentMiddleware):
         *,
         config_getter: Callable[[], Mapping[str, Any]] = get_config,
     ) -> None:
+        """Create middleware with an injectable per-run config source."""
         super().__init__()
         self._config_getter = config_getter
 
@@ -262,6 +263,7 @@ class ResearchIncompleteError(RuntimeError):
         malformed_todo_count: int,
         report_reason: ReportFailureReason | None,
     ) -> None:
+        """Build a privacy-safe completion-exhaustion error."""
         report_summary = report_reason or "complete"
         super().__init__(
             "Research incomplete after automatic continuation limit "
@@ -270,6 +272,100 @@ class ResearchIncompleteError(RuntimeError):
             f"malformed_todos={malformed_todo_count}, "
             f"report={report_summary})."
         )
+
+
+def completion_ready_for_finalization(
+    state: Mapping[str, Any],
+    *,
+    verification_enabled: bool,
+) -> bool:
+    """Return whether this exact owned report version may be exposed."""
+    if not _inspect_state_completion(state).ready:
+        return False
+    if not verification_enabled:
+        return True
+
+    modified_at = _report_modified_at(state.get("files"))
+    if modified_at is None:
+        return False
+    return modified_at in {
+        state.get("completion_verified_report_modified_at"),
+        state.get("completion_accepted_at_limit_report_modified_at"),
+    }
+
+
+def finalize_accepted_report(
+    state: Mapping[str, Any],
+    *,
+    verification_enabled: bool,
+) -> dict[str, Any] | None:
+    """Build cited findings and final-report messages once after acceptance."""
+    if not completion_ready_for_finalization(
+        state,
+        verification_enabled=verification_enabled,
+    ):
+        return None
+
+    files = state.get("files")
+    if not isinstance(files, Mapping):
+        return None
+    streamed = {
+        path
+        for path in (state.get("_streamed_files") or [])
+        if isinstance(path, str)
+    }
+    messages: list[AIMessage] = []
+
+    cited_files = sorted(
+        (
+            path
+            for path in files
+            if isinstance(path, str)
+            and path.lstrip("/").startswith("cited_response")
+            and path.endswith(".md")
+            and path not in streamed
+        ),
+        key=_cited_report_sort_key,
+    )
+    for file_path in cited_files:
+        file_data = files[file_path]
+        if not isinstance(file_data, Mapping):
+            continue
+        try:
+            content = file_data_to_string(file_data)  # type: ignore[arg-type]
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not content.strip():
+            continue
+        messages.append(
+            AIMessage(
+                content=f"**LLM Wiki Query Findings:**\n\n{content.strip()}"
+            )
+        )
+        streamed.add(file_path)
+
+    if messages and FINAL_REPORT_PATH not in streamed:
+        messages.append(AIMessage(content="---"))
+
+    if FINAL_REPORT_PATH not in streamed:
+        report = files.get(FINAL_REPORT_PATH)
+        if isinstance(report, Mapping):
+            try:
+                content = file_data_to_string(report)  # type: ignore[arg-type]
+            except (KeyError, TypeError, ValueError):
+                content = ""
+            if content.strip():
+                messages.append(
+                    AIMessage(content=f"**Final Report:**\n\n{content.strip()}")
+                )
+                streamed.add(FINAL_REPORT_PATH)
+
+    if not messages:
+        return None
+    return {
+        "messages": messages,
+        "_streamed_files": sorted(streamed),
+    }
 
 
 def get_max_completion_attempts() -> int:
@@ -465,6 +561,14 @@ def _report_modified_at(files: object) -> str | None:
         return None
     modified_at = report.get("modified_at")
     return modified_at if isinstance(modified_at, str) and modified_at else None
+
+
+def _cited_report_sort_key(path: str) -> tuple[int, int]:
+    stem = path.removesuffix(".md").rstrip("/")
+    if stem in {"/cited_response", "cited_response"}:
+        return 0, 0
+    suffix = stem.rsplit("_", 1)[-1]
+    return 1, int(suffix) if suffix.isdigit() else 99
 
 
 def _correlate_artifact_ownership(

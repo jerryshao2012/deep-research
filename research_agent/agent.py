@@ -38,7 +38,11 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.config import get_config
 
 from research_agent.cli_utils import get_ssl_verify_config, str2bool
-from research_agent.completion_guard import CompletionState
+from research_agent.completion_guard import (
+    CompletionState,
+    completion_ready_for_finalization,
+    finalize_accepted_report,
+)
 from research_agent.document_context import (
     configure_document_tools,
     has_document_context,
@@ -300,6 +304,28 @@ def _apply_verification_verdict(
     if isinstance(updates["messages"], list):
         updates["messages"].append(_tag_verification_intermediate(terminal))
     updates["jump_to"] = "model"
+
+
+def _merge_finalization_update(
+    updates: dict[str, Any],
+    state: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Append accepted report output without replacing other hook updates."""
+    effective_state = {**state, **updates}
+    finalization = finalize_accepted_report(
+        effective_state,
+        verification_enabled=ENABLE_VERIFICATION,
+    )
+    if finalization is None:
+        return effective_state
+
+    final_messages = finalization.get("messages")
+    if isinstance(final_messages, list):
+        updates.setdefault("messages", [])
+        if isinstance(updates["messages"], list):
+            updates["messages"].extend(final_messages)
+    updates["_streamed_files"] = finalization["_streamed_files"]
+    return {**state, **updates}
 
 
 # Get current date
@@ -570,77 +596,7 @@ class ResearchStateMiddleware(AgentMiddleware):
             chat_elapsed_seconds = time.time() - chat_start_time
             updates["chat_elapsed_seconds"] = chat_elapsed_seconds
 
-        # ── Stream reports into chat history ──────────────────────────────
-        # When /final_report.md is ready and the model is no longer emitting
-        # tool calls, stream cited_response*.md files first (once each), then
-        # a separator, then the final report.  Gating on /final_report.md
-        # ensures everything streams together at the end instead of trickling
-        # in mid-research.
         state_files = state.get("files") or {}
-        if (
-                isinstance(state_files, dict)
-                and not last_tool_calls
-                and "/final_report.md" in state_files
-        ):
-            streamed = set(state.get("_streamed_files") or [])
-            new_messages: list = []
-
-            # ── Phase 1: unstreamed cited_response files, sorted ──────────
-            cited_files = sorted(
-                [
-                    f for f in state_files
-                    if f.lstrip("/").startswith("cited_response")
-                       and f.endswith(".md")
-                       and f not in streamed
-                ],
-                key=lambda f: (
-                    0 if f.rstrip(".md").rstrip("/") in ("/cited_response", "cited_response")
-                    else int(f.rstrip(".md").rsplit("_", 1)[-1])
-                    if f.rstrip(".md").rsplit("_", 1)[-1].isdigit()
-                    else 99
-                ),
-            )
-            for file_path in cited_files:
-                try:
-                    content = file_data_to_string(state_files[file_path])
-                    if content.strip():
-                        new_messages.append(
-                            AIMessage(
-                                content=f"**LLM Wiki Query Findings:**\n\n{content.strip()}"
-                            )
-                        )
-                        streamed.add(file_path)
-                except Exception:
-                    logger.debug(
-                        "Failed to stream %s to chat", file_path, exc_info=True
-                    )
-
-            # ── Phase 2: separator ────────────────────────────────────────
-            if new_messages and "/final_report.md" not in streamed:
-                new_messages.append(AIMessage(content="---"))
-
-            # ── Phase 3: final report ─────────────────────────────────────
-            if "/final_report.md" not in streamed:
-                try:
-                    content = file_data_to_string(state_files["/final_report.md"])
-                    if content.strip():
-                        new_messages.append(
-                            AIMessage(
-                                content=f"**Final Report:**\n\n{content.strip()}"
-                            )
-                        )
-                        streamed.add("/final_report.md")
-                except Exception:
-                    logger.debug(
-                        "Failed to stream /final_report.md to chat", exc_info=True
-                    )
-
-            if new_messages:
-                if "messages" in updates:
-                    updates["messages"].extend(new_messages)
-                else:
-                    updates["messages"] = new_messages
-                updates["_streamed_files"] = list(streamed)
 
         # ── Post-generation verification hook ────────────────────────────
         # Verify only a completed current-request plan and its owned report.
@@ -734,17 +690,26 @@ class ResearchStateMiddleware(AgentMiddleware):
                     report_modified_at=report_modified_at,
                 )
 
+        effective_state = {**state, **updates}
+        accepted_report_ready = (
+            isinstance(last_msg, AIMessage)
+            and not last_tool_calls
+            and completion_ready_for_finalization(
+                effective_state,
+                verification_enabled=ENABLE_VERIFICATION,
+            )
+        )
+        if accepted_report_ready:
+            effective_state = _merge_finalization_update(updates, state)
+
         # Optional: Log eval metrics on completion (when graph is done)
-        # This checks if we're at the end of execution by looking for final artifacts
-        if ENABLE_EVAL_TRACKING and state.get("files"):
+        if ENABLE_EVAL_TRACKING and accepted_report_ready:
             files = state.get("files", {})
             if not isinstance(files, dict):
                 return updates if updates else None
 
-            has_final_output = "/final_report.md" in files
-
             # Check if already logged (use .get() with default False since TypedDict doesn't support defaults)
-            if has_final_output and not state.get("_eval_logged", False):
+            if not effective_state.get("_eval_logged", False):
                 # Mark as logged to avoid duplicate logging
                 updates["_eval_logged"] = True
 
@@ -823,72 +788,7 @@ class ResearchStateMiddleware(AgentMiddleware):
             chat_elapsed_seconds = time.time() - chat_start_time
             updates["chat_elapsed_seconds"] = chat_elapsed_seconds
 
-        # ── Stream reports into chat history ──────────────────────────────
         state_files = state.get("files") or {}
-        if (
-                isinstance(state_files, dict)
-                and not last_tool_calls
-                and "/final_report.md" in state_files
-        ):
-            streamed = set(state.get("_streamed_files") or [])
-            new_messages: list = []
-
-            # ── Phase 1: unstreamed cited_response files, sorted ──────────
-            cited_files = sorted(
-                [
-                    f for f in state_files
-                    if f.lstrip("/").startswith("cited_response")
-                       and f.endswith(".md")
-                       and f not in streamed
-                ],
-                key=lambda f: (
-                    0 if f.rstrip(".md").rstrip("/") in ("/cited_response", "cited_response")
-                    else int(f.rstrip(".md").rsplit("_", 1)[-1])
-                    if f.rstrip(".md").rsplit("_", 1)[-1].isdigit()
-                    else 99
-                ),
-            )
-            for file_path in cited_files:
-                try:
-                    content = file_data_to_string(state_files[file_path])
-                    if content.strip():
-                        new_messages.append(
-                            AIMessage(
-                                content=f"**LLM Wiki Query Findings:**\n\n{content.strip()}"
-                            )
-                        )
-                        streamed.add(file_path)
-                except Exception:
-                    logger.debug(
-                        "Failed to stream %s to chat", file_path, exc_info=True
-                    )
-
-            # ── Phase 2: separator ────────────────────────────────────────
-            if new_messages and "/final_report.md" not in streamed:
-                new_messages.append(AIMessage(content="---"))
-
-            # ── Phase 3: final report ─────────────────────────────────────
-            if "/final_report.md" not in streamed:
-                try:
-                    content = file_data_to_string(state_files["/final_report.md"])
-                    if content.strip():
-                        new_messages.append(
-                            AIMessage(
-                                content=f"**Final Report:**\n\n{content.strip()}"
-                            )
-                        )
-                        streamed.add("/final_report.md")
-                except Exception:
-                    logger.debug(
-                        "Failed to stream /final_report.md to chat", exc_info=True
-                    )
-
-            if new_messages:
-                if "messages" in updates:
-                    updates["messages"].extend(new_messages)
-                else:
-                    updates["messages"] = new_messages
-                updates["_streamed_files"] = list(streamed)
 
         # ── Post-generation verification hook ────────────────────────────
         owned_report = _owned_report_for_verification(state)
@@ -959,15 +859,25 @@ class ResearchStateMiddleware(AgentMiddleware):
                     report_modified_at=report_modified_at,
                 )
 
+        effective_state = {**state, **updates}
+        accepted_report_ready = (
+            isinstance(last_msg, AIMessage)
+            and not last_tool_calls
+            and completion_ready_for_finalization(
+                effective_state,
+                verification_enabled=ENABLE_VERIFICATION,
+            )
+        )
+        if accepted_report_ready:
+            effective_state = _merge_finalization_update(updates, state)
+
         # Optional: Log eval metrics on completion (when graph is done)
-        if ENABLE_EVAL_TRACKING and state.get("files"):
+        if ENABLE_EVAL_TRACKING and accepted_report_ready:
             files = state.get("files", {})
             if not isinstance(files, dict):
                 return updates if updates else None
 
-            has_final_output = "/final_report.md" in files
-
-            if has_final_output and not state.get("_eval_logged", False):
+            if not effective_state.get("_eval_logged", False):
                 updates["_eval_logged"] = True
                 runtime_seconds = 0.0
                 if isinstance(chat_start_time, (int, float)):

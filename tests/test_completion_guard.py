@@ -236,6 +236,70 @@ def test_report_inspection_accepts_changed_nonempty_owned_report() -> None:
     assert inspection.ready is True
 
 
+@pytest.mark.parametrize(
+    ("verified", "accepted_at_limit", "expected"),
+    [
+        ("report-v2", None, True),
+        (None, "report-v2", True),
+        ("report-v1", None, False),
+        (None, "report-v1", False),
+        ("report-v1", "report-v1", False),
+    ],
+)
+def test_finalization_acceptance_is_owned_by_exact_report_version(
+    verified: str | None,
+    accepted_at_limit: str | None,
+    expected: bool,
+) -> None:
+    readiness = getattr(
+        completion_guard,
+        "completion_ready_for_finalization",
+        None,
+    )
+    assert readiness is not None
+    state = {
+        "todos": [{"content": "Research", "status": "completed"}],
+        "files": {
+            "/final_report.md": _file(
+                "Finished report",
+                modified_at="report-v2",
+            )
+        },
+        "completion_request_generation": "generation-v1",
+        "completion_plan_owner_generation": "generation-v1",
+        "completion_report_owned": True,
+        "completion_report_baseline_modified_at": "prior-report",
+        "completion_verified_report_modified_at": verified,
+        "completion_accepted_at_limit_report_modified_at": accepted_at_limit,
+    }
+
+    assert readiness(state, verification_enabled=True) is expected
+
+
+def test_finalization_without_verification_still_requires_completion_readiness() -> None:
+    readiness = getattr(
+        completion_guard,
+        "completion_ready_for_finalization",
+        None,
+    )
+    assert readiness is not None
+    state = {
+        "todos": [{"content": "Research", "status": "pending"}],
+        "files": {
+            "/final_report.md": _file(
+                "Premature report",
+                modified_at="report-v1",
+            )
+        },
+        "completion_request_generation": "generation-v1",
+        "completion_plan_owner_generation": "generation-v1",
+        "completion_report_owned": True,
+        "completion_report_baseline_modified_at": "prior-report",
+    }
+
+    assert readiness(state, verification_enabled=False) is False
+
+
 def test_completion_requires_an_active_plan() -> None:
     inspection = inspect_completion(
         todos=[{"content": "Research", "status": "completed"}],
