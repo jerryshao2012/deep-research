@@ -324,10 +324,11 @@ async def test_sync_raising_unload_failure_preserves_external_cancellation():
         )
     )
     await started.wait()
-    caller.cancel()
+    caller.cancel("caller")
 
-    with pytest.raises(asyncio.CancelledError):
+    with pytest.raises(asyncio.CancelledError) as raised:
         await caller
+    assert raised.value.args == ("caller",)
 
 
 @_async_test
@@ -347,10 +348,45 @@ async def test_self_cancelling_unload_preserves_external_cancellation():
         )
     )
     await started.wait()
-    caller.cancel()
+    caller.cancel("caller")
 
-    with pytest.raises(asyncio.CancelledError):
+    with pytest.raises(asyncio.CancelledError) as raised:
         await caller
+    assert raised.value.args == ("caller",)
+
+
+@_async_test
+async def test_repeated_external_cancellation_interrupts_unload_promptly():
+    started = asyncio.Event()
+    unload_started = asyncio.Event()
+    release_unload = asyncio.Event()
+
+    async def unload() -> None:
+        unload_started.set()
+        await release_unload.wait()
+
+    async def pending() -> None:
+        started.set()
+        await asyncio.Event().wait()
+
+    caller = asyncio.create_task(
+        _run_with_deadline(
+            pending, policy=_policy(1, unload=True), metadata=_ollama_metadata(), unload=unload
+        )
+    )
+    await started.wait()
+    caller.cancel("first")
+    await unload_started.wait()
+
+    cancelled_at = time.monotonic()
+    caller.cancel("second")
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await caller
+
+    assert raised.value.args == ("second",)
+    assert time.monotonic() - cancelled_at < 0.1
+    release_unload.set()
+    await asyncio.sleep(0)
 
 
 @_async_test

@@ -218,13 +218,14 @@ async def _maybe_unload_ollama(
 async def _bounded_shielded_unload(operation: Awaitable[Any]) -> None:
     """Run unload with an independent deadline and consume a late failure."""
     task = asyncio.ensure_future(operation)
+    current_task = asyncio.current_task()
+    parent_cancellation_count = current_task.cancelling() if current_task is not None else 0
     try:
         await asyncio.wait_for(asyncio.shield(task), timeout=OLLAMA_UNLOAD_TIMEOUT_SECONDS)
     except asyncio.CancelledError:
         if not task.done():
             task.add_done_callback(_consume_task_exception)
-        current_task = asyncio.current_task()
-        if current_task is not None and current_task.cancelling():
+        if current_task is not None and current_task.cancelling() > parent_cancellation_count:
             raise
         _LOGGER.warning("Ollama unload cancelled after cancelled model call")
     except Exception:
@@ -281,7 +282,7 @@ async def _run_with_deadline[Result](
             timeout_seconds=policy.timeout_seconds,
             unload_requested=policy.force_ollama_unload and metadata.provider == "ollama",
         )
-    except asyncio.CancelledError:
+    except asyncio.CancelledError as original_cancel:
         if not task.done():
             task.cancel()
         try:
@@ -291,4 +292,4 @@ async def _run_with_deadline[Result](
             raise
         except Exception:
             _LOGGER.warning("Cancellation cleanup failed", exc_info=True)
-        raise
+        raise original_cancel
