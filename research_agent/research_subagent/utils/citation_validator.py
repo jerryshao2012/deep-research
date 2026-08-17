@@ -48,6 +48,7 @@ _STOP_WORDS = {
 
 _MAX_REDIRECTS = 3
 _REDIRECT_STATUSES = {301, 302, 303, 307, 308}
+_INVALID_REDIRECT_TARGET = object()
 
 
 def _extract_claim_for_citation(text: str, cite_index: int) -> str | None:
@@ -199,14 +200,36 @@ def _resolve_host_addresses(host: str, port: int | None) -> tuple[str, ...]:
     return tuple(sorted(addresses))
 
 
-def _unsafe_static_url(url: str) -> bool:
-    parsed = urlsplit(url)
-    host = parsed.hostname
+def _static_url_parts(
+    url: str,
+) -> tuple[str, str | None, str | None, str | None, int | None] | None:
+    """Read URL authority properties without exposing parse errors to callers."""
+    try:
+        parsed = urlsplit(url)
+        return (
+            parsed.scheme.lower(),
+            parsed.hostname,
+            parsed.username,
+            parsed.password,
+            parsed.port,
+        )
+    except (TypeError, UnicodeError, ValueError):
+        return None
+
+
+def _unsafe_static_url(
+    url: str,
+    parts: tuple[str, str | None, str | None, str | None, int | None] | None = None,
+) -> bool:
+    parts = _static_url_parts(url) if parts is None else parts
+    if parts is None:
+        return True
+    scheme, host, username, password, _ = parts
     if (
-        parsed.scheme.lower() not in {"http", "https"}
+        scheme not in {"http", "https"}
         or not host
-        or parsed.username is not None
-        or parsed.password is not None
+        or username is not None
+        or password is not None
     ):
         return True
     normalized = host.lower().rstrip(".")
@@ -226,13 +249,15 @@ def _safe_fetch_url(url: str) -> tuple[bool, str]:
     resolver can still rebind between this check and connect because httpx does
     not expose address pinning; callers must treat this as defense in depth.
     """
-    if _unsafe_static_url(url):
+    parts = _static_url_parts(url)
+    if _unsafe_static_url(url, parts):
         return False, "Unsafe URL target"
 
-    parsed = urlsplit(url)
+    assert parts is not None
+    scheme, host, _, _, configured_port = parts
     try:
-        port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
-        addresses = _resolve_host_addresses(parsed.hostname or "", port)
+        port = configured_port or (443 if scheme == "https" else 80)
+        addresses = _resolve_host_addresses(host or "", port)
     except (OSError, ValueError):
         return False, "DNS resolution failed"
     if not addresses:
@@ -248,11 +273,16 @@ def _safe_fetch_url(url: str) -> tuple[bool, str]:
     return True, "Safe target"
 
 
-def _redirect_target(url: str, response: httpx.Response) -> str | None:
+def _redirect_target(url: str, response: httpx.Response) -> str | object | None:
     if response.status_code not in _REDIRECT_STATUSES:
         return None
     location = response.headers.get("location")
-    return urljoin(url, location) if location else ""
+    if not location:
+        return ""
+    try:
+        return urljoin(url, location)
+    except (TypeError, UnicodeError, ValueError):
+        return _INVALID_REDIRECT_TARGET
 
 
 def _safe_request_error(error: Exception) -> str:
@@ -301,6 +331,8 @@ async def _check_url_reachable(url: str, timeout: float = 3.0) -> tuple[bool, st
                 if response is not None:
                     target = _redirect_target(current_url, response)
                     if target is not None:
+                        if target is _INVALID_REDIRECT_TARGET:
+                            return False, "Unsafe URL target"
                         if not target:
                             return False, "Redirect missing location"
                         if redirect_count == _MAX_REDIRECTS:
@@ -313,6 +345,8 @@ async def _check_url_reachable(url: str, timeout: float = 3.0) -> tuple[bool, st
                 response = await client.get(current_url)
                 target = _redirect_target(current_url, response)
                 if target is not None:
+                    if target is _INVALID_REDIRECT_TARGET:
+                        return False, "Unsafe URL target"
                     if not target:
                         return False, "Redirect missing location"
                     if redirect_count == _MAX_REDIRECTS:

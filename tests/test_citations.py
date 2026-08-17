@@ -45,6 +45,50 @@ class _FakeAsyncClient:
 
 
 class TestCitationValidatorSafeFetch:
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://[::1/report",
+            "https://public.publisher.org:bad-port/report",
+            "https://user＠public.publisher.org/report",
+        ],
+    )
+    def test_malformed_authority_is_rejected_before_dns_or_fetch(
+        self, monkeypatch: pytest.MonkeyPatch, url: str
+    ) -> None:
+        def resolver(*args: object) -> tuple[str, ...]:
+            raise AssertionError("malformed URLs must not resolve")
+
+        def client(*args: object, **kwargs: object) -> _FakeAsyncClient:
+            raise AssertionError("malformed URLs must not fetch")
+
+        monkeypatch.setattr(citation_validator, "_resolve_host_addresses", resolver)
+        monkeypatch.setattr(citation_validator.httpx, "AsyncClient", client)
+
+        reachable, reason = asyncio.run(citation_validator._check_url_reachable(url))
+
+        assert (reachable, reason) == (False, "Unsafe URL target")
+
+    def test_malformed_redirect_authority_is_rejected_without_exception(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake_client = _FakeAsyncClient(
+            [_FakeHttpResponse(302, {"location": "https://[::1/report"})]
+        )
+        monkeypatch.setattr(
+            citation_validator,
+            "_resolve_host_addresses",
+            lambda host, port: ("93.184.216.34",),
+        )
+        monkeypatch.setattr(citation_validator.httpx, "AsyncClient", lambda **kwargs: fake_client)
+
+        reachable, reason = asyncio.run(
+            citation_validator._check_url_reachable("https://public.publisher.org/start")
+        )
+
+        assert (reachable, reason) == (False, "Unsafe URL target")
+        assert fake_client.requests == [("HEAD", "https://public.publisher.org/start")]
+
     def test_userinfo_url_is_rejected_before_dns_or_fetch(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
