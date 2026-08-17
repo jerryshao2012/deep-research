@@ -59,17 +59,18 @@ git diff --cached --name-status
 
 Expected: commit contains exactly the three named runtime/test paths. Previously staged documentation moves remain staged and unchanged; `uv.lock` and duplicate files remain outside the commit.
 
-- [ ] **Step 4: Create a clean implementation worktree and immutable range base**
+- [ ] **Step 4: Record the exact range base and create a clean implementation worktree**
 
 Run from the original worktree:
 
 ```bash
+git rev-parse HEAD
 git branch codex/research-completion-guard-base
 git worktree add .worktrees/research-completion-guard-impl -b codex/research-completion-guard-impl codex/research-completion-guard-base
 git -C .worktrees/research-completion-guard-impl status --short
 ```
 
-Expected: implementation worktree is clean. All remaining tasks run from `.worktrees/research-completion-guard-impl`; original worktree and its user-owned index remain untouched.
+Expected: record the printed 40-character commit as `COMPLETION_GUARD_BASE_SHA` in execution notes; that commit object is the immutable final range base. Implementation worktree is clean. All remaining tasks run from `.worktrees/research-completion-guard-impl`; original worktree and its user-owned index remain untouched.
 
 ### Task 2: Add Pure Completion Policy
 
@@ -155,25 +156,26 @@ Test `before_agent` with API-shaped `{"run_id": UUID(...), "configurable": {...}
 - ordinary run resets attempts/exhaustion, clears stale todos, records report baseline, clears ownership and streamed files;
 - explicit resume resets attempts/exhaustion but preserves prior plan, baseline, report ownership, and verification ownership;
 - identical user text in two distinct run IDs creates distinct generations;
-- exhausted run followed by explicit resume can finish without stale `after_agent` failure.
+- identical-text ordinary generations clear verification round/feedback, verified and accepted-at-limit ownership, `_eval_logged`, and `_streamed_files`;
+- A-complete → B-no-report → explicit-resume-B keeps B request generation and plan owner, receives a new current run ID, and never adopts A report ownership;
+- exhausted run followed by explicit resume can finish without stale `after_agent` failure;
+- resolved attempt limit is stored once per visible run and does not change when environment changes between same-run continuations.
 
 - [ ] **Step 2: Run lifecycle tests and confirm RED**
 
 Run:
 
 ```bash
-uv run pytest tests/test_completion_guard.py -q -k "generation or resume or exhaustion"
+uv run pytest tests/test_completion_guard.py -q -k "generation or resume or exhaustion or attempt_limit"
 ```
 
 Expected: FAIL because lifecycle hooks/state are absent.
 
 - [ ] **Step 3: Implement completion state and `before_agent`**
 
-Define `CompletionState(FilesystemState)` fields for run ID, generation, attempts, plan/report ownership, report baseline, verification ownership, and exhaustion metadata. Implement `CompletionGuardMiddleware.before_agent` using top-level `get_config().get("run_id")` with UUID-to-string normalization and UUID fallback.
+Define `CompletionState(FilesystemState)` fields for current run ID, request generation, plan-owner generation, report ownership, resume-adopted generation marker, attempts, stored resolved attempt limit, report baseline, verification ownership, and exhaustion metadata. Implement `CompletionGuardMiddleware.before_agent` using top-level `get_config().get("run_id")` with UUID-to-string normalization and UUID fallback. Resume-B changes current run ID but retains B request generation and B plan owner; adoption never changes report ownership.
 
 Store the resolved `completion_attempt_limit` once per visible run. Same-run model jumps retain it even if environment changes.
-
-Also assert ordinary repeated-text generations clear verification round/feedback, verified and accepted-at-limit ownership, `_eval_logged`, and `_streamed_files`. Add the full A-complete → B-no-report → explicit-resume-B sequence and assert B never adopts A's report owner.
 
 - [ ] **Step 4: Run lifecycle tests and confirm GREEN**
 
@@ -491,7 +493,14 @@ Add:
 MAX_COMPLETION_ATTEMPTS=3
 ```
 
-- [ ] **Step 2: Run focused suites**
+- [ ] **Step 2: Commit documentation before final range verification**
+
+```bash
+git add .env.example
+git commit --only .env.example -m "docs: configure bounded completion attempts"
+```
+
+- [ ] **Step 3: Run focused suites**
 
 ```bash
 uv run pytest tests/test_completion_guard.py tests/test_agent_contracts.py tests/test_resume.py tests/test_verification.py tests/test_verification_progress.py tests/test_tools.py -q
@@ -499,17 +508,19 @@ uv run pytest tests/test_completion_guard.py tests/test_agent_contracts.py tests
 
 Expected: PASS.
 
-- [ ] **Step 3: Run quality checks**
+- [ ] **Step 4: Run quality and complete-range checks**
 
 ```bash
 uv run ruff check research_agent/completion_guard.py research_agent/agent.py tests/test_completion_guard.py tests/test_agent_contracts.py tests/test_verification.py tests/test_verification_progress.py
-git diff --check codex/research-completion-guard-base..HEAD
-git diff --name-status codex/research-completion-guard-base..HEAD
+COMPLETION_GUARD_BASE_SHA="<40-character SHA recorded in Task 1 Step 4>"
+git diff --check "${COMPLETION_GUARD_BASE_SHA}..HEAD"
+git diff --name-status "${COMPLETION_GUARD_BASE_SHA}..HEAD"
+git status --short
 ```
 
-Expected: PASS with no whitespace errors and only planned feature files in the range.
+Expected: PASS with no whitespace errors, only planned feature files in the complete range (including `.env.example`), and a clean implementation worktree.
 
-- [ ] **Step 4: Run broader regression suite**
+- [ ] **Step 5: Run broader regression suite**
 
 ```bash
 uv run pytest tests/ -q
@@ -517,20 +528,13 @@ uv run pytest tests/ -q
 
 Expected: PASS. If a failure appears pre-existing/environmental, reproduce it from a separate clean worktree at `codex/research-completion-guard-base` before documenting it.
 
-- [ ] **Step 5: Inspect Threadroot evidence**
+- [ ] **Step 6: Inspect Threadroot evidence**
 
 ```bash
 threadroot score latest
 ```
 
 Expected: score available if the preflight run recorded successfully; otherwise document the existing `.codex/threadroot` permission failure.
-
-- [ ] **Step 6: Commit documentation**
-
-```bash
-git add .env.example
-git commit --only .env.example -m "docs: configure bounded completion attempts"
-```
 
 - [ ] **Step 7: Request final code review**
 
