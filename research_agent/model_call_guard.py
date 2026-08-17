@@ -33,26 +33,30 @@ def _safe_provider(provider: str) -> ModelProvider:
 
 
 def _normalize_base_url(base_url: str | None) -> str | None:
-    if base_url is None or not str(base_url).strip():
+    if base_url is None:
         return None
 
     value = str(base_url).strip()
-    parsed = urlsplit(value)
-    if parsed.scheme and parsed.netloc:
-        try:
-            hostname = parsed.hostname or ""
-            port = parsed.port
-        except ValueError:
-            hostname, port = "", None
-        host = hostname.lower()
-        if ":" in host and not host.startswith("["):
-            host = f"[{host}]"
-        netloc = f"{host}:{port}" if port is not None else host
-        path = parsed.path.rstrip("/")
-        return urlunsplit((parsed.scheme.lower(), netloc, path, "", ""))
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        raise ValueError("base_url must be an absolute HTTP(S) URL with a hostname") from None
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("base_url must be an absolute HTTP(S) URL with a hostname")
+    try:
+        hostname = parsed.hostname or ""
+        port = parsed.port
+    except ValueError:
+        raise ValueError("base_url must be an absolute HTTP(S) URL with a hostname") from None
+    if not hostname:
+        raise ValueError("base_url must be an absolute HTTP(S) URL with a hostname")
 
+    host = hostname.lower()
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    netloc = f"{host}:{port}" if port is not None else host
     path = parsed.path.rstrip("/")
-    return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+    return urlunsplit((parsed.scheme.lower(), netloc, path, "", ""))
 
 
 def _parse_timeout(value: str | None) -> float:
@@ -95,7 +99,7 @@ class ModelRuntimeMetadata:
         object.__setattr__(self, "base_url", _normalize_base_url(self.base_url))
 
 
-class ModelCallTimeoutError(TimeoutError):
+class ModelCallTimeoutError(RuntimeError):
     """Safe timeout error that contains no request or prompt content."""
 
     def __init__(self, provider: str, timeout_seconds: float, unload_requested: bool) -> None:
@@ -110,7 +114,7 @@ class ModelCallTimeoutError(TimeoutError):
         )
 
 
-class UnsupportedModelOverrideError(ValueError):
+class UnsupportedModelOverrideError(RuntimeError):
     """Safe error for a model override that cannot be applied."""
 
     def __init__(self, provider: str, model_name: str | None = None) -> None:

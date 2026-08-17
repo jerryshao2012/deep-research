@@ -5,6 +5,8 @@ import pytest
 
 from research_agent.model_call_guard import (
     DEFAULT_MODEL_CALL_TIMEOUT_SECONDS,
+    MODEL_CANCEL_GRACE_SECONDS,
+    OLLAMA_UNLOAD_TIMEOUT_SECONDS,
     ModelCallPolicy,
     ModelCallTimeoutError,
     ModelRuntimeMetadata,
@@ -37,9 +39,13 @@ def test_finite_positive_timeout_is_accepted(monkeypatch, value):
 def test_non_finite_numeric_timeout_uses_safe_default(monkeypatch):
     monkeypatch.setenv("MODEL_CALL_TIMEOUT_SECONDS", str(nan))
     assert ModelCallPolicy.from_env().timeout_seconds == DEFAULT_MODEL_CALL_TIMEOUT_SECONDS
-
     monkeypatch.setenv("MODEL_CALL_TIMEOUT_SECONDS", str(inf))
     assert ModelCallPolicy.from_env().timeout_seconds == DEFAULT_MODEL_CALL_TIMEOUT_SECONDS
+
+
+def test_cancellation_constants_are_bounded():
+    assert MODEL_CANCEL_GRACE_SECONDS == 2.0
+    assert OLLAMA_UNLOAD_TIMEOUT_SECONDS == 2.0
 
 
 @pytest.mark.parametrize("value", ["true", "TRUE", " true "])
@@ -79,6 +85,37 @@ def test_runtime_metadata_normalizes_base_url_without_sensitive_parts():
     )
 
     assert metadata.base_url == "https://example.com:11434/api"
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "user:secret@example.com:11434/api?token=secret#fragment",
+        "//user:secret@example.com:11434/api?token=secret#fragment",
+        "ftp://user:secret@example.com:11434/api?token=secret#fragment",
+        "http:///api?token=secret#fragment",
+    ],
+)
+def test_runtime_metadata_rejects_unsafe_base_url_forms(base_url):
+    with pytest.raises(ValueError) as raised:
+        ModelRuntimeMetadata(provider="ollama", model_name="llama3", base_url=base_url)
+
+    assert "secret" not in str(raised.value)
+    assert "secret" not in repr(raised.value)
+
+
+def test_safe_errors_are_direct_runtime_errors():
+    timeout_error = ModelCallTimeoutError(
+        provider="ollama", timeout_seconds=3, unload_requested=True
+    )
+    override_error = UnsupportedModelOverrideError(provider="ollama")
+
+    assert ModelCallTimeoutError.__bases__ == (RuntimeError,)
+    assert UnsupportedModelOverrideError.__bases__ == (RuntimeError,)
+    assert isinstance(timeout_error, RuntimeError)
+    assert isinstance(override_error, RuntimeError)
+    assert not isinstance(timeout_error, TimeoutError)
+    assert not isinstance(override_error, ValueError)
 
 
 def test_timeout_error_is_safe_and_describes_deadline():
