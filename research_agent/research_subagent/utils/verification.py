@@ -31,7 +31,23 @@ logger = logging.getLogger(__name__)
 # Configuration
 # ---------------------------------------------------------------------------
 
-MAX_VERIFICATION_ROUNDS = int(os.environ.get("MAX_VERIFICATION_ROUNDS", "2"))
+DEFAULT_MAX_VERIFICATION_ROUNDS = 2
+
+
+def _parse_max_verification_rounds(raw_value: str | None) -> int:
+    """Return a safe effective verification-round limit."""
+    if raw_value is None:
+        return DEFAULT_MAX_VERIFICATION_ROUNDS
+    try:
+        parsed = int(raw_value)
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_VERIFICATION_ROUNDS
+    return max(parsed, 0)
+
+
+MAX_VERIFICATION_ROUNDS = _parse_max_verification_rounds(
+    os.environ.get("MAX_VERIFICATION_ROUNDS")
+)
 ENABLE_VERIFICATION = os.environ.get("ENABLE_VERIFICATION", "true").lower() not in (
     "false", "0", "no", "off",
 )

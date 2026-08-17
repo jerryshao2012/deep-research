@@ -82,6 +82,7 @@ class CompletionState(FilesystemState, PlanningState):
     verification_round: Annotated[NotRequired[int], OmitFromInput]
     verification_feedback: Annotated[NotRequired[str | None], OmitFromInput]
     _eval_logged: Annotated[NotRequired[bool], OmitFromInput]
+    _eval_pending: Annotated[NotRequired[bool], OmitFromInput]
     _streamed_files: Annotated[
         NotRequired[list[str] | None], OmitFromInput
     ]
@@ -165,6 +166,7 @@ class CompletionGuardMiddleware(AgentMiddleware):
             "verification_round": 0,
             "verification_feedback": None,
             "_eval_logged": False,
+            "_eval_pending": False,
             "_streamed_files": [],
         }
 

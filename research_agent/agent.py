@@ -115,10 +115,29 @@ EVAL_HISTORY_FILE = os.environ.get(
 )
 EVAL_LOG_QUESTIONS = str2bool(os.environ.get("EVAL_LOG_QUESTIONS"), False)
 SYNC_EVAL_LOG_TIMEOUT_SECONDS = 2.0
+_SYNC_AWAIT_TIMEOUT = object()
 
 # Verification loop — post-generation quality review with iterative revision.
 # MAX_VERIFICATION_ROUNDS / ENABLE_VERIFICATION are defined in
 # research_agent.research_subagent.utils.verification — re-exported here for convenience.
+
+
+def _verification_is_enabled() -> bool:
+    """Return whether verification has at least one configured pass."""
+    return ENABLE_VERIFICATION and MAX_VERIFICATION_ROUNDS > 0
+
+
+def _is_legacy_generated_system_message(message: object) -> bool:
+    """Identify generated system messages persisted by older checkpoints."""
+    if not isinstance(message, SystemMessage) or not isinstance(
+        message.content, str
+    ):
+        return False
+    content = message.content.strip()
+    return content.startswith("Task configurations:") or (
+        content.startswith("<VerificationFeedback>")
+        and content.endswith("</VerificationFeedback>")
+    )
 
 
 def _build_verification_todo(
@@ -346,7 +365,7 @@ def _merge_finalization_update(
     effective_state = {**state, **updates}
     finalization = finalize_accepted_report(
         effective_state,
-        verification_enabled=ENABLE_VERIFICATION,
+        verification_enabled=_verification_is_enabled(),
     )
     if finalization is None:
         return effective_state
@@ -365,7 +384,7 @@ def _run_async_from_sync(
     *,
     timeout_seconds: float,
 ) -> Any:
-    """Run a coroutine from sync code with a bounded daemon-worker wait."""
+    """Run a coroutine with a bounded wait, distinguishing timeout from None."""
     result: concurrent.futures.Future[Any] = concurrent.futures.Future()
     ready = threading.Event()
     cancellation_requested = threading.Event()
@@ -427,7 +446,7 @@ def _run_async_from_sync(
         ):
             loop.call_soon_threadsafe(task.cancel)
         worker.join(timeout=min(max(timeout_seconds, 0.0), 0.05))
-        return None
+        return _SYNC_AWAIT_TIMEOUT
 
 
 # Get current date
@@ -615,11 +634,7 @@ class ResearchStateMiddleware(AgentMiddleware):
         filtered_messages = [
             message
             for message in request.messages
-            if not (
-                isinstance(message, SystemMessage)
-                and isinstance(message.content, str)
-                and message.content.startswith("Task configurations:")
-            )
+            if not _is_legacy_generated_system_message(message)
         ]
         messages = (
             request.messages
@@ -706,7 +721,7 @@ class ResearchStateMiddleware(AgentMiddleware):
         # configure_request so strict Ollama templates keep system-first order.
         owned_report = _owned_report_for_verification(state)
         if (
-                ENABLE_VERIFICATION
+                _verification_is_enabled()
                 and isinstance(last_msg, AIMessage)
                 and not last_tool_calls
                 and isinstance(state_files, dict)
@@ -799,7 +814,7 @@ class ResearchStateMiddleware(AgentMiddleware):
             and not last_tool_calls
             and completion_ready_for_finalization(
                 effective_state,
-                verification_enabled=ENABLE_VERIFICATION,
+                verification_enabled=_verification_is_enabled(),
             )
         )
         if accepted_report_ready:
@@ -812,7 +827,10 @@ class ResearchStateMiddleware(AgentMiddleware):
                 return updates if updates else None
 
             # Check if already logged (use .get() with default False since TypedDict doesn't support defaults)
-            if not effective_state.get("_eval_logged", False):
+            if (
+                not effective_state.get("_eval_logged", False)
+                and not effective_state.get("_eval_pending", False)
+            ):
                 # Calculate runtime
                 runtime_seconds = 0.0
                 if isinstance(chat_start_time, (int, float)):
@@ -872,6 +890,10 @@ class ResearchStateMiddleware(AgentMiddleware):
                 except Exception as e:
                     logger.error(f"⚠️  Failed metrics logging: {e}")
                 else:
+                    if log_result is _SYNC_AWAIT_TIMEOUT:
+                        updates["_eval_pending"] = True
+                        logger.error("⚠️  Metrics logging timed out; write still pending")
+                        return updates if updates else None
                     if log_result is None:
                         logger.error("⚠️  Metrics logging returned no success result")
                         return updates if updates else None
@@ -900,7 +922,7 @@ class ResearchStateMiddleware(AgentMiddleware):
         # ── Post-generation verification hook ────────────────────────────
         owned_report = _owned_report_for_verification(state)
         if (
-                ENABLE_VERIFICATION
+                _verification_is_enabled()
                 and isinstance(last_msg, AIMessage)
                 and not last_tool_calls
                 and isinstance(state_files, dict)
@@ -973,7 +995,7 @@ class ResearchStateMiddleware(AgentMiddleware):
             and not last_tool_calls
             and completion_ready_for_finalization(
                 effective_state,
-                verification_enabled=ENABLE_VERIFICATION,
+                verification_enabled=_verification_is_enabled(),
             )
         )
         if accepted_report_ready:
@@ -985,7 +1007,10 @@ class ResearchStateMiddleware(AgentMiddleware):
             if not isinstance(files, dict):
                 return updates if updates else None
 
-            if not effective_state.get("_eval_logged", False):
+            if (
+                not effective_state.get("_eval_logged", False)
+                and not effective_state.get("_eval_pending", False)
+            ):
                 runtime_seconds = 0.0
                 if isinstance(chat_start_time, (int, float)):
                     runtime_seconds = time.time() - chat_start_time

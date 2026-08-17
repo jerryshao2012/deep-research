@@ -36,6 +36,25 @@ class _FakeJudgeModel:
         return AIMessage(content=self.content)
 
 
+@pytest.mark.parametrize(
+    ("raw_value", "expected"),
+    [
+        (None, 2),
+        ("", 2),
+        ("invalid", 2),
+        ("0", 0),
+        ("-3", 0),
+        ("1", 1),
+        ("2", 2),
+    ],
+)
+def test_parse_max_verification_rounds_uses_safe_effective_value(
+    raw_value: str | None,
+    expected: int,
+) -> None:
+    assert verification_module._parse_max_verification_rounds(raw_value) == expected
+
+
 # ---------------------------------------------------------------------------
 # make_verdict
 # ---------------------------------------------------------------------------
@@ -480,28 +499,71 @@ def test_repeated_resume_controls_never_replace_generation_owned_question(
     assert "please proceed" not in seen_questions
 
 
-def test_next_model_request_injects_verification_feedback_system_first() -> None:
+@pytest.mark.parametrize("request_path", ["direct", "sync", "async"])
+def test_next_model_request_removes_legacy_verification_feedback_system_message(
+    request_path: str,
+) -> None:
     feedback = "<VerificationFeedback>Add evidence.</VerificationFeedback>"
+    legacy_feedback = (
+        "<VerificationFeedback>Stale checkpoint feedback.</VerificationFeedback>"
+    )
     state = _verification_state()
     state["verification_feedback"] = feedback
+    persisted_messages = [
+        HumanMessage(content="Original request"),
+        AIMessage(content="Draft complete"),
+        SystemMessage(content=legacy_feedback),
+        HumanMessage(content="continue"),
+    ]
     request = ModelRequest(
         model=FakeListChatModel(responses=["done"]),
-        messages=[HumanMessage(content="Continue the report")],
+        messages=persisted_messages,
         system_message=SystemMessage(content="Existing orchestrator guidance"),
         state=state,
     )
+    middleware = agent_module.ResearchStateMiddleware()
+    captured: list[ModelRequest] = []
 
-    configured = agent_module.ResearchStateMiddleware().configure_request(request)
+    if request_path == "direct":
+        configured = middleware.configure_request(request)
+    elif request_path == "sync":
+        middleware.wrap_model_call(
+            request,
+            lambda configured_request: captured.append(configured_request),
+        )
+        configured = captured[0]
+    else:
+        async def handler(configured_request: ModelRequest) -> None:
+            captured.append(configured_request)
+
+        asyncio.run(middleware.awrap_model_call(request, handler))
+        configured = captured[0]
 
     assert configured.system_message is not None
     assert str(configured.system_message.content).startswith(
         "Existing orchestrator guidance"
     )
     assert feedback in str(configured.system_message.content)
-    assert all(
-        not isinstance(message, SystemMessage) for message in configured.messages
+    assert legacy_feedback not in str(configured.system_message.content)
+    assert [type(message) for message in configured.messages] == [
+        HumanMessage,
+        AIMessage,
+        HumanMessage,
+    ]
+    assert request.messages == persisted_messages
+
+
+def test_next_model_request_preserves_arbitrary_persisted_system_message() -> None:
+    user_system_message = SystemMessage(content="User-managed system guidance")
+    request = ModelRequest(
+        model=FakeListChatModel(responses=["done"]),
+        messages=[HumanMessage(content="Question"), user_system_message],
+        state=_verification_state(),
     )
-    assert request.messages == [HumanMessage(content="Continue the report")]
+
+    configured = agent_module.ResearchStateMiddleware().configure_request(request)
+
+    assert user_system_message in configured.messages
 
 
 @pytest.mark.parametrize("async_", [False, True])
@@ -784,6 +846,49 @@ def test_eval_logging_uses_same_accepted_report_readiness(
 
 
 @pytest.mark.parametrize("async_", [False, True])
+@pytest.mark.parametrize("max_rounds", [-2, 0, 1, 2])
+def test_verification_round_limit_controls_verification_and_finalization_once(
+    monkeypatch: pytest.MonkeyPatch,
+    async_: bool,
+    max_rounds: int,
+) -> None:
+    verification_calls = 0
+    eval_calls = 0
+
+    async def fake_verify_report(*, question: str, report: str) -> VerificationVerdict:
+        nonlocal verification_calls
+        verification_calls += 1
+        return VerificationVerdict(status="complete", sufficiency_score=1.0)
+
+    async def fake_log_server_metrics(**kwargs: Any) -> dict[str, bool]:
+        nonlocal eval_calls
+        eval_calls += 1
+        return {"logged": True}
+
+    monkeypatch.setattr(agent_module, "ENABLE_VERIFICATION", True)
+    monkeypatch.setattr(agent_module, "MAX_VERIFICATION_ROUNDS", max_rounds)
+    monkeypatch.setattr(agent_module, "ENABLE_EVAL_TRACKING", True)
+    monkeypatch.setattr(agent_module, "verify_report", fake_verify_report)
+    monkeypatch.setattr(agent_module, "log_server_metrics", fake_log_server_metrics)
+    middleware = agent_module.ResearchStateMiddleware()
+    state = _streamable_state()
+
+    first = _run_after_model(middleware, state, async_=async_)
+    repeated = _run_after_model(
+        middleware,
+        {**state, **(first or {})},
+        async_=async_,
+    )
+
+    assert verification_calls == (0 if max_rounds <= 0 else 1)
+    assert eval_calls == 1
+    assert first is not None
+    assert first["_eval_logged"] is True
+    assert _message_texts(first).count("**Final Report:**\n\nFinal report") == 1
+    assert not _message_texts(repeated)
+
+
+@pytest.mark.parametrize("async_", [False, True])
 def test_finalizer_excludes_unchanged_prior_generation_citations(
     monkeypatch: pytest.MonkeyPatch,
     async_: bool,
@@ -1027,6 +1132,7 @@ def test_eval_logged_only_after_sync_and_async_logger_success(
     assert calls == 1
     assert result is not None
     assert result.get("_eval_logged", False) is (result_kind == "success")
+    assert result.get("_eval_pending", False) is False
 
 
 @pytest.mark.parametrize("returns_success", [True, False])
@@ -1137,6 +1243,49 @@ def test_sync_eval_timeout_without_running_loop_returns_promptly_and_cleans_up(
     assert result is not None
     assert result.get("_eval_logged", False) is False
     assert cleaned_up.wait(timeout=1.0)
+
+
+def test_sync_eval_timeout_does_not_schedule_duplicate_inflight_side_effect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = threading.Event()
+    release = threading.Event()
+    completed = threading.Event()
+    worker_calls = 0
+
+    def blocking_side_effect() -> dict[str, bool]:
+        nonlocal worker_calls
+        worker_calls += 1
+        started.set()
+        release.wait(timeout=1.0)
+        completed.set()
+        return {"logged": True}
+
+    async def stalled_log_server_metrics(**kwargs: Any) -> dict[str, bool]:
+        return await asyncio.to_thread(blocking_side_effect)
+
+    monkeypatch.setattr(agent_module, "ENABLE_VERIFICATION", False)
+    monkeypatch.setattr(agent_module, "ENABLE_EVAL_TRACKING", True)
+    monkeypatch.setattr(agent_module, "SYNC_EVAL_LOG_TIMEOUT_SECONDS", 0.02)
+    monkeypatch.setattr(
+        agent_module,
+        "log_server_metrics",
+        stalled_log_server_metrics,
+    )
+    middleware = agent_module.ResearchStateMiddleware()
+    state = _streamable_state()
+
+    first = middleware.after_model(state, runtime=None)
+    assert started.wait(timeout=0.5)
+    second = middleware.after_model({**state, **(first or {})}, runtime=None)
+    release.set()
+
+    assert first is not None
+    assert first.get("_eval_logged", False) is False
+    assert first["_eval_pending"] is True
+    assert second is None or second.get("_eval_logged", False) is False
+    assert worker_calls == 1
+    assert completed.wait(timeout=1.0)
 
 
 def test_research_state_extends_completion_state() -> None:

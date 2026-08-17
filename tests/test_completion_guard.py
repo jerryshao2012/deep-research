@@ -84,6 +84,7 @@ def test_compiled_guard_schema_hides_and_drops_forged_completion_controls() -> N
     input_properties = graph.get_input_jsonschema()["properties"]
 
     assert not any(name.startswith("completion_") for name in input_properties)
+    assert "_eval_pending" not in input_properties
 
     forged = graph.get_input_schema().model_validate(
         {
@@ -91,6 +92,7 @@ def test_compiled_guard_schema_hides_and_drops_forged_completion_controls() -> N
             "completion_request_generation": "forged-generation",
             "completion_plan_owner_generation": "forged-generation",
             "completion_report_owned": True,
+            "_eval_pending": True,
         }
     )
 
@@ -529,6 +531,7 @@ def test_ordinary_generation_resets_request_scoped_completion_state(
         "verification_round": 2,
         "verification_feedback": "Fix the report",
         "_eval_logged": True,
+        "_eval_pending": True,
         "_streamed_files": ["/final_report.md"],
     }
 
@@ -560,6 +563,7 @@ def test_ordinary_generation_resets_request_scoped_completion_state(
         "verification_round": 0,
         "verification_feedback": None,
         "_eval_logged": False,
+        "_eval_pending": False,
         "_streamed_files": [],
     }
 
@@ -586,6 +590,7 @@ def test_explicit_resume_preserves_generation_plan_and_report_ownership() -> Non
         "verification_round": 2,
         "verification_feedback": "Retained feedback",
         "_eval_logged": True,
+        "_eval_pending": True,
         "_streamed_files": ["/final_report.md"],
     }
 
@@ -611,6 +616,7 @@ def test_explicit_resume_preserves_generation_plan_and_report_ownership() -> Non
     assert resumed["verification_round"] == 2
     assert resumed["verification_feedback"] == "Retained feedback"
     assert resumed["_eval_logged"] is True
+    assert resumed["_eval_pending"] is True
     assert resumed["_streamed_files"] == ["/final_report.md"]
 
 
