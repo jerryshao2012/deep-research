@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import Future as ConcurrentFuture
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import FrozenInstanceError
@@ -567,6 +568,43 @@ class _InFlightDetachedStreamChatModel(_DetachedBindToolsChatModel):
         yield ChatGenerationChunk(message=AIMessageChunk(content="chunk"))
 
 
+class _CancellationCallbackStreamChatModel(_AsyncOnlyChatModel):
+    """Provider fake with one chunk followed by cancellable pending work."""
+
+    async def _astream(
+        self,
+        messages: list[Any],
+        stop: list[str] | None = None,
+        run_manager: Any = None,
+        **kwargs: Any,
+    ):
+        del messages, stop, run_manager, kwargs
+        yield ChatGenerationChunk(message=AIMessageChunk(content="chunk"))
+        await asyncio.Event().wait()
+
+
+class _LateDetachedCallbackChatModel(_AsyncOnlyChatModel):
+    """Provider fake emits a copied callback after its outer route expires."""
+
+    _detached_task: asyncio.Task[Any] | None = PrivateAttr(default=None)
+    _release_detached: asyncio.Event = PrivateAttr(default_factory=asyncio.Event)
+
+    def bind_tools(self, tools: Any, *, tool_choice: str | None = None, **kwargs: Any):
+        del tools, tool_choice, kwargs
+
+        async def spawn_detached(_input: Any) -> AIMessage:
+            manager = AsyncCallbackManager.configure(self.callbacks)
+
+            async def emit_late() -> None:
+                await self._release_detached.wait()
+                await manager.on_custom_event("late-provider-event", {"late": True})
+
+            self._detached_task = asyncio.create_task(emit_late())
+            return AIMessage(content="spawned")
+
+        return RunnableLambda(spawn_detached)
+
+
 class _CleanupDetachedBindToolsChatModel(_DetachedBindToolsChatModel):
     """Provider fake retaining owner cleanup while detached work wakes."""
 
@@ -733,6 +771,48 @@ class _LoopAffineAsyncCallback(AsyncCallbackHandler):
         await self.gate
 
 
+class _ForeverAsyncCallback(AsyncCallbackHandler):
+    raise_error = True
+
+    def __init__(self, release: threading.Event) -> None:
+        del release
+
+    async def on_chat_model_start(self, *_args: Any, **_kwargs: Any) -> None:
+        await asyncio.Event().wait()
+
+
+class _BlockingSyncCallback(BaseCallbackHandler):
+    run_inline = True
+    raise_error = True
+
+    def __init__(self, release: threading.Event) -> None:
+        self.release = release
+        self.finished = threading.Event()
+
+    def on_chat_model_start(self, *_args: Any, **_kwargs: Any) -> None:
+        self.release.wait()
+        self.finished.set()
+
+
+class _ImmediateAsyncCallback(AsyncCallbackHandler):
+    raise_error = True
+
+    def __init__(self) -> None:
+        self.completed = False
+
+    async def on_chat_model_start(self, *_args: Any, **_kwargs: Any) -> None:
+        await asyncio.sleep(0)
+        self.completed = True
+
+
+class _RaisingSyncCallback(BaseCallbackHandler):
+    run_inline = True
+    raise_error = True
+
+    def on_chat_model_start(self, *_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("callback exploded")
+
+
 class _ThreadProbeTracer(LangChainTracer):
     threads: ClassVar[list[int]] = []
     copies: ClassVar[int] = 0
@@ -804,6 +884,47 @@ async def test_run_with_deadline_cancels_request_within_bounded_cleanup_grace(
 
     assert cancelled.is_set()
     assert time.monotonic() - started < 0.03 + 0.03 + 0.08
+
+
+@_async_test
+async def test_callback_origin_timeout_runs_ollama_cleanup_and_unload_once():
+    import research_agent.model_call_guard as guard
+
+    unload_calls = 0
+    cancel_calls = 0
+    policy = _policy(0.01, unload=True)
+    metadata = _ollama_metadata()
+    pump = guard._SyncCallerCallbackPump(
+        time.monotonic() - 1,
+        lambda: ModelCallTimeoutError(
+            provider="ollama",
+            timeout_seconds=policy.timeout_seconds,
+            unload_requested=True,
+        ),
+    )
+
+    async def callback_timeout() -> None:
+        await pump.dispatch(lambda: None)
+
+    async def unload() -> None:
+        nonlocal unload_calls
+        unload_calls += 1
+
+    def cancel() -> None:
+        nonlocal cancel_calls
+        cancel_calls += 1
+
+    with pytest.raises(ModelCallTimeoutError):
+        await _run_with_deadline(
+            callback_timeout,
+            policy=policy,
+            metadata=metadata,
+            unload=unload,
+            on_cancel=cancel,
+        )
+
+    assert cancel_calls == 1
+    assert unload_calls == 1
 
 
 @_async_test
@@ -1770,7 +1891,115 @@ def test_in_flight_detached_callback_is_drained_before_sync_pump_retires():
 
     assert nested.content == "complete"
     assert [name for name, _, _ in callback.events] == ["start", "end"]
-    assert callback.events[0][1] == caller_thread
+    assert callback.events[0][1] != caller_thread
+
+
+@_async_test
+async def test_expired_sync_callback_pump_dispatch_finishes_promptly():
+    import research_agent.model_call_guard as guard
+
+    pump = guard._SyncCallerCallbackPump(time.monotonic() - 1)
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(pump.dispatch(lambda: None), timeout=0.05)
+
+    timeout_error = ModelCallTimeoutError(
+        provider="openai",
+        timeout_seconds=0.01,
+        unload_requested=False,
+    )
+    owned_pump = guard._SyncCallerCallbackPump(
+        time.monotonic() - 1,
+        lambda: timeout_error,
+    )
+    with pytest.raises(ModelCallTimeoutError) as raised:
+        await owned_pump.dispatch(lambda: None)
+    assert raised.value is timeout_error
+
+
+def test_detached_late_callback_cannot_wait_on_expired_sync_pump():
+    import research_agent.model_call_guard as guard
+
+    callback = _ThreadRecordingCallback()
+    guarded = guard_model(
+        _LateDetachedCallbackChatModel(callbacks=[callback]),
+        metadata=_fake_metadata(),
+        policy=_policy(0.03),
+    )
+
+    result = guarded.bind_tools([]).invoke("hello")
+    assert result.content == "spawned"
+    assert guarded._detached_task is not None
+    time.sleep(0.04)
+
+    loop = guard._GLOBAL_BRIDGE_RUNTIME._loop
+    assert loop is not None
+    loop.call_soon_threadsafe(guarded._release_detached.set)
+
+    async def wait_task() -> str:
+        assert guarded._detached_task is not None
+        try:
+            await guarded._detached_task
+        except asyncio.CancelledError:
+            return "cancelled"
+        return "completed"
+
+    future = asyncio.run_coroutine_threadsafe(wait_task(), loop)
+    try:
+        assert future.result(0.15) == "cancelled"
+    finally:
+        future.cancel()
+
+    assert guarded._detached_task.done()
+    assert callback.events == []
+
+
+def test_detached_callback_started_before_expiry_is_bounded_by_copied_deadline():
+    import research_agent.model_call_guard as guard
+
+    release = threading.Event()
+    started = threading.Event()
+
+    class BlockingCustomEventCallback(BaseCallbackHandler):
+        run_inline = True
+        raise_error = True
+
+        def on_custom_event(self, *_args: Any, **_kwargs: Any) -> None:
+            started.set()
+            release.wait()
+
+    guarded = guard_model(
+        _LateDetachedCallbackChatModel(
+            callbacks=[BlockingCustomEventCallback()]
+        ),
+        metadata=_fake_metadata(),
+        policy=_policy(0.08),
+    )
+
+    assert guarded.bind_tools([]).invoke("hello").content == "spawned"
+    assert guarded._detached_task is not None
+    time.sleep(0.03)
+    loop = guard._GLOBAL_BRIDGE_RUNTIME._loop
+    assert loop is not None
+    loop.call_soon_threadsafe(guarded._release_detached.set)
+    assert started.wait(0.05)
+
+    async def wait_task() -> str:
+        assert guarded._detached_task is not None
+        try:
+            await guarded._detached_task
+        except asyncio.CancelledError:
+            return "cancelled"
+        return "completed"
+
+    future = asyncio.run_coroutine_threadsafe(wait_task(), loop)
+    try:
+        assert future.result(0.12) == "cancelled"
+    finally:
+        release.set()
+        future.cancel()
+
+    assert guarded._detached_task.done()
 
 
 def test_sync_stream_drains_in_flight_callback_before_item_and_close():
@@ -1802,7 +2031,7 @@ def test_sync_stream_drains_in_flight_callback_before_item_and_close():
 
     assert nested.content == "complete"
     assert callback.events
-    assert any(thread_id == caller_thread for _, thread_id, _ in callback.events)
+    assert all(thread_id != caller_thread for _, thread_id, _ in callback.events)
 
 
 @_async_test
@@ -2844,6 +3073,115 @@ def test_ollama_reconstruction_fails_closed_for_custom_inherited_transports():
         _close_guarded_local_ollama(guarded)
 
 
+def test_ollama_reconstruction_fails_closed_for_custom_client_state():
+    from langchain_ollama import ChatOllama
+
+    import research_agent.model_call_guard as guard
+
+    class CustomAuth(httpx.Auth):
+        def auth_flow(self, request: httpx.Request):
+            yield request
+
+    class Hook:
+        def __call__(self, _request: httpx.Request) -> None:
+            return None
+
+    guarded = build_guarded_provider_model(
+        ChatOllama,
+        {
+            "model": "fork-custom-client-state",
+            "sync_client_kwargs": {
+                "auth": CustomAuth(),
+                "event_hooks": {"request": [Hook()]},
+            },
+        },
+        ModelRuntimeMetadata(
+            provider="ollama",
+            model_name="fork-custom-client-state",
+        ),
+        _policy(0.2),
+    )
+    guarded._guard_pid = -1
+
+    with pytest.raises(UnsupportedModelOverrideError) as raised:
+        guard._ensure_model_process(guarded)
+    try:
+        assert raised.value.provider == "ollama"
+    finally:
+        _close_guarded_local_ollama(guarded)
+
+
+def test_ollama_reconstruction_clones_declared_client_state_each_generation():
+    from langchain_ollama import ChatOllama
+
+    import research_agent.model_call_guard as guard
+
+    class CustomAuth(httpx.Auth):
+        def auth_flow(self, request: httpx.Request):
+            yield request
+
+    class Hook:
+        def __call__(self, _request: httpx.Request) -> None:
+            return None
+
+    class CloneableStateChatOllama(ChatOllama):
+        def clone_model_http_client_state(
+            self,
+            *,
+            auth: Any,
+            event_hooks: dict[str, list[Any]],
+            asynchronous: bool,
+        ) -> tuple[Any, dict[str, list[Any]]]:
+            del asynchronous
+            return (
+                CustomAuth() if auth is not None else None,
+                {
+                    name: [Hook() for _hook in hooks]
+                    for name, hooks in event_hooks.items()
+                },
+            )
+
+    guarded = build_guarded_provider_model(
+        CloneableStateChatOllama,
+        {
+            "model": "fork-cloneable-client-state",
+            "sync_client_kwargs": {
+                "auth": CustomAuth(),
+                "event_hooks": {"request": [Hook()]},
+            },
+            "async_client_kwargs": {
+                "auth": CustomAuth(),
+                "event_hooks": {"request": [Hook()]},
+            },
+        },
+        ModelRuntimeMetadata(
+            provider="ollama",
+            model_name="fork-cloneable-client-state",
+        ),
+        _policy(0.2),
+    )
+    original_state_ids = {
+        id(guarded._client._client._auth),
+        id(guarded._async_client._client._auth),
+        id(guarded._client._client.event_hooks["request"][0]),
+        id(guarded._async_client._client.event_hooks["request"][0]),
+    }
+    guarded._guard_pid = -1
+
+    guard._ensure_model_process(guarded)
+    fresh_state = (
+        guarded._client._client._auth,
+        guarded._async_client._client._auth,
+        guarded._client._client.event_hooks["request"][0],
+        guarded._async_client._client.event_hooks["request"][0],
+    )
+    try:
+        assert len({id(value) for value in fresh_state}) == len(fresh_state)
+        assert not original_state_ids.intersection(id(value) for value in fresh_state)
+    finally:
+        _close_guarded_local_ollama(guarded)
+
+
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork")
 def test_forked_child_fails_closed_for_undeclared_custom_transport():
     from langchain_ollama import ChatOllama
@@ -3123,7 +3461,7 @@ async def test_async_callbacks_remain_on_caller_loop(
 
 
 @pytest.mark.parametrize("method", ["invoke", "stream"])
-def test_sync_callbacks_run_once_on_original_caller_thread(method: str):
+def test_sync_callbacks_run_once_in_bounded_workers_with_order_preserved(method: str):
     caller_thread = threading.get_ident()
     callback = _ThreadRecordingCallback()
     guarded = guard_model(
@@ -3148,11 +3486,131 @@ def test_sync_callbacks_run_once_on_original_caller_thread(method: str):
             "token",
             "end",
         ]
-    assert {thread_id for _, thread_id, _ in callback.events} == {caller_thread}
+    assert all(thread_id != caller_thread for _, thread_id, _ in callback.events)
+
+
+@pytest.mark.parametrize(
+    "callback_factory",
+    [_ForeverAsyncCallback, _BlockingSyncCallback],
+    ids=["async", "sync"],
+)
+def test_untrusted_sync_call_callback_cannot_exceed_model_deadline(
+    callback_factory: type[BaseCallbackHandler],
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import research_agent.model_call_guard as guard
+
+    monkeypatch.setattr(guard, "MODEL_CANCEL_GRACE_SECONDS", 0.03)
+    release = threading.Event()
+    callback = callback_factory(release)
+    guarded = _guarded_fake(timeout=0.03)
+    outcome: list[BaseException] = []
+    scope_id = f"blocking-callback-{callback_factory.__name__}"
+
+    def invoke() -> None:
+        try:
+            guarded.invoke(
+                "hello",
+                config={
+                    "callbacks": [callback],
+                    "configurable": {"model_call_scope_id": scope_id},
+                },
+            )
+        except BaseException as exc:
+            outcome.append(exc)
+
+    caller = threading.Thread(target=invoke, daemon=True)
+    started = time.monotonic()
+    caller.start()
+    caller.join(0.12)
+    completed_in_budget = not caller.is_alive()
+    elapsed = time.monotonic() - started
+    if caller.is_alive():
+        cancel_model_call_scope(scope_id)
+    release.set()
+    caller.join(0.5)
+
+    assert completed_in_budget
+    assert elapsed < 0.12
+    assert len(outcome) == 1
+    timeout = outcome[0]
+    assert isinstance(timeout, ModelCallTimeoutError)
+    assert timeout.provider == "openai"
+    assert timeout.timeout_seconds == 0.03
+    if isinstance(callback, _BlockingSyncCallback):
+        assert callback.finished.wait(0.2)
+    assert guarded._calls == []
+
+
+@_async_test
+async def test_sync_invoke_inside_active_loop_handles_async_callback_without_run():
+    callback = _ImmediateAsyncCallback()
+    guarded = _guarded_fake(timeout=0.5)
+
+    result = guarded.invoke("hello", config={"callbacks": [callback]})
+
+    assert result.content == "complete"
+    assert callback.completed
+
+
+def test_sync_callback_exception_propagates_without_provider_invocation():
+    guarded = _guarded_fake(timeout=0.5)
+
+    with pytest.raises(RuntimeError, match="callback exploded"):
+        guarded.invoke("hello", config={"callbacks": [_RaisingSyncCallback()]})
+
+    assert guarded._calls == []
+
+
+@pytest.mark.parametrize("publication", ["result", "error"])
+def test_callback_worker_revoke_race_ignores_late_publication(publication: str):
+    import research_agent.model_call_guard as guard
+
+    checked = threading.Event()
+    release = threading.Event()
+
+    class BarrierFuture(ConcurrentFuture[Any]):
+        def done(self) -> bool:
+            result = super().done()
+            checked.set()
+            release.wait()
+            return result
+
+    future = BarrierFuture()
+    record = guard._SyncCallbackRecord(
+        callback=lambda: None,
+        context=contextvars.copy_context(),
+        future=future,
+        deadline=time.monotonic() + 1,
+    )
+    errors: list[BaseException] = []
+
+    def publish() -> None:
+        try:
+            if publication == "result":
+                record._publish_result("late")
+            else:
+                record._publish_error(RuntimeError("late"))
+        except BaseException as exc:
+            errors.append(exc)
+
+    publisher = threading.Thread(target=publish)
+    publisher.start()
+    assert checked.wait(0.2)
+    revoker = threading.Thread(target=record.revoke)
+    revoker.start()
+    time.sleep(0.01)
+    release.set()
+    publisher.join(0.2)
+    revoker.join(0.2)
+
+    assert not publisher.is_alive()
+    assert not revoker.is_alive()
+    assert errors == []
 
 
 @pytest.mark.parametrize("source", ["explicit", "ambient"])
-def test_sync_v2_tracer_callbacks_stay_on_original_caller_thread(source: str):
+def test_sync_v2_tracer_callbacks_use_bounded_worker(source: str):
     _ThreadProbeTracer.threads = []
     _ThreadProbeTracer.copies = 0
     tracer = _ThreadProbeTracer(project_name="guard-probe", client=object())
@@ -3168,10 +3626,10 @@ def test_sync_v2_tracer_callbacks_stay_on_original_caller_thread(source: str):
     assert result.content == "complete"
     assert _ThreadProbeTracer.copies >= 1
     assert _ThreadProbeTracer.threads
-    assert set(_ThreadProbeTracer.threads) == {caller_thread}
+    assert caller_thread not in _ThreadProbeTracer.threads
 
 
-def test_sync_ambient_run_collector_stays_on_original_caller_thread():
+def test_sync_ambient_run_collector_uses_bounded_worker():
     caller_thread = threading.get_ident()
     persisted_threads: list[int] = []
     with collect_runs() as collector:
@@ -3185,7 +3643,8 @@ def test_sync_ambient_run_collector_stays_on_original_caller_thread():
         result = _guarded_fake(timeout=0.5).invoke("hello")
 
     assert result.content == "complete"
-    assert persisted_threads == [caller_thread]
+    assert len(persisted_threads) == 1
+    assert persisted_threads[0] != caller_thread
 
 
 def test_sync_ambient_run_collector_preserves_nested_runnable_context():
@@ -3258,7 +3717,7 @@ async def test_concurrent_callback_calls_mutate_one_provider_instance():
     assert len(callback.starts) == 2
 
 
-def test_sync_error_callback_runs_once_on_original_caller_thread():
+def test_sync_error_callback_runs_once_in_bounded_worker():
     caller_thread = threading.get_ident()
     callback = _ThreadRecordingCallback()
     guarded = guard_model(
@@ -3271,7 +3730,7 @@ def test_sync_error_callback_runs_once_on_original_caller_thread():
         guarded.invoke("hello", config={"callbacks": [callback]})
 
     assert [name for name, _, _ in callback.events] == ["start", "error"]
-    assert {thread_id for _, thread_id, _ in callback.events} == {caller_thread}
+    assert all(thread_id != caller_thread for _, thread_id, _ in callback.events)
 
 
 def test_sync_callback_can_invoke_another_guarded_model_without_deadlock():
@@ -3291,12 +3750,12 @@ def test_sync_callback_can_invoke_another_guarded_model_without_deadlock():
 
     assert result.content == "complete"
     assert [name for name, _, _ in callback.events] == ["start", "end"]
-    assert {thread_id for _, thread_id, _ in callback.events} == {caller_thread}
+    assert all(thread_id != caller_thread for _, thread_id, _ in callback.events)
     assert len(inner._calls) == 1
 
 
 @pytest.mark.parametrize("method", ["invoke", "stream"])
-def test_bound_sync_model_callbacks_stay_on_original_caller_thread(method: str):
+def test_bound_sync_model_callbacks_use_bounded_workers(method: str):
     caller_thread = threading.get_ident()
     callback = _ThreadRecordingCallback()
     guarded = guard_model(
@@ -3313,10 +3772,10 @@ def test_bound_sync_model_callbacks_stay_on_original_caller_thread(method: str):
         assert "".join(str(chunk.content) for chunk in chunks) == "chunk"
 
     assert callback.events
-    assert {thread_id for _, thread_id, _ in callback.events} == {caller_thread}
+    assert all(thread_id != caller_thread for _, thread_id, _ in callback.events)
 
 
-def test_inherited_only_config_callback_runs_nested_event_on_sync_caller_thread():
+def test_inherited_only_config_callback_runs_nested_event_in_bounded_worker():
     caller_thread = threading.get_ident()
     callback = _ThreadRecordingCallback()
     callback_manager = AsyncCallbackManager(
@@ -3332,9 +3791,11 @@ def test_inherited_only_config_callback_runs_nested_event_on_sync_caller_thread(
     result = guarded.invoke("hello", config={"callbacks": callback_manager})
 
     assert result.content == "complete"
-    assert callback.events == [
-        ("nested-provider-event", caller_thread, {"kept": True})
-    ]
+    assert len(callback.events) == 1
+    name, thread_id, payload = callback.events[0]
+    assert name == "nested-provider-event"
+    assert thread_id != caller_thread
+    assert payload == {"kept": True}
 
 
 @_async_test
@@ -3394,6 +3855,29 @@ def test_sync_stream_close_cancels_async_provider_and_cleans_bridge():
 
     assert guarded._cancelled.wait(0.2)
     assert guarded._bridge_registry.active_count("close-scope") == 0
+
+
+def test_sync_stream_close_drains_cooperative_cancellation_callback_before_join(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import research_agent.model_call_guard as guard
+
+    monkeypatch.setattr(guard, "MODEL_CANCEL_GRACE_SECONDS", 0.2)
+    callback = _ThreadRecordingCallback()
+    guarded = guard_model(
+        _CancellationCallbackStreamChatModel(callbacks=[callback]),
+        metadata=_fake_metadata(),
+        policy=_policy(1.0),
+    )
+    stream = guarded.stream("hello")
+    assert next(stream).content == "chunk"
+    time.sleep(0.01)
+
+    started = time.monotonic()
+    stream.close()
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.12
 
 
 def test_sync_stream_without_scope_retains_private_scope_on_control():
@@ -4337,6 +4821,334 @@ def test_openai_provider_clones_recognized_explicit_clients_without_sharing(
         assert not async_client.is_closed
         sync_client.close()
         asyncio.run(async_client.aclose())
+
+
+def test_openai_provider_rejects_loop_affine_explicit_auth_after_raw_use():
+    from langchain_openai import ChatOpenAI
+
+    class LoopAffineAuth(httpx.Auth):
+        def __init__(self) -> None:
+            self.loop: asyncio.AbstractEventLoop | None = None
+
+        async def async_auth_flow(self, request: httpx.Request):
+            self.loop = asyncio.get_running_loop()
+            yield request
+
+    auth = LoopAffineAuth()
+    sync_client = httpx.Client(trust_env=False)
+    async_client = httpx.AsyncClient(auth=auth, trust_env=False)
+    with _ollama_compatible_server() as (base_url, _requests):
+        asyncio.run(async_client.get(base_url))
+        raw = ChatOpenAI(
+            model="custom-auth-openai",
+            api_key="sk-test",
+            base_url=f"{base_url}/v1",
+            http_client=sync_client,
+            http_async_client=async_client,
+        )
+
+        try:
+            with pytest.raises(UnsupportedModelOverrideError) as raised:
+                adapt_model_override(raw, policy=_policy(0.2))
+            assert raised.value.provider == "openai"
+            assert auth.loop is not None
+        finally:
+            sync_client.close()
+            asyncio.run(async_client.aclose())
+
+
+def test_openai_provider_rejects_loop_affine_explicit_event_hook_after_raw_use():
+    from langchain_openai import ChatOpenAI
+
+    hook_loops: list[asyncio.AbstractEventLoop] = []
+
+    async def loop_affine_hook(_request: httpx.Request) -> None:
+        hook_loops.append(asyncio.get_running_loop())
+
+    sync_client = httpx.Client(trust_env=False)
+    async_client = httpx.AsyncClient(
+        event_hooks={"request": [loop_affine_hook]},
+        trust_env=False,
+    )
+    with _ollama_compatible_server() as (base_url, _requests):
+        asyncio.run(async_client.get(base_url))
+        raw = ChatOpenAI(
+            model="custom-hook-openai",
+            api_key="sk-test",
+            base_url=f"{base_url}/v1",
+            http_client=sync_client,
+            http_async_client=async_client,
+        )
+
+        try:
+            with pytest.raises(UnsupportedModelOverrideError) as raised:
+                adapt_model_override(raw, policy=_policy(0.2))
+            assert raised.value.provider == "openai"
+            assert hook_loops
+        finally:
+            sync_client.close()
+            asyncio.run(async_client.aclose())
+
+
+def test_openai_provider_uses_declared_http_client_state_clone_factory():
+    from langchain_openai import ChatOpenAI
+
+    import research_agent.model_call_guard as guard
+
+    class CustomAuth(httpx.Auth):
+        async def async_auth_flow(self, request: httpx.Request):
+            request.headers["x-custom-auth"] = "kept"
+            yield request
+
+    class Hook:
+        def __init__(self, calls: list[str]) -> None:
+            self.calls = calls
+
+        async def __call__(self, request: httpx.Request) -> None:
+            self.calls.append(str(request.url))
+
+    raw_hook_calls: list[str] = []
+    guarded_hook_calls: list[str] = []
+    raw_auth = CustomAuth()
+    raw_hook = Hook(raw_hook_calls)
+
+    class CloneableClientStateChatOpenAI(ChatOpenAI):
+        def clone_model_http_client_state(
+            self,
+            *,
+            auth: Any,
+            event_hooks: dict[str, list[Any]],
+            asynchronous: bool,
+        ) -> tuple[Any, dict[str, list[Any]]]:
+            del asynchronous
+            cloned_auth = CustomAuth() if auth is not None else None
+            cloned_hooks = {
+                name: [Hook(guarded_hook_calls) for _hook in hooks]
+                for name, hooks in event_hooks.items()
+            }
+            return cloned_auth, cloned_hooks
+
+    sync_client = httpx.Client(trust_env=False)
+    async_client = httpx.AsyncClient(
+        auth=raw_auth,
+        event_hooks={"request": [raw_hook]},
+        trust_env=False,
+    )
+    guarded: BaseChatModel | None = None
+    with _ollama_compatible_server() as (base_url, _requests):
+        asyncio.run(async_client.get(base_url))
+        raw = CloneableClientStateChatOpenAI(
+            model="cloneable-client-state",
+            api_key="sk-test",
+            base_url=f"{base_url}/v1",
+            max_retries=0,
+            http_client=sync_client,
+            http_async_client=async_client,
+        )
+        try:
+            guarded = adapt_model_override(raw, policy=_policy(1.0))
+            reply = asyncio.run(guarded.ainvoke("hello"))
+
+            assert reply.content == "local-reply"
+            assert guarded.http_async_client._auth is not raw_auth
+            assert guarded.http_async_client.event_hooks["request"][0] is not raw_hook
+            assert len(raw_hook_calls) == 1
+            assert guarded_hook_calls
+            first_auth = guarded.http_async_client._auth
+            first_hook = guarded.http_async_client.event_hooks["request"][0]
+            first_sync_client = guarded.http_client
+            first_async_client = guarded.http_async_client
+
+            guarded._guard_pid = -1
+            guard._ensure_model_process(guarded)
+
+            assert guarded.http_async_client._auth is not first_auth
+            assert guarded.http_async_client.event_hooks["request"][0] is not first_hook
+            assert asyncio.run(guarded.ainvoke("after-reset")).content == "local-reply"
+            close_control = guard._start_bridge(
+                first_async_client.aclose,
+                scope_id="first-generation-client-state-close",
+                registry=guarded._bridge_registry,
+            )
+            guard._bridge_result(
+                close_control,
+                time.monotonic() + 1,
+                policy=guarded._model_call_policy,
+                metadata=guarded._runtime_metadata,
+            )
+            first_sync_client.close()
+        finally:
+            if guarded is not None:
+                _close_guarded_default_openai(guarded)
+            sync_client.close()
+            asyncio.run(async_client.aclose())
+
+
+def test_openai_provider_rejects_clone_factory_reusing_reordered_hooks():
+    from langchain_openai import ChatOpenAI
+
+    async def first_hook(_request: httpx.Request) -> None:
+        return None
+
+    async def second_hook(_request: httpx.Request) -> None:
+        return None
+
+    class ReorderingClientStateChatOpenAI(ChatOpenAI):
+        def clone_model_http_client_state(
+            self,
+            *,
+            auth: Any,
+            event_hooks: dict[str, list[Any]],
+            asynchronous: bool,
+        ) -> tuple[Any, dict[str, list[Any]]]:
+            del asynchronous
+            return auth, {
+                name: list(reversed(hooks))
+                for name, hooks in event_hooks.items()
+            }
+
+    sync_client = httpx.Client(trust_env=False)
+    async_client = httpx.AsyncClient(
+        event_hooks={"request": [first_hook, second_hook]},
+        trust_env=False,
+    )
+    raw = ReorderingClientStateChatOpenAI(
+        model="reordered-hook-state",
+        api_key="sk-test",
+        http_client=sync_client,
+        http_async_client=async_client,
+    )
+    guarded: BaseChatModel | None = None
+    try:
+        with pytest.raises(UnsupportedModelOverrideError) as raised:
+            guarded = adapt_model_override(raw, policy=_policy(0.2))
+        assert raised.value.provider == "openai"
+    finally:
+        if guarded is not None:
+            _close_guarded_default_openai(guarded)
+        sync_client.close()
+        asyncio.run(async_client.aclose())
+
+
+def test_openai_provider_rejects_cached_state_shared_across_sync_async_clones():
+    from langchain_openai import ChatOpenAI
+
+    class DualAuth(httpx.Auth):
+        def auth_flow(self, request: httpx.Request):
+            yield request
+
+        async def async_auth_flow(self, request: httpx.Request):
+            yield request
+
+    class Hook:
+        def __call__(self, _request: httpx.Request) -> None:
+            return None
+
+    cached_auth = DualAuth()
+    cached_hook = Hook()
+
+    class CachedClientStateChatOpenAI(ChatOpenAI):
+        def clone_model_http_client_state(
+            self,
+            *,
+            auth: Any,
+            event_hooks: dict[str, list[Any]],
+            asynchronous: bool,
+        ) -> tuple[Any, dict[str, list[Any]]]:
+            del auth, asynchronous
+            return cached_auth, {
+                name: [cached_hook for _hook in hooks]
+                for name, hooks in event_hooks.items()
+            }
+
+    sync_client = httpx.Client(
+        auth=DualAuth(),
+        event_hooks={"request": [Hook()]},
+        trust_env=False,
+    )
+    async_client = httpx.AsyncClient(
+        auth=DualAuth(),
+        event_hooks={"request": [Hook()]},
+        trust_env=False,
+    )
+    raw = CachedClientStateChatOpenAI(
+        model="cached-client-state",
+        api_key="sk-test",
+        http_client=sync_client,
+        http_async_client=async_client,
+    )
+    guarded: BaseChatModel | None = None
+    try:
+        with pytest.raises(UnsupportedModelOverrideError) as raised:
+            guarded = adapt_model_override(raw, policy=_policy(0.2))
+        assert raised.value.provider == "openai"
+    finally:
+        if guarded is not None:
+            _close_guarded_default_openai(guarded)
+        sync_client.close()
+        asyncio.run(async_client.aclose())
+
+
+def test_openai_provider_rejects_caller_state_swapped_between_client_clones():
+    from langchain_openai import ChatOpenAI
+
+    class DualAuth(httpx.Auth):
+        def auth_flow(self, request: httpx.Request):
+            yield request
+
+        async def async_auth_flow(self, request: httpx.Request):
+            yield request
+
+    sync_auth = DualAuth()
+    async_auth = DualAuth()
+
+    class SwappingClientStateChatOpenAI(ChatOpenAI):
+        def clone_model_http_client_state(
+            self,
+            *,
+            auth: Any,
+            event_hooks: dict[str, list[Any]],
+            asynchronous: bool,
+        ) -> tuple[Any, dict[str, list[Any]]]:
+            del auth
+            return (sync_auth if asynchronous else async_auth), event_hooks
+
+    sync_client = httpx.Client(auth=sync_auth, trust_env=False)
+    async_client = httpx.AsyncClient(auth=async_auth, trust_env=False)
+    raw = SwappingClientStateChatOpenAI(
+        model="swapped-client-state",
+        api_key="sk-test",
+        http_client=sync_client,
+        http_async_client=async_client,
+    )
+    guarded: BaseChatModel | None = None
+    try:
+        with pytest.raises(UnsupportedModelOverrideError) as raised:
+            guarded = adapt_model_override(raw, policy=_policy(0.2))
+        assert raised.value.provider == "openai"
+    finally:
+        if guarded is not None:
+            _close_guarded_default_openai(guarded)
+        sync_client.close()
+        asyncio.run(async_client.aclose())
+
+
+def test_openai_process_reset_rejects_new_unsupported_custom_client_state():
+    import research_agent.model_call_guard as guard
+
+    class CustomAuth(httpx.Auth):
+        def auth_flow(self, request: httpx.Request):
+            yield request
+
+    guarded = _guarded_default_openai()
+    guarded.root_client._client._auth = CustomAuth()
+    guarded._guard_pid = -1
+    try:
+        with pytest.raises(UnsupportedModelOverrideError) as raised:
+            guard._ensure_model_process(guarded)
+        assert raised.value.provider == "openai"
+    finally:
+        _close_guarded_default_openai(guarded)
 
 
 def test_openai_provider_uses_declared_custom_transport_clone_capability():

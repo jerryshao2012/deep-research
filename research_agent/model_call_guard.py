@@ -466,7 +466,14 @@ async def _run_with_deadline[Result](
     try:
         done, _ = await asyncio.wait({task}, timeout=policy.timeout_seconds)
         if done:
-            return task.result()
+            try:
+                return task.result()
+            except ModelCallTimeoutError:
+                if on_cancel is not None:
+                    on_cancel()
+                await _bounded_task_cleanup(task)
+                await attempt_unload()
+                raise
 
         if on_cancel is not None:
             on_cancel()
@@ -514,6 +521,20 @@ class ModelHTTPTransportCloner(Protocol):
         asynchronous: bool,
     ) -> httpx.BaseTransport | httpx.AsyncBaseTransport:
         """Return an independent transport preserving custom routing semantics."""
+
+
+@runtime_checkable
+class ModelHTTPClientStateCloner(Protocol):
+    """Optional capability for cloning stateful HTTP auth and event hooks."""
+
+    def clone_model_http_client_state(
+        self,
+        *,
+        auth: Any,
+        event_hooks: Mapping[str, Sequence[Callable[..., Any]]],
+        asynchronous: bool,
+    ) -> tuple[Any, Mapping[str, Sequence[Callable[..., Any]]]]:
+        """Return independent auth and hook objects for one guarded client."""
 
 
 class BridgeRegistry:
@@ -963,12 +984,18 @@ def _bridge_result[ResultT](
     except KeyboardInterrupt:
         control.cancel()
         control.join(MODEL_CANCEL_GRACE_SECONDS)
+        if callback_pump is not None:
+            callback_pump.revoke()
         raise
     except queue.Empty:
         control.cancel()
         control.join(MODEL_CANCEL_GRACE_SECONDS)
+        if callback_pump is not None:
+            callback_pump.revoke()
         raise _timeout_error(policy, metadata) from None
     control.join(0)
+    if callback_pump is not None:
+        callback_pump.revoke()
     if kind == "error":
         raise value
     return value
@@ -1194,6 +1221,8 @@ class _SyncStreamIterator[OutputT](Iterator[OutputT]):
             return value
         self._closed = True
         self._control.join(MODEL_CANCEL_GRACE_SECONDS)
+        if self._callback_pump is not None:
+            self._callback_pump.revoke()
         if kind == "error":
             raise value
         raise StopIteration
@@ -1204,9 +1233,11 @@ class _SyncStreamIterator[OutputT](Iterator[OutputT]):
             return
         self._closed = True
         self._control.cancel()
-        self._control.join(MODEL_CANCEL_GRACE_SECONDS)
         if self._callback_pump is not None:
             self._callback_pump.drain()
+        self._control.join(MODEL_CANCEL_GRACE_SECONDS)
+        if self._callback_pump is not None:
+            self._callback_pump.revoke()
 
     def __del__(self) -> None:
         self.close()
@@ -1225,20 +1256,120 @@ class _AttemptVisibility:
         return not self._visible.is_set()
 
 
-@dataclass
+@dataclass(eq=False)
 class _SyncCallbackRecord:
-    """One callback invocation waiting for its original sync caller thread."""
+    """One callback invocation isolated in a bounded daemon worker."""
 
     callback: Callable[[], Any]
     context: contextvars.Context
     future: ConcurrentFuture[Any]
+    deadline: float
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+    _revoked: threading.Event = field(default_factory=threading.Event)
+    _loop: asyncio.AbstractEventLoop | None = None
+    _task: asyncio.Task[Any] | None = None
+
+    def start(self) -> None:
+        """Start callback work without creating a process-blocking thread."""
+        threading.Thread(
+            target=self._run,
+            name="model-callback-worker",
+            daemon=True,
+        ).start()
+
+    def revoke(self) -> None:
+        """Cancel awaitable work and ignore any late synchronous result."""
+        with self._lock:
+            self._revoked.set()
+            self.future.cancel()
+            loop = self._loop
+            task = self._task
+        if loop is not None and task is not None and not task.done():
+            try:
+                loop.call_soon_threadsafe(task.cancel)
+            except RuntimeError:
+                pass
+
+    def _publish_result(self, result: Any) -> None:
+        with self._lock:
+            if (
+                not self._revoked.is_set()
+                and time.monotonic() < self.deadline
+                and not self.future.done()
+            ):
+                self.future.set_result(result)
+
+    def _publish_error(self, error: BaseException) -> None:
+        with self._lock:
+            if (
+                not self._revoked.is_set()
+                and time.monotonic() < self.deadline
+                and not self.future.done()
+            ):
+                self.future.set_exception(error)
+
+    def _run_awaitable(self, awaitable: Awaitable[Any]) -> Any:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        task = self.context.run(loop.create_task, awaitable)
+        with self._lock:
+            self._loop = loop
+            self._task = task
+            revoked = self._revoked.is_set()
+        if revoked:
+            task.cancel()
+        try:
+            return loop.run_until_complete(task)
+        finally:
+            pending = asyncio.all_tasks(loop)
+            for pending_task in pending:
+                pending_task.cancel()
+            if pending:
+                loop.run_until_complete(
+                    asyncio.gather(*pending, return_exceptions=True)
+                )
+            loop.run_until_complete(loop.shutdown_asyncgens())
+            with self._lock:
+                self._task = None
+                self._loop = None
+            loop.close()
+
+    def _run(self) -> None:
+        try:
+            if self._revoked.is_set() or time.monotonic() >= self.deadline:
+                self.revoke()
+                return
+            result = self.context.run(self.callback)
+            if inspect.isawaitable(result):
+                if self._revoked.is_set() or time.monotonic() >= self.deadline:
+                    if inspect.iscoroutine(result):
+                        result.close()
+                    self.revoke()
+                    return
+                result = self._run_awaitable(result)
+        except BaseException as exc:
+            self._publish_error(exc)
+        else:
+            self._publish_result(result)
 
 
 class _SyncCallerCallbackPump:
-    """Move bridge callbacks onto the thread blocked on a synchronous API."""
+    """Track callback workers within one absolute model deadline.
 
-    def __init__(self) -> None:
-        self._records: queue.Queue[_SyncCallbackRecord] = queue.Queue()
+    Sync boundaries intentionally trade caller-thread affinity for bounded safety:
+    user callback code runs in daemon workers and late results are discarded.
+    """
+
+    def __init__(
+        self,
+        deadline: float,
+        timeout_error_factory: Callable[[], BaseException] | None = None,
+    ) -> None:
+        self._deadline = deadline
+        self._timeout_error_factory = timeout_error_factory
+        self._lock = threading.Lock()
+        self._active = True
+        self._records: set[_SyncCallbackRecord] = set()
 
     async def dispatch(
         self,
@@ -1246,48 +1377,58 @@ class _SyncCallerCallbackPump:
         *args: Any,
         **kwargs: Any,
     ) -> Any:
-        """Queue callback and suspend bridge work until caller executes it."""
+        """Run callback in an isolated worker and await only its bounded result."""
         future: ConcurrentFuture[Any] = ConcurrentFuture()
-        self._records.put(
-            _SyncCallbackRecord(
-                callback=functools.partial(event, *args, **kwargs),
-                context=contextvars.copy_context(),
-                future=future,
-            )
+        record = _SyncCallbackRecord(
+            callback=functools.partial(event, *args, **kwargs),
+            context=contextvars.copy_context(),
+            future=future,
+            deadline=self._deadline,
         )
+        with self._lock:
+            accepted = self._active
+            expired = time.monotonic() >= self._deadline
+            if accepted:
+                self._records.add(record)
+        if not accepted:
+            record.revoke()
+            raise asyncio.CancelledError
+        if expired:
+            record.revoke()
+            with self._lock:
+                self._records.discard(record)
+            if self._timeout_error_factory is not None:
+                raise self._timeout_error_factory()
+            raise asyncio.CancelledError
+        record.start()
         try:
-            return await asyncio.wrap_future(future)
+            remaining = max(0.0, self._deadline - time.monotonic())
+            return await asyncio.wait_for(
+                asyncio.wrap_future(future),
+                timeout=remaining,
+            )
+        except TimeoutError:
+            record.revoke()
+            if self._timeout_error_factory is not None:
+                raise self._timeout_error_factory() from None
+            raise asyncio.CancelledError from None
         except asyncio.CancelledError:
-            future.cancel()
+            record.revoke()
             raise
-
-    def run_one(self, timeout: float = 0.0) -> bool:
-        """Execute at most one queued callback on the current caller thread."""
-        try:
-            record = self._records.get(timeout=max(0.0, timeout))
-        except queue.Empty:
-            return False
-        if record.future.cancelled():
-            return True
-
-        def invoke() -> Any:
-            result = record.callback()
-            return asyncio.run(result) if inspect.isawaitable(result) else result
-
-        try:
-            result = record.context.run(invoke)
-        except BaseException as exc:
-            if not record.future.done():
-                record.future.set_exception(exc)
-        else:
-            if not record.future.done():
-                record.future.set_result(result)
-        return True
+        finally:
+            with self._lock:
+                self._records.discard(record)
 
     def drain(self) -> None:
-        """Execute all callbacks already visible to the caller."""
-        while self.run_one():
-            pass
+        """Yield a nonblocking synchronization point before bridge joins."""
+
+    def revoke(self) -> None:
+        """Prevent new callbacks and detach every late worker result."""
+        with self._lock:
+            self._active = False
+            records = tuple(self._records)
+        for record in records:
+            record.revoke()
 
 
 def _sync_wait_queue(
@@ -1297,19 +1438,7 @@ def _sync_wait_queue(
     callback_pump: _SyncCallerCallbackPump | None,
 ) -> tuple[str, Any]:
     """Wait for bridge output while servicing sync-thread callback records."""
-    if callback_pump is None:
-        return results.get(timeout=timeout)
-    wait_deadline = time.monotonic() + timeout
-    while True:
-        callback_pump.drain()
-        remaining = wait_deadline - time.monotonic()
-        if remaining <= 0:
-            raise queue.Empty
-        try:
-            return results.get(timeout=min(remaining, 0.002))
-        except queue.Empty:
-            if time.monotonic() >= wait_deadline:
-                raise
+    return results.get(timeout=timeout)
 
 
 class _CallerLoopCallbackProxy(BaseCallbackHandler):
@@ -1395,8 +1524,16 @@ class _CallerLoopCallbackProxy(BaseCallbackHandler):
                 if isinstance(resolved_target, _SyncCallerCallbackPump):
                     return await resolved_target.dispatch(event, *args, **kwargs)
                 if resolved_target is None:
-                    result = event(*args, **kwargs)
-                    return await result if inspect.isawaitable(result) else result
+                    deadline = _ACTIVE_DEADLINE.get()
+                    callback_worker = _SyncCallerCallbackPump(
+                        deadline
+                        if deadline is not None
+                        else time.monotonic() + DEFAULT_MODEL_CALL_TIMEOUT_SECONDS
+                    )
+                    try:
+                        return await callback_worker.dispatch(event, *args, **kwargs)
+                    finally:
+                        callback_worker.revoke()
 
                 async def invoke_on_caller_loop() -> Any:
                     if inspect.iscoroutinefunction(event):
@@ -1724,7 +1861,14 @@ class _GuardedBoundRunnable[InputT, OutputT](Runnable[InputT, OutputT]):
     ) -> OutputT:
         deadline = _capture_deadline(self._owner._model_call_policy)
         scope_id = _scope_id_from_config(config, self._boundary_config)
-        callback_pump = _SyncCallerCallbackPump()
+        callback_pump = _SyncCallerCallbackPump(
+            deadline,
+            functools.partial(
+                _timeout_error,
+                self._owner._model_call_policy,
+                self._owner._runtime_metadata,
+            ),
+        )
         control = _start_bridge(
             lambda: _run_with_callback_target(
                 lambda: _run_with_absolute_deadline(
@@ -1769,7 +1913,14 @@ class _GuardedBoundRunnable[InputT, OutputT](Runnable[InputT, OutputT]):
     ) -> Iterator[OutputT]:
         deadline = _capture_deadline(self._owner._model_call_policy)
         scope_id = _scope_id_from_config(config, self._boundary_config)
-        callback_pump = _SyncCallerCallbackPump()
+        callback_pump = _SyncCallerCallbackPump(
+            deadline,
+            functools.partial(
+                _timeout_error,
+                self._owner._model_call_policy,
+                self._owner._runtime_metadata,
+            ),
+        )
         return _SyncStreamIterator(
             lambda: _stream_with_callback_target(
                 lambda: self._astream_with_deadline(
@@ -1934,7 +2085,10 @@ class ModelCallGuardMixin:
         policy = self._model_call_policy
         deadline = _capture_deadline(policy)
         scope_id = _scope_id_from_config(config)
-        callback_pump = _SyncCallerCallbackPump()
+        callback_pump = _SyncCallerCallbackPump(
+            deadline,
+            functools.partial(_timeout_error, policy, self._runtime_metadata),
+        )
         control = _start_bridge(
             lambda: _run_with_callback_target(
                 lambda: self._guarded_ainvoke(
@@ -2078,7 +2232,14 @@ class ModelCallGuardMixin:
         _ensure_model_process(self)
         deadline = _capture_deadline(self._model_call_policy)
         scope_id = _scope_id_from_config(config)
-        callback_pump = _SyncCallerCallbackPump()
+        callback_pump = _SyncCallerCallbackPump(
+            deadline,
+            functools.partial(
+                _timeout_error,
+                self._model_call_policy,
+                self._runtime_metadata,
+            ),
+        )
         return _SyncStreamIterator(
             lambda: _stream_with_callback_target(
                 lambda: self._guarded_astream(
@@ -2715,12 +2876,21 @@ def _validated_provider_fields(
                 None,
             )
         fresh_http_client: httpx.Client | None = None
+        state_clients = tuple(
+            client
+            for client in (http_client, http_async_client)
+            if isinstance(client, (httpx.Client, httpx.AsyncClient))
+        )
+        forbidden_state_ids = _httpx_client_state_identity_ids(*state_clients)
+        claimed_state_ids: set[int] = set()
         if clone_http_transports and isinstance(http_client, httpx.Client):
             fresh_http_client = _fresh_httpx_client_after_fork(
                 http_client,
                 policy,
                 owner=model,
                 metadata=metadata,
+                forbidden_state_ids=forbidden_state_ids,
+                claimed_state_ids=claimed_state_ids,
             )
             fields["http_client"] = fresh_http_client
         if clone_http_transports and isinstance(http_async_client, httpx.AsyncClient):
@@ -2730,6 +2900,8 @@ def _validated_provider_fields(
                     policy,
                     owner=model,
                     metadata=metadata,
+                    forbidden_state_ids=forbidden_state_ids,
+                    claimed_state_ids=claimed_state_ids,
                 )
             except BaseException:
                 if fresh_http_client is not None:
@@ -2854,14 +3026,132 @@ def _fresh_httpx_mounts_after_fork(
     return mounts
 
 
+def _httpx_client_state_identity_ids(
+    *clients: httpx.Client | httpx.AsyncClient,
+) -> set[int]:
+    """Collect every caller-owned auth and callback identity before cloning."""
+    identities: set[int] = set()
+    for client in clients:
+        if client._auth is not None:
+            identities.add(id(client._auth))
+        identities.update(
+            id(hook)
+            for hooks in client.event_hooks.values()
+            for hook in hooks
+        )
+    return identities
+
+
+def _fresh_httpx_client_state(
+    client: httpx.Client | httpx.AsyncClient,
+    *,
+    asynchronous: bool,
+    owner: BaseChatModel | None,
+    metadata: ModelRuntimeMetadata | None,
+    forbidden_state_ids: set[int] | None = None,
+    claimed_state_ids: set[int] | None = None,
+) -> tuple[Any, dict[str, list[Callable[..., Any]]]]:
+    """Clone auth/hooks or fail closed before crossing loop/process ownership."""
+    auth = client._auth
+    event_hooks = {
+        name: list(hooks)
+        for name, hooks in client.event_hooks.items()
+    }
+    has_hooks = any(event_hooks.values())
+    if auth is None and not has_hooks:
+        return None, event_hooks
+    if type(auth) is httpx.BasicAuth and not has_hooks:
+        cloned_auth = copy.copy(auth)
+        cloned_hooks = event_hooks
+    else:
+        clone = getattr(owner, "clone_model_http_client_state", None)
+        if not callable(clone):
+            raise UnsupportedModelOverrideError(
+                provider=(metadata.provider if metadata is not None else "unknown")
+            )
+        try:
+            cloned_auth, cloned_hooks_value = clone(
+                auth=auth,
+                event_hooks=event_hooks,
+                asynchronous=asynchronous,
+            )
+            cloned_hooks = {
+                name: list(hooks)
+                for name, hooks in cloned_hooks_value.items()
+            }
+        except Exception:
+            raise UnsupportedModelOverrideError(
+                provider=(metadata.provider if metadata is not None else "unknown")
+            ) from None
+
+    valid_auth = (
+        auth is None
+        and cloned_auth is None
+    ) or (
+        auth is not None and cloned_auth is not None and cloned_auth is not auth
+    )
+    original_hook_ids = {
+        id(hook)
+        for hooks in event_hooks.values()
+        for hook in hooks
+    }
+    valid_hooks = set(cloned_hooks) == set(event_hooks)
+    for name, hooks in event_hooks.items():
+        replacements = cloned_hooks.get(name, [])
+        if len(replacements) != len(hooks) or any(
+            id(replacement) in original_hook_ids or not callable(replacement)
+            for replacement in replacements
+        ):
+            valid_hooks = False
+            break
+    cloned_state_ids = (
+        ([id(cloned_auth)] if cloned_auth is not None else [])
+        + [
+            id(hook)
+            for hooks in cloned_hooks.values()
+            for hook in hooks
+        ]
+    )
+    forbidden = (
+        forbidden_state_ids
+        if forbidden_state_ids is not None
+        else _httpx_client_state_identity_ids(client)
+    )
+    unique_cloned_state_ids = set(cloned_state_ids)
+    state_is_independent = (
+        not forbidden.intersection(unique_cloned_state_ids)
+        and not (
+            claimed_state_ids is not None
+            and claimed_state_ids.intersection(unique_cloned_state_ids)
+        )
+    )
+    if not valid_auth or not valid_hooks or not state_is_independent:
+        raise UnsupportedModelOverrideError(
+            provider=(metadata.provider if metadata is not None else "unknown")
+        )
+    if claimed_state_ids is not None:
+        claimed_state_ids.update(unique_cloned_state_ids)
+    return cloned_auth, cloned_hooks
+
+
 def _fresh_httpx_client_after_fork(
     client: httpx.Client,
     policy: ModelCallPolicy,
     *,
     owner: BaseChatModel | None = None,
     metadata: ModelRuntimeMetadata | None = None,
+    forbidden_state_ids: set[int] | None = None,
+    claimed_state_ids: set[int] | None = None,
 ) -> httpx.Client:
     """Clone stable client settings around a new process-local transport."""
+    auth, event_hooks = _fresh_httpx_client_state(
+        client,
+        asynchronous=False,
+        owner=owner,
+        metadata=metadata,
+        forbidden_state_ids=forbidden_state_ids,
+        claimed_state_ids=claimed_state_ids,
+    )
     transport = _fresh_httpx_transport_after_fork(
         client._transport,
         asynchronous=False,
@@ -2869,7 +3159,7 @@ def _fresh_httpx_client_after_fork(
         metadata=metadata,
     )
     return httpx.Client(
-        auth=client._auth,
+        auth=auth,
         params=client.params,
         headers=client.headers,
         cookies=client.cookies,
@@ -2885,7 +3175,7 @@ def _fresh_httpx_client_after_fork(
         timeout=_bounded_native_timeout(client.timeout, policy),
         follow_redirects=client.follow_redirects,
         max_redirects=client.max_redirects,
-        event_hooks={name: list(hooks) for name, hooks in client.event_hooks.items()},
+        event_hooks=event_hooks,
         base_url=client.base_url,
         transport=transport,
         default_encoding=client._default_encoding,
@@ -2898,8 +3188,18 @@ def _fresh_httpx_async_client_after_fork(
     *,
     owner: BaseChatModel | None = None,
     metadata: ModelRuntimeMetadata | None = None,
+    forbidden_state_ids: set[int] | None = None,
+    claimed_state_ids: set[int] | None = None,
 ) -> httpx.AsyncClient:
     """Clone stable async settings around a new process-local transport."""
+    auth, event_hooks = _fresh_httpx_client_state(
+        client,
+        asynchronous=True,
+        owner=owner,
+        metadata=metadata,
+        forbidden_state_ids=forbidden_state_ids,
+        claimed_state_ids=claimed_state_ids,
+    )
     transport = _fresh_httpx_transport_after_fork(
         client._transport,
         asynchronous=True,
@@ -2907,7 +3207,7 @@ def _fresh_httpx_async_client_after_fork(
         metadata=metadata,
     )
     return httpx.AsyncClient(
-        auth=client._auth,
+        auth=auth,
         params=client.params,
         headers=client.headers,
         cookies=client.cookies,
@@ -2923,7 +3223,7 @@ def _fresh_httpx_async_client_after_fork(
         timeout=_bounded_native_timeout(client.timeout, policy),
         follow_redirects=client.follow_redirects,
         max_redirects=client.max_redirects,
-        event_hooks={name: list(hooks) for name, hooks in client.event_hooks.items()},
+        event_hooks=event_hooks,
         base_url=client.base_url,
         transport=transport,
         default_encoding=client._default_encoding,
@@ -2943,6 +3243,8 @@ def _install_fresh_ollama_transport_fields(
         client_kwargs["trust_env"] = False
         client_kwargs.pop("mounts", None)
         client_kwargs.pop("transport", None)
+        client_kwargs.pop("auth", None)
+        client_kwargs.pop("event_hooks", None)
         fields[name] = client_kwargs
     clients = (
         (
@@ -2956,10 +3258,32 @@ def _install_fresh_ollama_transport_fields(
             True,
         ),
     )
+    source_clients = tuple(
+        client
+        for _, client, asynchronous in clients
+        if isinstance(
+            client,
+            httpx.AsyncClient if asynchronous else httpx.Client,
+        )
+    )
+    forbidden_state_ids = _httpx_client_state_identity_ids(*source_clients)
+    claimed_state_ids: set[int] = set()
     for field_name, client, asynchronous in clients:
         expected_client_type = httpx.AsyncClient if asynchronous else httpx.Client
         if not isinstance(client, expected_client_type):
             continue
+        auth, event_hooks = _fresh_httpx_client_state(
+            client,
+            asynchronous=asynchronous,
+            owner=model,
+            metadata=metadata,
+            forbidden_state_ids=forbidden_state_ids,
+            claimed_state_ids=claimed_state_ids,
+        )
+        if auth is not None:
+            fields[field_name]["auth"] = auth
+        if any(event_hooks.values()):
+            fields[field_name]["event_hooks"] = event_hooks
         fields[field_name]["mounts"] = _fresh_httpx_mounts_after_fork(
             client,
             asynchronous=asynchronous,
@@ -2990,6 +3314,8 @@ def _provider_fields_after_fork(model: BaseChatModel) -> dict[str, Any]:
             client_kwargs["trust_env"] = False
             client_kwargs.pop("mounts", None)
             client_kwargs.pop("transport", None)
+            client_kwargs.pop("auth", None)
+            client_kwargs.pop("event_hooks", None)
             fields[name] = client_kwargs
         sync_client = getattr(getattr(model, "_client", None), "_client", None)
         async_client = getattr(
@@ -2997,7 +3323,26 @@ def _provider_fields_after_fork(model: BaseChatModel) -> dict[str, Any]:
             "_client",
             None,
         )
+        state_clients = tuple(
+            client
+            for client in (sync_client, async_client)
+            if isinstance(client, (httpx.Client, httpx.AsyncClient))
+        )
+        forbidden_state_ids = _httpx_client_state_identity_ids(*state_clients)
+        claimed_state_ids: set[int] = set()
         if isinstance(sync_client, httpx.Client):
+            sync_auth, sync_event_hooks = _fresh_httpx_client_state(
+                sync_client,
+                asynchronous=False,
+                owner=model,
+                metadata=metadata,
+                forbidden_state_ids=forbidden_state_ids,
+                claimed_state_ids=claimed_state_ids,
+            )
+            if sync_auth is not None:
+                fields["sync_client_kwargs"]["auth"] = sync_auth
+            if any(sync_event_hooks.values()):
+                fields["sync_client_kwargs"]["event_hooks"] = sync_event_hooks
             fields["sync_client_kwargs"]["mounts"] = (
                 _fresh_httpx_mounts_after_fork(
                     sync_client,
@@ -3014,6 +3359,18 @@ def _provider_fields_after_fork(model: BaseChatModel) -> dict[str, Any]:
             )
             fields["sync_client_kwargs"]["transport"] = sync_transport
         if isinstance(async_client, httpx.AsyncClient):
+            async_auth, async_event_hooks = _fresh_httpx_client_state(
+                async_client,
+                asynchronous=True,
+                owner=model,
+                metadata=metadata,
+                forbidden_state_ids=forbidden_state_ids,
+                claimed_state_ids=claimed_state_ids,
+            )
+            if async_auth is not None:
+                fields["async_client_kwargs"]["auth"] = async_auth
+            if any(async_event_hooks.values()):
+                fields["async_client_kwargs"]["event_hooks"] = async_event_hooks
             fields["async_client_kwargs"]["mounts"] = (
                 _fresh_httpx_mounts_after_fork(
                     async_client,
@@ -3051,6 +3408,13 @@ def _provider_fields_after_fork(model: BaseChatModel) -> dict[str, Any]:
             if isinstance(root_async_client, httpx.AsyncClient)
             else getattr(model, "http_async_client", None)
         )
+        state_clients = tuple(
+            client
+            for client in (sync_client, async_client)
+            if isinstance(client, (httpx.Client, httpx.AsyncClient))
+        )
+        forbidden_state_ids = _httpx_client_state_identity_ids(*state_clients)
+        claimed_state_ids: set[int] = set()
         fields.pop("http_client", None)
         fields.pop("http_async_client", None)
         if "http_client" in model_fields:
@@ -3060,6 +3424,8 @@ def _provider_fields_after_fork(model: BaseChatModel) -> dict[str, Any]:
                     policy,
                     owner=model,
                     metadata=metadata,
+                    forbidden_state_ids=forbidden_state_ids,
+                    claimed_state_ids=claimed_state_ids,
                 )
                 if isinstance(sync_client, httpx.Client)
                 else httpx.Client(
@@ -3074,6 +3440,8 @@ def _provider_fields_after_fork(model: BaseChatModel) -> dict[str, Any]:
                     policy,
                     owner=model,
                     metadata=metadata,
+                    forbidden_state_ids=forbidden_state_ids,
+                    claimed_state_ids=claimed_state_ids,
                 )
                 if isinstance(async_client, httpx.AsyncClient)
                 else httpx.AsyncClient(
@@ -3112,12 +3480,21 @@ def _install_fork_safe_anthropic_clients(
     source_async_client = source.__dict__.get("_async_client")
     source_http_client = getattr(source_client, "_client", None)
     source_http_async_client = getattr(source_async_client, "_client", None)
+    state_clients = tuple(
+        client
+        for client in (source_http_client, source_http_async_client)
+        if isinstance(client, (httpx.Client, httpx.AsyncClient))
+    )
+    forbidden_state_ids = _httpx_client_state_identity_ids(*state_clients)
+    claimed_state_ids: set[int] = set()
     http_client = (
         _fresh_httpx_client_after_fork(
             source_http_client,
             policy,
             owner=source,
             metadata=source._runtime_metadata,
+            forbidden_state_ids=forbidden_state_ids,
+            claimed_state_ids=claimed_state_ids,
         )
         if isinstance(source_http_client, httpx.Client)
         else httpx.Client(**http_client_params)
@@ -3128,6 +3505,8 @@ def _install_fork_safe_anthropic_clients(
             policy,
             owner=source,
             metadata=source._runtime_metadata,
+            forbidden_state_ids=forbidden_state_ids,
+            claimed_state_ids=claimed_state_ids,
         )
         if isinstance(source_http_async_client, httpx.AsyncClient)
         else httpx.AsyncClient(**http_client_params)
@@ -3152,17 +3531,26 @@ def _install_fork_safe_google_clients(
     target_api_client = target.client._api_client
     source_http_client = source_api_client._httpx_client
     source_http_async_client = source_api_client._async_httpx_client
+    forbidden_state_ids = _httpx_client_state_identity_ids(
+        source_http_client,
+        source_http_async_client,
+    )
+    claimed_state_ids: set[int] = set()
     target_api_client._httpx_client = _fresh_httpx_client_after_fork(
         source_http_client,
         policy,
         owner=source,
         metadata=source._runtime_metadata,
+        forbidden_state_ids=forbidden_state_ids,
+        claimed_state_ids=claimed_state_ids,
     )
     target_api_client._async_httpx_client = _fresh_httpx_async_client_after_fork(
         source_http_async_client,
         policy,
         owner=source,
         metadata=source._runtime_metadata,
+        forbidden_state_ids=forbidden_state_ids,
+        claimed_state_ids=claimed_state_ids,
     )
 
 
