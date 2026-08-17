@@ -313,7 +313,12 @@ def _needs_revision_verdict() -> VerificationVerdict:
                 }
             ]
         },
-        {"completion_report_baseline_modified_at": "report-v1"},
+        {
+            "completion_report_baseline_modified_at": "report-v1",
+            "completion_report_baseline_fingerprint": (
+                completion_guard.artifact_fingerprint(_report())
+            ),
+        },
         {
             "completion_verified_report_modified_at": "report-v1",
             "completion_verified_report_fingerprint": (
@@ -912,6 +917,83 @@ def test_same_timestamp_report_edit_blocks_streaming_and_eval(
     assert result is None or "_streamed_files" not in result
     assert result is None or "_eval_logged" not in result
     assert calls == 0
+
+
+@pytest.mark.parametrize("async_", [False, True])
+def test_same_timestamp_changed_report_is_verified_and_finalized(
+    monkeypatch: pytest.MonkeyPatch,
+    async_: bool,
+) -> None:
+    calls = 0
+
+    async def fake_verify_report(*, question: str, report: str) -> VerificationVerdict:
+        nonlocal calls
+        calls += 1
+        assert report == "Final report"
+        return VerificationVerdict(status="complete", sufficiency_score=1.0)
+
+    monkeypatch.setattr(agent_module, "ENABLE_VERIFICATION", True)
+    monkeypatch.setattr(agent_module, "ENABLE_EVAL_TRACKING", False)
+    monkeypatch.setattr(agent_module, "verify_report", fake_verify_report)
+    state = _streamable_state(report_modified_at="same-timestamp")
+    state["completion_report_baseline_modified_at"] = "same-timestamp"
+    state["completion_report_baseline_fingerprint"] = (
+        completion_guard.artifact_fingerprint(
+            _report("Prior report", modified_at="same-timestamp")
+        )
+    )
+
+    result = _run_after_model(
+        agent_module.ResearchStateMiddleware(), state, async_=async_
+    )
+
+    assert calls == 1
+    assert result is not None
+    current_fingerprint = completion_guard.artifact_fingerprint(
+        state["files"]["/final_report.md"]
+    )
+    assert result["completion_verified_report_modified_at"] == "same-timestamp"
+    assert result["completion_verified_report_fingerprint"] == current_fingerprint
+    assert "**Final Report:**\n\nFinal report" in _message_texts(result)
+
+
+@pytest.mark.parametrize("async_", [False, True])
+def test_same_timestamp_unchanged_report_is_rejected_and_continued(
+    monkeypatch: pytest.MonkeyPatch,
+    async_: bool,
+) -> None:
+    calls = 0
+
+    async def fake_verify_report(*, question: str, report: str) -> VerificationVerdict:
+        nonlocal calls
+        calls += 1
+        return VerificationVerdict(status="complete", sufficiency_score=1.0)
+
+    monkeypatch.setattr(agent_module, "ENABLE_VERIFICATION", True)
+    monkeypatch.setattr(agent_module, "ENABLE_EVAL_TRACKING", False)
+    monkeypatch.setattr(agent_module, "verify_report", fake_verify_report)
+    state = _streamable_state(report_modified_at="same-timestamp")
+    fingerprint = completion_guard.artifact_fingerprint(
+        state["files"]["/final_report.md"]
+    )
+    state["completion_report_baseline_modified_at"] = "same-timestamp"
+    state["completion_report_baseline_fingerprint"] = fingerprint
+
+    research_update = _run_after_model(
+        agent_module.ResearchStateMiddleware(), state, async_=async_
+    )
+    completion_update = _run_after_model(
+        completion_guard.CompletionGuardMiddleware(
+            config_getter=lambda: {"run_id": "run-v1"}
+        ),
+        {**state, **(research_update or {})},
+        async_=async_,
+    )
+
+    assert calls == 0
+    assert not _message_texts(research_update)
+    assert completion_update is not None
+    assert completion_update["jump_to"] == "model"
 
 
 @pytest.mark.parametrize("async_", [False, True])

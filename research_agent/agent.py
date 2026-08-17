@@ -193,11 +193,7 @@ def _owned_report_for_verification(
     if not isinstance(report, Mapping):
         return None
     modified_at = report.get("modified_at")
-    if (
-        not isinstance(modified_at, str)
-        or not modified_at
-        or modified_at == state.get("completion_report_baseline_modified_at")
-    ):
+    if not isinstance(modified_at, str) or not modified_at:
         return None
     try:
         report_text = file_data_to_string(report)  # type: ignore[arg-type]
@@ -207,6 +203,14 @@ def _owned_report_for_verification(
         return None
     fingerprint = artifact_fingerprint(report)
     if fingerprint is None:
+        return None
+    baseline_fingerprint = state.get("completion_report_baseline_fingerprint")
+    if isinstance(baseline_fingerprint, str):
+        if fingerprint == baseline_fingerprint:
+            return None
+    elif baseline_fingerprint is not None:
+        return None
+    elif modified_at == state.get("completion_report_baseline_modified_at"):
         return None
     owned_fingerprint = state.get("completion_report_owned_fingerprint")
     has_fingerprint_ownership = "completion_report_owned_fingerprint" in state
