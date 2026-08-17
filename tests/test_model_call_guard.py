@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import time
 from dataclasses import FrozenInstanceError
 from functools import wraps
@@ -198,6 +199,110 @@ async def test_default_policy_never_calls_ollama_unload():
             pending, policy=_policy(unload=False), metadata=_ollama_metadata(), unload=unload
         )
     assert unload_calls == 0
+
+
+@_async_test
+async def test_timeout_unload_lifecycle_is_bounded_including_client_close(monkeypatch):
+    import research_agent.model_call_guard as guard
+
+    monkeypatch.setattr(guard, "OLLAMA_UNLOAD_TIMEOUT_SECONDS", 0.03)
+    close_started = asyncio.Event()
+    release_close = asyncio.Event()
+
+    class HangingCloseClient:
+        async def __aenter__(self):
+            return self
+
+        async def post(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+        async def __aexit__(self, *_args: object) -> None:
+            close_started.set()
+            await release_close.wait()
+
+    monkeypatch.setattr(httpx, "AsyncClient", HangingCloseClient)
+
+    async def pending() -> None:
+        await asyncio.Event().wait()
+
+    caller = asyncio.create_task(
+        _run_with_deadline(
+            pending, policy=_policy(unload=True), metadata=_ollama_metadata(), unload=None
+        )
+    )
+    try:
+        await close_started.wait()
+        done, _ = await asyncio.wait({caller}, timeout=0.03 + 0.03 + 0.08)
+        assert done
+        with pytest.raises(ModelCallTimeoutError):
+            await caller
+    finally:
+        release_close.set()
+        if not caller.done():
+            with pytest.raises(ModelCallTimeoutError):
+                await caller
+
+
+@_async_test
+async def test_external_cancellation_during_timeout_unload_attempts_once(monkeypatch):
+    import research_agent.model_call_guard as guard
+
+    monkeypatch.setattr(guard, "MODEL_CANCEL_GRACE_SECONDS", 0.03)
+    monkeypatch.setattr(guard, "OLLAMA_UNLOAD_TIMEOUT_SECONDS", 0.03)
+    unload_started = asyncio.Event()
+    release_unload = asyncio.Event()
+    unload_calls = 0
+
+    async def unload() -> None:
+        nonlocal unload_calls
+        unload_calls += 1
+        unload_started.set()
+        await release_unload.wait()
+
+    async def pending() -> None:
+        await asyncio.Event().wait()
+
+    caller = asyncio.create_task(
+        _run_with_deadline(
+            pending, policy=_policy(0.02, unload=True), metadata=_ollama_metadata(), unload=unload
+        )
+    )
+    try:
+        await unload_started.wait()
+        cancelled_at = time.monotonic()
+        caller.cancel("caller")
+        with pytest.raises(asyncio.CancelledError) as raised:
+            await caller
+        assert raised.value.args == ("caller",)
+        assert unload_calls == 1
+        assert time.monotonic() - cancelled_at < 0.03 + 0.03 + 0.08
+    finally:
+        release_unload.set()
+        await asyncio.sleep(0)
+
+
+@_async_test
+async def test_unload_failure_log_excludes_integration_exception(caplog):
+    secret = "integration-secret-that-must-not-log"
+    caplog.set_level(logging.WARNING, logger="research_agent.model_call_guard")
+
+    async def unload() -> None:
+        raise RuntimeError(secret)
+
+    async def pending() -> None:
+        await asyncio.Event().wait()
+
+    with pytest.raises(ModelCallTimeoutError):
+        await _run_with_deadline(
+            pending, policy=_policy(unload=True), metadata=_ollama_metadata(), unload=unload
+        )
+
+    assert secret not in caplog.text
+    assert any(
+        record.message == "Ollama unload provider=ollama action=unload status=failed"
+        and record.exc_info is None
+        for record in caplog.records
+    )
 
 
 @_async_test

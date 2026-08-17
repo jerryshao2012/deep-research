@@ -183,6 +183,21 @@ def _has_valid_ollama_model_name(metadata: ModelRuntimeMetadata) -> bool:
     return isinstance(metadata.model_name, str) and bool(metadata.model_name.strip())
 
 
+def _log_ollama_unload(status: str) -> None:
+    """Log fixed, non-secret metadata for best-effort Ollama unloads."""
+    _LOGGER.warning("Ollama unload provider=ollama action=unload status=%s", status)
+
+
+async def _unload_ollama_with_client(
+    endpoint: str,
+    payload: dict[str, object],
+    client_factory: Callable[[], Any],
+) -> None:
+    """Post an unload request and close its client as one bounded operation."""
+    async with client_factory() as client:
+        await client.post(endpoint, json=payload)
+
+
 async def _maybe_unload_ollama(
     *,
     metadata: ModelRuntimeMetadata,
@@ -195,7 +210,7 @@ async def _maybe_unload_ollama(
 
     endpoint = _ollama_generate_url(metadata.base_url)
     if endpoint is None or not _has_valid_ollama_model_name(metadata):
-        _LOGGER.warning("Skipping Ollama unload because runtime metadata is incomplete")
+        _log_ollama_unload("skipped")
         return
     model_name = metadata.model_name.strip()
 
@@ -207,12 +222,13 @@ async def _maybe_unload_ollama(
 
         import httpx
 
-        async with httpx.AsyncClient() as client:
-            await _bounded_shielded_unload(client.post(endpoint, json=payload))
+        await _bounded_shielded_unload(
+            _unload_ollama_with_client(endpoint, payload, httpx.AsyncClient)
+        )
     except asyncio.CancelledError:
         raise
     except Exception:
-        _LOGGER.warning("Ollama unload failed after cancelled model call", exc_info=True)
+        _log_ollama_unload("failed")
 
 
 async def _bounded_shielded_unload(operation: Awaitable[Any]) -> None:
@@ -227,13 +243,13 @@ async def _bounded_shielded_unload(operation: Awaitable[Any]) -> None:
             task.add_done_callback(_consume_task_exception)
         if current_task is not None and current_task.cancelling() > parent_cancellation_count:
             raise
-        _LOGGER.warning("Ollama unload cancelled after cancelled model call")
+        _log_ollama_unload("cancelled")
     except Exception:
         if task.done():
             _consume_task_exception(task)
         else:
             task.add_done_callback(_consume_task_exception)
-        _LOGGER.warning("Ollama unload failed after cancelled model call", exc_info=True)
+        _log_ollama_unload("failed")
 
 
 async def _run_optional_unload(
@@ -260,13 +276,13 @@ async def _run_optional_unload(
         except asyncio.CancelledError:
             if current_task is not None and current_task.cancelling() > parent_cancellation_count:
                 raise
-            _LOGGER.warning("Ollama unload cancelled after cancelled model call")
+            _log_ollama_unload("cancelled")
             return
         await _bounded_shielded_unload(operation)
     except asyncio.CancelledError:
         raise
     except Exception:
-        _LOGGER.warning("Ollama unload failed after cancelled model call", exc_info=True)
+        _log_ollama_unload("failed")
 
 
 async def _run_with_deadline[Result](
@@ -278,6 +294,16 @@ async def _run_with_deadline[Result](
 ) -> Result:
     """Run a model request under a total deadline and bounded cancellation cleanup."""
     task = asyncio.create_task(factory())
+    unload_attempted = False
+
+    async def attempt_unload() -> None:
+        """Run at most one best-effort unload for this model call."""
+        nonlocal unload_attempted
+        if unload_attempted:
+            return
+        unload_attempted = True
+        await _run_optional_unload(metadata=metadata, policy=policy, unload=unload)
+
     try:
         done, _ = await asyncio.wait({task}, timeout=policy.timeout_seconds)
         if done:
@@ -285,7 +311,7 @@ async def _run_with_deadline[Result](
 
         task.cancel()
         await _bounded_task_cleanup(task)
-        await _run_optional_unload(metadata=metadata, policy=policy, unload=unload)
+        await attempt_unload()
         raise ModelCallTimeoutError(
             provider=metadata.provider,
             timeout_seconds=policy.timeout_seconds,
@@ -296,9 +322,9 @@ async def _run_with_deadline[Result](
             task.cancel()
         try:
             await _bounded_task_cleanup(task)
-            await _run_optional_unload(metadata=metadata, policy=policy, unload=unload)
+            await attempt_unload()
         except asyncio.CancelledError:
             raise
         except Exception:
-            _LOGGER.warning("Cancellation cleanup failed", exc_info=True)
+            _LOGGER.warning("Model cancellation cleanup failed")
         raise original_cancel
