@@ -455,7 +455,6 @@ def main():
     result = {}
     start_time = time.time()
     last_time = start_time
-    stream_fallback_used = False
 
     # Determine output folder for output
     output_folder = configure_output_folder(args.doc_folder)
@@ -494,7 +493,6 @@ def main():
 
                 # Inspect the latest state change
                 msgs = state.get("messages", [])
-                files = state.get("files", {})
                 next_spinner_msg = "Agent is working..."
 
                 if msgs:
@@ -548,7 +546,6 @@ def main():
         except Exception as e:
             spinner.stop()
             total_time = time.time() - start_time
-            stream_fallback_used = True
             role, name, preview = _last_stream_message_diagnostics(last_stream_state)
             diagnostic_tool_name = name or last_tool_name or "unknown"
 

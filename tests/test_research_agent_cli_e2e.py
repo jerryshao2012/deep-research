@@ -4,13 +4,25 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import threading
+import time
 from pathlib import Path
+from typing import Any
 
 import pytest
+from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
+from pydantic import PrivateAttr
 
 from research_agent import cli as research_agent_cli
-from research_agent.model_call_guard import ModelCallTimeoutError
+from research_agent.model_call_guard import (
+    ModelCallPolicy,
+    ModelCallTimeoutError,
+    ModelRuntimeMetadata,
+    cancel_model_call_scope,
+    guard_model,
+)
 
 
 class FakeAgent:
@@ -29,6 +41,43 @@ class FakeAgent:
         self.stream_calls += 1
         self.last_config = config
         yield from self.stream_states
+
+
+class _BlockingGuardedChatModel(BaseChatModel):
+    """Provider fake exposing real guarded bridge cancellation to CLI tests."""
+
+    _started: threading.Event = PrivateAttr(default_factory=threading.Event)
+    _cancelled: threading.Event = PrivateAttr(default_factory=threading.Event)
+    _release: threading.Event = PrivateAttr(default_factory=threading.Event)
+
+    @property
+    def _llm_type(self) -> str:
+        return "blocking-cli-test-model"
+
+    def _generate(self, *args: Any, **kwargs: Any) -> ChatResult:
+        raise AssertionError("guard must use async provider path")
+
+    async def _agenerate(self, *args: Any, **kwargs: Any) -> ChatResult:
+        self._started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self._cancelled.set()
+            raise
+        return ChatResult(generations=[ChatGeneration(message=AIMessage(content="ok"))])
+
+
+def _guarded_blocking_model(timeout_seconds: float = 0.5):
+    provider = _BlockingGuardedChatModel()
+    guarded = guard_model(
+        provider,
+        metadata=ModelRuntimeMetadata(provider="openai", model_name="cli-test"),
+        policy=ModelCallPolicy(
+            timeout_seconds=timeout_seconds,
+            force_ollama_unload=False,
+        ),
+    )
+    return provider, guarded
 
 
 def _run_cli(monkeypatch, tmp_path: Path, argv: list[str], fake_agent: FakeAgent, title: str) -> Path:
@@ -317,17 +366,19 @@ def _configure_timeout_cli(
     fake_agent: FakeAgent,
     *,
     argv: list[str],
+    cancel_real_bridges: bool = False,
 ) -> list[str]:
     cancelled_scopes: list[str] = []
     _RecordingSpinner.instances = []
     monkeypatch.setattr(research_agent_cli, "agent", fake_agent)
     monkeypatch.setenv("REPORTS_OUTPUT_FOLDER", str(tmp_path))
     monkeypatch.setattr(research_agent_cli, "Spinner", _RecordingSpinner)
-    monkeypatch.setattr(
-        research_agent_cli,
-        "cancel_model_call_scope",
-        cancelled_scopes.append,
-    )
+    def record_cancel(scope_id: str) -> None:
+        cancelled_scopes.append(scope_id)
+        if cancel_real_bridges:
+            cancel_model_call_scope(scope_id)
+
+    monkeypatch.setattr(research_agent_cli, "cancel_model_call_scope", record_cancel)
     monkeypatch.setattr(research_agent_cli, "show_prompt", lambda *args, **kwargs: None)
     monkeypatch.setattr(research_agent_cli, "format_messages", lambda *args, **kwargs: None)
     monkeypatch.setattr(sys, "argv", ["research_agent/cli.py", *argv])
@@ -454,3 +505,136 @@ def test_title_timeout_receives_exact_scope_cancels_and_never_falls_back(
     assert raised.value is error
     assert seen_configs == [config]
     assert cancelled_scopes == ["scope-1"]
+
+
+@pytest.mark.parametrize(
+    ("mode", "argv"),
+    [
+        ("verbose", ["topic", "--verbose", "True"]),
+        ("fallback", ["topic", "--verbose", "True"]),
+        ("nonverbose", ["topic", "--verbose", "False"]),
+    ],
+)
+def test_cli_guarded_timeout_cancels_real_bridge_without_continuation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mode: str,
+    argv: list[str],
+) -> None:
+    _provider, guarded = _guarded_blocking_model()
+
+    class GuardedAgent(FakeAgent):
+        def invoke(self, messages, config=None):  # noqa: ANN001
+            self.invoke_calls += 1
+            self.last_config = config
+            return guarded.invoke(messages["messages"], config=config)
+
+        def stream(self, messages, config=None, stream_mode="values"):  # noqa: ANN001
+            self.stream_calls += 1
+            self.last_config = config
+            if mode == "fallback":
+                raise RuntimeError("stream unsupported")
+            guarded.invoke(messages["messages"], config=config)
+            yield {}
+
+    fake_agent = GuardedAgent()
+    cancelled_scopes = _configure_timeout_cli(
+        monkeypatch,
+        tmp_path,
+        fake_agent,
+        argv=argv,
+        cancel_real_bridges=True,
+    )
+
+    with pytest.raises(ModelCallTimeoutError):
+        research_agent_cli.main()
+
+    assert guarded._started.wait(timeout=0.5)
+    assert guarded._cancelled.wait(timeout=0.5)
+    assert fake_agent.invoke_calls == (1 if mode != "verbose" else 0)
+    assert fake_agent.stream_calls == (1 if mode != "nonverbose" else 0)
+    assert len(cancelled_scopes) == 1
+    scope_id = fake_agent.last_config["configurable"]["model_call_scope_id"]
+    assert cancelled_scopes == [scope_id]
+    assert guarded._bridge_registry.active_count(scope_id) == 0
+    assert all(spinner.stops >= 1 for spinner in _RecordingSpinner.instances)
+
+
+def test_cli_keyboard_interrupt_cancels_two_real_bridges_in_same_scope(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _provider, guarded = _guarded_blocking_model(timeout_seconds=2.0)
+    caller_errors: list[BaseException] = []
+
+    class InterruptingAgent(FakeAgent):
+        def stream(self, messages, config=None, stream_mode="values"):  # noqa: ANN001
+            self.stream_calls += 1
+            self.last_config = config
+            scope_id = config["configurable"]["model_call_scope_id"]
+
+            def invoke_guarded() -> None:
+                try:
+                    guarded.invoke("research", config=config)
+                except BaseException as exc:
+                    caller_errors.append(exc)
+
+            callers = [threading.Thread(target=invoke_guarded) for _ in range(2)]
+            self.callers = callers
+            for caller in callers:
+                caller.start()
+            deadline = time.monotonic() + 0.5
+            while guarded._bridge_registry.active_count(scope_id) != 2:
+                assert time.monotonic() < deadline
+                time.sleep(0.005)
+            assert guarded._started.wait(timeout=0.5)
+            raise KeyboardInterrupt
+            yield {}
+
+    fake_agent = InterruptingAgent()
+    cancelled_scopes = _configure_timeout_cli(
+        monkeypatch,
+        tmp_path,
+        fake_agent,
+        argv=["topic", "--verbose", "True"],
+        cancel_real_bridges=True,
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        research_agent_cli.main()
+
+    scope_id = fake_agent.last_config["configurable"]["model_call_scope_id"]
+    deadline = time.monotonic() + 0.5
+    while guarded._bridge_registry.active_count(scope_id):
+        assert time.monotonic() < deadline
+        time.sleep(0.005)
+    assert guarded._cancelled.wait(timeout=0.5)
+    assert cancelled_scopes == [scope_id]
+    for caller in fake_agent.callers:
+        caller.join(timeout=0.5)
+    assert all(not caller.is_alive() for caller in fake_agent.callers)
+    assert len(caller_errors) == 2
+    assert all(isinstance(error, asyncio.CancelledError) for error in caller_errors)
+    assert all(spinner.stops >= 1 for spinner in _RecordingSpinner.instances)
+
+
+def test_title_guarded_timeout_preserves_scope_and_never_uses_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _provider, guarded = _guarded_blocking_model()
+    seen_configs: list[dict] = []
+    config = {"configurable": {"thread_id": "thread-1", "model_call_scope_id": "scope-1"}}
+
+    class GuardedTitleModel:
+        def invoke(self, messages, config=None):  # noqa: ANN001
+            seen_configs.append(config)
+            return guarded.invoke(messages, config=config)
+
+    monkeypatch.setattr(research_agent_cli, "model", GuardedTitleModel())
+
+    with pytest.raises(ModelCallTimeoutError):
+        research_agent_cli.generate_research_title("content", config=config)
+
+    assert seen_configs == [config]
+    assert guarded._started.wait(timeout=0.5)
+    assert guarded._cancelled.wait(timeout=0.5)
+    assert guarded._bridge_registry.active_count("scope-1") == 0

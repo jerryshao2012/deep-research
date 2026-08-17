@@ -7,7 +7,6 @@ skills mapping.
 
 import asyncio
 import concurrent.futures
-import contextvars
 import hashlib
 import os
 import re
@@ -435,42 +434,45 @@ def _run_async_from_sync(
             asyncio.set_event_loop(None)
             loop.close()
 
-    caller_context = contextvars.copy_context()
     worker = threading.Thread(
-        target=lambda: caller_context.run(run_in_thread),
+        target=run_in_thread,
         name="research-eval-logger",
         daemon=True,
     )
     worker.start()
+
+    def cancel_worker(*, join_timeout: float) -> None:
+        """Cancel the coroutine before its worker can start provider work."""
+        cancellation_requested.set()
+        with control_lock:
+            loop = control.get("loop")
+            task = control.get("task")
+        if isinstance(loop, asyncio.AbstractEventLoop) and isinstance(
+            task, asyncio.Task
+        ):
+            try:
+                loop.call_soon_threadsafe(task.cancel)
+            except RuntimeError:
+                pass
+        worker.join(timeout=join_timeout)
+
     if timeout_seconds is None:
-        ready.wait()
-        return result.result()
+        try:
+            ready.wait()
+            return result.result()
+        except BaseException:
+            cancel_worker(join_timeout=0.05)
+            raise
 
     deadline = time.monotonic() + max(timeout_seconds, 0.0)
-    ready.wait(timeout=max(deadline - time.monotonic(), 0.0))
     try:
+        ready.wait(timeout=max(deadline - time.monotonic(), 0.0))
         return result.result(timeout=max(deadline - time.monotonic(), 0.0))
     except concurrent.futures.TimeoutError:
-        cancellation_requested.set()
-        with control_lock:
-            loop = control.get("loop")
-            task = control.get("task")
-        if isinstance(loop, asyncio.AbstractEventLoop) and isinstance(
-            task, asyncio.Task
-        ):
-            loop.call_soon_threadsafe(task.cancel)
-        worker.join(timeout=min(max(timeout_seconds, 0.0), 0.05))
+        cancel_worker(join_timeout=min(max(timeout_seconds, 0.0), 0.05))
         return _SYNC_AWAIT_TIMEOUT
-    except (asyncio.CancelledError, KeyboardInterrupt):
-        cancellation_requested.set()
-        with control_lock:
-            loop = control.get("loop")
-            task = control.get("task")
-        if isinstance(loop, asyncio.AbstractEventLoop) and isinstance(
-            task, asyncio.Task
-        ):
-            loop.call_soon_threadsafe(task.cancel)
-        worker.join(timeout=0.05)
+    except BaseException:
+        cancel_worker(join_timeout=0.05)
         raise
 
 

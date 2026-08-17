@@ -244,6 +244,29 @@ class TestCheckReportSufficiency:
         with pytest.raises(type(error)):
             asyncio.run(_check_report_sufficiency("What is X?", "X is explained."))
 
+    @pytest.mark.parametrize(
+        "response",
+        [RuntimeError("provider unavailable"), AIMessage(content="not json")],
+    )
+    def test_ordinary_failures_return_neutral_result(
+        self, monkeypatch: pytest.MonkeyPatch, response: RuntimeError | AIMessage
+    ) -> None:
+        class FailingJudge:
+            async def ainvoke(self, messages: list[HumanMessage]) -> AIMessage:
+                if isinstance(response, BaseException):
+                    raise response
+                return response
+
+        monkeypatch.setattr(
+            verification_module, "get_configured_model", lambda: FailingJudge()
+        )
+
+        score, reason = asyncio.run(
+            _check_report_sufficiency("What is X?", "X is explained.")
+        )
+        assert score == 0.5
+        assert "error" in reason.lower()
+
 
 # ---------------------------------------------------------------------------
 # _adversarial_gap_analysis  (model boundary replaced with deterministic fake)
@@ -276,8 +299,13 @@ class TestAdversarialGapAnalysis:
         assert len(gaps) >= 1
         assert any("empty" in g.lower() for g in gaps)
 
-    def test_control_errors_propagate(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        error = ModelCallTimeoutError("ollama", 1.0, False)
+    @pytest.mark.parametrize("error", [
+        ModelCallTimeoutError("ollama", 1.0, False),
+        asyncio.CancelledError(),
+    ])
+    def test_control_errors_propagate(
+        self, monkeypatch: pytest.MonkeyPatch, error: BaseException
+    ) -> None:
 
         class FailingJudge:
             async def ainvoke(self, messages: list[HumanMessage]) -> AIMessage:
@@ -287,9 +315,22 @@ class TestAdversarialGapAnalysis:
             verification_module, "get_configured_model", lambda: FailingJudge()
         )
 
-        with pytest.raises(ModelCallTimeoutError) as raised:
+        with pytest.raises(type(error)) as raised:
             asyncio.run(_adversarial_gap_analysis("What is X?", "X is explained."))
         assert raised.value is error
+
+    def test_provider_error_returns_empty_gaps(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        class FailingJudge:
+            async def ainvoke(self, messages: list[HumanMessage]) -> AIMessage:
+                raise RuntimeError("provider unavailable")
+
+        monkeypatch.setattr(
+            verification_module, "get_configured_model", lambda: FailingJudge()
+        )
+
+        assert asyncio.run(
+            _adversarial_gap_analysis("What is X?", "X is explained.")
+        ) == []
 
 
 # ---------------------------------------------------------------------------
@@ -377,6 +418,39 @@ def _needs_revision_verdict() -> VerificationVerdict:
         sufficiency_score=0.5,
         sufficiency_reason="Add missing evidence.",
     )
+
+
+def test_sync_verifier_bridge_interrupt_cancels_before_coroutine_can_register(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coroutine_started = threading.Event()
+    coroutine_cancelled = threading.Event()
+
+    async def verifier() -> None:
+        coroutine_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            coroutine_cancelled.set()
+
+    def interrupted_result(self, timeout: float | None = None):
+        assert coroutine_started.wait(timeout=1.0)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        agent_module.concurrent.futures.Future,
+        "result",
+        interrupted_result,
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        agent_module._run_async_from_sync(
+            lambda: verifier(),
+            timeout_seconds=None,
+            propagate_cancel=True,
+        )
+
+    assert coroutine_cancelled.wait(timeout=1.0)
 
 
 @pytest.mark.parametrize("async_", [False, True])
