@@ -4,7 +4,7 @@
 
 **Goal:** Bound every application-owned model call by a total wall-clock deadline, cancel active requests, and optionally unload an Ollama model without affecting cloud providers.
 
-**Architecture:** Add a focused `BaseChatModel`-compatible guard module that owns timeout parsing, immutable provider metadata, async cancellation, sync-to-async bridging, bound-runnable streaming preservation, override adaptation, and Ollama unload. Model factory returns guarded models after existing retry/rate shaping; request-boundary middleware is installed in root, explicit research, and explicit general-purpose subagents. Verification judges become truly async and CLI sync entrypoints use the guarded bridge.
+**Architecture:** Add a focused guard module that owns timeout parsing, immutable provider metadata, async cancellation, run-scoped sync-to-async bridge registration, bound-runnable streaming preservation, provider-identity-preserving override adaptation, and Ollama unload. Provider-specific guarded subclasses remain genuine `ChatOllama`/`ChatOpenAI`/`AzureChatOpenAI`/`ChatAnthropic`/`ChatGoogleGenerativeAI` instances, so LangChain strategy, multimodal-file, and Anthropic cache middleware keep working. Request-boundary middleware is installed in root, explicit research, and explicit general-purpose subagents. Verification judges become truly async and CLI sync entrypoints use the guarded bridge.
 
 **Tech Stack:** Python 3.12+, asyncio, threading, httpx, LangChain Runnable/BaseChatModel APIs, LangGraph middleware, pytest/pytest-asyncio.
 
@@ -12,7 +12,7 @@
 
 ## File map
 
-- Create `research_agent/model_call_guard.py` — timeout configuration, runtime metadata, `BaseChatModel` proxy, guarded bound runnable, sync bridge, override registry, unload helper, and safe errors.
+- Create `research_agent/model_call_guard.py` — timeout configuration, runtime metadata, provider-preserving guard mixin/subclasses, guarded bound runnable, run-scoped sync bridge registry, override registry, unload helper, and safe errors.
 - Modify `research_agent/model_factory.py:272-384` — construct provider metadata/native HTTP deadlines and guard the selected model after retry wrapping.
 - Modify `research_agent/agent.py:54,693-1066,1361-1433` — propagate control errors and register request-boundary guards for root/explicit/general-purpose agents.
 - Modify `research_agent/research_subagent/utils/verification.py:117-235` — propagate timeout/cancellation from direct sufficiency and adversarial judge calls.
@@ -179,18 +179,23 @@ git add research_agent/model_call_guard.py tests/test_model_call_guard.py
 git commit -m "feat: cancel timed out model requests"
 ```
 
-### Task 3: BaseChatModel proxy, tool binding, streaming, and sync bridge
+### Task 3: Provider-preserving model guards, tool binding, streaming, and sync bridge registry
 
 **Files:**
 - Modify: `research_agent/model_call_guard.py`
 - Modify: `tests/test_model_call_guard.py`
 
-- [ ] **Step 1: Add RED tests for runnable parity**
+- [ ] **Step 1: Add RED tests for provider identity and runnable parity**
 
 Cover `invoke`, `ainvoke`, `stream`, `astream`, `bind`, and `bind_tools`. A fake runnable emits `AIMessageChunk` tool-call chunks and usage metadata. Assert:
 
 ```python
 assert isinstance(guarded, BaseChatModel)
+assert isinstance(guarded_ollama, ChatOllama)
+assert isinstance(guarded_openai, ChatOpenAI)
+assert isinstance(guarded_azure, AzureChatOpenAI)
+assert isinstance(guarded_anthropic, ChatAnthropic)
+assert isinstance(guarded_google, ChatGoogleGenerativeAI)
 bound = guarded.bind_tools([fake_tool])
 assert is_guarded_model(bound)
 assert bound.runtime_metadata == guarded.runtime_metadata
@@ -200,51 +205,60 @@ assert await collect(bound.astream(...)) == expected_chunks
 
 Callbacks, tags, configurable values, response metadata, message IDs, tool-call chunks, and usage metadata must be byte/equality-identical.
 
-- [ ] **Step 2: Add RED slow-trickle sync tests**
+Add integration contracts proving provider identity still drives LangChain's provider strategy, OpenAI/Google multimodal-file handling is unchanged, and Anthropic prompt-caching middleware still recognizes/configures the guarded model. These tests must fail if guarding replaces a provider instance with a generic `BaseChatModel` proxy.
+
+- [ ] **Step 2: Add RED slow-trickle and lazy-consumption tests**
 
 Run an async stream in which each chunk arrives faster than the native inactivity timeout but total duration exceeds the guard deadline. Assert sync `stream()`/`invoke()` raises `ModelCallTimeoutError`, local server sees disconnect, elapsed time is bounded, and the named bridge daemon exits for supported fakes.
 
-- [ ] **Step 3: Implement `GuardedChatModel`, bound-runnable guard, and sync bridge**
+Call public `stream()` and `astream()`, delay before consuming their returned iterators, then consume. Assert deadline starts when public method is called, not when iteration begins. Cover both a delayed first pull and slow trickle. Testing only `_stream`/`_astream` is insufficient because Python generator bodies start lazily.
+
+- [ ] **Step 3: Implement provider-identity-preserving guarded subclasses**
+
+Use a `ModelCallGuardMixin` before each concrete provider in the MRO. Construct and cache concrete classes such as `type("GuardedChatOllama", (ModelCallGuardMixin, ChatOllama), {})`, then instantiate them from the exact winning provider kwargs in `model_factory.py`. Store policy, runtime metadata, and bridge registry in Pydantic `PrivateAttr`s; do not declare a replacement `profile` property or wrap provider models in a generic Pydantic field. Inherited provider fields and `isinstance` identity must remain intact.
 
 Required public surface:
 
 ```python
-class GuardedChatModel(BaseChatModel):
-    inner: BaseChatModel
-    runtime_metadata: ModelRuntimeMetadata
-    policy: ModelCallPolicy
-    @property
-    def _llm_type(self) -> str: return f"guarded-{self.inner._llm_type}"
-    @property
-    def profile(self): return self.inner.profile
+class ModelCallGuardMixin:
     async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs): ...
     def _generate(self, messages, stop=None, run_manager=None, **kwargs): ...
     async def _astream(self, messages, stop=None, run_manager=None, **kwargs): ...
     def _stream(self, messages, stop=None, run_manager=None, **kwargs): ...
-    def bind(self, **kwargs): return GuardedBoundRunnable(self.inner.bind(**kwargs), ...)
-    def bind_tools(self, tools, **kwargs): return GuardedBoundRunnable(self.inner.bind_tools(tools, **kwargs), ...)
+    def stream(self, input, config=None, **kwargs): ...
+    def astream(self, input, config=None, **kwargs): ...
+    def bind(self, **kwargs): return GuardedBoundRunnable(super().bind(**kwargs), ...)
+    def bind_tools(self, tools, **kwargs): return GuardedBoundRunnable(super().bind_tools(tools, **kwargs), ...)
 
 class GuardedBoundRunnable(Runnable):
     def invoke(self, input, config=None, **kwargs): ...
     async def ainvoke(self, input, config=None, **kwargs): ...
     def stream(self, input, config=None, **kwargs): ...
-    async def astream(self, input, config=None, **kwargs): ...
+    def astream(self, input, config=None, **kwargs): ...
     def bind(self, **kwargs): ...
 ```
 
-`GuardedChatModel` must remain a real `BaseChatModel` so DeepAgents `resolve_model()` accepts it. Delegate identifying params, profile, name, callbacks/cache configuration, and model metadata required by LangChain. `bind_tools()` may return `GuardedBoundRunnable` only after model resolution.
+Public `stream()` and `astream()` must be regular methods that capture `time.monotonic() + timeout` immediately and return a nested iterator/async iterator; those nested iterators pass the captured absolute deadline through `_stream`/`_astream`. `bind_tools()` may return `GuardedBoundRunnable` only after DeepAgents/LangChain model resolution has seen the provider-identifiable model. Bound runnable public streaming uses the same eager deadline capture.
 
-The sync bridge must copy `contextvars.copy_context()`, create one daemon thread/event loop, expose loop/task handles through a thread-safe control object, cancel on timeout/`KeyboardInterrupt`/generator close, join only for cleanup grace, consume late exceptions, and never create a `ThreadPoolExecutor`. Capture a stream deadline before returning the iterator, not at first iteration; test delayed first consumption.
+The sync bridge must copy `contextvars.copy_context()`, create one daemon thread/event loop, expose loop/task handles through a thread-safe control object, cancel on timeout/`KeyboardInterrupt`/generator close, join only for cleanup grace, consume late exceptions, and never create a `ThreadPoolExecutor`.
 
-- [ ] **Step 4: Add RED override-adapter tests**
+- [ ] **Step 4: Add a run/context-scoped bridge registry**
+
+Implement a thread-safe `BridgeRegistry` keyed by `model_call_scope_id`. Every sync bridge registers before starting and unregisters in `finally`. `cancel_model_call_scope(scope_id)` snapshots and cancels every active bridge in that scope, then applies bounded joins independently; it is not a singleton/current-thread pointer.
+
+The CLI creates one UUID scope per top-level invocation and puts it in `RunnableConfig.configurable.model_call_scope_id`. LangGraph subagents inherit configurable context, so parallel root, research, and general-purpose bridges join the same scope. Direct callers without a scope get a private generated scope that remains cancellable through the returned control handle.
+
+Add a RED test with two concurrently blocked sync calls in one scope. One cancellation must disconnect both, leave no registered controls, and return within one cleanup-grace bound rather than serially waiting a full timeout for each.
+
+- [ ] **Step 5: Add RED override-adapter tests**
 
 Test already guarded passthrough; known ChatOllama/OpenAI/Azure/Anthropic/Google class metadata extraction; custom `ModelRuntimeDescriptor` protocol; unknown raw override rejection; mixed-provider environment does not affect concrete override metadata; unknown override never unloads.
 
-- [ ] **Step 5: Implement idempotent adapter registry and middleware**
+- [ ] **Step 6: Implement idempotent adapter registry and middleware**
 
 ```python
-def guard_model(model: BaseChatModel, *, metadata=None, policy=None) -> GuardedChatModel: ...
-def adapt_model_override(model) -> GuardedChatModel: ...
+def guard_model(model: BaseChatModel, *, metadata=None, policy=None) -> BaseChatModel: ...
+def adapt_model_override(model) -> BaseChatModel: ...
 
 class ModelCallGuardMiddleware(AgentMiddleware):
     def wrap_model_call(self, request, handler):
@@ -252,15 +266,15 @@ class ModelCallGuardMiddleware(AgentMiddleware):
     async def awrap_model_call(self, request, handler): ...
 ```
 
-Known raw providers must be rebuilt with native timeout when required; unknown raw providers raise `UnsupportedModelOverrideError` before invocation.
+Known raw providers must be rebuilt as the corresponding provider-preserving guarded subclass with copied validated constructor fields plus explicit native timeout/client kwargs. Already guarded instances pass through unchanged. Unknown raw providers raise `UnsupportedModelOverrideError` before invocation. Test model profile equality and provider-specific fields after rebuild; prohibit `__class__` mutation and generic proxy fallback.
 
-- [ ] **Step 6: Run complete guard suite and confirm GREEN**
+- [ ] **Step 7: Run complete guard suite and confirm GREEN**
 
 Run: `uv run pytest tests/test_model_call_guard.py -q`
 
 Expected: pass; no task/thread leak warnings.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
 git add research_agent/model_call_guard.py tests/test_model_call_guard.py
@@ -276,9 +290,11 @@ git commit -m "feat: preserve guarded model runnable behavior"
 - Create: `tests/test_model_factory_timeout.py`
 - Modify: `tests/test_agent_contracts.py`
 
-- [ ] **Step 1: Write RED provider-factory tests**
+- [ ] **Step 1: Write RED provider-factory and skill-factory tests**
 
 Patch constructors, set mixed provider environments, and assert the first selected provider supplies exact `ModelRuntimeMetadata`, native HTTP timeout, async client where supported, and outer guard. Cover AWS Bedrock-compatible OpenAI, legacy/new Azure, Google, Anthropic, and Ollama.
+
+Add a focused RED contract that imports `.deepagents/skills/golden-dataset/scripts/skill_model_factory.py`, patches `research_agent.model_factory.get_configured_model`, and proves the skill calls `get_configured_model(bypass_cache=True)` rather than any provider constructor. Assert returned guarded model identity is preserved.
 
 - [ ] **Step 2: Run provider tests and confirm RED**
 
@@ -288,13 +304,20 @@ Expected: failures because factory returns raw/retry-mutated models without meta
 
 - [ ] **Step 3: Guard each selected model after existing retry/rate shaping**
 
-Refactor repeated returns to:
+Refactor repeated provider branches to retain their constructor kwargs and build the concrete provider-preserving guarded subclass before returning:
 
 ```python
-def _finalize_model(model, metadata, policy):
-    retry_model = wrap_model_with_rate_limiting(model)
-    return guard_model(retry_model, metadata=metadata, policy=policy)
+def _finalize_model(provider_cls, provider_kwargs, metadata, policy):
+    guarded = build_guarded_provider_model(
+        provider_cls,
+        provider_kwargs,
+        metadata=metadata,
+        policy=policy,
+    )
+    return wrap_model_with_rate_limiting(guarded)
 ```
+
+`wrap_model_with_rate_limiting()` mutates methods on and returns the same provider instance; add an assertion for object identity and `isinstance` after rate shaping. Guard deadline must remain the outer public request boundary, including retries. If existing rate shaping replaces a guarded public method, refactor it to a composable inner hook instead of sacrificing total-deadline ownership.
 
 Use installed provider APIs exactly:
 
@@ -340,9 +363,11 @@ git commit -m "feat: guard every research model path"
 
 Convert sufficiency and adversarial helpers to async functions that call `await model.ainvoke()`. Tests must re-raise `ModelCallTimeoutError` and `asyncio.CancelledError` rather than return neutral scores/gaps. Ordinary parse/provider failures retain current fallback.
 
-- [ ] **Step 2: Write RED CLI interruption tests**
+- [ ] **Step 2: Write RED CLI timeout and interruption tests**
 
-Patch a guarded async provider that blocks. Trigger `KeyboardInterrupt` during verbose stream, fallback invoke, non-verbose invoke, and title generation. Assert spinner stops, bridge task is cancelled, server disconnect/cancel event fires before configured deadline, no fallback retry starts for timeout/cancellation, and process exit remains interrupt semantics.
+Patch a guarded async provider that blocks. Trigger both `KeyboardInterrupt` and `ModelCallTimeoutError` during verbose stream, fallback invoke, non-verbose invoke, and `generate_research_title()`. Assert spinner stops, every bridge registered under the invocation's `model_call_scope_id` is cancelled, server disconnect/cancel events fire before configured deadline, no fallback retry starts for timeout/cancellation, and process exit remains interrupt/timeout semantics. The title helper must re-raise timeout/cancellation instead of returning its default title.
+
+Add an integration case with two parallel subagent bridges registered under the CLI scope. Interrupting the CLI must cancel both bridges and leave registry empty.
 
 - [ ] **Step 3: Run slices and confirm RED**
 
@@ -350,7 +375,9 @@ Run: `uv run pytest tests/test_verification.py tests/test_research_agent_cli_e2e
 
 - [ ] **Step 4: Implement explicit control-exception branches**
 
-Remove `ThreadPoolExecutor.result(timeout=60)` from both judge helpers. Make `verify_report()` await them directly. In synchronous `ResearchStateMiddleware.after_model`, run the async verifier through the shared cancellable sync bridge without a second competing 120-second executor timeout; in `aafter_model`, await it normally. Both hooks catch `ModelCallTimeoutError` only to re-raise, and never catch `CancelledError` under generic fail-open fallback. In CLI, use `except KeyboardInterrupt: spinner.stop(); cancel_active_sync_bridge(); raise` before stream fallback logic. Timeout is a run failure and must not call `agent.invoke` fallback or completion continuation.
+Remove `ThreadPoolExecutor.result(timeout=60)` from both judge helpers. Make `verify_report()` await them directly. In synchronous `ResearchStateMiddleware.after_model`, run the async verifier through the shared cancellable sync bridge without a second competing 120-second executor timeout; in `aafter_model`, await it normally. Both hooks catch `ModelCallTimeoutError` only to re-raise, and never catch `CancelledError` under generic fail-open fallback.
+
+At CLI entry, create `model_call_scope_id = str(uuid.uuid4())` and include it in the top-level configurable config used by title, stream, fallback, non-verbose, and all inherited subagent calls. In every broad-catch site, including `generate_research_title()`, put `except ModelCallTimeoutError: ...; cancel_model_call_scope(model_call_scope_id); raise` and `except KeyboardInterrupt: ...; cancel_model_call_scope(model_call_scope_id); raise` before generic fallback/error handling. Stop active spinner before re-raising. Timeout is a run failure and must not call `agent.invoke` fallback, return default title, or enter completion continuation.
 
 - [ ] **Step 5: Run judge/CLI and completion regressions**
 
@@ -434,7 +461,7 @@ Expected: all pass.
 - [ ] **Step 2: Run static checks**
 
 ```bash
-uv run ruff check research_agent/model_call_guard.py research_agent/model_factory.py research_agent/agent.py research_agent/cli.py research_agent/research_subagent/utils/verification.py tests/test_model_call_guard.py tests/test_model_factory_timeout.py
+uv run ruff check research_agent/model_call_guard.py research_agent/model_factory.py research_agent/agent.py research_agent/cli.py research_agent/research_subagent/utils/verification.py .deepagents/skills/golden-dataset/scripts/skill_model_factory.py tests/test_model_call_guard.py tests/test_model_factory_timeout.py
 uv run python -m compileall -q research_agent
 git diff --check main...HEAD
 ```

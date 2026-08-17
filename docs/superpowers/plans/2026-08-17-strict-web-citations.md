@@ -200,6 +200,8 @@ Compile a minimal graph with `InMemorySaver` and the production state/middleware
 5. natural-language `no web` and `with web` directives still work when raw input is omitted; and
 6. completion/verification internal `jump_to: model` retains the current effective value.
 
+Add stale-message regressions: after a prior visible request containing `no web`, resume the same checkpoint with no new human message and omitted raw `no_web`; effective mode must reset to public default false rather than re-parsing the stale message. Then append an identical-content human message without an ID and prove the increased human-message count makes it a fresh directive. Cover stable message-ID and missing-ID clients.
+
 Also prove document context + effective no-web true is exempt, while document context + effective no-web false remains strict.
 
 - [ ] **Step 2: Run transition tests and confirm RED**
@@ -218,9 +220,19 @@ class ResearchState(CompletionState):
     effective_no_web: Annotated[NotRequired[bool], OmitFromInput]
     strict_web_citations: Annotated[NotRequired[bool], OmitFromInput]
     web_mode_run_id: Annotated[NotRequired[str | None], OmitFromInput]
+    web_mode_last_human_id: Annotated[NotRequired[str | None], OmitFromInput]
+    web_mode_last_human_count: Annotated[NotRequired[int], OmitFromInput]
 ```
 
-In every visible `before_agent`, including explicit incomplete-todo resume, resolve web mode with this precedence: supplied ephemeral `no_web` value; current user message's `_extract_no_web()` directive; public default false. Overwrite all three effective fields before the existing resume branch. `_extract_parameters_from_user_input()` must stop writing raw `no_web`; it may return the textual value to the resolver only. Internal model jumps do not rerun `before_agent`, so they retain current effective fields. Replace prompt, tool eligibility, verification, and metrics reads of raw `no_web` with `effective_no_web`.
+In every visible `before_agent`, including explicit incomplete-todo resume, compute the latest human marker as `(message.id, total_human_count)`. A stable nonempty ID is primary; total count is the fallback and also distinguishes identical id-less messages. Compare marker with hidden prior marker before inspecting natural language.
+
+Resolve web mode with this precedence:
+
+1. supplied ephemeral raw `no_web` value, on every visible invocation;
+2. current user message's `_extract_no_web()` directive only when marker proves a newly supplied visible human message; and
+3. public default false when raw input is omitted and no new human message exists.
+
+Overwrite all effective fields and both marker fields before the existing resume branch. `_extract_parameters_from_user_input()` must stop writing raw `no_web`; it may return a textual value only for the fresh-message resolver. Explicit checkpoint resume with the same historical messages therefore cannot reuse a prior textual directive. Internal model jumps do not rerun `before_agent`, so they retain current effective fields. Replace prompt, tool eligibility, verification, and metrics reads of raw `no_web` with `effective_no_web`.
 
 - [ ] **Step 4: Run checkpointed transition tests and confirm GREEN**
 
