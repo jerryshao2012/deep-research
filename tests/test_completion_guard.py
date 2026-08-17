@@ -17,6 +17,7 @@ from langchain_core.messages import (
     SystemMessage,
     ToolMessage,
 )
+from langgraph.checkpoint.memory import InMemorySaver
 from langgraph_api.serde import default as serialize_default
 
 import research_agent.completion_guard as completion_guard
@@ -962,6 +963,35 @@ def test_after_model_ignores_nonterminal_tool_call_response() -> None:
     assert _middleware(run_id="run-b").after_model(state, runtime=None) is None
 
 
+def test_after_model_is_inactive_without_current_plan_ownership() -> None:
+    message = _terminal_message()
+    state = _incomplete_state(message)
+    state["completion_plan_owner_generation"] = None
+
+    update = _middleware(run_id="run-b").after_model(state, runtime=None)
+
+    assert update is None
+    assert message.response_metadata == {
+        "model": "gemma4",
+        "finish_reason": "stop",
+    }
+
+
+def test_wrap_model_call_is_inactive_without_current_plan_ownership() -> None:
+    state = _incomplete_state(_terminal_message(), attempts=1)
+    state["completion_plan_owner_generation"] = None
+    request = _model_request(state)
+    captured: list[ModelRequest] = []
+
+    _middleware(run_id="run-b").wrap_model_call(
+        request,
+        lambda configured: captured.append(configured) or "response",
+    )
+
+    assert captured == [request]
+    assert captured[0].system_message == request.system_message
+
+
 def _model_request(state: dict[str, Any]) -> ModelRequest:
     return ModelRequest(
         model=FakeListChatModel(responses=["done"]),
@@ -1100,12 +1130,58 @@ def test_after_agent_raises_only_for_matching_current_exhausted_run() -> None:
     other_current = {**matching, "completion_current_run_id": "other-run"}
     assert middleware.after_agent(other_current, runtime=None) is None
 
+    other_config_run = _middleware(run_id="run-c")
+    assert other_config_run.after_agent(matching, runtime=None) is None
+
+
+def test_after_agent_uses_before_agent_fallback_when_config_has_no_run_id() -> None:
+    middleware = _middleware(run_id=None)
+    started = _apply(
+        {"messages": [], "files": {}},
+        middleware.before_agent(
+            {"messages": [], "files": {}},
+            runtime=None,
+        ),
+    )
+    fallback_run_id = started["completion_current_run_id"]
+    started.update(
+        {
+            "completion_plan_owner_generation": started[
+                "completion_request_generation"
+            ],
+            "todos": [{"content": "Finish report", "status": "pending"}],
+            "completion_exhausted_run_id": fallback_run_id,
+            "completion_exhausted_incomplete_todo_count": 1,
+            "completion_exhausted_malformed_todo_count": 0,
+            "completion_exhausted_report_reason": "missing",
+        }
+    )
+
+    with pytest.raises(completion_guard.ResearchIncompleteError):
+        middleware.after_agent(started, runtime=None)
+
+
+def test_after_agent_is_inactive_without_current_plan_ownership() -> None:
+    state = _incomplete_state(_terminal_message(), attempts=3, limit=3)
+    state.update(
+        {
+            "completion_plan_owner_generation": None,
+            "completion_exhausted_run_id": "run-b",
+            "completion_exhausted_incomplete_todo_count": 2,
+            "completion_exhausted_malformed_todo_count": 0,
+            "completion_exhausted_report_reason": "missing",
+        }
+    )
+
+    assert _middleware(run_id="run-b").after_agent(state, runtime=None) is None
+
 
 def test_research_incomplete_error_serializes_safe_summary_only() -> None:
     error = completion_guard.ResearchIncompleteError(
         incomplete_todo_count=2,
         malformed_todo_count=1,
         report_reason="missing",
+        attempt_limit=3,
     )
 
     serialized = serialize_default(error)
@@ -1114,8 +1190,110 @@ def test_research_incomplete_error_serializes_safe_summary_only() -> None:
         "error": "ResearchIncompleteError",
         "message": (
             "Research incomplete after automatic continuation limit "
-            "(incomplete_todos=2, malformed_todos=1, report=missing)."
+            "(attempt_limit=3, incomplete_todos=2, malformed_todos=1, "
+            "report=missing)."
         ),
     }
     assert "Private research detail" not in repr(serialized)
     assert "Partial answer" not in repr(serialized)
+
+
+class _OwnedPlanCompletionGuard(completion_guard.CompletionGuardMiddleware):
+    """Seed an owned plan so compiled tests can focus on guard routing."""
+
+    def before_agent(
+        self,
+        state: completion_guard.CompletionState,
+        runtime: Any,
+    ) -> dict[str, Any] | None:
+        update = super().before_agent(state, runtime)
+        assert update is not None
+        generation = update["completion_request_generation"]
+        return {
+            **update,
+            "completion_plan_owner_generation": generation,
+            "todos": [{"content": "Private task", "status": "pending"}],
+        }
+
+
+def _compiled_graph(
+    *,
+    responses: list[str],
+    middleware: completion_guard.CompletionGuardMiddleware,
+) -> Any:
+    return create_agent(
+        FakeListChatModel(responses=responses),
+        tools=[],
+        middleware=[middleware],
+        checkpointer=InMemorySaver(),
+    )
+
+
+def _invoke_compiled(graph: Any, config: dict[str, Any], *, async_: bool) -> Any:
+    input_state = {"messages": [HumanMessage(content="Research privately")]}
+    if async_:
+        return asyncio.run(graph.ainvoke(input_state, config=config))
+    return graph.invoke(input_state, config=config)
+
+
+@pytest.mark.parametrize("async_", [False, True])
+def test_compiled_inactive_plan_terminal_passes_through_untouched(
+    async_: bool,
+) -> None:
+    run_id = uuid4()
+    graph = _compiled_graph(
+        responses=["Clarification response"],
+        middleware=_middleware(run_id=run_id),
+    )
+    config = {
+        "run_id": run_id,
+        "configurable": {"thread_id": f"inactive-{async_}"},
+    }
+
+    result = _invoke_compiled(graph, config, async_=async_)
+
+    assert len(result["messages"]) == 2
+    terminal = result["messages"][-1]
+    assert terminal.content == "Clarification response"
+    assert terminal.response_metadata.get("resume_intermediate") is None
+    assert result["completion_attempts"] == 0
+    assert result["completion_exhausted_run_id"] is None
+
+
+@pytest.mark.parametrize("async_", [False, True])
+def test_compiled_owned_plan_replaces_then_appends_and_checkpoints_exhaustion(
+    monkeypatch: pytest.MonkeyPatch,
+    async_: bool,
+) -> None:
+    monkeypatch.setenv("MAX_COMPLETION_ATTEMPTS", "1")
+    run_id = uuid4()
+    graph = _compiled_graph(
+        responses=["Partial one", "Partial two"],
+        middleware=_OwnedPlanCompletionGuard(
+            config_getter=lambda: {"run_id": run_id, "configurable": {}}
+        ),
+    )
+    config = {
+        "run_id": run_id,
+        "configurable": {"thread_id": f"exhausted-{async_}"},
+    }
+
+    with pytest.raises(completion_guard.ResearchIncompleteError) as caught:
+        _invoke_compiled(graph, config, async_=async_)
+
+    assert "attempt_limit=1" in str(caught.value)
+    snapshot = graph.get_state(config)
+    values = snapshot.values
+    assert values["completion_attempts"] == 1
+    assert values["completion_exhausted_run_id"] == str(run_id)
+    messages = values["messages"]
+    assert [message.content for message in messages] == [
+        "Research privately",
+        "Partial one",
+        "Partial two",
+    ]
+    assert len({message.id for message in messages[1:]}) == 2
+    assert all(
+        message.response_metadata.get("resume_intermediate") is True
+        for message in messages[1:]
+    )

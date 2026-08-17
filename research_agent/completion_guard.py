@@ -193,15 +193,25 @@ class CompletionGuardMiddleware(AgentMiddleware):
         runtime: Any,
     ) -> dict[str, Any] | None:
         """Fail a run only after its matching exhaustion checkpoint is saved."""
+        if not _plan_is_active(state):
+            return None
         exhausted_run_id = state.get("completion_exhausted_run_id")
         current_run_id = state.get("completion_current_run_id")
+        actual_run_id = _configured_run_id(
+            self._config(),
+            fallback=current_run_id,
+        )
         if (
             not isinstance(exhausted_run_id, str)
             or not exhausted_run_id
             or exhausted_run_id != current_run_id
+            or exhausted_run_id != actual_run_id
         ):
             return None
         raise ResearchIncompleteError(
+            attempt_limit=_completion_attempt_limit(
+                state.get("completion_attempt_limit")
+            ),
             incomplete_todo_count=_safe_count(
                 state.get("completion_exhausted_incomplete_todo_count")
             ),
@@ -247,6 +257,7 @@ class ResearchIncompleteError(RuntimeError):
     def __init__(
         self,
         *,
+        attempt_limit: int,
         incomplete_todo_count: int,
         malformed_todo_count: int,
         report_reason: ReportFailureReason | None,
@@ -254,7 +265,8 @@ class ResearchIncompleteError(RuntimeError):
         report_summary = report_reason or "complete"
         super().__init__(
             "Research incomplete after automatic continuation limit "
-            f"(incomplete_todos={incomplete_todo_count}, "
+            f"(attempt_limit={attempt_limit}, "
+            f"incomplete_todos={incomplete_todo_count}, "
             f"malformed_todos={malformed_todo_count}, "
             f"report={report_summary})."
         )
@@ -281,7 +293,7 @@ def _completion_update(state: CompletionState) -> dict[str, Any] | None:
         return None
 
     inspection = _inspect_state_completion(state)
-    if inspection.ready:
+    if not inspection.plan_active or inspection.ready:
         return None
 
     attempts = _safe_count(state.get("completion_attempts"))
@@ -318,16 +330,10 @@ def _completion_update(state: CompletionState) -> dict[str, Any] | None:
 def _inspect_state_completion(
     state: Mapping[str, Any],
 ) -> CompletionInspection:
-    generation = state.get("completion_request_generation")
-    plan_active = (
-        isinstance(generation, str)
-        and bool(generation)
-        and state.get("completion_plan_owner_generation") == generation
-    )
     return inspect_completion(
         todos=state.get("todos"),
         files=state.get("files"),
-        plan_active=plan_active,
+        plan_active=_plan_is_active(state),
         report_owned=state.get("completion_report_owned") is True,
         report_baseline_modified_at=state.get(
             "completion_report_baseline_modified_at"
@@ -342,7 +348,7 @@ def _tag_intermediate(message: AIMessage) -> AIMessage:
 
 def _configure_continuation_request(request: ModelRequest) -> ModelRequest:
     state = request.state
-    if not isinstance(state, Mapping):
+    if not isinstance(state, Mapping) or not _plan_is_active(state):
         return request
     attempts = _safe_count(state.get("completion_attempts"))
     if attempts <= 0 or state.get("completion_exhausted_run_id") is not None:
@@ -371,6 +377,15 @@ def _configure_continuation_request(request: ModelRequest) -> ModelRequest:
             }
         )
     return request.override(system_message=configured_system)
+
+
+def _plan_is_active(state: Mapping[str, Any]) -> bool:
+    generation = state.get("completion_request_generation")
+    return (
+        isinstance(generation, str)
+        and bool(generation)
+        and state.get("completion_plan_owner_generation") == generation
+    )
 
 
 def _completion_guidance(
@@ -419,6 +434,19 @@ def _completion_attempt_limit(value: object) -> int:
     if isinstance(value, int) and not isinstance(value, bool):
         return min(max(value, 1), MAX_ALLOWED_COMPLETION_ATTEMPTS)
     return DEFAULT_MAX_COMPLETION_ATTEMPTS
+
+
+def _configured_run_id(
+    config: Mapping[str, Any],
+    *,
+    fallback: object,
+) -> str | None:
+    value = config.get("run_id")
+    if isinstance(value, UUID):
+        return str(value)
+    if isinstance(value, str) and value:
+        return value
+    return fallback if isinstance(fallback, str) and fallback else None
 
 
 def _normalize_run_id(value: object) -> str:
