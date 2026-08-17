@@ -22,6 +22,9 @@ class _FakeHttpResponse:
         self.status_code = status_code
         self.headers = headers or {}
 
+    async def aread(self) -> bytes:
+        raise AssertionError("reachability probes must not read response bodies")
+
 
 class _FakeAsyncClient:
     def __init__(self, responses: list[_FakeHttpResponse], **kwargs: object) -> None:
@@ -43,8 +46,73 @@ class _FakeAsyncClient:
         self.requests.append(("GET", url))
         return self.responses.pop(0)
 
+    def stream(self, method: str, url: str):
+        self.requests.append((method, url))
+        response = self.responses.pop(0)
+
+        class _Stream:
+            async def __aenter__(self) -> _FakeHttpResponse:
+                return response
+
+            async def __aexit__(self, *args: object) -> None:
+                return None
+
+        return _Stream()
+
 
 class TestCitationValidatorSafeFetch:
+    def test_dns_resolution_is_cached_per_redirect_target(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake_client = _FakeAsyncClient(
+            [
+                _FakeHttpResponse(302, {"location": "https://next.publisher.org/report"}),
+                _FakeHttpResponse(200),
+            ]
+        )
+        calls: list[str] = []
+
+        def resolver(host: str, port: int) -> tuple[str, ...]:
+            calls.append(host)
+            return ("93.184.216.34",)
+
+        monkeypatch.setattr(citation_validator, "_resolve_host_addresses", resolver)
+        monkeypatch.setattr(citation_validator.httpx, "AsyncClient", lambda **kwargs: fake_client)
+
+        assert asyncio.run(
+            citation_validator._check_url_reachable("https://public.publisher.org/start")
+        ) == (True, "Reachable")
+        assert calls == ["public.publisher.org", "next.publisher.org"]
+
+    def test_total_probe_deadline_cancels_slow_header_stream(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class SlowClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args: object) -> None:
+                return None
+
+            def stream(self, method: str, url: str):
+                class SlowStream:
+                    async def __aenter__(self):
+                        await asyncio.sleep(0.05)
+                        return _FakeHttpResponse(200)
+
+                    async def __aexit__(self, *args: object) -> None:
+                        return None
+
+                return SlowStream()
+
+        monkeypatch.setattr(
+            citation_validator, "_resolve_host_addresses", lambda host, port: ("93.184.216.34",)
+        )
+        monkeypatch.setattr(citation_validator.httpx, "AsyncClient", lambda **kwargs: SlowClient())
+
+        assert asyncio.run(
+            citation_validator._check_url_reachable("https://public.publisher.org/report", timeout=0.01)
+        ) == (False, "Request timeout")
     @pytest.mark.parametrize(
         "url",
         [

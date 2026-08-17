@@ -117,6 +117,7 @@ class TestFormatFeedback:
 
     def test_produces_xml_block_with_grounding_issues(self):
         from research_agent.research_subagent.utils.citation_validator import (
+            CitationValidationCategory,
             ValidationResult,
         )
 
@@ -125,18 +126,17 @@ class TestFormatFeedback:
             sufficiency_score=0.6,
             grounding_results=[
                 ValidationResult(
-                    url="https://example.com",
+                    citation_index=1,
                     reachable=False,
                     grounded=False,
-                    reason="HTTP 404",
+                    category=CitationValidationCategory.UNREACHABLE,
                 ),
             ],
             adversarial_gaps=[],
             sufficiency_reason="",
         )
         text = format_feedback(verdict)
-        assert "https://example.com" in text
-        assert "HTTP 404" in text
+        assert "Citation 1: unreachable" in text
 
     def test_no_gaps_section_when_empty(self):
         verdict = VerificationVerdict(

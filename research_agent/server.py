@@ -1901,8 +1901,8 @@ async def _execute_run(run_id: str, thread_id: str) -> None:
                             appendix_lines = ["", "### Citation Verification"]
                             for res in validation_results:
                                 appendix_lines.append(
-                                    f"- **[{res.url}]({res.url})**: Reachable: {'Yes' if res.reachable else 'No'}, "
-                                    f"Grounded: {'Yes' if res.grounded else 'No'} ({res.reason})"
+                                    f"- Citation {res.citation_index}: Reachable: {'Yes' if res.reachable else 'No'}, "
+                                    f"Grounded: {'Yes' if res.grounded else 'No'} ({res.category.value})"
                                 )
                             appendix = "\n".join(appendix_lines)
                             new_report_text = report_text + "\n" + appendix

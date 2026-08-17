@@ -80,10 +80,32 @@ async def test_validate_web_citations() -> None:
         results = await validate_web_citations(citations, text)
         assert len(results) == 2
 
-        profit_res = [r for r in results if "profit" in r.url][0]
+        profit_res = results[0]
         assert profit_res.reachable is True
         assert profit_res.grounded is True
 
-        unreach_res = [r for r in results if "unreachable" in r.url][0]
+        unreach_res = results[1]
         assert unreach_res.reachable is False
         assert unreach_res.grounded is False
+
+
+@pytest.mark.anyio
+async def test_cached_content_cannot_override_failed_reachability() -> None:
+    citation = SourceCitation(kind="web", url="https://public.publisher.org/profit")
+    text = (
+        "We earned $10B [1].\n\n"
+        "### Sources\n"
+        "[1] Earnings: https://public.publisher.org/profit\n"
+    )
+
+    with patch(
+        "research_agent.research_subagent.utils.citation_validator._check_url_reachable",
+        new_callable=AsyncMock,
+        return_value=(False, "Unsafe DNS target"),
+    ):
+        results = await validate_web_citations(
+            [citation], text, {"https://public.publisher.org/profit": "We earned $10B."}
+        )
+
+    assert results[0].reachable is False
+    assert results[0].grounded is True

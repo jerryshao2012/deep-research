@@ -282,7 +282,7 @@ def format_feedback(verdict: VerificationVerdict) -> str:
             lines.append("")
             lines.append("Citation issues found:")
             for r in failed:
-                lines.append(f"  - [{r.url}] {r.reason}")
+                lines.append(f"  - Citation {r.citation_index}: {r.category.value}")
 
     if verdict.adversarial_gaps and not verdict.citation_defects:
         lines.append("")
@@ -353,8 +353,8 @@ async def verify_report(
             )
         except (ModelCallTimeoutError, asyncio.CancelledError, ReportCitationError):
             raise
-        except Exception as exc:
-            logger.warning("Citation grounding failed: %s", exc)
+        except Exception:
+            logger.warning("Citation grounding failed")
 
     grounding_failures = sum(
         1 for r in grounding_results if not r.grounded or not r.reachable

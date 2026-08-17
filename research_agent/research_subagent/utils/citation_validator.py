@@ -6,11 +6,13 @@ are actually grounded in the fetched source texts by comparing keywords and sent
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import re
 import socket
 import ssl
 from dataclasses import dataclass
+from enum import StrEnum
 from urllib.parse import urljoin, urlsplit
 
 import httpx
@@ -31,10 +33,26 @@ class ValidationResult:
         reason: Human-readable explanation of the validation outcome.
     """
 
-    url: str
+    citation_index: int
     reachable: bool
     grounded: bool
-    reason: str
+    category: CitationValidationCategory
+
+
+class CitationValidationCategory(StrEnum):
+    """Fixed, report-safe citation validation outcomes."""
+
+    UNREACHABLE = "unreachable"
+    GROUNDING_UNAVAILABLE = "grounding_unavailable"
+    CLAIM_CONTEXT_MISSING = "claim_context_missing"
+    GROUNDED = "grounded"
+    UNGROUNDED = "ungrounded"
+
+
+@dataclass(frozen=True)
+class _HeaderResponse:
+    status_code: int
+    headers: object
 
 
 _STOP_WORDS = {
@@ -47,6 +65,7 @@ _STOP_WORDS = {
 }
 
 _MAX_REDIRECTS = 3
+_DNS_TIMEOUT_SECONDS = 1.0
 _REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 _INVALID_REDIRECT_TARGET = object()
 
@@ -242,7 +261,10 @@ def _unsafe_static_url(
     return not address.is_global
 
 
-def _safe_fetch_url(url: str) -> tuple[bool, str]:
+async def _safe_fetch_url(
+    url: str,
+    resolution_cache: dict[tuple[str, int], tuple[bool, str]] | None = None,
+) -> tuple[bool, str]:
     """Reject static and DNS-resolved non-global targets before each request.
 
     DNS is checked immediately before every request, including redirects.  A
@@ -255,25 +277,46 @@ def _safe_fetch_url(url: str) -> tuple[bool, str]:
 
     assert parts is not None
     scheme, host, _, _, configured_port = parts
+    port = configured_port or (443 if scheme == "https" else 80)
+    key = (host or "", port)
+    if resolution_cache and key in resolution_cache:
+        return resolution_cache[key]
     try:
-        port = configured_port or (443 if scheme == "https" else 80)
-        addresses = _resolve_host_addresses(host or "", port)
-    except (OSError, ValueError):
-        return False, "DNS resolution failed"
+        addresses = await asyncio.wait_for(
+            asyncio.to_thread(_resolve_host_addresses, host or "", port),
+            timeout=_DNS_TIMEOUT_SECONDS,
+        )
+    except (OSError, ValueError, TimeoutError):
+        result = (False, "DNS resolution failed")
+        if resolution_cache is not None:
+            resolution_cache[key] = result
+        return result
     if not addresses:
-        return False, "DNS resolution returned no addresses"
+        result = (False, "DNS resolution returned no addresses")
+        if resolution_cache is not None:
+            resolution_cache[key] = result
+        return result
 
     for raw_address in addresses:
         try:
             address = ipaddress.ip_address(raw_address)
         except ValueError:
-            return False, "DNS resolution returned an invalid address"
+            result = (False, "DNS resolution returned an invalid address")
+            if resolution_cache is not None:
+                resolution_cache[key] = result
+            return result
         if not address.is_global:
-            return False, "Unsafe DNS target"
-    return True, "Safe target"
+            result = (False, "Unsafe DNS target")
+            if resolution_cache is not None:
+                resolution_cache[key] = result
+            return result
+    result = (True, "Safe target")
+    if resolution_cache is not None:
+        resolution_cache[key] = result
+    return result
 
 
-def _redirect_target(url: str, response: httpx.Response) -> str | object | None:
+def _redirect_target(url: str, response: httpx.Response | _HeaderResponse) -> str | object | None:
     if response.status_code not in _REDIRECT_STATUSES:
         return None
     location = response.headers.get("location")
@@ -298,10 +341,6 @@ def _safe_request_error(error: Exception) -> str:
 
 async def _check_url_reachable(url: str, timeout: float = 3.0) -> tuple[bool, str]:
     """Check reachability without proxies and with DNS screening per hop."""
-    safe, reason = _safe_fetch_url(url)
-    if not safe:
-        return False, reason
-
     verify_ssl = get_ssl_verify_config()
     headers = {
         "User-Agent": (
@@ -310,26 +349,47 @@ async def _check_url_reachable(url: str, timeout: float = 3.0) -> tuple[bool, st
         )
     }
     try:
-        async with httpx.AsyncClient(
+        async with asyncio.timeout(timeout):
+            resolution_cache: dict[tuple[str, int], tuple[bool, str]] = {}
+            safe, reason = await _safe_fetch_url(url, resolution_cache)
+            if not safe:
+                return False, reason
+            async with httpx.AsyncClient(
             verify=verify_ssl,
             headers=headers,
             timeout=timeout,
             trust_env=False,
             follow_redirects=False,
-        ) as client:
-            current_url = url
-            for redirect_count in range(_MAX_REDIRECTS + 1):
-                safe, reason = _safe_fetch_url(current_url)
-                if not safe:
-                    return False, reason
+            ) as client:
+                current_url = url
+                for redirect_count in range(_MAX_REDIRECTS + 1):
+                    safe, reason = await _safe_fetch_url(current_url, resolution_cache)
+                    if not safe:
+                        return False, reason
 
-                try:
-                    response = await client.head(current_url)
-                except Exception:
-                    response = None
+                    try:
+                        async with client.stream("HEAD", current_url) as stream_response:
+                            status_code, headers = stream_response.status_code, stream_response.headers
+                    except Exception:
+                        status_code, headers = 599, {}
 
-                if response is not None:
-                    target = _redirect_target(current_url, response)
+                    if status_code != 599:
+                        target = _redirect_target(current_url, _HeaderResponse(status_code, headers))
+                        if target is not None:
+                            if target is _INVALID_REDIRECT_TARGET:
+                                return False, "Unsafe URL target"
+                            if not target:
+                                return False, "Redirect missing location"
+                            if redirect_count == _MAX_REDIRECTS:
+                                return False, "Too many redirects"
+                            current_url = target
+                            continue
+                        if status_code < 400:
+                            return True, "Reachable"
+
+                    async with client.stream("GET", current_url) as stream_response:
+                        status_code, headers = stream_response.status_code, stream_response.headers
+                    target = _redirect_target(current_url, _HeaderResponse(status_code, headers))
                     if target is not None:
                         if target is _INVALID_REDIRECT_TARGET:
                             return False, "Unsafe URL target"
@@ -339,23 +399,11 @@ async def _check_url_reachable(url: str, timeout: float = 3.0) -> tuple[bool, st
                             return False, "Too many redirects"
                         current_url = target
                         continue
-                    if response.status_code < 400:
+                    if status_code < 400:
                         return True, "Reachable"
-
-                response = await client.get(current_url)
-                target = _redirect_target(current_url, response)
-                if target is not None:
-                    if target is _INVALID_REDIRECT_TARGET:
-                        return False, "Unsafe URL target"
-                    if not target:
-                        return False, "Redirect missing location"
-                    if redirect_count == _MAX_REDIRECTS:
-                        return False, "Too many redirects"
-                    current_url = target
-                    continue
-                if response.status_code < 400:
-                    return True, "Reachable"
-                return False, f"HTTP {response.status_code}"
+                    return False, f"HTTP {status_code}"
+    except TimeoutError:
+        return False, "Request timeout"
     except Exception as error:
         return False, _safe_request_error(error)
 
@@ -375,7 +423,7 @@ async def validate_web_citations(
         url = match.group(3).strip()
         sources_block_urls[url] = idx
 
-    for cit in citations:
+    for citation_index, cit in enumerate(citations, start=1):
         if cit.kind != "web":
             continue
 
@@ -383,7 +431,7 @@ async def validate_web_citations(
         if not url:
             continue
 
-        reachable, reach_reason = await _check_url_reachable(url)
+        reachable, _ = await _check_url_reachable(url)
 
         content = None
         if fetched_contents and url in fetched_contents:
@@ -394,17 +442,17 @@ async def validate_web_citations(
         if not content:
             if not reachable:
                 results.append(ValidationResult(
-                    url=url,
+                    citation_index=citation_index,
                     reachable=False,
                     grounded=False,
-                    reason=f"URL unreachable: {reach_reason}"
+                    category=CitationValidationCategory.UNREACHABLE,
                 ))
             else:
                 results.append(ValidationResult(
-                    url=url,
+                    citation_index=citation_index,
                     reachable=True,
                     grounded=False,
-                    reason="Grounding skipped (source page content not fetched during run)"
+                    category=CitationValidationCategory.GROUNDING_UNAVAILABLE,
                 ))
             continue
 
@@ -417,27 +465,27 @@ async def validate_web_citations(
 
         if not claim:
             results.append(ValidationResult(
-                url=url,
+                citation_index=citation_index,
                 reachable=reachable,
                 grounded=False,
-                reason="Grounded check failed: claim context could not be extracted"
+                category=CitationValidationCategory.CLAIM_CONTEXT_MISSING,
             ))
             continue
 
         is_grounded = _is_claim_grounded(claim, content)
         if is_grounded:
             results.append(ValidationResult(
-                url=url,
-                reachable=True,
+                citation_index=citation_index,
+                reachable=reachable,
                 grounded=True,
-                reason="Reachable and grounded (claim matches source content)"
+                category=CitationValidationCategory.GROUNDED,
             ))
         else:
             results.append(ValidationResult(
-                url=url,
-                reachable=True,
+                citation_index=citation_index,
+                reachable=reachable,
                 grounded=False,
-                reason=f"Claim not found in content (Claim: '{claim[:100]}...')"
+                category=CitationValidationCategory.UNGROUNDED,
             ))
 
     return results
