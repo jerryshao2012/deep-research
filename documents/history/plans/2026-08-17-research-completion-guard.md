@@ -526,15 +526,16 @@ Expected: PASS with no whitespace errors, only planned feature files in the comp
 uv run pytest tests/ -q
 ```
 
-Expected: PASS. If a failure appears pre-existing/environmental, reproduce it from a separate clean worktree at `codex/research-completion-guard-base` before documenting it.
+Expected: PASS. If a failure appears pre-existing/environmental, reproduce it from a separate clean worktree at the recorded `COMPLETION_GUARD_BASE_SHA` before documenting it.
 
 - [ ] **Step 6: Inspect Threadroot evidence**
 
 ```bash
 threadroot score latest
+git status --short
 ```
 
-Expected: score available if the preflight run recorded successfully; otherwise document the existing `.codex/threadroot` permission failure.
+Expected: score available if the preflight run recorded successfully; otherwise document the existing `.codex/threadroot` permission failure. Implementation worktree remains clean.
 
 - [ ] **Step 7: Request final code review**
 
