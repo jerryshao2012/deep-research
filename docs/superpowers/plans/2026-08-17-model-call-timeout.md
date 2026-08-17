@@ -13,13 +13,15 @@
 ## File map
 
 - Create `research_agent/model_call_guard.py` — timeout configuration, runtime metadata, provider-preserving guard mixin/subclasses, guarded bound runnable, run-scoped sync bridge registry, override registry, unload helper, and safe errors.
-- Modify `research_agent/model_factory.py:272-384` — construct provider metadata/native HTTP deadlines and guard the selected model after retry wrapping.
+- Modify `research_agent/model_factory.py:272-384` — construct provider metadata/native HTTP deadlines, build provider-preserving guard, and attach inner retry controller.
+- Modify `research_agent/retry_utils.py:80-230` — expose composable retry/rate-limit operations that run inside one absolute guard deadline; stop instance-patching public invoke methods.
 - Modify `research_agent/agent.py:54,693-1066,1361-1433` — propagate control errors and register request-boundary guards for root/explicit/general-purpose agents.
 - Modify `research_agent/research_subagent/utils/verification.py:117-235` — propagate timeout/cancellation from direct sufficiency and adversarial judge calls.
 - Modify `.deepagents/skills/golden-dataset/scripts/skill_model_factory.py` — reuse the shared guarded factory for active skill judge calls.
 - Modify `research_agent/cli.py:107-131,388-568` — preserve model-control failures and cancel active bridge on CLI interruption.
 - Create `tests/test_model_call_guard.py` — unit/integration coverage for deadlines, cancellation, unload, binding, streaming, and overrides.
 - Create `tests/test_model_factory_timeout.py` — provider precedence, metadata, and native client deadline contracts.
+- Modify `tests/test_retry_utils.py` — retry/backoff remains inside one total model-call deadline.
 - Modify `tests/test_agent_contracts.py` — compiled root/subagent registration and exactly-once wrapping.
 - Modify `tests/test_verification.py` — direct judge timeout/cancellation pass-through.
 - Modify `tests/test_research_agent_cli_e2e.py` — CLI interruption and timeout behavior.
@@ -215,12 +217,14 @@ Call public `stream()` and `astream()`, delay before consuming their returned it
 
 - [ ] **Step 3: Implement provider-identity-preserving guarded subclasses**
 
-Use a `ModelCallGuardMixin` before each concrete provider in the MRO. Construct and cache concrete classes such as `type("GuardedChatOllama", (ModelCallGuardMixin, ChatOllama), {})`, then instantiate them from the exact winning provider kwargs in `model_factory.py`. Store policy, runtime metadata, and bridge registry in Pydantic `PrivateAttr`s; do not declare a replacement `profile` property or wrap provider models in a generic Pydantic field. Inherited provider fields and `isinstance` identity must remain intact.
+Use a `ModelCallGuardMixin` before each concrete provider in the MRO. Construct and cache concrete classes such as `type("GuardedChatOllama", (ModelCallGuardMixin, ChatOllama), generated_namespace)`, then instantiate them from the exact winning provider kwargs in `model_factory.py`. A plain Python mixin does not register Pydantic private attributes: put every `PrivateAttr` declaration (`_model_call_policy`, `_runtime_metadata`, `_bridge_registry`, `_retry_controller`) directly in `generated_namespace` before the provider metaclass creates the class, then initialize them explicitly after validated construction. Do not declare a replacement `profile` property or wrap provider models in a generic Pydantic field. Inherited provider fields and `isinstance` identity must remain intact.
 
 Required public surface:
 
 ```python
 class ModelCallGuardMixin:
+    def invoke(self, input, config=None, **kwargs): ...
+    def ainvoke(self, input, config=None, **kwargs): ...
     async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs): ...
     def _generate(self, messages, stop=None, run_manager=None, **kwargs): ...
     async def _astream(self, messages, stop=None, run_manager=None, **kwargs): ...
@@ -232,13 +236,15 @@ class ModelCallGuardMixin:
 
 class GuardedBoundRunnable(Runnable):
     def invoke(self, input, config=None, **kwargs): ...
-    async def ainvoke(self, input, config=None, **kwargs): ...
+    def ainvoke(self, input, config=None, **kwargs): ...
     def stream(self, input, config=None, **kwargs): ...
     def astream(self, input, config=None, **kwargs): ...
     def bind(self, **kwargs): ...
 ```
 
-Public `stream()` and `astream()` must be regular methods that capture `time.monotonic() + timeout` immediately and return a nested iterator/async iterator; those nested iterators pass the captured absolute deadline through `_stream`/`_astream`. `bind_tools()` may return `GuardedBoundRunnable` only after DeepAgents/LangChain model resolution has seen the provider-identifiable model. Bound runnable public streaming uses the same eager deadline capture.
+Public `invoke()`, `ainvoke()`, `stream()`, and `astream()` must read `model_call_scope_id` from `config["configurable"]`, capture `time.monotonic() + timeout` immediately, and delegate through nested callables/awaitables/iterators carrying both values. `ainvoke()` and `astream()` are regular methods returning a nested coroutine/async iterator so capture happens at method call, not first await/pull. This is required because `BaseChatModel.invoke(config=...)` does not forward arbitrary configurable values to `_generate`. `bind_tools()` may return `GuardedBoundRunnable` only after DeepAgents/LangChain model resolution has seen the provider-identifiable model. Bound runnable public invoke and streaming methods use the same scope/deadline capture.
+
+Add construction/copy tests for every supported provider asserting each private attribute contains its initialized value rather than a `ModelPrivateAttr` descriptor. Exercise invoke, bind, `model_copy()`, and known-override rebuild; copied models retain independent initialized guard state and provider identity.
 
 The sync bridge must copy `contextvars.copy_context()`, create one daemon thread/event loop, expose loop/task handles through a thread-safe control object, cancel on timeout/`KeyboardInterrupt`/generator close, join only for cleanup grace, consume late exceptions, and never create a `ThreadPoolExecutor`.
 
@@ -285,9 +291,11 @@ git commit -m "feat: preserve guarded model runnable behavior"
 
 **Files:**
 - Modify: `research_agent/model_factory.py:272-384`
+- Modify: `research_agent/retry_utils.py:80-230`
 - Modify: `research_agent/agent.py:54,1361-1433`
 - Modify: `.deepagents/skills/golden-dataset/scripts/skill_model_factory.py`
 - Create: `tests/test_model_factory_timeout.py`
+- Modify: `tests/test_retry_utils.py`
 - Modify: `tests/test_agent_contracts.py`
 
 - [ ] **Step 1: Write RED provider-factory and skill-factory tests**
@@ -295,6 +303,8 @@ git commit -m "feat: preserve guarded model runnable behavior"
 Patch constructors, set mixed provider environments, and assert the first selected provider supplies exact `ModelRuntimeMetadata`, native HTTP timeout, async client where supported, and outer guard. Cover AWS Bedrock-compatible OpenAI, legacy/new Azure, Google, Anthropic, and Ollama.
 
 Add a focused RED contract that imports `.deepagents/skills/golden-dataset/scripts/skill_model_factory.py`, patches `research_agent.model_factory.get_configured_model`, and proves the skill calls `get_configured_model(bypass_cache=True)` rather than any provider constructor. Assert returned guarded model identity is preserved.
+
+In `tests/test_retry_utils.py`, add sync and async clock-controlled regressions: first provider attempt raises a rate-limit error, retry backoff begins, and the original absolute model deadline expires during backoff. Assert `ModelCallTimeoutError` occurs at the original deadline, no second full deadline is created, no later provider attempt starts, and cancellation/registry cleanup completes.
 
 - [ ] **Step 2: Run provider tests and confirm RED**
 
@@ -314,10 +324,13 @@ def _finalize_model(provider_cls, provider_kwargs, metadata, policy):
         metadata=metadata,
         policy=policy,
     )
-    return wrap_model_with_rate_limiting(guarded)
+    guarded.set_retry_controller(build_model_retry_controller())
+    return guarded
 ```
 
-`wrap_model_with_rate_limiting()` mutates methods on and returns the same provider instance; add an assertion for object identity and `isinstance` after rate shaping. Guard deadline must remain the outer public request boundary, including retries. If existing rate shaping replaces a guarded public method, refactor it to a composable inner hook instead of sacrificing total-deadline ownership.
+Refactor `wrap_model_with_rate_limiting()` into a compatibility entrypoint that attaches a `ModelRetryController` but never instance-patches public `invoke`/`ainvoke`/stream methods. Controller exposes sync/async operation helpers that apply proactive limiter, retry classification, and backoff to the provider operation. Guard captures one absolute deadline first, then executes the controller inside `_run_with_deadline`; controller backoff uses cancellable sleep and remaining-deadline checks. All attempts and sleeps therefore share one budget. Preserve the existing decorator API for unrelated direct functions and its tests.
+
+Add assertions that attaching retry control returns the identical provider instance, retains `isinstance`, and cannot replace any guard public method. Inspect method ownership in the regression, then prove rate-limit attempt + backoff + retry cannot exceed one total deadline.
 
 Use installed provider APIs exactly:
 
@@ -339,14 +352,14 @@ Import it in `research_agent/agent.py` and add it at the root request boundary w
 
 - [ ] **Step 6: Run factory/graph tests and confirm GREEN**
 
-Run: `uv run pytest tests/test_model_factory_timeout.py tests/test_model_call_guard.py tests/test_agent_contracts.py -q`
+Run: `uv run pytest tests/test_model_factory_timeout.py tests/test_model_call_guard.py tests/test_retry_utils.py tests/test_agent_contracts.py -q`
 
 Expected: pass.
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add research_agent/model_factory.py research_agent/agent.py .deepagents/skills/golden-dataset/scripts/skill_model_factory.py tests/test_model_factory_timeout.py tests/test_agent_contracts.py
+git add research_agent/model_factory.py research_agent/retry_utils.py research_agent/agent.py .deepagents/skills/golden-dataset/scripts/skill_model_factory.py tests/test_model_factory_timeout.py tests/test_retry_utils.py tests/test_agent_contracts.py
 git commit -m "feat: guard every research model path"
 ```
 
@@ -367,6 +380,8 @@ Convert sufficiency and adversarial helpers to async functions that call `await 
 
 Patch a guarded async provider that blocks. Trigger both `KeyboardInterrupt` and `ModelCallTimeoutError` during verbose stream, fallback invoke, non-verbose invoke, and `generate_research_title()`. Assert spinner stops, every bridge registered under the invocation's `model_call_scope_id` is cancelled, server disconnect/cancel events fire before configured deadline, no fallback retry starts for timeout/cancellation, and process exit remains interrupt/timeout semantics. The title helper must re-raise timeout/cancellation instead of returning its default title.
 
+Change the title contract to `generate_research_title(query, *, config)` and add an explicit test that its `model.invoke(..., config=config)` receives the identical `model_call_scope_id`; the blocked title bridge must appear in that scope's registry before cancellation. No helper may reconstruct a config that drops `configurable` keys.
+
 Add an integration case with two parallel subagent bridges registered under the CLI scope. Interrupting the CLI must cancel both bridges and leave registry empty.
 
 - [ ] **Step 3: Run slices and confirm RED**
@@ -377,7 +392,7 @@ Run: `uv run pytest tests/test_verification.py tests/test_research_agent_cli_e2e
 
 Remove `ThreadPoolExecutor.result(timeout=60)` from both judge helpers. Make `verify_report()` await them directly. In synchronous `ResearchStateMiddleware.after_model`, run the async verifier through the shared cancellable sync bridge without a second competing 120-second executor timeout; in `aafter_model`, await it normally. Both hooks catch `ModelCallTimeoutError` only to re-raise, and never catch `CancelledError` under generic fail-open fallback.
 
-At CLI entry, create `model_call_scope_id = str(uuid.uuid4())` and include it in the top-level configurable config used by title, stream, fallback, non-verbose, and all inherited subagent calls. In every broad-catch site, including `generate_research_title()`, put `except ModelCallTimeoutError: ...; cancel_model_call_scope(model_call_scope_id); raise` and `except KeyboardInterrupt: ...; cancel_model_call_scope(model_call_scope_id); raise` before generic fallback/error handling. Stop active spinner before re-raising. Timeout is a run failure and must not call `agent.invoke` fallback, return default title, or enter completion continuation.
+At CLI entry, create `model_call_scope_id = str(uuid.uuid4())` and include it in the single top-level configurable config passed unchanged to title, stream, fallback, non-verbose, and all inherited subagent calls. `generate_research_title(query, config=config)` passes that config to guarded `model.invoke`. In every broad-catch site, including `generate_research_title()`, put `except ModelCallTimeoutError: ...; cancel_model_call_scope(model_call_scope_id); raise` and `except KeyboardInterrupt: ...; cancel_model_call_scope(model_call_scope_id); raise` before generic fallback/error handling. Stop active spinner before re-raising. Timeout is a run failure and must not call `agent.invoke` fallback, return default title, or enter completion continuation.
 
 - [ ] **Step 5: Run judge/CLI and completion regressions**
 
@@ -448,6 +463,7 @@ Run:
 uv run pytest \
   tests/test_model_call_guard.py \
   tests/test_model_factory_timeout.py \
+  tests/test_retry_utils.py \
   tests/test_agent_contracts.py \
   tests/test_verification.py \
   tests/test_research_agent_cli_e2e.py \
@@ -461,7 +477,7 @@ Expected: all pass.
 - [ ] **Step 2: Run static checks**
 
 ```bash
-uv run ruff check research_agent/model_call_guard.py research_agent/model_factory.py research_agent/agent.py research_agent/cli.py research_agent/research_subagent/utils/verification.py .deepagents/skills/golden-dataset/scripts/skill_model_factory.py tests/test_model_call_guard.py tests/test_model_factory_timeout.py
+uv run ruff check research_agent/model_call_guard.py research_agent/model_factory.py research_agent/retry_utils.py research_agent/agent.py research_agent/cli.py research_agent/research_subagent/utils/verification.py .deepagents/skills/golden-dataset/scripts/skill_model_factory.py tests/test_model_call_guard.py tests/test_model_factory_timeout.py tests/test_retry_utils.py
 uv run python -m compileall -q research_agent
 git diff --check main...HEAD
 ```
