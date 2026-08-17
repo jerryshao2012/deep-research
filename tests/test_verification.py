@@ -2,8 +2,16 @@
 
 from __future__ import annotations
 
-from langchain_core.messages import AIMessage
+import asyncio
+from typing import Any
 
+import pytest
+from langchain.agents.middleware.types import ModelRequest
+from langchain_core.language_models.fake_chat_models import FakeListChatModel
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+
+from research_agent import agent as agent_module
+from research_agent.completion_guard import CompletionState
 from research_agent.research_subagent.utils import verification as verification_module
 from research_agent.research_subagent.utils.verification import (
     VerificationVerdict,
@@ -197,3 +205,254 @@ class TestAdversarialGapAnalysis:
         gaps = _adversarial_gap_analysis(question="What is X?", report="")
         assert len(gaps) >= 1
         assert any("empty" in g.lower() for g in gaps)
+
+
+# ---------------------------------------------------------------------------
+# ResearchStateMiddleware verification routing
+# ---------------------------------------------------------------------------
+
+
+def _report(content: str = "Final report", *, modified_at: str = "report-v1") -> dict[str, Any]:
+    return {
+        "content": [content],
+        "encoding": "utf-8",
+        "created_at": "created",
+        "modified_at": modified_at,
+    }
+
+
+def _verification_state(
+    *,
+    todos: list[dict[str, str]] | None = None,
+    report_owned: bool = True,
+    report_modified_at: str = "report-v1",
+    baseline_modified_at: str | None = "prior-report",
+    verification_round: int = 0,
+) -> dict[str, Any]:
+    return {
+        "messages": [
+            HumanMessage(content="What is graph engineering?"),
+            AIMessage(
+                content="Research complete.",
+                id="terminal-response",
+                response_metadata={"model": "gemma4", "finish_reason": "stop"},
+            ),
+        ],
+        "files": {
+            "/research_request.md": _report(
+                "What is graph engineering?", modified_at="request-v1"
+            ),
+            "/final_report.md": _report(modified_at=report_modified_at),
+        },
+        "todos": todos
+        if todos is not None
+        else [
+            {
+                "id": "research",
+                "content": "Research graph engineering",
+                "status": "completed",
+            }
+        ],
+        "verification_round": verification_round,
+        "verification_feedback": None,
+        "completion_request_generation": "generation-v1",
+        "completion_plan_owner_generation": "generation-v1",
+        "completion_report_owned": report_owned,
+        "completion_report_baseline_modified_at": baseline_modified_at,
+        "completion_verified_report_modified_at": None,
+        "completion_accepted_at_limit_report_modified_at": None,
+        "completion_attempts": 2,
+        "_streamed_files": ["/final_report.md"],
+    }
+
+
+def _run_after_model(
+    middleware: agent_module.ResearchStateMiddleware,
+    state: dict[str, Any],
+    *,
+    async_: bool,
+) -> dict[str, Any] | None:
+    if async_:
+        return asyncio.run(middleware.aafter_model(state=state, runtime=None))
+    return middleware.after_model(state=state, runtime=None)
+
+
+def _needs_revision_verdict() -> VerificationVerdict:
+    return VerificationVerdict(
+        status="needs_revision",
+        sufficiency_score=0.5,
+        sufficiency_reason="Add missing evidence.",
+    )
+
+
+@pytest.mark.parametrize("async_", [False, True])
+@pytest.mark.parametrize(
+    "state_update",
+    [
+        {"completion_report_owned": False},
+        {"completion_plan_owner_generation": "prior-generation"},
+        {
+            "todos": [
+                {
+                    "id": "research",
+                    "content": "Research graph engineering",
+                    "status": "in_progress",
+                }
+            ]
+        },
+        {"completion_report_baseline_modified_at": "report-v1"},
+        {"completion_verified_report_modified_at": "report-v1"},
+    ],
+)
+def test_verification_runs_only_for_current_owned_report_after_research_completes(
+    monkeypatch: pytest.MonkeyPatch,
+    async_: bool,
+    state_update: dict[str, Any],
+) -> None:
+    calls = 0
+
+    async def fake_verify_report(*, question: str, report: str) -> VerificationVerdict:
+        nonlocal calls
+        calls += 1
+        return VerificationVerdict(status="complete", sufficiency_score=1.0)
+
+    monkeypatch.setattr(agent_module, "ENABLE_VERIFICATION", True)
+    monkeypatch.setattr(agent_module, "ENABLE_EVAL_TRACKING", False)
+    monkeypatch.setattr(agent_module, "verify_report", fake_verify_report)
+    state = {**_verification_state(), **state_update}
+
+    result = _run_after_model(
+        agent_module.ResearchStateMiddleware(), state, async_=async_
+    )
+
+    assert calls == 0
+    assert result is None
+
+
+@pytest.mark.parametrize("async_", [False, True])
+def test_nonfinal_revision_routes_to_model_without_persisted_system_message(
+    monkeypatch: pytest.MonkeyPatch,
+    async_: bool,
+) -> None:
+    async def fake_verify_report(*, question: str, report: str) -> VerificationVerdict:
+        assert question == "What is graph engineering?"
+        assert report == "Final report"
+        return _needs_revision_verdict()
+
+    monkeypatch.setattr(agent_module, "ENABLE_VERIFICATION", True)
+    monkeypatch.setattr(agent_module, "ENABLE_EVAL_TRACKING", False)
+    monkeypatch.setattr(agent_module, "MAX_VERIFICATION_ROUNDS", 2)
+    monkeypatch.setattr(agent_module, "verify_report", fake_verify_report)
+    state = _verification_state()
+
+    result = _run_after_model(
+        agent_module.ResearchStateMiddleware(), state, async_=async_
+    )
+
+    assert result is not None
+    assert result["jump_to"] == "model"
+    assert result["verification_round"] == 1
+    assert "<VerificationFeedback>" in result["verification_feedback"]
+    assert "completion_attempts" not in result
+    assert state["completion_attempts"] == 2
+    assert all(not isinstance(message, SystemMessage) for message in result["messages"])
+    tagged = next(
+        message
+        for message in result["messages"]
+        if isinstance(message, AIMessage) and message.id == "terminal-response"
+    )
+    assert tagged.response_metadata == {
+        "model": "gemma4",
+        "finish_reason": "stop",
+        "resume_intermediate": True,
+    }
+
+
+def test_next_model_request_injects_verification_feedback_system_first() -> None:
+    feedback = "<VerificationFeedback>Add evidence.</VerificationFeedback>"
+    state = _verification_state()
+    state["verification_feedback"] = feedback
+    request = ModelRequest(
+        model=FakeListChatModel(responses=["done"]),
+        messages=[HumanMessage(content="Continue the report")],
+        system_message=SystemMessage(content="Existing orchestrator guidance"),
+        state=state,
+    )
+
+    configured = agent_module.ResearchStateMiddleware().configure_request(request)
+
+    assert configured.system_message is not None
+    assert str(configured.system_message.content).startswith(
+        "Existing orchestrator guidance"
+    )
+    assert feedback in str(configured.system_message.content)
+    assert all(
+        not isinstance(message, SystemMessage) for message in configured.messages
+    )
+    assert request.messages == [HumanMessage(content="Continue the report")]
+
+
+@pytest.mark.parametrize("async_", [False, True])
+def test_passing_verification_records_current_report_ownership(
+    monkeypatch: pytest.MonkeyPatch,
+    async_: bool,
+) -> None:
+    async def fake_verify_report(*, question: str, report: str) -> VerificationVerdict:
+        return VerificationVerdict(status="complete", sufficiency_score=1.0)
+
+    monkeypatch.setattr(agent_module, "ENABLE_VERIFICATION", True)
+    monkeypatch.setattr(agent_module, "ENABLE_EVAL_TRACKING", False)
+    monkeypatch.setattr(agent_module, "verify_report", fake_verify_report)
+
+    result = _run_after_model(
+        agent_module.ResearchStateMiddleware(),
+        _verification_state(report_modified_at="report-v2"),
+        async_=async_,
+    )
+
+    assert result is not None
+    assert result["completion_verified_report_modified_at"] == "report-v2"
+    assert "completion_accepted_at_limit_report_modified_at" not in result
+    assert "jump_to" not in result
+    assert "completion_attempts" not in result
+
+
+@pytest.mark.parametrize("async_", [False, True])
+def test_final_revision_limit_accepts_only_current_owned_report_without_jump(
+    monkeypatch: pytest.MonkeyPatch,
+    async_: bool,
+) -> None:
+    async def fake_verify_report(*, question: str, report: str) -> VerificationVerdict:
+        return _needs_revision_verdict()
+
+    monkeypatch.setattr(agent_module, "ENABLE_VERIFICATION", True)
+    monkeypatch.setattr(agent_module, "ENABLE_EVAL_TRACKING", False)
+    monkeypatch.setattr(agent_module, "MAX_VERIFICATION_ROUNDS", 2)
+    monkeypatch.setattr(agent_module, "verify_report", fake_verify_report)
+
+    result = _run_after_model(
+        agent_module.ResearchStateMiddleware(),
+        _verification_state(
+            report_modified_at="report-v2", verification_round=1
+        ),
+        async_=async_,
+    )
+
+    assert result is not None
+    assert result["completion_accepted_at_limit_report_modified_at"] == "report-v2"
+    assert result["verification_round"] == 2
+    assert result["verification_feedback"] is None
+    assert "completion_verified_report_modified_at" not in result
+    assert "jump_to" not in result
+    assert "completion_attempts" not in result
+
+
+def test_research_state_extends_completion_state() -> None:
+    assert CompletionState in agent_module.ResearchState.__orig_bases__
+
+
+def test_verification_hooks_declare_explicit_model_and_end_routes() -> None:
+    middleware = agent_module.ResearchStateMiddleware()
+
+    assert getattr(middleware.after_model, "__can_jump_to__") == ["model", "end"]
+    assert getattr(middleware.aafter_model, "__can_jump_to__") == ["model", "end"]

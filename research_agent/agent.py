@@ -12,7 +12,7 @@ import os
 import re
 import time
 import traceback
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -22,7 +22,6 @@ from deepagents.backends.utils import (
     create_file_data,
     file_data_to_string,
 )
-from deepagents.middleware.filesystem import FilesystemState
 from dotenv import load_dotenv
 from langchain.agents.middleware import (
     AgentMiddleware,
@@ -39,6 +38,7 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.config import get_config
 
 from research_agent.cli_utils import get_ssl_verify_config, str2bool
+from research_agent.completion_guard import CompletionState
 from research_agent.document_context import (
     configure_document_tools,
     has_document_context,
@@ -138,6 +138,138 @@ def _build_verification_todo(
     }
 
 
+def research_todos_complete(todos: object) -> bool:
+    """Return whether every non-verification todo is valid and completed."""
+    if not isinstance(todos, list):
+        return False
+    research_todos = [
+        todo
+        for todo in todos
+        if not (
+            isinstance(todo, Mapping)
+            and todo.get("id") == "verification_pass"
+        )
+    ]
+    if not research_todos:
+        return False
+    return all(
+        isinstance(todo, Mapping)
+        and isinstance(todo.get("content"), str)
+        and bool(todo["content"].strip())
+        and todo.get("status") == "completed"
+        for todo in research_todos
+    )
+
+
+def _owned_report_for_verification(
+    state: Mapping[str, Any],
+) -> tuple[str, str] | None:
+    """Return current report text/version when this request owns it."""
+    generation = state.get("completion_request_generation")
+    if (
+        not isinstance(generation, str)
+        or not generation
+        or state.get("completion_plan_owner_generation") != generation
+        or state.get("completion_report_owned") is not True
+        or not research_todos_complete(state.get("todos"))
+    ):
+        return None
+
+    files = state.get("files")
+    if not isinstance(files, Mapping):
+        return None
+    report = files.get("/final_report.md")
+    if not isinstance(report, Mapping):
+        return None
+    modified_at = report.get("modified_at")
+    if (
+        not isinstance(modified_at, str)
+        or not modified_at
+        or modified_at == state.get("completion_report_baseline_modified_at")
+        or modified_at == state.get("completion_verified_report_modified_at")
+        or modified_at
+        == state.get("completion_accepted_at_limit_report_modified_at")
+    ):
+        return None
+    try:
+        report_text = file_data_to_string(report)  # type: ignore[arg-type]
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not report_text.strip():
+        return None
+    return report_text, modified_at
+
+
+def _verification_round(state: Mapping[str, Any]) -> int:
+    value = state.get("verification_round")
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return 0
+
+
+def _verification_question(
+    state: Mapping[str, Any], files: Mapping[str, Any]
+) -> str:
+    messages = state.get("messages")
+    if isinstance(messages, list):
+        for message in reversed(messages):
+            if isinstance(message, HumanMessage):
+                return str(message.content)
+            if isinstance(message, Mapping) and message.get("role") == "user":
+                return str(message.get("content", ""))
+    request_file = files.get("/research_request.md")
+    if isinstance(request_file, Mapping):
+        try:
+            return file_data_to_string(request_file)  # type: ignore[arg-type]
+        except (KeyError, TypeError, ValueError):
+            pass
+    return ""
+
+
+def _tag_verification_intermediate(message: AIMessage) -> AIMessage:
+    metadata = {**message.response_metadata, "resume_intermediate": True}
+    return message.model_copy(update={"response_metadata": metadata})
+
+
+def _apply_verification_verdict(
+    *,
+    updates: dict[str, Any],
+    terminal: AIMessage,
+    filtered_todos: list[Any],
+    verdict: VerificationVerdict,
+    verification_round: int,
+    report_modified_at: str,
+) -> None:
+    """Apply one verdict without consuming completion-guard attempts."""
+    updates["todos"] = filtered_todos + [
+        _build_verification_todo(
+            verdict_status=verdict.status,
+            verification_round=verification_round,
+            max_rounds=MAX_VERIFICATION_ROUNDS,
+        )
+    ]
+    if verdict.status != "needs_revision":
+        updates["verification_round"] = verification_round
+        updates["verification_feedback"] = None
+        updates["completion_verified_report_modified_at"] = report_modified_at
+        return
+
+    next_round = verification_round + 1
+    updates["verification_round"] = next_round
+    if next_round >= MAX_VERIFICATION_ROUNDS:
+        updates["verification_feedback"] = None
+        updates["completion_accepted_at_limit_report_modified_at"] = (
+            report_modified_at
+        )
+        return
+
+    updates["verification_feedback"] = format_feedback(verdict)
+    updates.setdefault("messages", [])
+    if isinstance(updates["messages"], list):
+        updates["messages"].append(_tag_verification_intermediate(terminal))
+    updates["jump_to"] = "model"
+
+
 # Get current date
 current_date = datetime.now().strftime("%Y-%m-%d")
 
@@ -145,7 +277,7 @@ current_date = datetime.now().strftime("%Y-%m-%d")
 skill_registry = get_skill_registry()
 
 
-class ResearchState(FilesystemState):
+class ResearchState(CompletionState):
     """Runtime state for the research agent."""
 
     doc_folder: str | None
@@ -154,12 +286,7 @@ class ResearchState(FilesystemState):
     no_web: bool | None
     chat_start_time: float | None
     chat_elapsed_seconds: float | None
-    _eval_logged: bool
-    _streamed_files: list[str] | None
     _last_user_msg_hash: str | None
-    # Post-generation verification loop (Wave 1: Reflect)
-    verification_round: int
-    verification_feedback: str | None
     # Multi-pass research (Wave 2: Plan + Execute)
     research_pass: int
 
@@ -388,7 +515,7 @@ class ResearchStateMiddleware(AgentMiddleware):
             "_eval_logged": False,
         }
 
-    @hook_config(can_jump_to=["end"])
+    @hook_config(can_jump_to=["model", "end"])
     def after_model(self, state: ResearchState, runtime: Any) -> dict[str, Any] | None:
         """Calculate chat_elapsed_seconds after each model response and optionally track eval metrics.
 
@@ -484,159 +611,96 @@ class ResearchStateMiddleware(AgentMiddleware):
                 updates["_streamed_files"] = list(streamed)
 
         # ── Post-generation verification hook ────────────────────────────
-        # When the model has written /final_report.md and is no longer
-        # emitting tool calls, run adversarial verification.  If the report
-        # needs revision, inject structured feedback as a SystemMessage so
-        # the model gets another chance to improve it (up to
-        # MAX_VERIFICATION_ROUNDS iterations).
-        #
-        # This reuses the same "jump_to / SystemMessage injection" pattern
-        # proven in the wiki-complete guard above.
+        # Verify only a completed current-request plan and its owned report.
+        # Non-final feedback remains in state and is injected ephemerally by
+        # configure_request so strict Ollama templates keep system-first order.
+        owned_report = _owned_report_for_verification(state)
         if (
                 ENABLE_VERIFICATION
+                and isinstance(last_msg, AIMessage)
                 and not last_tool_calls
                 and isinstance(state_files, dict)
-                and "/final_report.md" in state_files
+                and owned_report is not None
         ):
-            verification_round = state.get("verification_round", 0)
+            verification_round = _verification_round(state)
             if verification_round < MAX_VERIFICATION_ROUNDS:
+                report_text, report_modified_at = owned_report
+                user_question = _verification_question(state, state_files)
+
+                logger.info(
+                    "Verification round %d/%d — reviewing /final_report.md",
+                    verification_round + 1,
+                    MAX_VERIFICATION_ROUNDS,
+                )
+
+                existing_todos = list(state.get("todos") or [])
+                filtered_todos = [
+                    todo
+                    for todo in existing_todos
+                    if not (
+                        isinstance(todo, Mapping)
+                        and todo.get("id") == "verification_pass"
+                    )
+                ]
+
                 try:
-                    report_text = file_data_to_string(
-                        state_files["/final_report.md"]
-                    )
-                except Exception:
-                    report_text = ""
-
-                if report_text.strip():
-                    # Extract user question from state messages.
-                    user_question = ""
-                    msgs = state.get("messages", [])
-                    for m in reversed(msgs):
-                        if isinstance(m, HumanMessage):
-                            user_question = str(m.content)
-                            break
-                        elif isinstance(m, dict) and m.get("role") == "user":
-                            user_question = str(m.get("content", ""))
-                            break
-                    if not user_question:
-                        # Fallback: read from research_request file.
-                        if "/research_request.md" in state_files:
-                            try:
-                                user_question = file_data_to_string(
-                                    state_files["/research_request.md"]
-                                )
-                            except Exception:
-                                pass
-
-                    logger.info(
-                        "Verification round %d/%d — reviewing /final_report.md",
-                        verification_round + 1,
-                        MAX_VERIFICATION_ROUNDS,
-                    )
-
-                    # ── Emit verification progress to do ─────────────────
-                    existing_todos = list(state.get("todos") or [])
-                    verification_todo = {
-                        "id": "verification_pass",
-                        "content": (
-                            f"Verifying report quality "
-                            f"(round {verification_round + 1}/{MAX_VERIFICATION_ROUNDS})..."
-                        ),
-                        "status": "in_progress",
-                    }
-                    filtered_todos = [
-                        t for t in existing_todos
-                        if not (
-                                isinstance(t, dict)
-                                and "verif" in str(t.get("id", "")).lower()
+                    async def _verify():
+                        return await verify_report(
+                            question=user_question,
+                            report=report_text,
                         )
-                    ]
-                    updates["todos"] = filtered_todos + [verification_todo]
+
+                    def _run_verify():
+                        return asyncio.run(_verify())
 
                     try:
-                        # Run verification synchronously (the event-loop
-                        # / thread-pool pattern from _check_if_needs_deep_research).
-                        async def _verify():
-                            return await verify_report(
-                                question=user_question,
-                                report=report_text,
-                            )
+                        current_loop = asyncio.get_running_loop()
+                    except RuntimeError:
+                        current_loop = None
 
-                        def _run_verify():
-                            return asyncio.run(_verify())
-
-                        try:
-                            current_loop = asyncio.get_running_loop()
-                        except RuntimeError:
-                            current_loop = None
-
-                        if (
-                                current_loop is not None
-                                and current_loop.is_running()
-                        ):
-                            with concurrent.futures.ThreadPoolExecutor(
-                                    max_workers=1
-                            ) as pool:
-                                verdict: VerificationVerdict = pool.submit(
-                                    _run_verify
-                                ).result(timeout=120)
-                        else:
-                            verdict = asyncio.run(_verify())
-
-                        logger.info(
-                            "Verification verdict: %s (score=%.2f, "
-                            "grounding_failures=%d, gaps=%d)",
-                            verdict.status,
-                            verdict.sufficiency_score,
-                            sum(
-                                1
-                                for r in verdict.grounding_results
-                                if not r.grounded or not r.reachable
-                            ),
-                            len(verdict.adversarial_gaps),
-                        )
-                    except Exception as exc:
-                        logger.warning(
-                            "Verification check failed: %s. "
-                            "Allowing report through without revision.",
-                            exc,
-                        )
-                        verdict = VerificationVerdict(
-                            status="complete",
-                            sufficiency_score=1.0,
-                            sufficiency_reason="",
-                            error_message=str(exc),
-                        )
-
-                    updates["todos"] = filtered_todos + [
-                        _build_verification_todo(
-                            verdict_status=verdict.status,
-                            verification_round=verification_round,
-                            max_rounds=MAX_VERIFICATION_ROUNDS,
-                        )
-                    ]
-
-                    if verdict.status == "needs_revision":
-                        feedback_text = format_feedback(verdict)
-                        logger.info(
-                            "Report needs revision — injecting feedback "
-                            "for round %d",
-                            verification_round + 1,
-                        )
-                        updates["verification_round"] = verification_round + 1
-                        updates["verification_feedback"] = feedback_text
-                        # Inject feedback as SystemMessage so the model
-                        # sees it on the next iteration and revises.
-                        updates.setdefault("messages", [])
-                        if isinstance(updates["messages"], list):
-                            updates["messages"] = [
-                                                      SystemMessage(content=feedback_text)
-                                                  ] + updates["messages"]
-                        # Do NOT jump to end — let the model revise.
+                    if current_loop is not None and current_loop.is_running():
+                        with concurrent.futures.ThreadPoolExecutor(
+                                max_workers=1
+                        ) as pool:
+                            verdict: VerificationVerdict = pool.submit(
+                                _run_verify
+                            ).result(timeout=120)
                     else:
-                        # Report is complete — allow normal termination.
-                        updates["verification_round"] = verification_round
-                        updates["verification_feedback"] = None
+                        verdict = asyncio.run(_verify())
+
+                    logger.info(
+                        "Verification verdict: %s (score=%.2f, "
+                        "grounding_failures=%d, gaps=%d)",
+                        verdict.status,
+                        verdict.sufficiency_score,
+                        sum(
+                            1
+                            for result in verdict.grounding_results
+                            if not result.grounded or not result.reachable
+                        ),
+                        len(verdict.adversarial_gaps),
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Verification check failed: %s. "
+                        "Allowing report through without revision.",
+                        exc,
+                    )
+                    verdict = VerificationVerdict(
+                        status="complete",
+                        sufficiency_score=1.0,
+                        sufficiency_reason="",
+                        error_message=str(exc),
+                    )
+
+                _apply_verification_verdict(
+                    updates=updates,
+                    terminal=last_msg,
+                    filtered_todos=filtered_todos,
+                    verdict=verdict,
+                    verification_round=verification_round,
+                    report_modified_at=report_modified_at,
+                )
 
         # Optional: Log eval metrics on completion (when graph is done)
         # This checks if we're at the end of execution by looking for final artifacts
@@ -712,6 +776,7 @@ class ResearchStateMiddleware(AgentMiddleware):
 
         return updates if updates else None
 
+    @hook_config(can_jump_to=["model", "end"])
     async def aafter_model(self, state: ResearchState, runtime: Any) -> dict[str, Any] | None:
         """Asynchronous version of after_model that runs verification without blocking the main event loop."""
         chat_start_time = state.get("chat_start_time")
@@ -794,123 +859,73 @@ class ResearchStateMiddleware(AgentMiddleware):
                 updates["_streamed_files"] = list(streamed)
 
         # ── Post-generation verification hook ────────────────────────────
+        owned_report = _owned_report_for_verification(state)
         if (
                 ENABLE_VERIFICATION
+                and isinstance(last_msg, AIMessage)
                 and not last_tool_calls
                 and isinstance(state_files, dict)
-                and "/final_report.md" in state_files
+                and owned_report is not None
         ):
-            verification_round = state.get("verification_round", 0)
+            verification_round = _verification_round(state)
             if verification_round < MAX_VERIFICATION_ROUNDS:
+                report_text, report_modified_at = owned_report
+                user_question = _verification_question(state, state_files)
+
+                logger.info(
+                    "Verification round %d/%d — reviewing /final_report.md (async)",
+                    verification_round + 1,
+                    MAX_VERIFICATION_ROUNDS,
+                )
+
+                existing_todos = list(state.get("todos") or [])
+                filtered_todos = [
+                    todo
+                    for todo in existing_todos
+                    if not (
+                        isinstance(todo, Mapping)
+                        and todo.get("id") == "verification_pass"
+                    )
+                ]
+
                 try:
-                    report_text = file_data_to_string(
-                        state_files["/final_report.md"]
+                    verdict = await verify_report(
+                        question=user_question,
+                        report=report_text,
                     )
-                except Exception:
-                    report_text = ""
-
-                if report_text.strip():
-                    user_question = ""
-                    msgs = state.get("messages", [])
-                    for m in reversed(msgs):
-                        if isinstance(m, HumanMessage):
-                            user_question = str(m.content)
-                            break
-                        elif isinstance(m, dict) and m.get("role") == "user":
-                            user_question = str(m.get("content", ""))
-                            break
-                    if not user_question:
-                        if "/research_request.md" in state_files:
-                            try:
-                                user_question = file_data_to_string(
-                                    state_files["/research_request.md"]
-                                )
-                            except Exception:
-                                pass
-
                     logger.info(
-                        "Verification round %d/%d — reviewing /final_report.md (async)",
-                        verification_round + 1,
-                        MAX_VERIFICATION_ROUNDS,
+                        "Verification verdict: %s (score=%.2f, "
+                        "grounding_failures=%d, gaps=%d)",
+                        verdict.status,
+                        verdict.sufficiency_score,
+                        sum(
+                            1
+                            for result in verdict.grounding_results
+                            if not result.grounded or not result.reachable
+                        ),
+                        len(verdict.adversarial_gaps),
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Verification check failed: %s. "
+                        "Allowing report through without revision.",
+                        exc,
+                    )
+                    verdict = VerificationVerdict(
+                        status="complete",
+                        sufficiency_score=1.0,
+                        sufficiency_reason="",
+                        error_message=str(exc),
                     )
 
-                    # ── Emit verification progress todo ─────────────────
-                    # Add an in_progress verification task so the frontend
-                    # shows a clock icon during the hook's execution window.
-                    existing_todos = list(state.get("todos") or [])
-                    verification_todo = {
-                        "id": "verification_pass",
-                        "content": (
-                            f"Verifying report quality "
-                            f"(round {verification_round + 1}/{MAX_VERIFICATION_ROUNDS})..."
-                        ),
-                        "status": "in_progress",
-                    }
-                    filtered_todos = [
-                        t for t in existing_todos
-                        if not (
-                                isinstance(t, dict)
-                                and "verif" in str(t.get("id", "")).lower()
-                        )
-                    ]
-                    updates["todos"] = filtered_todos + [verification_todo]
-
-                    try:
-                        # Direct await — completely non-blocking!
-                        verdict = await verify_report(
-                            question=user_question,
-                            report=report_text,
-                        )
-                        logger.info(
-                            "Verification verdict: %s (score=%.2f, "
-                            "grounding_failures=%d, gaps=%d)",
-                            verdict.status,
-                            verdict.sufficiency_score,
-                            sum(
-                                1
-                                for r in verdict.grounding_results
-                                if not r.grounded or not r.reachable
-                            ),
-                            len(verdict.adversarial_gaps),
-                        )
-                    except Exception as exc:
-                        logger.warning(
-                            "Verification check failed: %s. "
-                            "Allowing report through without revision.",
-                            exc,
-                        )
-                        verdict = VerificationVerdict(
-                            status="complete",
-                            sufficiency_score=1.0,
-                            sufficiency_reason="",
-                            error_message=str(exc),
-                        )
-
-                    updates["todos"] = filtered_todos + [
-                        _build_verification_todo(
-                            verdict_status=verdict.status,
-                            verification_round=verification_round,
-                            max_rounds=MAX_VERIFICATION_ROUNDS,
-                        )
-                    ]
-
-                    if verdict.status == "needs_revision":
-                        feedback_text = format_feedback(verdict)
-                        logger.info(
-                            "Report needs revision — injecting feedback "
-                            "for round %d",
-                            verification_round + 1,
-                        )
-                        updates["verification_round"] = verification_round + 1
-                        updates["verification_feedback"] = feedback_text
-                        updates.setdefault("messages", [])
-                        if isinstance(updates["messages"], list):
-                            updates["messages"] = [
-                                                      SystemMessage(content=feedback_text)
-                                                  ] + updates["messages"]
-                    else:
-                        updates["verification_round"] = verification_round
-                        updates["verification_feedback"] = None
+                _apply_verification_verdict(
+                    updates=updates,
+                    terminal=last_msg,
+                    filtered_todos=filtered_todos,
+                    verdict=verdict,
+                    verification_round=verification_round,
+                    report_modified_at=report_modified_at,
+                )
 
         # Optional: Log eval metrics on completion (when graph is done)
         if ENABLE_EVAL_TRACKING and state.get("files"):

@@ -10,6 +10,7 @@ from deepagents.backends.utils import create_file_data
 from langchain_core.messages import HumanMessage
 
 from research_agent import agent as agent_module
+from research_agent.completion_guard import inspect_completion
 from research_agent.research_subagent.utils.verification import VerificationVerdict
 
 POLICY_CASES = [
@@ -84,13 +85,20 @@ def test_middleware_paths_publish_verification_progress_policy(
 
     middleware = agent_module.ResearchStateMiddleware()
     state: dict[str, Any] = {
-        "messages": [HumanMessage(content="What is graph engineering?")],
+        "messages": [
+            HumanMessage(content="What is graph engineering?"),
+            agent_module.AIMessage(content="Done", id="terminal-response"),
+        ],
         "files": {"/final_report.md": create_file_data("Final report")},
         "todos": [
             {"id": "research", "content": "Research graph engineering", "status": "completed"},
             {"id": "verification_pass", "content": "old", "status": "in_progress"},
         ],
         "verification_round": verification_round,
+        "completion_request_generation": "generation-v1",
+        "completion_plan_owner_generation": "generation-v1",
+        "completion_report_owned": True,
+        "completion_report_baseline_modified_at": "prior-report",
         "_streamed_files": ["/final_report.md"],
     }
 
@@ -108,3 +116,99 @@ def test_middleware_paths_publish_verification_progress_policy(
             "status": expected_status,
         },
     ]
+
+
+@pytest.mark.parametrize("async_", [False, True])
+def test_second_verification_round_excludes_only_internal_verification_todo(
+    monkeypatch: pytest.MonkeyPatch,
+    async_: bool,
+) -> None:
+    calls = 0
+
+    async def fake_verify_report(*, question: str, report: str) -> VerificationVerdict:
+        nonlocal calls
+        calls += 1
+        return VerificationVerdict(status="complete", sufficiency_score=1.0)
+
+    monkeypatch.setattr(agent_module, "ENABLE_VERIFICATION", True)
+    monkeypatch.setattr(agent_module, "ENABLE_EVAL_TRACKING", False)
+    monkeypatch.setattr(agent_module, "MAX_VERIFICATION_ROUNDS", 2)
+    monkeypatch.setattr(agent_module, "verify_report", fake_verify_report)
+    report = create_file_data("Revised final report")
+    state: dict[str, Any] = {
+        "messages": [
+            HumanMessage(content="What is graph engineering?"),
+            agent_module.AIMessage(content="Revised", id="terminal-response"),
+        ],
+        "files": {"/final_report.md": report},
+        "todos": [
+            {"id": "research", "content": "Research", "status": "completed"},
+            {
+                "id": "verification_pass",
+                "content": "Verification 1/2 complete — revision required",
+                "status": "in_progress",
+            },
+        ],
+        "verification_round": 1,
+        "verification_feedback": "previous feedback",
+        "completion_request_generation": "generation-v1",
+        "completion_plan_owner_generation": "generation-v1",
+        "completion_report_owned": True,
+        "completion_report_baseline_modified_at": "prior-report",
+        "_streamed_files": ["/final_report.md"],
+    }
+
+    middleware = agent_module.ResearchStateMiddleware()
+    if async_:
+        result = asyncio.run(middleware.aafter_model(state, runtime=None))
+    else:
+        result = middleware.after_model(state, runtime=None)
+
+    assert calls == 1
+    assert result is not None
+    assert result["todos"][-1]["id"] == "verification_pass"
+    assert result["todos"][-1]["status"] == "completed"
+    assert agent_module.research_todos_complete(state["todos"]) is True
+
+
+def test_research_todos_complete_does_not_exclude_similarly_named_user_todo() -> None:
+    todos = [
+        {"id": "research", "content": "Research", "status": "completed"},
+        {
+            "id": "verification_pass_external",
+            "content": "Verify external source",
+            "status": "in_progress",
+        },
+    ]
+
+    assert agent_module.research_todos_complete(todos) is False
+
+
+def test_final_readiness_still_requires_completed_verification_todo() -> None:
+    report = create_file_data("Final report")
+    todos = [
+        {"id": "research", "content": "Research", "status": "completed"},
+        {
+            "id": "verification_pass",
+            "content": "Verification 1/2 complete — revision required",
+            "status": "in_progress",
+        },
+    ]
+
+    pending = inspect_completion(
+        todos=todos,
+        files={"/final_report.md": report},
+        plan_active=True,
+        report_owned=True,
+        report_baseline_modified_at="prior-report",
+    )
+    completed = inspect_completion(
+        todos=[*todos[:-1], {**todos[-1], "status": "completed"}],
+        files={"/final_report.md": report},
+        plan_active=True,
+        report_owned=True,
+        report_baseline_modified_at="prior-report",
+    )
+
+    assert pending.ready is False
+    assert completed.ready is True
