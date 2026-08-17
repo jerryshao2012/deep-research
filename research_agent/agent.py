@@ -56,7 +56,10 @@ from research_agent.research_subagent.clarification.middleware import (
 from research_agent.research_subagent.clarification.tool import clarify_requirements
 from research_agent.research_subagent.prompts import RESEARCHER_DESCRIPTION
 from research_agent.research_subagent.resume.middleware import ResumeMiddleware
-from research_agent.research_subagent.resume.policy import inspect_todos
+from research_agent.research_subagent.resume.policy import (
+    inspect_todos,
+    is_resume_intent,
+)
 from research_agent.research_subagent.tools import (
     fetch_webpage_content,
     glob,
@@ -240,8 +243,16 @@ def _verification_question(
         and bool(generation)
         and state.get("completion_resume_adopted_generation") == generation
     )
-    if is_current_generation_resume and len(human_questions) >= 2:
-        return human_questions[-2]
+    if is_current_generation_resume:
+        expected_hash = state.get("_last_user_msg_hash")
+        for question in reversed(human_questions):
+            if is_resume_intent(question):
+                continue
+            if isinstance(expected_hash, str) and expected_hash:
+                if hashlib.md5(question.encode()).hexdigest() != expected_hash:
+                    continue
+            return question
+        return ""
     return human_questions[-1] if human_questions else ""
 
 

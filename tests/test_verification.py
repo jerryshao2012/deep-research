@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from typing import Any
 
 import pytest
@@ -411,6 +412,50 @@ def test_resumed_verification_uses_original_current_generation_question(
     assert seen_questions == ["Original current-generation research question"]
     assert "Stale prior-generation question" not in seen_questions
     assert "continue" not in seen_questions
+
+
+@pytest.mark.parametrize("async_", [False, True])
+@pytest.mark.parametrize("request_file_kind", ["missing", "malformed"])
+def test_repeated_resume_controls_never_replace_generation_owned_question(
+    monkeypatch: pytest.MonkeyPatch,
+    async_: bool,
+    request_file_kind: str,
+) -> None:
+    original_question = "Continue comparing graph systems with evidence"
+    seen_questions: list[str] = []
+
+    async def fake_verify_report(*, question: str, report: str) -> VerificationVerdict:
+        seen_questions.append(question)
+        return VerificationVerdict(status="complete", sufficiency_score=1.0)
+
+    monkeypatch.setattr(agent_module, "ENABLE_VERIFICATION", True)
+    monkeypatch.setattr(agent_module, "ENABLE_EVAL_TRACKING", False)
+    monkeypatch.setattr(agent_module, "verify_report", fake_verify_report)
+    state = _verification_state()
+    state["messages"] = [
+        HumanMessage(content="Stale prior-generation question"),
+        HumanMessage(content=original_question),
+        HumanMessage(content="continue"),
+        HumanMessage(content="please proceed"),
+        AIMessage(content="Research complete.", id="terminal-response"),
+    ]
+    state["completion_resume_adopted_generation"] = "generation-v1"
+    state["_last_user_msg_hash"] = hashlib.md5(original_question.encode()).hexdigest()
+    if request_file_kind == "missing":
+        del state["files"]["/research_request.md"]
+    else:
+        state["files"]["/research_request.md"] = {
+            "content": object(),
+            "encoding": "utf-8",
+            "modified_at": "request-v1",
+        }
+
+    _run_after_model(agent_module.ResearchStateMiddleware(), state, async_=async_)
+
+    assert seen_questions == [original_question]
+    assert "Stale prior-generation question" not in seen_questions
+    assert "continue" not in seen_questions
+    assert "please proceed" not in seen_questions
 
 
 def test_next_model_request_injects_verification_feedback_system_first() -> None:
