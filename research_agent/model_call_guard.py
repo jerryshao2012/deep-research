@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import math
 import os
-import re
 from dataclasses import dataclass
 from typing import Literal, Mapping
 from urllib.parse import urlsplit, urlunsplit
@@ -24,7 +23,6 @@ ModelProvider = Literal[
 ]
 
 _KNOWN_PROVIDERS = frozenset(ModelProvider.__args__)
-_SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9._:/-]+$")
 
 
 def _safe_provider(provider: str) -> ModelProvider:
@@ -74,6 +72,19 @@ class ModelCallPolicy:
     timeout_seconds: float
     force_ollama_unload: bool
 
+    def __post_init__(self) -> None:
+        """Reject invalid direct construction values without normalization."""
+        try:
+            valid_timeout = (
+                not isinstance(self.timeout_seconds, bool)
+                and math.isfinite(self.timeout_seconds)
+                and self.timeout_seconds > 0
+            )
+        except (TypeError, ValueError):
+            valid_timeout = False
+        if not valid_timeout:
+            raise ValueError("timeout_seconds must be finite and positive")
+
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> ModelCallPolicy:
         """Build policy from environment values, falling back safely."""
@@ -118,12 +129,7 @@ class UnsupportedModelOverrideError(RuntimeError):
     """Safe error for a model override that cannot be applied."""
 
     def __init__(self, provider: str, model_name: str | None = None) -> None:
-        """Create an error without retaining arbitrary request content."""
+        """Create an error without retaining or rendering model name input."""
+        del model_name
         self.provider = _safe_provider(provider)
-        self.model_name = (
-            model_name.strip()
-            if model_name and _SAFE_IDENTIFIER.fullmatch(model_name.strip())
-            else None
-        )
-        detail = f" for model {self.model_name!r}" if self.model_name else ""
-        super().__init__(f"Unsupported model override for provider {self.provider!r}{detail}")
+        super().__init__(f"Unsupported model override for provider {self.provider!r}")

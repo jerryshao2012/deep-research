@@ -29,6 +29,12 @@ def test_invalid_timeout_uses_safe_default(monkeypatch, value):
     assert policy.timeout_seconds == DEFAULT_MODEL_CALL_TIMEOUT_SECONDS == 300.0
 
 
+@pytest.mark.parametrize("value", [nan, inf, 0.0, -1.0])
+def test_direct_policy_construction_rejects_invalid_timeout(value):
+    with pytest.raises(ValueError, match="finite and positive"):
+        ModelCallPolicy(timeout_seconds=value, force_ollama_unload=False)
+
+
 @pytest.mark.parametrize("value", ["0.001", "3", "300.5", "1e6"])
 def test_finite_positive_timeout_is_accepted(monkeypatch, value):
     monkeypatch.setenv("MODEL_CALL_TIMEOUT_SECONDS", value)
@@ -140,4 +146,18 @@ def test_unsupported_override_error_does_not_retain_arbitrary_content():
     )
 
     assert "prompt content" not in str(error)
-    assert error.model_name is None
+    assert not hasattr(error, "model_name")
+
+
+@pytest.mark.parametrize("model_name", [
+    "sk-proj-secret-token-123",
+    "x" * 10000,
+])
+def test_unsupported_override_error_does_not_retain_model_name(model_name):
+    error = UnsupportedModelOverrideError(provider="ollama", model_name=model_name)
+
+    assert model_name not in str(error)
+    assert model_name not in repr(error)
+    assert model_name not in repr(error.args)
+    assert model_name not in repr(vars(error))
+    assert not hasattr(error, "model_name")
