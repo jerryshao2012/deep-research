@@ -414,6 +414,50 @@ def test_repeated_numeric_ranges_keep_defects_bounded_during_discovery() -> None
     assert peak < 8_000_000
 
 
+def _alternating_headings(count: int) -> str:
+    return "\n".join(
+        f"## {'Sources' if index % 2 == 0 else 'Other'}\n[1] https://source{index}.publisher.org/a"
+        for index in range(count)
+    )
+
+
+def test_source_heading_ranges_scale_without_suffix_slicing() -> None:
+    started = perf_counter()
+    audit_web_citations(_alternating_headings(1_000))
+    small = perf_counter() - started
+    started = perf_counter()
+    audit_web_citations(_alternating_headings(16_000))
+    large = perf_counter() - started
+
+    assert large < small * 32 + 0.2
+
+
+@pytest.mark.parametrize("url", ["https://127.1/a", "https://127.0.1/a", "https://0x7f.0.0.1/a", "https://127.0x1/a"])
+def test_rejects_legacy_numeric_ipv4_aliases(url: str) -> None:
+    audit = audit_web_citations(f"## Sources\n[1] {url}")
+
+    assert "placeholder_source" in [defect.code for defect in audit.defects]
+
+
+def test_masks_bracketed_ipv6_bare_uri_before_numeric_marker_scan() -> None:
+    audit = audit_web_citations("https://[2606:4700:4700::1111]/dns-query")
+
+    assert audit.defects == ()
+    assert audit.urls == ("https://[2606:4700:4700::1111]/dns-query",)
+
+
+def test_rejects_bare_loopback_ipv6_without_numeric_marker_defect() -> None:
+    audit = audit_web_citations("https://[::1]/a")
+
+    assert [defect.code for defect in audit.defects] == ["missing_url", "placeholder_source"]
+
+
+def test_normalizes_only_hostname_and_preserves_fullwidth_path_query_and_fragment() -> None:
+    audit = audit_web_citations("https://valid.publisher.org/Ｆｏｏ?x=ｙ#Ｆ")
+
+    assert audit.urls == ("https://valid.publisher.org/Ｆｏｏ?x=ｙ#Ｆ",)
+
+
 def test_numeric_scanner_is_bounded_for_unmatched_brackets() -> None:
     started = perf_counter()
     audit_web_citations("[" * 1_024)

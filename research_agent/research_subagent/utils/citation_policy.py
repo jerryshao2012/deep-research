@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ipaddress
 import re
+import socket
 import unicodedata
 from bisect import bisect_right
 from dataclasses import dataclass
@@ -25,6 +26,7 @@ _MAX_LINK_LABEL_LENGTH = 512
 _MAX_LINK_DESTINATION_LENGTH = 2_048
 _MAX_LINK_NESTING = 8
 _SOURCE_HEADINGS = {"sources", "references", "bibliography", "works cited"}
+# TODO: Fetch integration must resolve DNS then re-apply non-global address policy to prevent rebinding.
 _PLACEHOLDER_RE = re.compile(
     r"\b(?:conceptual\s+source|placeholder|example\s+source|source\s+needed|"
     r"citation\s+needed|tbd)\b",
@@ -136,7 +138,8 @@ def audit_web_citations(report: str) -> CitationAudit:
     for link in links:
         candidates.append((link.url, link.span))
     link_index = _IntervalIndex.build({link.span for link in links})
-    for raw_url, span in _scan_uri_tokens(visible):
+    uri_tokens = _scan_uri_tokens(visible)
+    for raw_url, span in uri_tokens:
         if not link_index.contains_span(span):
             candidates.append((raw_url, span))
 
@@ -172,7 +175,13 @@ def audit_web_citations(report: str) -> CitationAudit:
 
     prose = _mask_spans(
         visible,
-        [*source_ranges, *(link.span for link in links), *malformed_link_spans, *_entry_spans_to_ranges(entry_spans)],
+        [
+            *source_ranges,
+            *(link.span for link in links),
+            *malformed_link_spans,
+            *(span for _, span in uri_tokens),
+            *_entry_spans_to_ranges(entry_spans),
+        ],
     )
     _scan_numeric_markers(prose, source_urls, defects)
 
@@ -214,17 +223,21 @@ def _source_ranges(text: str) -> list[tuple[int, int]]:
         if match:
             positions.append((offset, len(match.group("marks")), match.group("title").strip().rstrip(":").lower()))
         offset += len(line)
+    boundaries: list[int] = [len(text)] * len(positions)
+    stack: list[tuple[int, int]] = []
+    for index in range(len(positions) - 1, -1, -1):
+        start, level, _ = positions[index]
+        while stack and stack[-1][1] > level:
+            stack.pop()
+        if stack:
+            boundaries[index] = stack[-1][0]
+        stack.append((start, level))
     ranges: list[tuple[int, int]] = []
-    for index, (start, level, title) in enumerate(positions):
+    for index, (start, _, title) in enumerate(positions):
         if title not in _SOURCE_HEADINGS:
             continue
-        end = len(text)
-        for next_start, next_level, _ in positions[index + 1 :]:
-            if next_level <= level:
-                end = next_start
-                break
         line_end = text.find("\n", start)
-        ranges.append((len(text) if line_end < 0 else line_end + 1, end))
+        ranges.append((len(text) if line_end < 0 else line_end + 1, boundaries[index]))
     return ranges
 
 
@@ -344,7 +357,7 @@ def _urls_in_text(text: str) -> tuple[str, ...]:
 
 
 def _normalise_web_url(raw_url: str) -> str | None:
-    value = unicodedata.normalize("NFKC", raw_url).strip().strip("<>").rstrip(".,;:!?")
+    value = raw_url.strip().strip("<>").rstrip(".,;:!?")
     while value.endswith(")") and value.count("(") < value.count(")"):
         value = value[:-1]
     try:
@@ -360,7 +373,7 @@ def _normalise_web_url(raw_url: str) -> str | None:
     if ":" in host and not host.startswith("["):
         host = f"[{host}]"
     netloc = host if port is None else f"{host}:{port}"
-    return urlunsplit((parsed.scheme.lower(), netloc, parsed.path or "", parsed.query, ""))
+    return urlunsplit((parsed.scheme.lower(), netloc, parsed.path or "", parsed.query, parsed.fragment))
 
 
 def _is_reserved_host(url: str) -> bool:
@@ -390,11 +403,9 @@ def _canonical_hostname(host: str) -> str | None:
     normalized = unicodedata.normalize("NFKC", host).lower().rstrip(".")
     if not normalized:
         return None
-    if normalized.isdecimal():
-        try:
-            return str(ipaddress.IPv4Address(int(normalized, 10)))
-        except ValueError:
-            return normalized
+    legacy_ipv4 = _parse_legacy_ipv4(normalized)
+    if legacy_ipv4 is not None:
+        return legacy_ipv4
     if _is_ambiguous_numeric_host(normalized):
         return normalized
     if normalized.isascii():
@@ -406,12 +417,20 @@ def _canonical_hostname(host: str) -> str | None:
 
 
 def _is_ambiguous_numeric_host(host: str) -> bool:
-    if host.lower().startswith("0x"):
-        return True
-    parts = host.split(".")
-    return len(parts) > 1 and all(part.isdecimal() for part in parts) and any(
-        len(part) > 1 and part.startswith("0") for part in parts
-    )
+    return _is_numeric_looking_host(host) and _parse_legacy_ipv4(host) is None
+
+
+def _parse_legacy_ipv4(host: str) -> str | None:
+    if not _is_numeric_looking_host(host):
+        return None
+    try:
+        return str(ipaddress.IPv4Address(socket.inet_aton(host)))
+    except OSError:
+        return None
+
+
+def _is_numeric_looking_host(host: str) -> bool:
+    return bool(re.fullmatch(r"[0-9a-fx.]+", host, re.IGNORECASE)) and any(character.isdigit() for character in host)
 
 
 def _is_source_candidate(
