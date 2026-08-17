@@ -7,6 +7,9 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
+from langchain.agents import create_agent
+from langchain.agents.middleware import TodoListMiddleware
+from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from langchain_core.messages import AIMessage, ToolMessage
 
 import research_agent.completion_guard as completion_guard
@@ -30,6 +33,20 @@ def _middleware(
 
 def _apply(state: dict[str, Any], update: dict[str, Any] | None) -> dict[str, Any]:
     return {**state, **(update or {})}
+
+
+def test_compiled_guard_schema_accepts_minimal_ordinary_input() -> None:
+    graph = create_agent(
+        FakeListChatModel(responses=["done"]),
+        middleware=[
+            TodoListMiddleware(system_prompt=""),
+            completion_guard.CompletionGuardMiddleware(),
+        ],
+    )
+
+    validated = graph.get_input_schema().model_validate({"messages": []})
+
+    assert validated.root == {"messages": []}
 
 
 @pytest.mark.parametrize(
@@ -579,6 +596,16 @@ def test_write_todos_rejects_malformed_tool_call_id() -> None:
     assert _middleware(run_id="run-b").before_model(state, runtime=None) is None
 
 
+@pytest.mark.parametrize("args", [{}, {"todos": "not-a-list"}])
+def test_write_todos_rejects_malformed_tool_arguments(args: dict[str, Any]) -> None:
+    state = _activation_state(
+        _tool_exchange(name="write_todos", args=args),
+        todos=[{"content": "Research", "status": "pending"}],
+    )
+
+    assert _middleware(run_id="run-b").before_model(state, runtime=None) is None
+
+
 @pytest.mark.parametrize(
     "args",
     [
@@ -665,5 +692,115 @@ def test_write_file_rejects_failed_mismatched_malformed_stale_or_nonfinal_result
     files: object,
 ) -> None:
     state = _activation_state(messages, files=files)
+
+    assert _middleware(run_id="run-b").before_model(state, runtime=None) is None
+
+
+@pytest.mark.parametrize("args", [{}, {"content": "   "}])
+def test_write_file_rejects_malformed_arguments_instead_of_assuming_default_path(
+    args: dict[str, Any],
+) -> None:
+    state = _activation_state(
+        _tool_exchange(name="write_file", args=args),
+        files={"/final_report.md": _file("Report", modified_at="current")},
+    )
+
+    assert _middleware(run_id="run-b").before_model(state, runtime=None) is None
+
+
+def test_tool_correlation_rejects_duplicate_ids_shared_by_different_tools() -> None:
+    call = AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "write_file",
+                "args": {"content": "Report"},
+                "id": "duplicate",
+                "type": "tool_call",
+            },
+            {
+                "name": "unrelated",
+                "args": {"value": 1},
+                "id": "duplicate",
+                "type": "tool_call",
+            },
+        ],
+    )
+    result = ToolMessage(
+        content="done",
+        tool_call_id="duplicate",
+        status="success",
+    )
+    state = _activation_state(
+        [call, result],
+        files={"/final_report.md": _file("Report", modified_at="current")},
+    )
+
+    assert _middleware(run_id="run-b").before_model(state, runtime=None) is None
+
+
+def test_tool_correlation_rejects_duplicate_result_ids() -> None:
+    messages = _tool_exchange(
+        name="write_file",
+        args={"content": "Report"},
+    )
+    messages.append(
+        ToolMessage(
+            content="duplicate",
+            tool_call_id="call-1",
+            status="success",
+        )
+    )
+    state = _activation_state(
+        messages,
+        files={"/final_report.md": _file("Report", modified_at="current")},
+    )
+
+    assert _middleware(run_id="run-b").before_model(state, runtime=None) is None
+
+
+def test_tool_correlation_rejects_unmatched_result_ids() -> None:
+    messages = _tool_exchange(
+        name="write_file",
+        args={"content": "Report"},
+    )
+    messages.append(
+        ToolMessage(
+            content="unmatched",
+            tool_call_id="other-call",
+            status="success",
+        )
+    )
+    state = _activation_state(
+        messages,
+        files={"/final_report.md": _file("Report", modified_at="current")},
+    )
+
+    assert _middleware(run_id="run-b").before_model(state, runtime=None) is None
+
+
+def test_tool_correlation_rejects_call_without_a_result() -> None:
+    call = AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "write_file",
+                "args": {"content": "Report"},
+                "id": "call-1",
+                "type": "tool_call",
+            },
+            {
+                "name": "unrelated",
+                "args": {"value": 1},
+                "id": "call-2",
+                "type": "tool_call",
+            },
+        ],
+    )
+    result = ToolMessage(content="done", tool_call_id="call-1", status="success")
+    state = _activation_state(
+        [call, result],
+        files={"/final_report.md": _file("Report", modified_at="current")},
+    )
 
     assert _middleware(run_id="run-b").before_model(state, runtime=None) is None

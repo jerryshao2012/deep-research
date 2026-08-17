@@ -5,12 +5,13 @@ from __future__ import annotations
 import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, NotRequired
 from uuid import UUID, uuid4
 
 from deepagents.backends.utils import file_data_to_string
 from deepagents.middleware.filesystem import FilesystemState
 from langchain.agents.middleware import AgentMiddleware
+from langchain.agents.middleware.todo import PlanningState
 from langchain_core.messages import AIMessage, ToolMessage
 from langgraph.config import get_config
 
@@ -21,28 +22,27 @@ FINAL_REPORT_PATH = "/final_report.md"
 ReportFailureReason = Literal["missing", "empty", "malformed", "stale"]
 
 
-class CompletionState(FilesystemState):
+class CompletionState(FilesystemState, PlanningState):
     """Request-scoped state used by completion enforcement middleware."""
 
-    todos: list[dict[str, Any]]
-    completion_current_run_id: str | None
-    completion_request_generation: str | None
-    completion_plan_owner_generation: str | None
-    completion_report_owned: bool
-    completion_resume_adopted_generation: str | None
-    completion_attempts: int
-    completion_attempt_limit: int
-    completion_report_baseline_modified_at: str | None
-    completion_verified_report_modified_at: str | None
-    completion_accepted_at_limit_report_modified_at: str | None
-    completion_exhausted_run_id: str | None
-    completion_exhausted_incomplete_todo_count: int
-    completion_exhausted_malformed_todo_count: int
-    completion_exhausted_report_reason: ReportFailureReason | None
-    verification_round: int
-    verification_feedback: str | None
-    _eval_logged: bool
-    _streamed_files: list[str] | None
+    completion_current_run_id: NotRequired[str | None]
+    completion_request_generation: NotRequired[str | None]
+    completion_plan_owner_generation: NotRequired[str | None]
+    completion_report_owned: NotRequired[bool]
+    completion_resume_adopted_generation: NotRequired[str | None]
+    completion_attempts: NotRequired[int]
+    completion_attempt_limit: NotRequired[int]
+    completion_report_baseline_modified_at: NotRequired[str | None]
+    completion_verified_report_modified_at: NotRequired[str | None]
+    completion_accepted_at_limit_report_modified_at: NotRequired[str | None]
+    completion_exhausted_run_id: NotRequired[str | None]
+    completion_exhausted_incomplete_todo_count: NotRequired[int]
+    completion_exhausted_malformed_todo_count: NotRequired[int]
+    completion_exhausted_report_reason: NotRequired[ReportFailureReason | None]
+    verification_round: NotRequired[int]
+    verification_feedback: NotRequired[str | None]
+    _eval_logged: NotRequired[bool]
+    _streamed_files: NotRequired[list[str] | None]
 
 
 class CompletionGuardMiddleware(AgentMiddleware):
@@ -211,10 +211,9 @@ def _correlate_artifact_ownership(
             or not isinstance(args, Mapping)
         ):
             continue
-        matching_results = results.get(call_id, ())
-        if len(matching_results) != 1:
+        if not _valid_tool_arguments(name, args):
             continue
-        result = matching_results[0]
+        result = results[call_id]
         if getattr(result, "status", None) != "success":
             continue
 
@@ -228,7 +227,7 @@ def _correlate_artifact_ownership(
 
 def _latest_tool_exchange(
     messages: object,
-) -> tuple[list[object], dict[str, tuple[ToolMessage, ...]]] | None:
+) -> tuple[list[object], dict[str, ToolMessage]] | None:
     if not isinstance(messages, list) or not messages:
         return None
 
@@ -246,14 +245,46 @@ def _latest_tool_exchange(
     ):
         return None
 
-    by_id: dict[str, list[ToolMessage]] = {}
+    call_ids: set[str] = set()
+    for tool_call in tool_message.tool_calls:
+        if not isinstance(tool_call, Mapping):
+            return None
+        call_id = tool_call.get("id")
+        name = tool_call.get("name")
+        args = tool_call.get("args")
+        if (
+            not isinstance(call_id, str)
+            or not call_id
+            or call_id in call_ids
+            or not isinstance(name, str)
+            or not name
+            or not isinstance(args, Mapping)
+        ):
+            return None
+        call_ids.add(call_id)
+
+    by_id: dict[str, ToolMessage] = {}
     for result in trailing_results:
         result_id = getattr(result, "tool_call_id", None)
-        if not isinstance(result_id, str) or not result_id:
-            continue
-        by_id.setdefault(result_id, []).append(result)
-    frozen_results = {key: tuple(value) for key, value in by_id.items()}
-    return list(tool_message.tool_calls), frozen_results
+        if (
+            not isinstance(result_id, str)
+            or not result_id
+            or result_id in by_id
+        ):
+            return None
+        by_id[result_id] = result
+    if set(by_id) != call_ids:
+        return None
+    return list(tool_message.tool_calls), by_id
+
+
+def _valid_tool_arguments(name: str, args: Mapping[str, Any]) -> bool:
+    if name == "write_todos":
+        return isinstance(args.get("todos"), list)
+    if name == "write_file":
+        content = args.get("content")
+        return isinstance(content, str) and bool(content.strip())
+    return True
 
 
 def _valid_nonempty_todos(todos: object) -> bool:
