@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import ipaddress
 import re
-import socket
 import unicodedata
 from bisect import bisect_right
 from dataclasses import dataclass
@@ -403,10 +402,10 @@ def _canonical_hostname(host: str) -> str | None:
     normalized = unicodedata.normalize("NFKC", host).lower().rstrip(".")
     if not normalized:
         return None
-    legacy_ipv4 = _parse_legacy_ipv4(normalized)
+    legacy_ipv4, numeric_looking = _parse_legacy_ipv4(normalized)
     if legacy_ipv4 is not None:
         return legacy_ipv4
-    if _is_ambiguous_numeric_host(normalized):
+    if numeric_looking:
         return normalized
     if normalized.isascii():
         return normalized
@@ -417,20 +416,66 @@ def _canonical_hostname(host: str) -> str | None:
 
 
 def _is_ambiguous_numeric_host(host: str) -> bool:
-    return _is_numeric_looking_host(host) and _parse_legacy_ipv4(host) is None
+    legacy_ipv4, numeric_looking = _parse_legacy_ipv4(host)
+    return numeric_looking and legacy_ipv4 is None
 
 
-def _parse_legacy_ipv4(host: str) -> str | None:
-    if not _is_numeric_looking_host(host):
-        return None
-    try:
-        return str(ipaddress.IPv4Address(socket.inet_aton(host)))
-    except OSError:
-        return None
+def _parse_legacy_ipv4(host: str) -> tuple[str | None, bool]:
+    """Return canonical legacy IPv4 and whether host uses legacy numeric syntax.
+
+    This deliberately mirrors inet_aton component widths without relying on
+    platform socket parsing.  A numeric-looking but invalid host is reported so
+    callers can fail closed rather than treating it as a DNS name.
+    """
+    components = host.split(".")
+    values: list[int] = []
+    for component in components:
+        value, numeric = _parse_legacy_ipv4_component(component)
+        if not numeric:
+            return None, False
+        if value is None:
+            return None, True
+        values.append(value)
+
+    widths_by_parts = ((32,), (8, 24), (8, 8, 16), (8, 8, 8, 8))
+    if not 1 <= len(values) <= len(widths_by_parts):
+        return None, True
+    widths = widths_by_parts[len(values) - 1]
+    if any(value >= 1 << width for value, width in zip(values, widths, strict=True)):
+        return None, True
+
+    address = 0
+    for value, width in zip(values, widths, strict=True):
+        address = (address << width) | value
+    return str(ipaddress.IPv4Address(address)), True
 
 
-def _is_numeric_looking_host(host: str) -> bool:
-    return bool(re.fullmatch(r"[0-9a-fx.]+", host, re.IGNORECASE)) and any(character.isdigit() for character in host)
+def _parse_legacy_ipv4_component(component: str) -> tuple[int | None, bool]:
+    """Parse decimal, hexadecimal, or leading-zero octal IPv4 component."""
+    if not component.isascii():
+        return None, False
+    base = 10
+    digits = component
+    if component.lower().startswith("0x"):
+        base = 16
+        digits = component[2:]
+        if not digits or any(character not in "0123456789abcdefABCDEF" for character in digits):
+            return None, True
+    elif component.isdecimal():
+        if len(component) > 1 and component.startswith("0"):
+            base = 8
+            if any(character not in "01234567" for character in component):
+                return None, True
+    else:
+        return None, False
+
+    value = 0
+    for character in digits:
+        digit = int(character, base=base)
+        value = value * base + digit
+        if value > 0xFFFFFFFF:
+            return None, True
+    return value, True
 
 
 def _is_source_candidate(

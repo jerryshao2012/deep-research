@@ -439,6 +439,21 @@ def test_rejects_legacy_numeric_ipv4_aliases(url: str) -> None:
     assert "placeholder_source" in [defect.code for defect in audit.defects]
 
 
+@pytest.mark.parametrize("host", ["a1.de", "cafe1.de", "1face.de"])
+def test_accepts_dns_labels_that_only_superficially_look_numeric(host: str) -> None:
+    audit = audit_web_citations(f"## Sources\n[1] https://{host}/a")
+
+    assert audit.defects == ()
+    assert audit.urls == (f"https://{host}/a",)
+
+
+def test_canonicalizes_public_legacy_numeric_ipv4() -> None:
+    audit = audit_web_citations("## Sources\n[1] https://0x08080808/a")
+
+    assert audit.defects == ()
+    assert audit.urls == ("https://8.8.8.8/a",)
+
+
 def test_masks_bracketed_ipv6_bare_uri_before_numeric_marker_scan() -> None:
     audit = audit_web_citations("https://[2606:4700:4700::1111]/dns-query")
 
