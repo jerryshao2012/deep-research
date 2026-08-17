@@ -1142,7 +1142,7 @@ def test_azure_build_strictly_decodes_quoted_resolver_assignments(tmp_path):
     assert not argv_log.exists()
 
 
-def test_azure_build_uses_root_dotenv_docker_credentials_without_leaking_pat(tmp_path):
+def test_azure_build_ignores_root_dotenv_docker_credentials(tmp_path):
     fixture, argv_log = _install_azure_script_fixture(tmp_path, "build.sh")
     login_capture = fixture / "login-pat"
     (fixture / "scripts/container_runtime.sh").write_text(
@@ -1178,13 +1178,14 @@ def test_azure_build_uses_root_dotenv_docker_credentials_without_leaking_pat(tmp
         text=True,
     )
 
-    assert result.returncode == 73
-    assert login_capture.read_text(encoding="utf-8") == pat_canary
-    assert "dotenv-user" in result.stdout
+    assert result.returncode == 1
+    assert not login_capture.exists()
+    assert "Please set DOCKER_HUB_USERNAME" in result.stdout
+    assert "dotenv-user" not in result.stdout + result.stderr
     assert pat_canary not in result.stdout + result.stderr
 
 
-def test_azure_build_process_docker_credentials_override_dotenv_fallback(tmp_path):
+def test_azure_build_uses_process_username_without_reading_dotenv_credentials(tmp_path):
     fixture, argv_log = _install_azure_script_fixture(tmp_path, "build.sh")
     login_capture = fixture / "login-pat"
     (fixture / "scripts/container_runtime.sh").write_text(
@@ -1217,8 +1218,8 @@ def test_azure_build_process_docker_credentials_override_dotenv_fallback(tmp_pat
         text=True,
     )
 
-    assert result.returncode == 73
-    assert login_capture.read_text(encoding="utf-8") == "exported-pat"
+    assert result.returncode == 64
+    assert not login_capture.exists()
     assert "exported-user" in result.stdout
     assert "fallback-user" not in result.stdout + result.stderr
     for canary in ("exported-pat", "fallback-pat"):

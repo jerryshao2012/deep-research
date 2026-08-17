@@ -29,9 +29,9 @@ RESTORE_RECEIPT_SCHEMA_VERSION = 1
 AWS_IMAGE_RUNTIME_VERSIONS: Mapping[str, str] = MappingProxyType(
     {
         "python": "3.12.13",
-        "langgraph": "1.2.6",
-        "langgraph-api": "0.11.2",
-        "langgraph-runtime-inmem": "0.31.2",
+        "langgraph": "1.2.11",
+        "langgraph-api": "0.12.0",
+        "langgraph-runtime-inmem": "0.32.0",
     }
 )
 
