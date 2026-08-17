@@ -759,8 +759,7 @@ class _ThreadRecordingCallback(BaseCallbackHandler):
 class _LoopAffineAsyncCallback(AsyncCallbackHandler):
     raise_error = True
 
-    def __init__(self, gate: asyncio.Future[None]) -> None:
-        self.gate = gate
+    def __init__(self) -> None:
         self.loops: list[asyncio.AbstractEventLoop] = []
 
     async def on_chat_model_start(
@@ -768,7 +767,7 @@ class _LoopAffineAsyncCallback(AsyncCallbackHandler):
     ) -> None:
         del serialized, messages, kwargs
         self.loops.append(asyncio.get_running_loop())
-        await self.gate
+        await asyncio.sleep(0)
 
 
 class _ForeverAsyncCallback(AsyncCallbackHandler):
@@ -811,6 +810,90 @@ class _RaisingSyncCallback(BaseCallbackHandler):
 
     def on_chat_model_start(self, *_args: Any, **_kwargs: Any) -> None:
         raise RuntimeError("callback exploded")
+
+
+@pytest.mark.parametrize("exception_name", ["KeyboardInterrupt", "SystemExit"])
+@pytest.mark.parametrize("method", ["invoke", "stream", "ainvoke", "astream"])
+def test_callback_base_exception_is_deferred_until_bridge_cleanup(
+    exception_name: str,
+    method: str,
+):
+    code = f"""
+import asyncio
+import threading
+import time
+import sys
+sys.path.insert(0, "tests")
+from langchain_core.callbacks import BaseCallbackHandler
+from langchain_core.messages import AIMessageChunk
+from test_model_call_guard import (
+    _AsyncOnlyChatModel,
+    _fake_metadata,
+    _pending_bridge_tasks,
+    _policy,
+)
+from research_agent.model_call_guard import (
+    _GLOBAL_BRIDGE_REGISTRY,
+    _GLOBAL_BRIDGE_RUNTIME,
+    guard_model,
+)
+
+FatalError = {exception_name}
+
+class FatalCallback(BaseCallbackHandler):
+    run_inline = True
+    raise_error = True
+
+    def on_chat_model_start(self, *_args, **_kwargs):
+        raise FatalError("callback-fatal")
+
+guarded = guard_model(
+    _AsyncOnlyChatModel(chunks=[AIMessageChunk(content="chunk")]),
+    metadata=_fake_metadata(),
+    policy=_policy(0.08),
+)
+scope_id = "base-exception-{method}-{exception_name}"
+config = {{
+    "callbacks": [FatalCallback()],
+    "configurable": {{"model_call_scope_id": scope_id}},
+}}
+
+async def invoke_async():
+    if "{method}" == "ainvoke":
+        await guarded.ainvoke("hello", config=config)
+    else:
+        await anext(guarded.astream("hello", config=config))
+
+started = time.monotonic()
+try:
+    if "{method}" == "invoke":
+        guarded.invoke("hello", config=config)
+    elif "{method}" == "stream":
+        next(guarded.stream("hello", config=config))
+    else:
+        asyncio.run(invoke_async())
+except FatalError as error:
+    assert error.args == ("callback-fatal",)
+else:
+    raise AssertionError("callback BaseException was not re-raised")
+
+assert time.monotonic() - started < 0.3
+assert _GLOBAL_BRIDGE_RUNTIME._thread.is_alive()
+assert guarded._bridge_registry.active_count(scope_id) == 0
+assert _GLOBAL_BRIDGE_REGISTRY.active_count(scope_id) == 0
+assert _pending_bridge_tasks() == []
+assert guarded.invoke("after-fatal").content == "complete"
+assert _GLOBAL_BRIDGE_RUNTIME._thread.is_alive()
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert completed.returncode == 0, completed.stderr
 
 
 class _ThreadProbeTracer(LangChainTracer):
@@ -2774,6 +2857,56 @@ def test_bridge_runtime_resets_in_child_and_parent_remains_usable():
 
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork")
+def test_callback_runtime_resets_in_child_and_parent_remains_usable():
+    import research_agent.model_call_guard as guard
+
+    guarded = _guarded_fake(timeout=0.2)
+    assert guarded.invoke(
+        "parent-before",
+        config={"callbacks": [_LoopAffineAsyncCallback()]},
+    ).content == "complete"
+    assert guard._GLOBAL_CALLBACK_RUNTIME.active_count() == 0
+    read_fd, write_fd = os.pipe()
+    child_pid = os.fork()
+    if child_pid == 0:
+        os.close(read_fd)
+        try:
+            reply = guarded.invoke(
+                "child",
+                config={"callbacks": [_LoopAffineAsyncCallback()]},
+            )
+            runtime = guard._GLOBAL_CALLBACK_RUNTIME
+            callback_threads = sum(
+                thread.name.startswith("model-callback-")
+                for thread in threading.enumerate()
+            )
+            payload = (
+                f"{reply.content}:{runtime.active_count()}:"
+                f"{callback_threads}:{runtime._pid == os.getpid()}"
+            ).encode()
+        except BaseException as exc:
+            payload = f"error:{type(exc).__name__}:{exc}".encode()
+        os.write(write_fd, payload)
+        os.close(write_fd)
+        os._exit(0)
+
+    os.close(write_fd)
+    try:
+        completed_pid, status = os.waitpid(child_pid, 0)
+        assert completed_pid == child_pid
+        assert os.waitstatus_to_exitcode(status) == 0
+        assert os.read(read_fd, 4096) == b"complete:0:4:True"
+    finally:
+        os.close(read_fd)
+
+    assert guarded.invoke(
+        "parent-after",
+        config={"callbacks": [_LoopAffineAsyncCallback()]},
+    ).content == "complete"
+    assert guard._GLOBAL_CALLBACK_RUNTIME.active_count() == 0
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork")
 def test_forked_child_recreates_inherited_real_provider_transport():
     with _ollama_compatible_server() as (base_url, requests):
         guarded = _guarded_local_ollama(base_url)
@@ -3435,20 +3568,20 @@ def test_callbacks_tags_metadata_and_configurable_config_survive_guard(method: s
 @pytest.mark.parametrize("method", ["ainvoke", "astream"])
 @pytest.mark.parametrize("callback_source", ["config", "model"])
 @_async_test
-async def test_async_callbacks_remain_on_caller_loop(
+async def test_async_callbacks_use_bounded_shared_callback_loop(
     callback_source: str,
     method: str,
 ):
+    import research_agent.model_call_guard as guard
+
     caller_loop = asyncio.get_running_loop()
-    gate = caller_loop.create_future()
-    callback = _LoopAffineAsyncCallback(gate)
+    callback = _LoopAffineAsyncCallback()
     raw = _AsyncOnlyChatModel(
         callbacks=[callback] if callback_source == "model" else None,
         chunks=[AIMessageChunk(content="complete")],
     )
     guarded = guard_model(raw, metadata=_fake_metadata(), policy=_policy(0.2))
     config = {"callbacks": [callback]} if callback_source == "config" else None
-    caller_loop.call_later(0.01, gate.set_result, None)
 
     if method == "ainvoke":
         result = await guarded.ainvoke("hello", config=config)
@@ -3457,7 +3590,8 @@ async def test_async_callbacks_remain_on_caller_loop(
         chunks = [chunk async for chunk in guarded.astream("hello", config=config)]
         assert "".join(str(chunk.content) for chunk in chunks) == "complete"
 
-    assert callback.loops == [caller_loop]
+    assert callback.loops == [guard._GLOBAL_CALLBACK_RUNTIME._async_loop]
+    assert callback.loops[0] is not caller_loop
 
 
 @pytest.mark.parametrize("method", ["invoke", "stream"])
@@ -3540,6 +3674,116 @@ def test_untrusted_sync_call_callback_cannot_exceed_model_deadline(
     if isinstance(callback, _BlockingSyncCallback):
         assert callback.finished.wait(0.2)
     assert guarded._calls == []
+
+
+@pytest.mark.parametrize("callback_kind", ["sync", "async"])
+def test_callback_runtime_bounds_stuck_work_and_rejects_excess_admission(
+    callback_kind: str,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import research_agent.model_call_guard as guard
+
+    capacity = 4
+    attempts = capacity * 2 + 2
+    release = threading.Event()
+    started_lock = threading.Lock()
+    started = 0
+
+    class BlockingCallback(BaseCallbackHandler):
+        run_inline = True
+        raise_error = True
+
+        def on_chat_model_start(self, *_args: Any, **_kwargs: Any) -> None:
+            nonlocal started
+            with started_lock:
+                started += 1
+            release.wait()
+
+    class CancellationResistantCallback(AsyncCallbackHandler):
+        raise_error = True
+
+        async def on_chat_model_start(self, *_args: Any, **_kwargs: Any) -> None:
+            nonlocal started
+            with started_lock:
+                started += 1
+            while not release.is_set():
+                try:
+                    await asyncio.sleep(0.01)
+                except asyncio.CancelledError:
+                    continue
+
+    callback = (
+        BlockingCallback()
+        if callback_kind == "sync"
+        else CancellationResistantCallback()
+    )
+    guarded = _guarded_fake(timeout=0.02)
+    monkeypatch.setattr(guard, "MODEL_CANCEL_GRACE_SECONDS", 0.02)
+
+    def invoke(index: int) -> BaseException | None:
+        try:
+            guarded.invoke(
+                f"request-{index}",
+                config={
+                    "callbacks": [callback],
+                    "configurable": {
+                        "model_call_scope_id": f"callback-capacity-{index}"
+                    },
+                },
+            )
+        except BaseException as exc:
+            return exc
+        return None
+
+    async def ainvoke(index: int) -> BaseException | None:
+        try:
+            await guarded.ainvoke(
+                f"request-{index}",
+                config={
+                    "callbacks": [callback],
+                    "configurable": {
+                        "model_call_scope_id": f"callback-capacity-{index}"
+                    },
+                },
+            )
+        except BaseException as exc:
+            return exc
+        return None
+
+    async def invoke_all_async() -> list[BaseException | None]:
+        return list(await asyncio.gather(*(ainvoke(index) for index in range(attempts))))
+
+    started_at = time.monotonic()
+    try:
+        if callback_kind == "sync":
+            with ThreadPoolExecutor(max_workers=attempts) as pool:
+                outcomes = list(pool.map(invoke, range(attempts)))
+        else:
+            outcomes = asyncio.run(invoke_all_async())
+        elapsed = time.monotonic() - started_at
+
+        runtime = getattr(guard, "_GLOBAL_CALLBACK_RUNTIME", None)
+        assert runtime is not None
+        assert guard.MODEL_CALLBACK_CAPACITY == capacity
+        assert runtime.active_count() <= capacity
+        assert runtime.async_task_count() <= capacity
+        callback_threads = [
+            thread
+            for thread in threading.enumerate()
+            if thread.name.startswith("model-callback-")
+        ]
+        assert len(callback_threads) <= capacity
+        assert 0 < started <= capacity
+        assert elapsed < 0.2
+        assert all(isinstance(outcome, ModelCallTimeoutError) for outcome in outcomes)
+        assert _guarded_fake(timeout=0.2).invoke("no-callback").content == "complete"
+    finally:
+        release.set()
+
+    cleanup_deadline = time.monotonic() + 0.3
+    while runtime.active_count() and time.monotonic() < cleanup_deadline:
+        time.sleep(0.005)
+    assert runtime.active_count() == 0
 
 
 @_async_test
@@ -5149,6 +5393,149 @@ def test_openai_process_reset_rejects_new_unsupported_custom_client_state():
         assert raised.value.provider == "openai"
     finally:
         _close_guarded_default_openai(guarded)
+
+
+def test_openai_process_reset_rolls_back_partial_client_clone_and_recovers(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import research_agent.model_call_guard as guard
+
+    guarded = _guarded_default_openai()
+    original_sync = guarded.root_client._client
+    original_async = guarded.root_async_client._client
+    clone_sync = guard._fresh_httpx_client_after_fork
+    clone_async = guard._fresh_httpx_async_client_after_fork
+    partial_sync_clients: list[httpx.Client] = []
+
+    def tracked_sync_clone(*args: Any, **kwargs: Any) -> httpx.Client:
+        client = clone_sync(*args, **kwargs)
+        partial_sync_clients.append(client)
+        return client
+
+    def fail_async_clone(*_args: Any, **_kwargs: Any) -> httpx.AsyncClient:
+        raise RuntimeError("async clone failed")
+
+    monkeypatch.setattr(guard, "_fresh_httpx_client_after_fork", tracked_sync_clone)
+    monkeypatch.setattr(
+        guard,
+        "_fresh_httpx_async_client_after_fork",
+        fail_async_clone,
+    )
+    guarded._guard_pid = -1
+    failed_clone_closed: list[bool] = []
+
+    for _attempt in range(3):
+        with pytest.raises(RuntimeError, match="async clone failed"):
+            guard._ensure_model_process(guarded)
+        assert guarded._guard_pid == -1
+        assert guarded.root_client._client is original_sync
+        assert guarded.root_async_client._client is original_async
+        failed_clone_closed.append(partial_sync_clients[-1].is_closed)
+
+    monkeypatch.setattr(
+        guard,
+        "_fresh_httpx_async_client_after_fork",
+        clone_async,
+    )
+    guard._ensure_model_process(guarded)
+    try:
+        assert guarded._guard_pid == os.getpid()
+        assert guarded.root_client._client is not original_sync
+        assert guarded.root_async_client._client is not original_async
+        assert failed_clone_closed == [True, True, True]
+        assert all(client.is_closed for client in partial_sync_clients[:-1])
+    finally:
+        for client in partial_sync_clients[:-1]:
+            client.close()
+        original_sync.close()
+        asyncio.run(original_async.aclose())
+        _close_guarded_default_openai(guarded)
+
+
+def test_google_process_reset_installer_is_transactional_on_async_clone_failure(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import research_agent.model_call_guard as guard
+
+    source = _guarded_default_google()
+    target = _guarded_default_google()
+    target_api_client = target.client._api_client
+    original_target_sync = target_api_client._httpx_client
+    original_target_async = target_api_client._async_httpx_client
+    clone_sync = guard._fresh_httpx_client_after_fork
+    tracked_sync_clients: list[httpx.Client] = []
+
+    def tracked_sync_clone(*args: Any, **kwargs: Any) -> httpx.Client:
+        client = clone_sync(*args, **kwargs)
+        tracked_sync_clients.append(client)
+        return client
+
+    def fail_async_clone(*_args: Any, **_kwargs: Any) -> httpx.AsyncClient:
+        raise RuntimeError("google async clone failed")
+
+    monkeypatch.setattr(guard, "_fresh_httpx_client_after_fork", tracked_sync_clone)
+    monkeypatch.setattr(
+        guard,
+        "_fresh_httpx_async_client_after_fork",
+        fail_async_clone,
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="google async clone failed"):
+            guard._install_fork_safe_google_clients(
+                source,
+                target,
+                target._model_call_policy,
+            )
+
+        assert tracked_sync_clients[0].is_closed
+        assert target_api_client._httpx_client is original_target_sync
+        assert target_api_client._async_httpx_client is original_target_async
+    finally:
+        for client in tracked_sync_clients:
+            client.close()
+        _close_guarded_default_google(source)
+        _close_guarded_default_google(target)
+
+
+def test_anthropic_process_reset_installer_closes_partial_sync_clone(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import research_agent.model_call_guard as guard
+
+    source = _guarded_default_anthropic()
+    target = _guarded_default_anthropic()
+    clone_sync = guard._fresh_httpx_client_after_fork
+    tracked_sync_clients: list[httpx.Client] = []
+
+    def tracked_sync_clone(*args: Any, **kwargs: Any) -> httpx.Client:
+        client = clone_sync(*args, **kwargs)
+        tracked_sync_clients.append(client)
+        return client
+
+    def fail_async_clone(*_args: Any, **_kwargs: Any) -> httpx.AsyncClient:
+        raise RuntimeError("anthropic async clone failed")
+
+    monkeypatch.setattr(guard, "_fresh_httpx_client_after_fork", tracked_sync_clone)
+    monkeypatch.setattr(
+        guard,
+        "_fresh_httpx_async_client_after_fork",
+        fail_async_clone,
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="anthropic async clone failed"):
+            guard._install_fork_safe_anthropic_clients(
+                source,
+                target,
+                target._model_call_policy,
+            )
+        assert tracked_sync_clients[0].is_closed
+    finally:
+        for client in tracked_sync_clients:
+            client.close()
+        _close_guarded_default_anthropic(source)
+        _close_guarded_default_anthropic(target)
 
 
 def test_openai_provider_uses_declared_custom_transport_clone_capability():

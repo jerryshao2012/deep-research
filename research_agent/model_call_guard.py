@@ -34,6 +34,7 @@ from pydantic import PrivateAttr
 DEFAULT_MODEL_CALL_TIMEOUT_SECONDS = 300.0
 MODEL_CANCEL_GRACE_SECONDS = 2.0
 OLLAMA_UNLOAD_TIMEOUT_SECONDS = 2.0
+MODEL_CALLBACK_CAPACITY = 4
 
 ModelProvider = Literal[
     "aws_bedrock",
@@ -677,6 +678,9 @@ def _reset_global_bridge_state_after_fork() -> None:
     _GUARDED_PROVIDER_CLASSES_LOCK = threading.Lock()
     _GLOBAL_BRIDGE_REGISTRY._ensure_process()
     _GLOBAL_BRIDGE_RUNTIME._ensure_process()
+    callback_runtime = globals().get("_GLOBAL_CALLBACK_RUNTIME")
+    if callback_runtime is not None:
+        callback_runtime._ensure_process()
 
 
 if hasattr(os, "register_at_fork"):
@@ -996,6 +1000,9 @@ def _bridge_result[ResultT](
     control.join(0)
     if callback_pump is not None:
         callback_pump.revoke()
+        callback_error = callback_pump.take_callback_base_error()
+        if callback_error is not None:
+            raise callback_error
     if kind == "error":
         raise value
     return value
@@ -1038,6 +1045,7 @@ async def _await_bridge_result[ResultT](
     *,
     policy: ModelCallPolicy,
     metadata: ModelRuntimeMetadata,
+    callback_boundary: _CallbackErrorBoundary | None = None,
 ) -> ResultT:
     """Await a bridge from any caller loop and propagate cancellation inward."""
     wrapped = asyncio.wrap_future(control.future)
@@ -1045,7 +1053,7 @@ async def _await_bridge_result[ResultT](
         async with asyncio.timeout(
             _bridge_wait_seconds(deadline, policy=policy, metadata=metadata)
         ):
-            return await asyncio.shield(wrapped)
+            result = await asyncio.shield(wrapped)
     except TimeoutError:
         control.cancel()
         await _await_bridge_cleanup(control, wrapped)
@@ -1057,6 +1065,19 @@ async def _await_bridge_result[ResultT](
         control.cancel()
         await _await_bridge_cleanup(control, wrapped)
         raise original_cancel
+    except Exception:
+        await _await_bridge_cleanup(control, wrapped)
+        if callback_boundary is not None:
+            callback_error = callback_boundary.take_callback_base_error()
+            if callback_error is not None:
+                raise callback_error
+        raise
+    control.join(0)
+    if callback_boundary is not None:
+        callback_error = callback_boundary.take_callback_base_error()
+        if callback_error is not None:
+            raise callback_error
+    return result
 
 
 class _AsyncBridgeStreamIterator[OutputT](AsyncIterator[OutputT]):
@@ -1065,7 +1086,7 @@ class _AsyncBridgeStreamIterator[OutputT](AsyncIterator[OutputT]):
     def __init__(
         self,
         factory: Callable[
-            [asyncio.AbstractEventLoop], AsyncIterator[OutputT]
+            [_SyncCallerCallbackPump], AsyncIterator[OutputT]
         ],
         *,
         deadline: float,
@@ -1073,6 +1094,7 @@ class _AsyncBridgeStreamIterator[OutputT](AsyncIterator[OutputT]):
         registry: BridgeRegistry,
         policy: ModelCallPolicy,
         metadata: ModelRuntimeMetadata,
+        callback_pump: _SyncCallerCallbackPump,
     ) -> None:
         self._factory = factory
         self._deadline = deadline
@@ -1080,6 +1102,7 @@ class _AsyncBridgeStreamIterator[OutputT](AsyncIterator[OutputT]):
         self._registry = registry
         self._policy = policy
         self._metadata = metadata
+        self._callback_pump = callback_pump
         self._iterator: AsyncIterator[OutputT] | None = None
         self._current: _BridgeControl[OutputT] | None = None
         self._lock = threading.Lock()
@@ -1091,11 +1114,9 @@ class _AsyncBridgeStreamIterator[OutputT](AsyncIterator[OutputT]):
     async def __anext__(self) -> OutputT:
         if self._closed:
             raise StopAsyncIteration
-        caller_loop = asyncio.get_running_loop()
-
         async def advance() -> OutputT:
             if self._iterator is None:
-                self._iterator = self._factory(caller_loop)
+                self._iterator = self._factory(self._callback_pump)
             return await anext(self._iterator)
 
         control = _start_bridge(
@@ -1111,12 +1132,15 @@ class _AsyncBridgeStreamIterator[OutputT](AsyncIterator[OutputT]):
                 self._deadline,
                 policy=self._policy,
                 metadata=self._metadata,
+                callback_boundary=self._callback_pump,
             )
         except StopAsyncIteration:
             self._closed = True
+            self._callback_pump.revoke()
             raise
         except BaseException:
             self._closed = True
+            self._callback_pump.revoke()
             raise
         finally:
             with self._lock:
@@ -1128,6 +1152,7 @@ class _AsyncBridgeStreamIterator[OutputT](AsyncIterator[OutputT]):
         if self._closed:
             return
         self._closed = True
+        self._callback_pump.revoke()
         with self._lock:
             current = self._current
         if current is not None:
@@ -1153,6 +1178,7 @@ class _AsyncBridgeStreamIterator[OutputT](AsyncIterator[OutputT]):
             control.join(MODEL_CANCEL_GRACE_SECONDS)
 
     def __del__(self) -> None:
+        self._callback_pump.revoke()
         with self._lock:
             current = self._current
         if current is not None:
@@ -1217,12 +1243,20 @@ class _SyncStreamIterator[OutputT](Iterator[OutputT]):
         except queue.Empty:
             self.close()
             raise _timeout_error(self._policy, self._metadata) from None
+        if self._callback_pump is not None:
+            callback_error = self._callback_pump.take_callback_base_error()
+            if callback_error is not None:
+                self.close()
+                raise callback_error
         if kind == "item":
             return value
         self._closed = True
         self._control.join(MODEL_CANCEL_GRACE_SECONDS)
         if self._callback_pump is not None:
             self._callback_pump.revoke()
+            callback_error = self._callback_pump.take_callback_base_error()
+            if callback_error is not None:
+                raise callback_error
         if kind == "error":
             raise value
         raise StopIteration
@@ -1256,6 +1290,57 @@ class _AttemptVisibility:
         return not self._visible.is_set()
 
 
+@dataclass(frozen=True)
+class _CallbackOutcome:
+    """Neutral callback result safe to transfer through event-loop tasks."""
+
+    kind: Literal["result", "error"]
+    value: Any
+
+
+class _CallbackBoundaryFailure(Exception):
+    """Ordinary bridge-local signal for a deferred callback BaseException."""
+
+
+class _CallbackErrorBoundary:
+    """Retain a callback BaseException until its public caller is cleaned up."""
+
+    def __init__(self) -> None:
+        self._callback_error_lock = threading.Lock()
+        self._callback_base_error: BaseException | None = None
+
+    def resolve_callback_outcome(self, outcome: _CallbackOutcome) -> Any:
+        """Return normal values and neutralize callback BaseException values."""
+        if outcome.kind == "result":
+            return outcome.value
+        error = outcome.value
+        if isinstance(error, asyncio.CancelledError):
+            raise error
+        if isinstance(error, Exception):
+            raise error
+        if not isinstance(error, BaseException):
+            raise RuntimeError("invalid callback failure envelope")
+        with self._callback_error_lock:
+            if self._callback_base_error is None:
+                self._callback_base_error = error
+        raise _CallbackBoundaryFailure("callback aborted")
+
+    def take_callback_base_error(self) -> BaseException | None:
+        """Take the first deferred BaseException exactly once."""
+        with self._callback_error_lock:
+            error = self._callback_base_error
+            self._callback_base_error = None
+            return error
+
+
+class _AsyncCallerCallbackTarget(_CallbackErrorBoundary):
+    """Caller-loop target that defers fatal callback failures until cleanup."""
+
+    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
+        super().__init__()
+        self.loop = loop
+
+
 @dataclass(eq=False)
 class _SyncCallbackRecord:
     """One callback invocation isolated in a bounded daemon worker."""
@@ -1269,13 +1354,9 @@ class _SyncCallbackRecord:
     _loop: asyncio.AbstractEventLoop | None = None
     _task: asyncio.Task[Any] | None = None
 
-    def start(self) -> None:
-        """Start callback work without creating a process-blocking thread."""
-        threading.Thread(
-            target=self._run,
-            name="model-callback-worker",
-            daemon=True,
-        ).start()
+    def start(self) -> bool:
+        """Submit callback work only when fixed runtime capacity is available."""
+        return _GLOBAL_CALLBACK_RUNTIME.submit(self)
 
     def revoke(self) -> None:
         """Cancel awaitable work and ignore any late synchronous result."""
@@ -1290,70 +1371,230 @@ class _SyncCallbackRecord:
             except RuntimeError:
                 pass
 
-    def _publish_result(self, result: Any) -> None:
+    def _publish_outcome(self, outcome: _CallbackOutcome) -> None:
         with self._lock:
             if (
                 not self._revoked.is_set()
                 and time.monotonic() < self.deadline
                 and not self.future.done()
             ):
-                self.future.set_result(result)
+                self.future.set_result(outcome)
+
+    def _publish_result(self, result: Any) -> None:
+        self._publish_outcome(_CallbackOutcome("result", result))
 
     def _publish_error(self, error: BaseException) -> None:
-        with self._lock:
-            if (
-                not self._revoked.is_set()
-                and time.monotonic() < self.deadline
-                and not self.future.done()
-            ):
-                self.future.set_exception(error)
+        self._publish_outcome(_CallbackOutcome("error", error))
 
-    def _run_awaitable(self, awaitable: Awaitable[Any]) -> Any:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        task = self.context.run(loop.create_task, awaitable)
+    def attach_async_task(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        task: asyncio.Task[Any],
+    ) -> None:
+        """Attach shared-loop async callback state for cooperative revocation."""
         with self._lock:
             self._loop = loop
             self._task = task
             revoked = self._revoked.is_set()
         if revoked:
             task.cancel()
-        try:
-            return loop.run_until_complete(task)
-        finally:
-            pending = asyncio.all_tasks(loop)
-            for pending_task in pending:
-                pending_task.cancel()
-            if pending:
-                loop.run_until_complete(
-                    asyncio.gather(*pending, return_exceptions=True)
-                )
-            loop.run_until_complete(loop.shutdown_asyncgens())
-            with self._lock:
-                self._task = None
-                self._loop = None
-            loop.close()
 
-    def _run(self) -> None:
+    def detach_async_task(self) -> None:
+        """Forget completed shared-loop callback task state."""
+        with self._lock:
+            self._task = None
+            self._loop = None
+
+    def invoke(self) -> _CallbackOutcome:
+        """Invoke callback synchronously and return only neutral outcome data."""
         try:
             if self._revoked.is_set() or time.monotonic() >= self.deadline:
-                self.revoke()
-                return
+                raise asyncio.CancelledError
             result = self.context.run(self.callback)
-            if inspect.isawaitable(result):
-                if self._revoked.is_set() or time.monotonic() >= self.deadline:
-                    if inspect.iscoroutine(result):
-                        result.close()
-                    self.revoke()
-                    return
-                result = self._run_awaitable(result)
         except BaseException as exc:
-            self._publish_error(exc)
-        else:
-            self._publish_result(result)
+            return _CallbackOutcome("error", exc)
+        return _CallbackOutcome("result", result)
 
 
-class _SyncCallerCallbackPump:
+class _CallbackRuntime:
+    """Fork-safe fixed-capacity daemon runtime for untrusted callbacks."""
+
+    def __init__(self, capacity: int) -> None:
+        self.capacity = capacity
+        self._pid = os.getpid()
+        self._initialize_process_state()
+
+    def _initialize_process_state(self) -> None:
+        self._lock = threading.Lock()
+        self._admission = threading.BoundedSemaphore(self.capacity)
+        self._queue: queue.Queue[_SyncCallbackRecord] = queue.Queue(
+            maxsize=self.capacity
+        )
+        self._active = 0
+        self._async_tasks: set[asyncio.Task[Any]] = set()
+        self._async_loop: asyncio.AbstractEventLoop | None = None
+        self._async_ready = threading.Event()
+        self._async_thread = threading.Thread(
+            target=self._async_thread_main,
+            name="model-callback-async-runtime",
+            daemon=True,
+        )
+        worker_count = max(1, self.capacity - 1)
+        self._workers = tuple(
+            threading.Thread(
+                target=self._worker_main,
+                name=f"model-callback-worker-{index}",
+                daemon=True,
+            )
+            for index in range(worker_count)
+        )
+        self._workers_started = False
+
+    def _ensure_process(self) -> None:
+        current_pid = os.getpid()
+        if current_pid == self._pid:
+            return
+        self._pid = current_pid
+        self._initialize_process_state()
+
+    def _ensure_workers(self) -> None:
+        self._ensure_process()
+        with self._lock:
+            if self._workers_started:
+                return
+            self._workers_started = True
+            workers = self._workers
+        for worker in workers:
+            worker.start()
+
+    def submit(self, record: _SyncCallbackRecord) -> bool:
+        """Admit without waiting or retaining work beyond fixed capacity."""
+        self._ensure_workers()
+        if not self._admission.acquire(blocking=False):
+            return False
+        with self._lock:
+            self._active += 1
+        try:
+            self._queue.put_nowait(record)
+        except queue.Full:
+            self._release_admission()
+            return False
+        return True
+
+    def _release_admission(self) -> None:
+        with self._lock:
+            self._active -= 1
+        self._admission.release()
+
+    def _worker_main(self) -> None:
+        while True:
+            record = self._queue.get()
+            outcome = record.invoke()
+            if outcome.kind == "result" and inspect.isawaitable(outcome.value):
+                self._schedule_async(record, outcome.value)
+                continue
+            record._publish_outcome(outcome)
+            self._release_admission()
+
+    def _ensure_async_loop(self) -> asyncio.AbstractEventLoop:
+        self._ensure_process()
+        with self._lock:
+            if not self._async_thread.is_alive():
+                self._async_thread.start()
+        self._async_ready.wait()
+        with self._lock:
+            loop = self._async_loop
+        if loop is None:
+            raise RuntimeError("model callback runtime failed to start")
+        return loop
+
+    def _async_thread_main(self) -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        with self._lock:
+            self._async_loop = loop
+        self._async_ready.set()
+        loop.run_forever()
+
+    def _schedule_async(
+        self,
+        record: _SyncCallbackRecord,
+        awaitable: Awaitable[Any],
+    ) -> None:
+        try:
+            loop = self._ensure_async_loop()
+        except BaseException as exc:
+            if inspect.iscoroutine(awaitable):
+                awaitable.close()
+            record._publish_error(exc)
+            self._release_admission()
+            return
+        callback_context = record.context.copy()
+
+        async def neutral_callback() -> _CallbackOutcome:
+            try:
+                result = await awaitable
+            except asyncio.CancelledError:
+                raise
+            except BaseException as exc:
+                return _CallbackOutcome("error", exc)
+            return _CallbackOutcome("result", result)
+
+        def create_task() -> None:
+            if record._revoked.is_set() or time.monotonic() >= record.deadline:
+                if inspect.iscoroutine(awaitable):
+                    awaitable.close()
+                record.revoke()
+                self._release_admission()
+                return
+            task = loop.create_task(neutral_callback(), context=callback_context)
+            record.attach_async_task(loop, task)
+            with self._lock:
+                self._async_tasks.add(task)
+            task.add_done_callback(
+                functools.partial(self._async_task_done, record)
+            )
+
+        try:
+            loop.call_soon_threadsafe(create_task, context=callback_context)
+        except BaseException as exc:
+            if inspect.iscoroutine(awaitable):
+                awaitable.close()
+            record._publish_error(exc)
+            self._release_admission()
+
+    def _async_task_done(
+        self,
+        record: _SyncCallbackRecord,
+        task: asyncio.Task[Any],
+    ) -> None:
+        try:
+            if task.cancelled():
+                outcome = _CallbackOutcome("error", asyncio.CancelledError())
+            else:
+                outcome = task.result()
+            record._publish_outcome(outcome)
+        finally:
+            record.detach_async_task()
+            with self._lock:
+                self._async_tasks.discard(task)
+            self._release_admission()
+
+    def active_count(self) -> int:
+        self._ensure_process()
+        with self._lock:
+            return self._active
+
+    def async_task_count(self) -> int:
+        self._ensure_process()
+        with self._lock:
+            return len(self._async_tasks)
+
+
+_GLOBAL_CALLBACK_RUNTIME = _CallbackRuntime(MODEL_CALLBACK_CAPACITY)
+
+
+class _SyncCallerCallbackPump(_CallbackErrorBoundary):
     """Track callback workers within one absolute model deadline.
 
     Sync boundaries intentionally trade caller-thread affinity for bounded safety:
@@ -1365,6 +1606,7 @@ class _SyncCallerCallbackPump:
         deadline: float,
         timeout_error_factory: Callable[[], BaseException] | None = None,
     ) -> None:
+        super().__init__()
         self._deadline = deadline
         self._timeout_error_factory = timeout_error_factory
         self._lock = threading.Lock()
@@ -1400,13 +1642,20 @@ class _SyncCallerCallbackPump:
             if self._timeout_error_factory is not None:
                 raise self._timeout_error_factory()
             raise asyncio.CancelledError
-        record.start()
+        if not record.start():
+            record.revoke()
+            with self._lock:
+                self._records.discard(record)
+            if self._timeout_error_factory is not None:
+                raise self._timeout_error_factory()
+            raise asyncio.CancelledError
         try:
             remaining = max(0.0, self._deadline - time.monotonic())
-            return await asyncio.wait_for(
+            outcome = await asyncio.wait_for(
                 asyncio.wrap_future(future),
                 timeout=remaining,
             )
+            return self.resolve_callback_outcome(outcome)
         except TimeoutError:
             record.revoke()
             if self._timeout_error_factory is not None:
@@ -1447,7 +1696,12 @@ class _CallerLoopCallbackProxy(BaseCallbackHandler):
     def __init__(
         self,
         handler: BaseCallbackHandler,
-        target: asyncio.AbstractEventLoop | _SyncCallerCallbackPump | object,
+        target: (
+            asyncio.AbstractEventLoop
+            | _AsyncCallerCallbackTarget
+            | _SyncCallerCallbackPump
+            | object
+        ),
     ) -> None:
         self._handler = handler
         self._target = target
@@ -1535,30 +1789,44 @@ class _CallerLoopCallbackProxy(BaseCallbackHandler):
                     finally:
                         callback_worker.revoke()
 
-                async def invoke_on_caller_loop() -> Any:
-                    if inspect.iscoroutinefunction(event):
-                        return await event(*args, **kwargs)
-                    if handler.run_inline:
-                        return event(*args, **kwargs)
-                    callback = functools.partial(event, *args, **kwargs)
-                    context = contextvars.copy_context()
-                    return await resolved_target.run_in_executor(
-                        None,
-                        context.run,
-                        callback,
-                    )
+                boundary = (
+                    resolved_target
+                    if isinstance(resolved_target, _AsyncCallerCallbackTarget)
+                    else _AsyncCallerCallbackTarget(resolved_target)
+                )
+
+                async def invoke_on_caller_loop() -> _CallbackOutcome:
+                    try:
+                        if inspect.iscoroutinefunction(event):
+                            result = await event(*args, **kwargs)
+                        elif handler.run_inline:
+                            result = event(*args, **kwargs)
+                        else:
+                            callback = functools.partial(event, *args, **kwargs)
+                            context = contextvars.copy_context()
+                            result = await boundary.loop.run_in_executor(
+                                None,
+                                context.run,
+                                callback,
+                            )
+                    except asyncio.CancelledError:
+                        raise
+                    except BaseException as exc:
+                        return _CallbackOutcome("error", exc)
+                    return _CallbackOutcome("result", result)
 
                 callback_coroutine = invoke_on_caller_loop()
                 try:
                     future = asyncio.run_coroutine_threadsafe(
                         callback_coroutine,
-                        resolved_target,
+                        boundary.loop,
                     )
                 except BaseException:
                     callback_coroutine.close()
                     raise
                 try:
-                    return await asyncio.wrap_future(future)
+                    outcome = await asyncio.wrap_future(future)
+                    return boundary.resolve_callback_outcome(outcome)
                 except asyncio.CancelledError:
                     future.cancel()
                     raise
@@ -1573,7 +1841,12 @@ class _CallerLoopCallbackProxy(BaseCallbackHandler):
 
 def _callback_proxy(
     handler: BaseCallbackHandler,
-    target: asyncio.AbstractEventLoop | _SyncCallerCallbackPump | object,
+    target: (
+        asyncio.AbstractEventLoop
+        | _AsyncCallerCallbackTarget
+        | _SyncCallerCallbackPump
+        | object
+    ),
 ) -> BaseCallbackHandler:
     """Create one caller-specific proxy, unwrapping an existing bridge proxy."""
     if isinstance(handler, _CallerLoopCallbackProxy):
@@ -1596,7 +1869,12 @@ def _callback_manager_on_caller_loop(
 
 def _proxy_callback_manager(
     manager: Any,
-    target: asyncio.AbstractEventLoop | _SyncCallerCallbackPump | object,
+    target: (
+        asyncio.AbstractEventLoop
+        | _AsyncCallerCallbackTarget
+        | _SyncCallerCallbackPump
+        | object
+    ),
     *,
     proxies: dict[int, BaseCallbackHandler] | None = None,
     excluded: set[int] | None = None,
@@ -1692,7 +1970,7 @@ def _provider_on_caller_callback_loop(
 def _provider_callbacks_on_caller(
     model: BaseChatModel,
     config: RunnableConfig | None,
-    target: asyncio.AbstractEventLoop | _SyncCallerCallbackPump,
+    target: _AsyncCallerCallbackTarget | _SyncCallerCallbackPump,
 ) -> tuple[BaseChatModel, RunnableConfig]:
     """Proxy and identity-dedupe config/model callbacks as one ordered set."""
     del target
@@ -2127,7 +2405,6 @@ class ModelCallGuardMixin:
         scope_id = _scope_id_from_config(config)
 
         async def run() -> Any:
-            caller_loop = asyncio.get_running_loop()
             if _GLOBAL_BRIDGE_RUNTIME.owns_current_loop():
                 return await self._guarded_ainvoke(
                     input,
@@ -2138,6 +2415,14 @@ class ModelCallGuardMixin:
                     callback_target=_ACTIVE_CALLBACK_TARGET.get(),
                     **kwargs,
                 )
+            callback_target = _SyncCallerCallbackPump(
+                deadline,
+                functools.partial(
+                    _timeout_error,
+                    self._model_call_policy,
+                    self._runtime_metadata,
+                ),
+            )
             control = _start_bridge(
                 lambda: _run_with_callback_target(
                     lambda: self._guarded_ainvoke(
@@ -2146,20 +2431,24 @@ class ModelCallGuardMixin:
                         stop=stop,
                         deadline=deadline,
                         scope_id=scope_id,
-                        callback_target=caller_loop,
+                        callback_target=callback_target,
                         **kwargs,
                     ),
-                    caller_loop,
+                    callback_target,
                 ),
                 scope_id=scope_id,
                 registry=self._bridge_registry,
             )
-            return await _await_bridge_result(
-                control,
-                deadline,
-                policy=self._model_call_policy,
-                metadata=self._runtime_metadata,
-            )
+            try:
+                return await _await_bridge_result(
+                    control,
+                    deadline,
+                    policy=self._model_call_policy,
+                    metadata=self._runtime_metadata,
+                    callback_boundary=callback_target,
+                )
+            finally:
+                callback_target.revoke()
 
         return run()
 
@@ -2171,7 +2460,9 @@ class ModelCallGuardMixin:
         stop: list[str] | None,
         deadline: float,
         scope_id: str,
-        callback_target: asyncio.AbstractEventLoop | _SyncCallerCallbackPump | None,
+        callback_target: (
+            _SyncCallerCallbackPump | None
+        ),
         **kwargs: Any,
     ) -> Any:
         provider_model = self
@@ -2273,9 +2564,17 @@ class ModelCallGuardMixin:
         _ensure_model_process(self)
         deadline = _capture_deadline(self._model_call_policy)
         scope_id = _scope_id_from_config(config)
+        callback_pump = _SyncCallerCallbackPump(
+            deadline,
+            functools.partial(
+                _timeout_error,
+                self._model_call_policy,
+                self._runtime_metadata,
+            ),
+        )
 
         def provider_stream(
-            callback_target: asyncio.AbstractEventLoop | None,
+            callback_target: _SyncCallerCallbackPump | None,
         ) -> AsyncIterator[Any]:
             return _stream_with_callback_target(
                 lambda: self._guarded_astream(
@@ -2299,6 +2598,7 @@ class ModelCallGuardMixin:
             registry=self._bridge_registry,
             policy=self._model_call_policy,
             metadata=self._runtime_metadata,
+            callback_pump=callback_pump,
         )
 
     async def _guarded_astream(
@@ -2309,7 +2609,9 @@ class ModelCallGuardMixin:
         stop: list[str] | None,
         deadline: float,
         scope_id: str,
-        callback_target: asyncio.AbstractEventLoop | _SyncCallerCallbackPump | None,
+        callback_target: (
+            _SyncCallerCallbackPump | None
+        ),
         **kwargs: Any,
     ) -> AsyncIterator[Any]:
         provider_model = self
@@ -3417,8 +3719,9 @@ def _provider_fields_after_fork(model: BaseChatModel) -> dict[str, Any]:
         claimed_state_ids: set[int] = set()
         fields.pop("http_client", None)
         fields.pop("http_async_client", None)
+        fresh_sync_client: httpx.Client | None = None
         if "http_client" in model_fields:
-            fields["http_client"] = (
+            fresh_sync_client = (
                 _fresh_httpx_client_after_fork(
                     sync_client,
                     policy,
@@ -3433,22 +3736,32 @@ def _provider_fields_after_fork(model: BaseChatModel) -> dict[str, Any]:
                     trust_env=False,
                 )
             )
+            fields["http_client"] = fresh_sync_client
         if "http_async_client" in model_fields:
-            fields["http_async_client"] = (
-                _fresh_httpx_async_client_after_fork(
-                    async_client,
-                    policy,
-                    owner=model,
-                    metadata=metadata,
-                    forbidden_state_ids=forbidden_state_ids,
-                    claimed_state_ids=claimed_state_ids,
+            try:
+                fields["http_async_client"] = (
+                    _fresh_httpx_async_client_after_fork(
+                        async_client,
+                        policy,
+                        owner=model,
+                        metadata=metadata,
+                        forbidden_state_ids=forbidden_state_ids,
+                        claimed_state_ids=claimed_state_ids,
+                    )
+                    if isinstance(async_client, httpx.AsyncClient)
+                    else httpx.AsyncClient(
+                        timeout=policy.timeout_seconds,
+                        trust_env=False,
+                    )
                 )
-                if isinstance(async_client, httpx.AsyncClient)
-                else httpx.AsyncClient(
-                    timeout=policy.timeout_seconds,
-                    trust_env=False,
-                )
-            )
+            except BaseException:
+                if fresh_sync_client is not None:
+                    try:
+                        fresh_sync_client.close()
+                    except Exception:
+                        pass
+                fields.pop("http_client", None)
+                raise
         if "http_socket_options" in model_fields:
             fields["http_socket_options"] = ()
     elif metadata.provider == "google":
@@ -3499,18 +3812,25 @@ def _install_fork_safe_anthropic_clients(
         if isinstance(source_http_client, httpx.Client)
         else httpx.Client(**http_client_params)
     )
-    http_async_client = (
-        _fresh_httpx_async_client_after_fork(
-            source_http_async_client,
-            policy,
-            owner=source,
-            metadata=source._runtime_metadata,
-            forbidden_state_ids=forbidden_state_ids,
-            claimed_state_ids=claimed_state_ids,
+    try:
+        http_async_client = (
+            _fresh_httpx_async_client_after_fork(
+                source_http_async_client,
+                policy,
+                owner=source,
+                metadata=source._runtime_metadata,
+                forbidden_state_ids=forbidden_state_ids,
+                claimed_state_ids=claimed_state_ids,
+            )
+            if isinstance(source_http_async_client, httpx.AsyncClient)
+            else httpx.AsyncClient(**http_client_params)
         )
-        if isinstance(source_http_async_client, httpx.AsyncClient)
-        else httpx.AsyncClient(**http_client_params)
-    )
+    except BaseException:
+        try:
+            http_client.close()
+        except Exception:
+            pass
+        raise
     target.__dict__["_client"] = anthropic.Anthropic(
         **client_params,
         http_client=http_client,
@@ -3536,7 +3856,7 @@ def _install_fork_safe_google_clients(
         source_http_async_client,
     )
     claimed_state_ids: set[int] = set()
-    target_api_client._httpx_client = _fresh_httpx_client_after_fork(
+    fresh_http_client = _fresh_httpx_client_after_fork(
         source_http_client,
         policy,
         owner=source,
@@ -3544,14 +3864,23 @@ def _install_fork_safe_google_clients(
         forbidden_state_ids=forbidden_state_ids,
         claimed_state_ids=claimed_state_ids,
     )
-    target_api_client._async_httpx_client = _fresh_httpx_async_client_after_fork(
-        source_http_async_client,
-        policy,
-        owner=source,
-        metadata=source._runtime_metadata,
-        forbidden_state_ids=forbidden_state_ids,
-        claimed_state_ids=claimed_state_ids,
-    )
+    try:
+        fresh_http_async_client = _fresh_httpx_async_client_after_fork(
+            source_http_async_client,
+            policy,
+            owner=source,
+            metadata=source._runtime_metadata,
+            forbidden_state_ids=forbidden_state_ids,
+            claimed_state_ids=claimed_state_ids,
+        )
+    except BaseException:
+        try:
+            fresh_http_client.close()
+        except Exception:
+            pass
+        raise
+    target_api_client._httpx_client = fresh_http_client
+    target_api_client._async_httpx_client = fresh_http_async_client
 
 
 def _ensure_model_process(model: BaseChatModel) -> None:
