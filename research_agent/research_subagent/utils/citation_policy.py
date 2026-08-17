@@ -30,7 +30,6 @@ _PLACEHOLDER_RE = re.compile(
 _HEADING_RE = re.compile(r"^(?P<marks>#{1,6})[ \t]+(?P<title>.*?)[ \t]*#*[ \t]*$")
 _ENTRY_RE = re.compile(r"^[ \t]*(?:\[(?P<bracket>\d{1,4})\][ \t]*:?|(?P<dot>\d{1,4})\.)[ \t]+(?P<body>.*)$")
 _DEFINITION_RE = re.compile(r"^[ \t]*\[\d{1,4}\][ \t]*:")
-_ANY_SCHEME_URL_RE = re.compile(r"(?<![\w+.-])(?P<url>[A-Za-z][A-Za-z0-9+.-]*://[^\s<>\[\]{}\"']*)")
 
 
 @dataclass(frozen=True, order=True, slots=True)
@@ -89,8 +88,10 @@ def audit_web_citations(report: str) -> CitationAudit:
     candidates: list[tuple[str, tuple[int, int]]] = []
     for link in links:
         candidates.append((link.url, link.span))
-    for match in _ANY_SCHEME_URL_RE.finditer(visible):
-        candidates.append((match.group("url"), match.span()))
+    link_spans = {link.span for link in links}
+    for raw_url, span in _scan_uri_tokens(visible):
+        if not _span_is_within_any(span, link_spans):
+            candidates.append((raw_url, span))
 
     seen_candidates: set[tuple[int, int]] = set()
     for raw_url, span in candidates:
@@ -103,7 +104,7 @@ def audit_web_citations(report: str) -> CitationAudit:
         if normalized is None:
             if _is_citation_link(span, links, source_ranges, entry_spans) or _is_source_candidate(
                 span, source_ranges, entry_spans
-            ) or raw_url.lower().startswith(("http", "ftp")):
+            ) or _is_explicit_uri(raw_url):
                 add("malformed_reference", "url")
             continue
         if _is_reserved_host(normalized):
@@ -286,7 +287,8 @@ def _check_reference(
 def _urls_in_text(text: str) -> tuple[str, ...]:
     links, _ = _scan_markdown_links(text)
     values = [link.url for link in links]
-    values.extend(match.group("url") for match in _ANY_SCHEME_URL_RE.finditer(text))
+    link_spans = {link.span for link in links}
+    values.extend(raw_url for raw_url, span in _scan_uri_tokens(text) if not _span_is_within_any(span, link_spans))
     return tuple(values)
 
 
@@ -349,6 +351,10 @@ def _numeric_link_label(label: str) -> int | None:
 
 
 def _span_is_contained(span: tuple[int, int], containers: set[tuple[int, int]]) -> bool:
+    return any(start <= span[0] and span[1] <= end for start, end in containers)
+
+
+def _span_is_within_any(span: tuple[int, int], containers: set[tuple[int, int]]) -> bool:
     return any(start <= span[0] and span[1] <= end for start, end in containers)
 
 
@@ -463,6 +469,14 @@ def _scan_link_destination(text: str, start: int) -> tuple[int | None, int | Non
             continue
         if character == "\n":
             return None, None, False
+        if character in " \t" and depth == 0:
+            title_start = index
+            while title_start < len(text) and text[title_start] in " \t":
+                title_start += 1
+            if title_start < len(text) and text[title_start] == ")":
+                return index, title_start, False
+            closing, overflow = _scan_link_title(text, title_start)
+            return (index, closing, overflow) if closing is not None else (None, None, overflow)
         if character == "(":
             depth += 1
             if depth > _MAX_LINK_NESTING:
@@ -473,6 +487,54 @@ def _scan_link_destination(text: str, start: int) -> tuple[int | None, int | Non
             depth -= 1
         index += 1
     return None, None, False
+
+
+def _scan_link_title(text: str, start: int) -> tuple[int | None, bool]:
+    if start >= len(text):
+        return None, False
+    delimiter = text[start]
+    if delimiter in "\"'":
+        index = start + 1
+        while index < len(text):
+            if index - start > _MAX_LINK_DESTINATION_LENGTH:
+                return None, True
+            if text[index] == "\\":
+                index += 2
+                continue
+            if text[index] == "\n":
+                return None, False
+            if text[index] == delimiter:
+                index += 1
+                while index < len(text) and text[index] in " \t":
+                    index += 1
+                return (index, False) if index < len(text) and text[index] == ")" else (None, False)
+            index += 1
+        return None, False
+    if delimiter != "(":
+        return None, False
+    depth = 1
+    index = start + 1
+    while index < len(text):
+        if index - start > _MAX_LINK_DESTINATION_LENGTH:
+            return None, True
+        if text[index] == "\\":
+            index += 2
+            continue
+        if text[index] == "\n":
+            return None, False
+        if text[index] == "(":
+            depth += 1
+            if depth > _MAX_LINK_NESTING:
+                return None, True
+        elif text[index] == ")":
+            depth -= 1
+            if depth == 0:
+                index += 1
+                while index < len(text) and text[index] in " \t":
+                    index += 1
+                return (index, False) if index < len(text) and text[index] == ")" else (None, False)
+        index += 1
+    return None, False
 
 
 def _unescape_markdown(value: str) -> str:
@@ -486,35 +548,80 @@ def _unescape_markdown(value: str) -> str:
     return "".join(result)
 
 
-def _mask_inline_code(line: str) -> str:
-    chars = list(line)
+def _scan_uri_tokens(text: str) -> tuple[tuple[str, tuple[int, int]], ...]:
+    tokens: list[tuple[str, tuple[int, int]]] = []
     index = 0
-    while (start := line.find("`", index)) >= 0:
-        delimiter_end = start
-        while delimiter_end < len(line) and line[delimiter_end] == "`":
-            delimiter_end += 1
-        delimiter = line[start:delimiter_end]
-        close = _find_inline_code_close(line, delimiter, delimiter_end)
-        if close is None:
-            index = delimiter_end
+    while index < len(text):
+        if not text[index].isalpha() or (index and _is_scheme_character(text[index - 1])):
+            index += 1
             continue
-        for position in range(start, close + len(delimiter)):
-            if chars[position] != "\n":
-                chars[position] = " "
-        index = close + len(delimiter)
+        start = index
+        index += 1
+        while index < len(text) and _is_scheme_character(text[index]):
+            index += 1
+        if index >= len(text) or text[index] != ":":
+            continue
+        content_start = index + 1
+        if content_start >= len(text) or text[content_start].isspace():
+            index = content_start
+            continue
+        end = content_start
+        parenthesis_depth = 0
+        while end < len(text):
+            character = text[end]
+            if character.isspace() or character in "<>[]{}\"'":
+                break
+            if character == "(":
+                parenthesis_depth += 1
+            elif character == ")":
+                if parenthesis_depth == 0:
+                    break
+                parenthesis_depth -= 1
+            end += 1
+        if end > content_start:
+            tokens.append((text[start:end], (start, end)))
+        index = max(end, content_start)
+    return tuple(tokens)
+
+
+def _is_scheme_character(character: str) -> bool:
+    return character.isalnum() or character in "+.-"
+
+
+def _is_explicit_uri(value: str) -> bool:
+    if not value or not value[0].isalpha():
+        return False
+    index = 1
+    while index < len(value) and _is_scheme_character(value[index]):
+        index += 1
+    return index + 1 < len(value) and value[index] == ":" and not value[index + 1].isspace()
+
+
+def _mask_inline_code(line: str) -> str:
+    changes = [0] * (len(line) + 1)
+    openings: dict[int, int] = {}
+    index = 0
+    while index < len(line):
+        if line[index] != "`":
+            index += 1
+            continue
+        start = index
+        while index < len(line) and line[index] == "`":
+            index += 1
+        delimiter_length = index - start
+        opener = openings.pop(delimiter_length, None)
+        if opener is None:
+            openings[delimiter_length] = start
+        else:
+            changes[opener] += 1
+            changes[index] -= 1
+    active = 0
+    chars = list(line)
+    for index, character in enumerate(chars):
+        active += changes[index]
+        if active and character != "\n":
+            chars[index] = " "
     return "".join(chars)
-
-
-def _find_inline_code_close(line: str, delimiter: str, start: int) -> int | None:
-    index = start
-    while (candidate := line.find("`", index)) >= 0:
-        candidate_end = candidate
-        while candidate_end < len(line) and line[candidate_end] == "`":
-            candidate_end += 1
-        if candidate_end - candidate == len(delimiter):
-            return candidate
-        index = candidate_end
-    return None
 
 
 def _normalise_defects(defects: list[CitationDefect]) -> tuple[CitationDefect, ...]:

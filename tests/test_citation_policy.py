@@ -256,6 +256,80 @@ def test_link_scanner_handles_nested_parentheses_and_bounds_adversarial_brackets
     assert perf_counter() - started < 1.0
 
 
+@pytest.mark.parametrize("title", ['"A source title"', "'A source title'", "(A source title)"])
+def test_link_destination_excludes_optional_markdown_title(title: str) -> None:
+    report = f"""Claim [1](https://publisher.org/article {title}).
+
+## Sources
+[1] https://publisher.org/article
+"""
+
+    assert audit_web_citations(report).urls == ("https://publisher.org/article",)
+    assert audit_web_citations(report).defects == ()
+
+
+@pytest.mark.parametrize("suffix", ['"unterminated', "unexpected-title"])
+def test_rejects_malformed_link_title_or_destination(suffix: str) -> None:
+    audit = audit_web_citations(f"Claim [1](https://publisher.org/article {suffix})")
+
+    assert "malformed_reference" in [defect.code for defect in audit.defects]
+
+
+@pytest.mark.parametrize("destination", ["s3://bucket/source", "file:///tmp/source", "mailto:author@publisher.org", "javascript:void", "data:text/plain,source", "ftp://publisher.org/source"])
+def test_rejects_any_explicit_non_http_uri_scheme(destination: str) -> None:
+    report = f"""Claim [1](https://valid.publisher.org/a) and [2]({destination}).
+
+## Sources
+[1] https://valid.publisher.org/a
+[2] {destination}
+"""
+
+    assert "malformed_reference" in [defect.code for defect in audit_web_citations(report).defects]
+
+
+@pytest.mark.parametrize("token", ["s3://bucket/source", "file:///tmp/source", "mailto:author@publisher.org", "javascript:void", "data:text/plain,source", "ftp://publisher.org/source"])
+def test_rejects_explicit_non_http_bare_source_token(token: str) -> None:
+    audit = audit_web_citations(f"## Sources\n[1] {token}\n[2] https://valid.publisher.org/a")
+
+    assert "malformed_reference" in [defect.code for defect in audit.defects]
+
+
+def test_rejects_explicit_non_http_uri_in_non_numeric_markdown_link() -> None:
+    audit = audit_web_citations("See [storage](s3://bucket/source) and https://valid.publisher.org/a")
+
+    assert "malformed_reference" in [defect.code for defect in audit.defects]
+
+
+def test_ignores_prose_word_colon_without_uri_content() -> None:
+    audit = audit_web_citations("A prose word: continues. https://valid.publisher.org/a")
+
+    assert audit.defects == ()
+
+
+def _unmatched_backtick_runs(size: int) -> str:
+    chunks: list[str] = []
+    length = 1
+    used = 0
+    while used + length + 1 <= size:
+        chunks.append("`" * length + "x")
+        used += length + 1
+        length += 1
+    return "".join(chunks)
+
+
+def test_inline_code_masking_scales_for_unmatched_delimiter_runs() -> None:
+    started = perf_counter()
+    audit_web_citations(_unmatched_backtick_runs(20_000))
+    fast = perf_counter() - started
+    started = perf_counter()
+    audit_web_citations(_unmatched_backtick_runs(160_000))
+    slow = perf_counter() - started
+
+    assert fast < 1.0
+    assert slow < 2.0
+    assert slow < fast * 12 + 0.1
+
+
 @pytest.mark.parametrize("size", [1_024, 16_384])
 def test_numeric_scanner_is_bounded_for_unmatched_brackets(size: int) -> None:
     started = perf_counter()
