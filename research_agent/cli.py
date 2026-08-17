@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 import uuid
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 
@@ -111,8 +112,51 @@ CSV_EXPORT_PATH_RE = re.compile(r"\*\*CSV exported to:\*\*\s*`([^`]+)`")
 MAX_STREAM_DIAGNOSTIC_CHARS = 600
 
 
+def _normalize_model_call_config(config):
+    """Return one safe config carrying a cancellable model-call scope."""
+    if not isinstance(config, Mapping):
+        return {"configurable": {"model_call_scope_id": str(uuid.uuid4())}}
+
+    configurable = config.get("configurable")
+    if isinstance(configurable, Mapping) and configurable.get("model_call_scope_id"):
+        return config
+
+    resolved = dict(config)
+    resolved_configurable = dict(configurable) if isinstance(configurable, Mapping) else {}
+    resolved_configurable["model_call_scope_id"] = str(uuid.uuid4())
+    resolved["configurable"] = resolved_configurable
+    return resolved
+
+
+def _model_call_scope_id(config) -> str | None:
+    configurable = config.get("configurable", {})
+    if not isinstance(configurable, Mapping):
+        return None
+    scope_id = configurable.get("model_call_scope_id")
+    return str(scope_id) if scope_id is not None else None
+
+
+def _contains_model_control_error(error: BaseException) -> bool:
+    """Detect timeout/cancellation controls, including nested exception groups."""
+    if isinstance(
+        error,
+        (ModelCallTimeoutError, asyncio.CancelledError, KeyboardInterrupt),
+    ):
+        return True
+    if isinstance(error, BaseExceptionGroup):
+        return any(_contains_model_control_error(item) for item in error.exceptions)
+    return False
+
+
+def _cancel_configured_model_scope(config) -> None:
+    scope_id = _model_call_scope_id(config)
+    if scope_id is not None:
+        cancel_model_call_scope(scope_id)
+
+
 def generate_research_title(research_content, *, config):
     """Generate a concise title for the research content using the configured LLM."""
+    config = _normalize_model_call_config(config)
     try:
         content_snippet = extract_message_content(research_content)[:2000]
 
@@ -133,15 +177,14 @@ def generate_research_title(research_content, *, config):
         title = re.sub(r'_+', '_', title)  # Replace multiple underscores with single
         title = title.strip('_')  # Remove leading/trailing underscores
         return title if title else "research-report"
-    except (ModelCallTimeoutError, asyncio.CancelledError, KeyboardInterrupt):
-        configurable = config.get("configurable", {})
-        scope_id = configurable.get("model_call_scope_id")
-        if scope_id is not None:
-            cancel_model_call_scope(scope_id)
+    except BaseException as error:
+        if _contains_model_control_error(error):
+            _cancel_configured_model_scope(config)
+            raise
+        if isinstance(error, Exception):
+            print(f"Warning: Could not generate title ({error}). Using default.")
+            return "research-report"
         raise
-    except Exception as e:
-        print(f"Warning: Could not generate title ({e}). Using default.")
-        return "research-report"
 
 
 def extract_message_content(message):
@@ -539,11 +582,14 @@ def main():
             spinner.stop()
             total_time = time.time() - start_time
             print(f"\n✨ Research completed in {total_time:.1f}s!\n")
-        except (ModelCallTimeoutError, asyncio.CancelledError, KeyboardInterrupt):
+        except BaseException as error:
             spinner.stop()
-            cancel_model_call_scope(model_call_scope_id)
-            raise
-        except Exception as e:
+            if _contains_model_control_error(error):
+                cancel_model_call_scope(model_call_scope_id)
+                raise
+            if not isinstance(error, Exception):
+                raise
+            e = error
             spinner.stop()
             total_time = time.time() - start_time
             role, name, preview = _last_stream_message_diagnostics(last_stream_state)
@@ -569,9 +615,10 @@ def main():
                     messages,
                     config=config,
                 )
-            except (ModelCallTimeoutError, asyncio.CancelledError, KeyboardInterrupt):
+            except BaseException as error:
                 spinner.stop()
-                cancel_model_call_scope(model_call_scope_id)
+                if _contains_model_control_error(error):
+                    cancel_model_call_scope(model_call_scope_id)
                 raise
             else:
                 spinner.stop()
@@ -585,8 +632,9 @@ def main():
                 messages,
                 config=config,
             )
-        except (ModelCallTimeoutError, asyncio.CancelledError, KeyboardInterrupt):
-            cancel_model_call_scope(model_call_scope_id)
+        except BaseException as error:
+            if _contains_model_control_error(error):
+                cancel_model_call_scope(model_call_scope_id)
             raise
         total_time = time.time() - start_time
         print(f"\n✨ Research completed in {total_time:.1f}s!\n")
@@ -600,9 +648,10 @@ def main():
                 messages,
                 config=config,
             )
-        except (ModelCallTimeoutError, asyncio.CancelledError, KeyboardInterrupt):
+        except BaseException as error:
             spinner.stop()
-            cancel_model_call_scope(model_call_scope_id)
+            if _contains_model_control_error(error):
+                cancel_model_call_scope(model_call_scope_id)
             raise
         else:
             spinner.stop()

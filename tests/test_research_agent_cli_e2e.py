@@ -707,6 +707,107 @@ def test_title_keyboard_interrupt_cancels_two_guarded_bridges_without_default(
     )
 
 
+def test_title_timeout_without_config_uses_known_scope_and_preserves_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timeout = ModelCallTimeoutError("ollama", 1.0, False)
+    seen_configs: list[dict] = []
+    cancelled_scopes: list[str] = []
+
+    class TimeoutTitleModel:
+        def invoke(self, messages, config=None):  # noqa: ANN001
+            seen_configs.append(config)
+            raise timeout
+
+    monkeypatch.setattr(research_agent_cli, "model", TimeoutTitleModel())
+    monkeypatch.setattr(research_agent_cli, "cancel_model_call_scope", cancelled_scopes.append)
+
+    with pytest.raises(ModelCallTimeoutError) as raised:
+        research_agent_cli.generate_research_title("content", config=None)
+
+    assert raised.value is timeout
+    assert len(seen_configs) == 1
+    scope_id = seen_configs[0]["configurable"]["model_call_scope_id"]
+    assert cancelled_scopes == [scope_id]
+
+
+def test_title_nested_timeout_group_cancels_scope_without_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timeout = ModelCallTimeoutError("ollama", 1.0, False)
+    error = ExceptionGroup("outer", [RuntimeError("other"), ExceptionGroup("inner", [timeout])])
+    config = {"configurable": {"model_call_scope_id": "group-scope"}}
+    cancelled_scopes: list[str] = []
+
+    class GroupTitleModel:
+        def invoke(self, messages, config=None):  # noqa: ANN001
+            raise error
+
+    monkeypatch.setattr(research_agent_cli, "model", GroupTitleModel())
+    monkeypatch.setattr(research_agent_cli, "cancel_model_call_scope", cancelled_scopes.append)
+
+    with pytest.raises(ExceptionGroup) as raised:
+        research_agent_cli.generate_research_title("content", config=config)
+
+    assert raised.value is error
+    assert cancelled_scopes == ["group-scope"]
+
+
+def test_cli_nested_timeout_group_stops_stream_and_does_not_fallback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    timeout = ModelCallTimeoutError("ollama", 1.0, False)
+    error = ExceptionGroup("outer", [RuntimeError("other"), ExceptionGroup("inner", [timeout])])
+    fake_agent = FakeAgent()
+
+    def stream(*args, **kwargs):  # noqa: ANN002, ANN003
+        raise error
+        yield  # pragma: no cover
+
+    fake_agent.stream = stream
+    cancelled_scopes = _configure_timeout_cli(
+        monkeypatch,
+        tmp_path,
+        fake_agent,
+        argv=["topic", "--verbose", "True"],
+    )
+
+    with pytest.raises(ExceptionGroup) as raised:
+        research_agent_cli.main()
+
+    assert raised.value is error
+    assert fake_agent.invoke_calls == 0
+    assert len(cancelled_scopes) == 1
+    assert all(spinner.stops >= 1 for spinner in _RecordingSpinner.instances)
+
+
+def test_cli_keyboard_group_cancels_nonverbose_scope(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    error = BaseExceptionGroup("outer", [KeyboardInterrupt(), RuntimeError("other")])
+
+    class GroupAgent(FakeAgent):
+        def invoke(self, messages, config=None):  # noqa: ANN001
+            self.invoke_calls += 1
+            self.last_config = config
+            raise error
+
+    fake_agent = GroupAgent()
+    cancelled_scopes = _configure_timeout_cli(
+        monkeypatch,
+        tmp_path,
+        fake_agent,
+        argv=["topic", "--verbose", "False"],
+    )
+
+    with pytest.raises(BaseExceptionGroup) as raised:
+        research_agent_cli.main()
+
+    assert raised.value is error
+    assert fake_agent.invoke_calls == 1
+    assert cancelled_scopes == [fake_agent.last_config["configurable"]["model_call_scope_id"]]
+
+
 def test_title_guarded_timeout_preserves_scope_and_never_uses_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
