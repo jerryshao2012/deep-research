@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Annotated, Any, Literal, NotRequired
 from uuid import UUID, uuid4
@@ -12,8 +12,12 @@ from deepagents.backends.utils import file_data_to_string
 from deepagents.middleware.filesystem import FilesystemState
 from langchain.agents.middleware import AgentMiddleware
 from langchain.agents.middleware.todo import PlanningState
-from langchain.agents.middleware.types import OmitFromInput
-from langchain_core.messages import AIMessage, ToolMessage
+from langchain.agents.middleware.types import (
+    ModelRequest,
+    OmitFromInput,
+    hook_config,
+)
+from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 from langgraph.config import get_config
 
 DEFAULT_MAX_COMPLETION_ATTEMPTS = 3
@@ -21,6 +25,13 @@ MAX_ALLOWED_COMPLETION_ATTEMPTS = 3
 FINAL_REPORT_PATH = "/final_report.md"
 
 ReportFailureReason = Literal["missing", "empty", "malformed", "stale"]
+
+COMPLETION_GUIDANCE = """<CompletionGuard>
+The prior response was not terminal because required research artifacts remain
+incomplete. Continue the existing research workflow now. Finish every active task
+and write a changed, non-empty /final_report.md before giving a terminal answer.
+Do not restart completed work.
+</CompletionGuard>"""
 
 
 class CompletionState(FilesystemState, PlanningState):
@@ -150,6 +161,66 @@ class CompletionGuardMiddleware(AgentMiddleware):
         """Async equivalent of request artifact activation."""
         return _correlate_artifact_ownership(state)
 
+    @hook_config(can_jump_to=["model", "end"])
+    def after_model(
+        self,
+        state: CompletionState,
+        runtime: Any,
+    ) -> dict[str, Any] | None:
+        """Continue an incomplete terminal response or checkpoint exhaustion."""
+        return _completion_update(state)
+
+    @hook_config(can_jump_to=["model", "end"])
+    async def aafter_model(
+        self,
+        state: CompletionState,
+        runtime: Any,
+    ) -> dict[str, Any] | None:
+        """Async equivalent of completion continuation enforcement."""
+        return _completion_update(state)
+
+    def wrap_model_call(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], Any],
+    ) -> Any:
+        """Append retry guidance to the ephemeral leading system message."""
+        return handler(_configure_continuation_request(request))
+
+    async def awrap_model_call(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], Awaitable[Any]],
+    ) -> Any:
+        """Async equivalent of ephemeral continuation guidance."""
+        return await handler(_configure_continuation_request(request))
+
+    def after_agent(
+        self,
+        state: CompletionState,
+        runtime: Any,
+    ) -> dict[str, Any] | None:
+        """Fail a run only after its matching exhaustion checkpoint is saved."""
+        exhausted_run_id = state.get("completion_exhausted_run_id")
+        current_run_id = state.get("completion_current_run_id")
+        if (
+            not isinstance(exhausted_run_id, str)
+            or not exhausted_run_id
+            or exhausted_run_id != current_run_id
+        ):
+            return None
+        raise ResearchIncompleteError(
+            incomplete_todo_count=_safe_count(
+                state.get("completion_exhausted_incomplete_todo_count")
+            ),
+            malformed_todo_count=_safe_count(
+                state.get("completion_exhausted_malformed_todo_count")
+            ),
+            report_reason=_safe_report_reason(
+                state.get("completion_exhausted_report_reason")
+            ),
+        )
+
     def _config(self) -> Mapping[str, Any]:
         try:
             config = self._config_getter()
@@ -178,6 +249,25 @@ class CompletionInspection:
         )
 
 
+class ResearchIncompleteError(RuntimeError):
+    """Safe terminal error raised after completion retry exhaustion."""
+
+    def __init__(
+        self,
+        *,
+        incomplete_todo_count: int,
+        malformed_todo_count: int,
+        report_reason: ReportFailureReason | None,
+    ) -> None:
+        report_summary = report_reason or "complete"
+        super().__init__(
+            "Research incomplete after automatic continuation limit "
+            f"(incomplete_todos={incomplete_todo_count}, "
+            f"malformed_todos={malformed_todo_count}, "
+            f"report={report_summary})."
+        )
+
+
 def get_max_completion_attempts() -> int:
     """Resolve automatic continuation budget, bounded to supported limits."""
     raw = os.getenv("MAX_COMPLETION_ATTEMPTS")
@@ -188,6 +278,125 @@ def get_max_completion_attempts() -> int:
     if parsed <= 0:
         return DEFAULT_MAX_COMPLETION_ATTEMPTS
     return min(parsed, MAX_ALLOWED_COMPLETION_ATTEMPTS)
+
+
+def _completion_update(state: CompletionState) -> dict[str, Any] | None:
+    messages = state.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return None
+    terminal = messages[-1]
+    if not isinstance(terminal, AIMessage) or terminal.tool_calls:
+        return None
+
+    inspection = _inspect_state_completion(state)
+    if inspection.ready:
+        return None
+
+    attempts = _safe_count(state.get("completion_attempts"))
+    limit = _completion_attempt_limit(state.get("completion_attempt_limit"))
+    tagged = _tag_intermediate(terminal)
+    if attempts < limit:
+        return {
+            "messages": [tagged],
+            "completion_attempts": attempts + 1,
+            "jump_to": "model",
+        }
+
+    current_run_id = state.get("completion_current_run_id")
+    exhausted_run_id = (
+        current_run_id
+        if isinstance(current_run_id, str) and current_run_id
+        else None
+    )
+    return {
+        "messages": [tagged],
+        "completion_attempts": attempts,
+        "completion_exhausted_run_id": exhausted_run_id,
+        "completion_exhausted_incomplete_todo_count": (
+            inspection.incomplete_todo_count
+        ),
+        "completion_exhausted_malformed_todo_count": (
+            inspection.malformed_todo_count
+        ),
+        "completion_exhausted_report_reason": inspection.report_reason,
+        "jump_to": "end",
+    }
+
+
+def _inspect_state_completion(state: CompletionState) -> CompletionInspection:
+    generation = state.get("completion_request_generation")
+    plan_active = (
+        isinstance(generation, str)
+        and bool(generation)
+        and state.get("completion_plan_owner_generation") == generation
+    )
+    return inspect_completion(
+        todos=state.get("todos"),
+        files=state.get("files"),
+        plan_active=plan_active,
+        report_owned=state.get("completion_report_owned") is True,
+        report_baseline_modified_at=state.get(
+            "completion_report_baseline_modified_at"
+        ),
+    )
+
+
+def _tag_intermediate(message: AIMessage) -> AIMessage:
+    metadata = {**message.response_metadata, "resume_intermediate": True}
+    return message.model_copy(update={"response_metadata": metadata})
+
+
+def _configure_continuation_request(request: ModelRequest) -> ModelRequest:
+    state = request.state
+    if not isinstance(state, Mapping):
+        return request
+    attempts = _safe_count(state.get("completion_attempts"))
+    if attempts <= 0 or state.get("completion_exhausted_run_id") is not None:
+        return request
+
+    system_message = request.system_message
+    if system_message is None:
+        configured_system = SystemMessage(content=COMPLETION_GUIDANCE)
+    elif isinstance(system_message.content, str):
+        configured_system = system_message.model_copy(
+            update={
+                "content": f"{system_message.content}\n\n{COMPLETION_GUIDANCE}"
+            }
+        )
+    else:
+        configured_system = system_message.model_copy(
+            update={
+                "content": [
+                    *system_message.content,
+                    {"type": "text", "text": COMPLETION_GUIDANCE},
+                ]
+            }
+        )
+    return request.override(system_message=configured_system)
+
+
+def _safe_count(value: object) -> int:
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return 0
+
+
+def _safe_report_reason(value: object) -> ReportFailureReason | None:
+    if value == "missing":
+        return "missing"
+    if value == "empty":
+        return "empty"
+    if value == "malformed":
+        return "malformed"
+    if value == "stale":
+        return "stale"
+    return None
+
+
+def _completion_attempt_limit(value: object) -> int:
+    if isinstance(value, int) and not isinstance(value, bool):
+        return min(max(value, 1), MAX_ALLOWED_COMPLETION_ATTEMPTS)
+    return DEFAULT_MAX_COMPLETION_ATTEMPTS
 
 
 def _normalize_run_id(value: object) -> str:

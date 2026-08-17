@@ -9,8 +9,15 @@ from uuid import UUID, uuid4
 import pytest
 from langchain.agents import create_agent
 from langchain.agents.middleware import TodoListMiddleware
+from langchain.agents.middleware.types import ModelRequest
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
-from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
+from langgraph_api.serde import default as serialize_default
 
 import research_agent.completion_guard as completion_guard
 from research_agent.completion_guard import (
@@ -828,3 +835,263 @@ def test_tool_correlation_rejects_call_without_a_result() -> None:
     )
 
     assert _middleware(run_id="run-b").before_model(state, runtime=None) is None
+
+
+def _incomplete_state(
+    message: AIMessage,
+    *,
+    attempts: int = 0,
+    limit: int = 3,
+    run_id: str = "run-b",
+) -> dict[str, Any]:
+    return {
+        "messages": [HumanMessage(content="Research privately"), message],
+        "todos": [
+            {"content": "Private research detail", "status": "in_progress"},
+            {"content": "Write report", "status": "pending"},
+        ],
+        "files": {},
+        "completion_current_run_id": run_id,
+        "completion_request_generation": "generation-b",
+        "completion_plan_owner_generation": "generation-b",
+        "completion_report_owned": False,
+        "completion_report_baseline_modified_at": None,
+        "completion_attempts": attempts,
+        "completion_attempt_limit": limit,
+        "completion_exhausted_run_id": None,
+    }
+
+
+def _terminal_message() -> AIMessage:
+    return AIMessage(
+        content=[{"type": "text", "text": "Partial answer"}],
+        id="terminal-message",
+        name="researcher",
+        additional_kwargs={"provider": "ollama"},
+        response_metadata={"model": "gemma4", "finish_reason": "stop"},
+        usage_metadata={
+            "input_tokens": 11,
+            "output_tokens": 7,
+            "total_tokens": 18,
+        },
+    )
+
+
+@pytest.mark.parametrize("limit", [1, 2, 3])
+def test_incomplete_terminal_response_consumes_exact_retry_budget(
+    limit: int,
+) -> None:
+    middleware = _middleware(run_id="run-b")
+    state = _incomplete_state(_terminal_message(), limit=limit)
+
+    for expected_attempt in range(1, limit + 1):
+        update = middleware.after_model(state, runtime=None)
+
+        assert update is not None
+        assert update["jump_to"] == "model"
+        assert update["completion_attempts"] == expected_attempt
+        state = _apply(state, update)
+
+    exhausted = middleware.after_model(state, runtime=None)
+
+    assert exhausted is not None
+    assert exhausted["jump_to"] == "end"
+    assert exhausted["completion_attempts"] == limit
+    assert exhausted["completion_exhausted_run_id"] == "run-b"
+
+
+def test_continuation_tags_replacement_preserves_terminal_message_metadata() -> None:
+    message = _terminal_message()
+    state = _incomplete_state(message)
+
+    update = _middleware(run_id="run-b").after_model(state, runtime=None)
+
+    assert update is not None
+    assert update["jump_to"] == "model"
+    assert update["completion_attempts"] == 1
+    assert len(update["messages"]) == 1
+    tagged = update["messages"][0]
+    assert isinstance(tagged, AIMessage)
+    assert tagged is not message
+    assert tagged.id == message.id
+    assert tagged.content == message.content
+    assert tagged.content_blocks == message.content_blocks
+    assert tagged.name == message.name
+    assert tagged.additional_kwargs == message.additional_kwargs
+    assert tagged.usage_metadata == message.usage_metadata
+    assert tagged.response_metadata == {
+        **message.response_metadata,
+        "resume_intermediate": True,
+    }
+    assert update.keys() == {"messages", "completion_attempts", "jump_to"}
+
+
+def test_async_after_model_matches_sync_continuation_update() -> None:
+    state = _incomplete_state(_terminal_message())
+    middleware = _middleware(run_id="run-b")
+
+    sync_update = middleware.after_model(state, runtime=None)
+    async_update = asyncio.run(middleware.aafter_model(state, runtime=None))
+
+    assert async_update == sync_update
+    assert getattr(middleware.after_model, "__can_jump_to__") == [
+        "model",
+        "end",
+    ]
+    assert getattr(middleware.aafter_model, "__can_jump_to__") == [
+        "model",
+        "end",
+    ]
+
+
+def test_after_model_ignores_nonterminal_tool_call_response() -> None:
+    tool_call = AIMessage(
+        content="Calling a tool",
+        id="tool-call",
+        tool_calls=[
+            {
+                "name": "think_tool",
+                "args": {"reflection": "continue"},
+                "id": "call-1",
+                "type": "tool_call",
+            }
+        ],
+    )
+    state = _incomplete_state(tool_call)
+
+    assert _middleware(run_id="run-b").after_model(state, runtime=None) is None
+
+
+def _model_request(state: dict[str, Any]) -> ModelRequest:
+    return ModelRequest(
+        model=FakeListChatModel(responses=["done"]),
+        messages=[HumanMessage(content="Continue")],
+        system_message=SystemMessage(
+            content="Existing system guidance",
+            id="system-message",
+            additional_kwargs={"provider": "ollama"},
+        ),
+        state=state,
+    )
+
+
+def test_sync_wrap_model_call_appends_ephemeral_leading_system_guidance() -> None:
+    state = _incomplete_state(_terminal_message(), attempts=1)
+    request = _model_request(state)
+    captured: list[ModelRequest] = []
+
+    result = _middleware(run_id="run-b").wrap_model_call(
+        request,
+        lambda configured: captured.append(configured) or "response",
+    )
+
+    assert result == "response"
+    assert len(captured) == 1
+    configured = captured[0]
+    assert configured.messages == request.messages
+    assert configured.system_message is not None
+    assert configured.system_message.id == "system-message"
+    assert configured.system_message.additional_kwargs == {"provider": "ollama"}
+    assert configured.system_message.content.startswith("Existing system guidance")
+    assert "<CompletionGuard>" in str(configured.system_message.content)
+    assert "Private research detail" not in str(configured.system_message.content)
+    assert request.system_message is not None
+    assert "<CompletionGuard>" not in str(request.system_message.content)
+    assert state["messages"][-1].content == _terminal_message().content
+
+
+def test_async_wrap_model_call_matches_sync_ollama_message_ordering() -> None:
+    state = _incomplete_state(_terminal_message(), attempts=1)
+    request = _model_request(state)
+    captured: list[ModelRequest] = []
+
+    async def handler(configured: ModelRequest) -> str:
+        captured.append(configured)
+        return "response"
+
+    result = asyncio.run(
+        _middleware(run_id="run-b").awrap_model_call(request, handler)
+    )
+
+    assert result == "response"
+    assert captured[0].messages == request.messages
+    assert all(
+        not isinstance(message, SystemMessage)
+        for message in captured[0].messages
+    )
+    assert captured[0].system_message is not None
+    assert str(captured[0].system_message.content).startswith(
+        "Existing system guidance"
+    )
+    assert "<CompletionGuard>" in str(captured[0].system_message.content)
+
+
+def test_exhaustion_checkpoints_only_safe_summary_and_jumps_to_end() -> None:
+    message = _terminal_message()
+    state = _incomplete_state(message, attempts=2, limit=2)
+
+    update = _middleware(run_id="run-b").after_model(state, runtime=None)
+
+    assert update is not None
+    assert update["jump_to"] == "end"
+    assert update["completion_attempts"] == 2
+    assert update["completion_exhausted_run_id"] == "run-b"
+    assert update["completion_exhausted_incomplete_todo_count"] == 2
+    assert update["completion_exhausted_malformed_todo_count"] == 0
+    assert update["completion_exhausted_report_reason"] == "missing"
+    tagged = update["messages"][0]
+    assert tagged.id == message.id
+    assert tagged.response_metadata["resume_intermediate"] is True
+    assert "Private research detail" not in repr(
+        {
+            key: value
+            for key, value in update.items()
+            if key not in {"messages"}
+        }
+    )
+
+
+def test_after_agent_raises_only_for_matching_current_exhausted_run() -> None:
+    middleware = _middleware(run_id="run-b")
+    matching = _incomplete_state(_terminal_message(), attempts=2, limit=2)
+    matching.update(
+        {
+            "completion_exhausted_run_id": "run-b",
+            "completion_exhausted_incomplete_todo_count": 2,
+            "completion_exhausted_malformed_todo_count": 0,
+            "completion_exhausted_report_reason": "missing",
+        }
+    )
+
+    with pytest.raises(completion_guard.ResearchIncompleteError) as caught:
+        middleware.after_agent(matching, runtime=None)
+
+    assert "incomplete_todos=2" in str(caught.value)
+    assert "malformed_todos=0" in str(caught.value)
+    assert "report=missing" in str(caught.value)
+
+    stale = {**matching, "completion_exhausted_run_id": "prior-run"}
+    assert middleware.after_agent(stale, runtime=None) is None
+
+    other_current = {**matching, "completion_current_run_id": "other-run"}
+    assert middleware.after_agent(other_current, runtime=None) is None
+
+
+def test_research_incomplete_error_serializes_safe_summary_only() -> None:
+    error = completion_guard.ResearchIncompleteError(
+        incomplete_todo_count=2,
+        malformed_todo_count=1,
+        report_reason="missing",
+    )
+
+    serialized = serialize_default(error)
+
+    assert serialized == {
+        "error": "ResearchIncompleteError",
+        "message": (
+            "Research incomplete after automatic continuation limit "
+            "(incomplete_todos=2, malformed_todos=1, report=missing)."
+        ),
+    }
+    assert "Private research detail" not in repr(serialized)
+    assert "Partial answer" not in repr(serialized)
