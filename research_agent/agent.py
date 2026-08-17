@@ -12,7 +12,7 @@ import os
 import re
 import time
 import traceback
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -26,6 +26,8 @@ from deepagents.middleware.filesystem import FilesystemState
 from dotenv import load_dotenv
 from langchain.agents.middleware import (
     AgentMiddleware,
+    ModelRequest,
+    TodoListMiddleware,
     hook_config,
 )
 from langchain_core.messages import (
@@ -37,6 +39,10 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.config import get_config
 
 from research_agent.cli_utils import get_ssl_verify_config, str2bool
+from research_agent.document_context import (
+    configure_document_tools,
+    has_document_context,
+)
 from research_agent.logger_utils import setup_logger
 from research_agent.model_factory import create_memory_saver, get_configured_model
 from research_agent.research_subagent import (
@@ -143,6 +149,7 @@ class ResearchState(FilesystemState):
     """Runtime state for the research agent."""
 
     doc_folder: str | None
+    has_documents: bool | None
     skill: str | None
     no_web: bool | None
     chat_start_time: float | None
@@ -225,6 +232,15 @@ class ResearchStateMiddleware(AgentMiddleware):
         messages = state.get("messages", [])
         current_user_message = self._get_current_user_message(messages)
         is_resume_round = self._is_resume_round(state)
+        if is_resume_round:
+            extracted_updates: dict[str, Any] = {}
+            effective_state = state
+        else:
+            extracted_updates = self._extract_parameters_from_user_input(
+                state,
+                messages,
+            )
+            effective_state = {**state, **extracted_updates}
 
         updates: dict[str, Any] = {}
         if not is_resume_round:
@@ -233,22 +249,13 @@ class ResearchStateMiddleware(AgentMiddleware):
                 current_user_message,
                 state,
             )
+            updates.update(extracted_updates)
 
         # ── Instant progress feedback ──────────────────────────────────────
         if not is_resume_round:
-            has_docs = bool(
-                state.get("doc_folder")
-                or (
-                        state.get("files")
-                        and any(
-                    k.startswith("/raw/") or k.startswith("/docs/")
-                    for k in (state.get("files") or {})
-                )
-                )
-            )
             status_text = (
                 "Searching your uploaded documents for relevant information…"
-                if has_docs
+                if has_document_context(effective_state)
                 else "Starting research…"
             )
             updates.setdefault("messages", [])
@@ -285,16 +292,6 @@ class ResearchStateMiddleware(AgentMiddleware):
                 updates["research_pass"] = 0
                 updates["_last_user_msg_hash"] = msg_hash
 
-            # Follow-up requests may select new parameters. Resume-only
-            # phrases retain settings from the original research request.
-            extracted_updates = self._extract_parameters_from_user_input(
-                state,
-                messages,
-            )
-            updates.update(extracted_updates)
-        else:
-            extracted_updates = {}
-
         # Configure OUTPUT_FOLDER based on extracted doc_folder
         if updates.get("doc_folder") or (
                 state.get("doc_folder") and not extracted_updates
@@ -304,18 +301,79 @@ class ResearchStateMiddleware(AgentMiddleware):
         else:
             self._configure_output_folder(None)
 
-        # Build instruction based on full state (including extracted parameters)
-        merged_state: ResearchState = {**state, **updates}  # type: ignore[assignment]
-        instruction = self._build_system_instruction(merged_state)
+        return updates if updates else None
 
-        result = updates if updates else {}
-        if instruction:
-            existing_msgs = result.get("messages", [])
-            result["messages"] = [
-                                     SystemMessage(content=f"Task configurations: \n{instruction}")
-                                 ] + existing_msgs
+    def configure_request(self, request: ModelRequest) -> ModelRequest:
+        """Inject task configuration into the leading system prompt.
 
-        return result if result else None
+        Task configuration used to be persisted as a ``SystemMessage`` after
+        the user's message. Strict Ollama chat templates reject that ordering,
+        so configuration is now ephemeral and model-request scoped. Generated
+        messages from older checkpoints are removed while their current value
+        is rebuilt from state.
+        """
+        request_state = request.state or {}
+        documents_available = has_document_context(request_state)
+        instruction = self._build_system_instruction(
+            request_state,
+            documents_available=documents_available,
+        )
+        task_configuration = f"Task configurations: \n{instruction}"
+        configured_tools = (
+            configure_document_tools(request.tools, documents_available)
+            if request.tools is not None
+            else None
+        )
+
+        filtered_messages = [
+            message
+            for message in request.messages
+            if not (
+                isinstance(message, SystemMessage)
+                and isinstance(message.content, str)
+                and message.content.startswith("Task configurations:")
+            )
+        ]
+        messages = (
+            request.messages
+            if len(filtered_messages) == len(request.messages)
+            else filtered_messages
+        )
+
+        system_message = request.system_message
+        if system_message is None:
+            content: str | list[str | dict[str, Any]] = task_configuration
+        elif isinstance(system_message.content, str):
+            content = (
+                f"{system_message.content}\n\n{task_configuration}"
+            ).strip()
+        else:
+            content = [
+                *system_message.content,
+                {"type": "text", "text": task_configuration},
+            ]
+
+        return request.override(
+            messages=messages,
+            system_message=SystemMessage(content=content),
+            tools=configured_tools,
+        )
+
+    def wrap_model_call(
+            self,
+            request: ModelRequest,
+            handler: Callable[[ModelRequest], Any],
+    ) -> Any:
+        """Apply task configuration to a synchronous model request."""
+        return handler(self.configure_request(request))
+
+    async def awrap_model_call(
+            self,
+            request: ModelRequest,
+            handler: Callable[[ModelRequest], Awaitable[Any]],
+    ) -> Any:
+        """Apply task configuration to an asynchronous model request."""
+        return await handler(self.configure_request(request))
 
     @hook_config(can_jump_to=["end"])
     def before_model(self, state: ResearchState, runtime: Any) -> dict[str, Any] | None:
@@ -1101,7 +1159,9 @@ class ResearchStateMiddleware(AgentMiddleware):
         return None
 
     @staticmethod
-    def _build_system_instruction(state: ResearchState) -> str:
+    def _build_system_instruction(
+            state: ResearchState, *, documents_available: bool | None = None
+    ) -> str:
         """Build system instruction from ResearchState parameters.
 
         Appends a *State Context* block so the agent knows what files are
@@ -1109,11 +1169,14 @@ class ResearchStateMiddleware(AgentMiddleware):
         work correctly in follow-up turns — the agent can decide the right
         workflow for any skill (post-process, extend, or start fresh).
         """
+        if documents_available is None:
+            documents_available = has_document_context(state)
+        no_web = str2bool(state.get("no_web"), False)
         instruction = build_instruction(
             subject="",
-            doc_folder=state.get("doc_folder"),
+            doc_folder=state.get("doc_folder") if documents_available else None,
             skill=state.get("skill"),
-            no_web=str2bool(state.get("no_web"), False),
+            no_web=no_web and documents_available,
         )
         instruction = instruction.replace(
             "Research the following subject: ", ""
@@ -1157,6 +1220,33 @@ class ResearchStateMiddleware(AgentMiddleware):
                 "relevant file first, then apply the requested skill or changes, "
                 "then use `write_file` to save the result."
                 "\n</State Context>"
+            )
+
+        if documents_available:
+            instruction += (
+                "\n\n<Source Guidance>"
+                "\nUploaded sources are available. Use `llm_wiki_query` or "
+                "`read_docs_folder` to ground relevant claims in those sources."
+                "\n</Source Guidance>"
+            )
+        elif no_web:
+            instruction += (
+                "\n\n<Source Guidance>"
+                "\nNeither uploaded documents nor web research is available. Do not "
+                "invent facts or use `llm_wiki_query`, `read_docs_folder`, "
+                "`tavily_search`, or `fetch_webpage_content`. You may still use "
+                "workflow and output tools such as `write_todos`, `write_file`, "
+                "and applicable `read_file`. Clearly report this source constraint "
+                "to the user."
+                "\n</Source Guidance>"
+            )
+        else:
+            instruction += (
+                "\n\n<Source Guidance>"
+                "\nNo uploaded document sources are available. Do not call "
+                "`llm_wiki_query` or `read_docs_folder`. Use `task` with "
+                '`subagent_type="research-agent"` for web research.'
+                "\n</Source Guidance>"
             )
 
         return instruction
@@ -1229,6 +1319,7 @@ _agent_kwargs: dict[str, Any] = dict(
     system_prompt=INSTRUCTIONS,
     subagents=[research_sub_agent],
     middleware=[
+        TodoListMiddleware(system_prompt=""),
         ClarificationMiddleware(),
         ResumeMiddleware(),
         ResearchStateMiddleware(),
