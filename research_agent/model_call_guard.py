@@ -249,11 +249,20 @@ async def _run_optional_unload(
         or not _has_valid_ollama_model_name(metadata)
     ):
         return
+    current_task = asyncio.current_task()
+    parent_cancellation_count = current_task.cancelling() if current_task is not None else 0
     try:
         if unload is None:
             await _maybe_unload_ollama(metadata=metadata, policy=policy)
             return
-        await _bounded_shielded_unload(unload())
+        try:
+            operation = unload()
+        except asyncio.CancelledError:
+            if current_task is not None and current_task.cancelling() > parent_cancellation_count:
+                raise
+            _LOGGER.warning("Ollama unload cancelled after cancelled model call")
+            return
+        await _bounded_shielded_unload(operation)
     except asyncio.CancelledError:
         raise
     except Exception:
