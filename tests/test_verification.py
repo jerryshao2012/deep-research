@@ -1016,6 +1016,47 @@ def test_sync_eval_timeout_inside_running_loop_returns_promptly_and_cleans_up(
     assert cleaned_up.wait(timeout=1.0)
 
 
+def test_sync_eval_timeout_without_running_loop_returns_promptly_and_cleans_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = threading.Event()
+    cleaned_up = threading.Event()
+
+    async def stalled_log_server_metrics(**kwargs: Any) -> dict[str, bool]:
+        started.set()
+        try:
+            await asyncio.sleep(0.5)
+        finally:
+            cleaned_up.set()
+        return {"logged": True}
+
+    monkeypatch.setattr(agent_module, "ENABLE_VERIFICATION", False)
+    monkeypatch.setattr(agent_module, "ENABLE_EVAL_TRACKING", True)
+    monkeypatch.setattr(
+        agent_module,
+        "SYNC_EVAL_LOG_TIMEOUT_SECONDS",
+        0.02,
+    )
+    monkeypatch.setattr(
+        agent_module,
+        "log_server_metrics",
+        stalled_log_server_metrics,
+    )
+    started_at = time.monotonic()
+
+    result = agent_module.ResearchStateMiddleware().after_model(
+        _streamable_state(),
+        runtime=None,
+    )
+    elapsed = time.monotonic() - started_at
+
+    assert started.wait(timeout=0.5)
+    assert elapsed < 0.2
+    assert result is not None
+    assert result.get("_eval_logged", False) is False
+    assert cleaned_up.wait(timeout=1.0)
+
+
 def test_research_state_extends_completion_state() -> None:
     assert CompletionState in agent_module.ResearchState.__orig_bases__
 

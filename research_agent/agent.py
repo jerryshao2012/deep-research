@@ -360,14 +360,7 @@ def _run_async_from_sync(
     *,
     timeout_seconds: float,
 ) -> Any:
-    """Run a coroutine from sync code without blocking an active event loop."""
-    try:
-        current_loop = asyncio.get_running_loop()
-    except RuntimeError:
-        current_loop = None
-    if current_loop is None or not current_loop.is_running():
-        return asyncio.run(coroutine_factory())
-
+    """Run a coroutine from sync code with a bounded daemon-worker wait."""
     result: concurrent.futures.Future[Any] = concurrent.futures.Future()
     ready = threading.Event()
     cancellation_requested = threading.Event()
