@@ -178,6 +178,11 @@ def _ollama_generate_url(base_url: str | None) -> str | None:
     return f"{base}/api/generate"
 
 
+def _has_valid_ollama_model_name(metadata: ModelRuntimeMetadata) -> bool:
+    """Return whether runtime metadata has a nonblank string Ollama model name."""
+    return isinstance(metadata.model_name, str) and bool(metadata.model_name.strip())
+
+
 async def _maybe_unload_ollama(
     *,
     metadata: ModelRuntimeMetadata,
@@ -189,10 +194,10 @@ async def _maybe_unload_ollama(
         return
 
     endpoint = _ollama_generate_url(metadata.base_url)
-    model_name = metadata.model_name.strip()
-    if endpoint is None or not model_name:
+    if endpoint is None or not _has_valid_ollama_model_name(metadata):
         _LOGGER.warning("Skipping Ollama unload because runtime metadata is incomplete")
         return
+    model_name = metadata.model_name.strip()
 
     payload = {"model": model_name, "keep_alive": 0}
     try:
@@ -234,12 +239,21 @@ async def _run_optional_unload(
     unload: Callable[[], Awaitable[Any]] | None,
 ) -> None:
     """Run injected or HTTP unload only for opt-in Ollama cancellation."""
-    if not policy.force_ollama_unload or metadata.provider != "ollama":
+    if (
+        not policy.force_ollama_unload
+        or metadata.provider != "ollama"
+        or not _has_valid_ollama_model_name(metadata)
+    ):
         return
-    if unload is None:
-        await _maybe_unload_ollama(metadata=metadata, policy=policy)
-        return
-    await _bounded_shielded_unload(unload())
+    try:
+        if unload is None:
+            await _maybe_unload_ollama(metadata=metadata, policy=policy)
+            return
+        await _bounded_shielded_unload(unload())
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        _LOGGER.warning("Ollama unload failed after cancelled model call", exc_info=True)
 
 
 async def _run_with_deadline[Result](

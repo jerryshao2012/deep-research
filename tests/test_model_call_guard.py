@@ -258,6 +258,20 @@ async def test_unload_failure_preserves_timeout_error():
 
 
 @_async_test
+async def test_sync_raising_unload_failure_preserves_timeout_error():
+    def unload() -> Any:
+        raise RuntimeError("unload failed before creating awaitable")
+
+    async def pending() -> None:
+        await asyncio.Event().wait()
+
+    with pytest.raises(ModelCallTimeoutError):
+        await _run_with_deadline(
+            pending, policy=_policy(unload=True), metadata=_ollama_metadata(), unload=unload
+        )
+
+
+@_async_test
 async def test_unload_failure_preserves_external_cancellation():
     started = asyncio.Event()
 
@@ -277,6 +291,51 @@ async def test_unload_failure_preserves_external_cancellation():
     caller.cancel()
     with pytest.raises(asyncio.CancelledError):
         await caller
+
+
+@_async_test
+async def test_sync_raising_unload_failure_preserves_external_cancellation():
+    started = asyncio.Event()
+
+    def unload() -> Any:
+        raise RuntimeError("unload failed before creating awaitable")
+
+    async def pending() -> None:
+        started.set()
+        await asyncio.Event().wait()
+
+    caller = asyncio.create_task(
+        _run_with_deadline(
+            pending, policy=_policy(1, unload=True), metadata=_ollama_metadata(), unload=unload
+        )
+    )
+    await started.wait()
+    caller.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+
+
+@_async_test
+@pytest.mark.parametrize("model_name", [None, 42, "   "])
+async def test_malformed_ollama_model_name_skips_unload_and_preserves_timeout(model_name):
+    unload_calls = 0
+
+    async def unload() -> None:
+        nonlocal unload_calls
+        unload_calls += 1
+
+    async def pending() -> None:
+        await asyncio.Event().wait()
+
+    metadata = _ollama_metadata()
+    object.__setattr__(metadata, "model_name", model_name)
+
+    with pytest.raises(ModelCallTimeoutError):
+        await _run_with_deadline(
+            pending, policy=_policy(unload=True), metadata=metadata, unload=unload
+        )
+    assert unload_calls == 0
 
 
 @_async_test
