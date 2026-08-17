@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import math
 import os
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Literal, Mapping
+from typing import Any, Literal, Mapping
 from urllib.parse import urlsplit, urlunsplit
 
 DEFAULT_MODEL_CALL_TIMEOUT_SECONDS = 300.0
@@ -23,6 +26,7 @@ ModelProvider = Literal[
 ]
 
 _KNOWN_PROVIDERS = frozenset(ModelProvider.__args__)
+_LOGGER = logging.getLogger(__name__)
 
 
 def _safe_provider(provider: str) -> ModelProvider:
@@ -133,3 +137,141 @@ class UnsupportedModelOverrideError(RuntimeError):
         del model_name
         self.provider = _safe_provider(provider)
         super().__init__(f"Unsupported model override for provider {self.provider!r}")
+
+
+def _consume_task_exception(task: asyncio.Task[Any]) -> None:
+    """Consume a detached task exception to prevent loop warning output."""
+    if not task.cancelled():
+        try:
+            task.exception()
+        except asyncio.CancelledError:
+            pass
+
+
+async def _bounded_task_cleanup(task: asyncio.Task[Any]) -> None:
+    """Wait briefly for a cancelled task, then detach it safely."""
+    if task.done():
+        _consume_task_exception(task)
+        return
+
+    try:
+        done, _ = await asyncio.wait({task}, timeout=MODEL_CANCEL_GRACE_SECONDS)
+    except asyncio.CancelledError:
+        task.add_done_callback(_consume_task_exception)
+        raise
+
+    if done:
+        _consume_task_exception(task)
+    else:
+        task.add_done_callback(_consume_task_exception)
+
+
+def _ollama_generate_url(base_url: str | None) -> str | None:
+    """Return Ollama generate endpoint for a normalized model base URL."""
+    if not base_url:
+        return None
+    base = base_url.rstrip("/")
+    if base.endswith("/api/generate"):
+        return base
+    if base.endswith("/api"):
+        return f"{base}/generate"
+    return f"{base}/api/generate"
+
+
+async def _maybe_unload_ollama(
+    *,
+    metadata: ModelRuntimeMetadata,
+    policy: ModelCallPolicy,
+    post: Callable[..., Awaitable[Any]] | None = None,
+) -> None:
+    """Best-effort unload an eligible Ollama model without request content."""
+    if not policy.force_ollama_unload or metadata.provider != "ollama":
+        return
+
+    endpoint = _ollama_generate_url(metadata.base_url)
+    model_name = metadata.model_name.strip()
+    if endpoint is None or not model_name:
+        _LOGGER.warning("Skipping Ollama unload because runtime metadata is incomplete")
+        return
+
+    payload = {"model": model_name, "keep_alive": 0}
+    try:
+        if post is not None:
+            await _bounded_shielded_unload(post(endpoint, json=payload))
+            return
+
+        import httpx
+
+        async with httpx.AsyncClient() as client:
+            await _bounded_shielded_unload(client.post(endpoint, json=payload))
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        _LOGGER.warning("Ollama unload failed after cancelled model call", exc_info=True)
+
+
+async def _bounded_shielded_unload(operation: Awaitable[Any]) -> None:
+    """Run unload with an independent deadline and consume a late failure."""
+    task = asyncio.ensure_future(operation)
+    try:
+        await asyncio.wait_for(asyncio.shield(task), timeout=OLLAMA_UNLOAD_TIMEOUT_SECONDS)
+    except asyncio.CancelledError:
+        if not task.done():
+            task.add_done_callback(_consume_task_exception)
+        raise
+    except Exception:
+        if task.done():
+            _consume_task_exception(task)
+        else:
+            task.add_done_callback(_consume_task_exception)
+        _LOGGER.warning("Ollama unload failed after cancelled model call", exc_info=True)
+
+
+async def _run_optional_unload(
+    *,
+    metadata: ModelRuntimeMetadata,
+    policy: ModelCallPolicy,
+    unload: Callable[[], Awaitable[Any]] | None,
+) -> None:
+    """Run injected or HTTP unload only for opt-in Ollama cancellation."""
+    if not policy.force_ollama_unload or metadata.provider != "ollama":
+        return
+    if unload is None:
+        await _maybe_unload_ollama(metadata=metadata, policy=policy)
+        return
+    await _bounded_shielded_unload(unload())
+
+
+async def _run_with_deadline[Result](
+    factory: Callable[[], Awaitable[Result]],
+    *,
+    policy: ModelCallPolicy,
+    metadata: ModelRuntimeMetadata,
+    unload: Callable[[], Awaitable[Any]] | None,
+) -> Result:
+    """Run a model request under a total deadline and bounded cancellation cleanup."""
+    task = asyncio.create_task(factory())
+    try:
+        done, _ = await asyncio.wait({task}, timeout=policy.timeout_seconds)
+        if done:
+            return task.result()
+
+        task.cancel()
+        await _bounded_task_cleanup(task)
+        await _run_optional_unload(metadata=metadata, policy=policy, unload=unload)
+        raise ModelCallTimeoutError(
+            provider=metadata.provider,
+            timeout_seconds=policy.timeout_seconds,
+            unload_requested=policy.force_ollama_unload and metadata.provider == "ollama",
+        )
+    except asyncio.CancelledError:
+        if not task.done():
+            task.cancel()
+        try:
+            await _bounded_task_cleanup(task)
+            await _run_optional_unload(metadata=metadata, policy=policy, unload=unload)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _LOGGER.warning("Cancellation cleanup failed", exc_info=True)
+        raise
