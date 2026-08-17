@@ -9,6 +9,7 @@ from __future__ import annotations
 import ipaddress
 import re
 import socket
+import ssl
 from dataclasses import dataclass
 from urllib.parse import urljoin, urlsplit
 
@@ -201,7 +202,12 @@ def _resolve_host_addresses(host: str, port: int | None) -> tuple[str, ...]:
 def _unsafe_static_url(url: str) -> bool:
     parsed = urlsplit(url)
     host = parsed.hostname
-    if parsed.scheme.lower() not in {"http", "https"} or not host:
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not host
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
         return True
     normalized = host.lower().rstrip(".")
     if normalized == "localhost" or normalized.endswith(".localhost"):
@@ -227,8 +233,8 @@ def _safe_fetch_url(url: str) -> tuple[bool, str]:
     try:
         port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
         addresses = _resolve_host_addresses(parsed.hostname or "", port)
-    except (OSError, ValueError) as exc:
-        return False, f"DNS resolution failed: {exc}"
+    except (OSError, ValueError):
+        return False, "DNS resolution failed"
     if not addresses:
         return False, "DNS resolution returned no addresses"
 
@@ -247,6 +253,17 @@ def _redirect_target(url: str, response: httpx.Response) -> str | None:
         return None
     location = response.headers.get("location")
     return urljoin(url, location) if location else ""
+
+
+def _safe_request_error(error: Exception) -> str:
+    """Classify transport failures without exposing endpoint or exception text."""
+    if isinstance(error, httpx.TimeoutException):
+        return "Request timeout"
+    if isinstance(error, httpx.ConnectError) and isinstance(error.__cause__, ssl.SSLError):
+        return "TLS error"
+    if isinstance(error, httpx.TransportError):
+        return "Transport error"
+    return "Transport error"
 
 
 async def _check_url_reachable(url: str, timeout: float = 3.0) -> tuple[bool, str]:
@@ -305,8 +322,8 @@ async def _check_url_reachable(url: str, timeout: float = 3.0) -> tuple[bool, st
                 if response.status_code < 400:
                     return True, "Reachable"
                 return False, f"HTTP {response.status_code}"
-    except Exception as e:
-        return False, str(e)
+    except Exception as error:
+        return False, _safe_request_error(error)
 
 
 async def validate_web_citations(

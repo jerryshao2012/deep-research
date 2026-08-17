@@ -132,6 +132,8 @@ async def _check_report_sufficiency(question: str, report: str) -> tuple[float, 
 
     try:
         model = get_configured_model()
+    except (ModelCallTimeoutError, ReportCitationError, asyncio.CancelledError):
+        raise
     except Exception as exc:
         logger.warning("Cannot create model for sufficiency check: %s", exc)
         return 0.5, f"Model unavailable: {exc}"
@@ -183,6 +185,8 @@ async def _adversarial_gap_analysis(question: str, report: str) -> list[str]:
 
     try:
         model = get_configured_model()
+    except (ModelCallTimeoutError, ReportCitationError, asyncio.CancelledError):
+        raise
     except Exception as exc:
         logger.warning("Cannot create model for adversarial analysis: %s", exc)
         return [f"Adversarial analysis unavailable: {exc}"]

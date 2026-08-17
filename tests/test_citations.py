@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import ssl
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -44,6 +45,28 @@ class _FakeAsyncClient:
 
 
 class TestCitationValidatorSafeFetch:
+    def test_userinfo_url_is_rejected_before_dns_or_fetch(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def resolver(*args: object) -> tuple[str, ...]:
+            raise AssertionError("credential-bearing URLs must not resolve")
+
+        def client(*args: object, **kwargs: object) -> _FakeAsyncClient:
+            raise AssertionError("credential-bearing URLs must not fetch")
+
+        monkeypatch.setattr(citation_validator, "_resolve_host_addresses", resolver)
+        monkeypatch.setattr(citation_validator.httpx, "AsyncClient", client)
+
+        reachable, reason = asyncio.run(
+            citation_validator._check_url_reachable(
+                "https://user:secret-password@public.publisher.org/report"
+            )
+        )
+
+        assert reachable is False
+        assert reason == "Unsafe URL target"
+        assert "secret-password" not in reason
+
     def test_private_or_loopback_literal_is_rejected_before_dns_or_fetch(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -125,6 +148,70 @@ class TestCitationValidatorSafeFetch:
         assert (reachable, reason) == (True, "Reachable")
         assert fake_client.kwargs["trust_env"] is False
         assert fake_client.kwargs["follow_redirects"] is False
+
+    def test_secret_bearing_dns_and_transport_errors_are_not_returned(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            citation_validator,
+            "_resolve_host_addresses",
+            lambda host, port: (_ for _ in ()).throw(OSError("dns-token=secret")),
+        )
+        reachable, reason = asyncio.run(
+            citation_validator._check_url_reachable("https://public.publisher.org/report")
+        )
+        assert (reachable, reason) == (False, "DNS resolution failed")
+        assert "secret" not in reason
+
+        class FailingClient:
+            async def __aenter__(self) -> _FakeAsyncClient:
+                raise RuntimeError("transport-token=secret")
+
+            async def __aexit__(self, *args: object) -> None:
+                return None
+
+        monkeypatch.setattr(
+            citation_validator, "_resolve_host_addresses", lambda host, port: ("93.184.216.34",)
+        )
+        monkeypatch.setattr(citation_validator.httpx, "AsyncClient", lambda **kwargs: FailingClient())
+        reachable, reason = asyncio.run(
+            citation_validator._check_url_reachable("https://public.publisher.org/report")
+        )
+        assert (reachable, reason) == (False, "Transport error")
+        assert "secret" not in reason
+
+    def test_timeout_and_tls_failures_use_safe_fixed_categories(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class TimeoutClient:
+            async def __aenter__(self) -> _FakeAsyncClient:
+                raise citation_validator.httpx.ReadTimeout("timeout-token=secret")
+
+            async def __aexit__(self, *args: object) -> None:
+                return None
+
+        class TlsClient:
+            async def __aenter__(self) -> _FakeAsyncClient:
+                try:
+                    raise ssl.SSLError("tls-token=secret")
+                except ssl.SSLError as error:
+                    raise citation_validator.httpx.ConnectError("connection failed") from error
+
+            async def __aexit__(self, *args: object) -> None:
+                return None
+
+        monkeypatch.setattr(
+            citation_validator, "_resolve_host_addresses", lambda host, port: ("93.184.216.34",)
+        )
+        monkeypatch.setattr(citation_validator.httpx, "AsyncClient", lambda **kwargs: TimeoutClient())
+        assert asyncio.run(
+            citation_validator._check_url_reachable("https://public.publisher.org/report")
+        ) == (False, "Request timeout")
+
+        monkeypatch.setattr(citation_validator.httpx, "AsyncClient", lambda **kwargs: TlsClient())
+        assert asyncio.run(
+            citation_validator._check_url_reachable("https://public.publisher.org/report")
+        ) == (False, "TLS error")
 
 # ── _render_page_chunk ─────────────────────────────────────────────────────
 

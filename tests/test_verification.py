@@ -419,6 +419,25 @@ class TestCheckReportSufficiency:
         with pytest.raises(type(error)):
             asyncio.run(_check_report_sufficiency("What is X?", "X is explained."))
 
+    @pytest.mark.parametrize("error", [
+        ModelCallTimeoutError("ollama", 1.0, False),
+        ReportCitationError("citation policy violation"),
+        asyncio.CancelledError(),
+    ])
+    def test_control_errors_propagate_from_model_construction(
+        self, monkeypatch: pytest.MonkeyPatch, error: BaseException
+    ) -> None:
+        def failing_model_construction() -> object:
+            raise error
+
+        monkeypatch.setattr(
+            verification_module, "get_configured_model", failing_model_construction
+        )
+
+        with pytest.raises(type(error)) as raised:
+            asyncio.run(_check_report_sufficiency("What is X?", "X is explained."))
+        assert raised.value is error
+
     @pytest.mark.parametrize(
         "response",
         [RuntimeError("provider unavailable"), AIMessage(content="not json")],
@@ -488,6 +507,25 @@ class TestAdversarialGapAnalysis:
 
         monkeypatch.setattr(
             verification_module, "get_configured_model", lambda: FailingJudge()
+        )
+
+        with pytest.raises(type(error)) as raised:
+            asyncio.run(_adversarial_gap_analysis("What is X?", "X is explained."))
+        assert raised.value is error
+
+    @pytest.mark.parametrize("error", [
+        ModelCallTimeoutError("ollama", 1.0, False),
+        ReportCitationError("citation policy violation"),
+        asyncio.CancelledError(),
+    ])
+    def test_control_errors_propagate_from_model_construction(
+        self, monkeypatch: pytest.MonkeyPatch, error: BaseException
+    ) -> None:
+        def failing_model_construction() -> object:
+            raise error
+
+        monkeypatch.setattr(
+            verification_module, "get_configured_model", failing_model_construction
         )
 
         with pytest.raises(type(error)) as raised:
