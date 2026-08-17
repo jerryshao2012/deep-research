@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
@@ -45,11 +46,26 @@ class CompletionState(FilesystemState, PlanningState):
     completion_report_baseline_modified_at: Annotated[
         NotRequired[str | None], OmitFromInput
     ]
+    completion_report_baseline_fingerprint: Annotated[
+        NotRequired[str | None], OmitFromInput
+    ]
+    completion_report_owned_fingerprint: Annotated[
+        NotRequired[str | None], OmitFromInput
+    ]
     completion_verified_report_modified_at: Annotated[
+        NotRequired[str | None], OmitFromInput
+    ]
+    completion_verified_report_fingerprint: Annotated[
         NotRequired[str | None], OmitFromInput
     ]
     completion_accepted_at_limit_report_modified_at: Annotated[
         NotRequired[str | None], OmitFromInput
+    ]
+    completion_accepted_at_limit_report_fingerprint: Annotated[
+        NotRequired[str | None], OmitFromInput
+    ]
+    completion_cited_baseline_fingerprints: Annotated[
+        NotRequired[dict[str, str]], OmitFromInput
     ]
     completion_exhausted_run_id: Annotated[
         NotRequired[str | None], OmitFromInput
@@ -129,8 +145,17 @@ class CompletionGuardMiddleware(AgentMiddleware):
             "completion_report_baseline_modified_at": _report_modified_at(
                 state.get("files")
             ),
+            "completion_report_baseline_fingerprint": _report_fingerprint(
+                state.get("files")
+            ),
+            "completion_report_owned_fingerprint": None,
             "completion_verified_report_modified_at": None,
+            "completion_verified_report_fingerprint": None,
             "completion_accepted_at_limit_report_modified_at": None,
+            "completion_accepted_at_limit_report_fingerprint": None,
+            "completion_cited_baseline_fingerprints": (
+                _snapshot_cited_fingerprints(state.get("files"))
+            ),
             "todos": [],
             "verification_round": 0,
             "verification_feedback": None,
@@ -286,12 +311,26 @@ def completion_ready_for_finalization(
         return True
 
     modified_at = _report_modified_at(state.get("files"))
-    if modified_at is None:
+    fingerprint = _report_fingerprint(state.get("files"))
+    owned_fingerprint = state.get("completion_report_owned_fingerprint")
+    if (
+        modified_at is None
+        or fingerprint is None
+        or not isinstance(owned_fingerprint, str)
+        or owned_fingerprint != fingerprint
+    ):
         return False
-    return modified_at in {
-        state.get("completion_verified_report_modified_at"),
-        state.get("completion_accepted_at_limit_report_modified_at"),
-    }
+    verified = (
+        state.get("completion_verified_report_modified_at") == modified_at
+        and state.get("completion_verified_report_fingerprint") == fingerprint
+    )
+    accepted_at_limit = (
+        state.get("completion_accepted_at_limit_report_modified_at")
+        == modified_at
+        and state.get("completion_accepted_at_limit_report_fingerprint")
+        == fingerprint
+    )
+    return verified or accepted_at_limit
 
 
 def finalize_accepted_report(
@@ -316,6 +355,11 @@ def finalize_accepted_report(
     }
     messages: list[AIMessage] = []
 
+    baseline = state.get("completion_cited_baseline_fingerprints")
+    baseline_is_valid = isinstance(baseline, Mapping) and all(
+        isinstance(path, str) and isinstance(fingerprint, str)
+        for path, fingerprint in baseline.items()
+    )
     cited_files = sorted(
         (
             path
@@ -324,6 +368,8 @@ def finalize_accepted_report(
             and path.lstrip("/").startswith("cited_response")
             and path.endswith(".md")
             and path not in streamed
+            and baseline_is_valid
+            and artifact_fingerprint(files[path]) != baseline.get(path)
         ),
         key=_cited_report_sort_key,
     )
@@ -426,7 +472,7 @@ def _completion_update(state: CompletionState) -> dict[str, Any] | None:
 def _inspect_state_completion(
     state: Mapping[str, Any],
 ) -> CompletionInspection:
-    return inspect_completion(
+    inspection = inspect_completion(
         todos=state.get("todos"),
         files=state.get("files"),
         plan_active=_plan_is_active(state),
@@ -434,6 +480,23 @@ def _inspect_state_completion(
         report_baseline_modified_at=state.get(
             "completion_report_baseline_modified_at"
         ),
+    )
+    if inspection.report_reason is not None:
+        return inspection
+
+    report_fingerprint = _report_fingerprint(state.get("files"))
+    owned_fingerprint = state.get("completion_report_owned_fingerprint")
+    if (
+        report_fingerprint is not None
+        and isinstance(owned_fingerprint, str)
+        and owned_fingerprint == report_fingerprint
+    ):
+        return inspection
+    return CompletionInspection(
+        plan_active=inspection.plan_active,
+        incomplete_todo_count=inspection.incomplete_todo_count,
+        malformed_todo_count=inspection.malformed_todo_count,
+        report_reason="stale",
     )
 
 
@@ -605,8 +668,11 @@ def _correlate_artifact_ownership(
 
         if name == "write_todos" and _valid_nonempty_todos(state.get("todos")):
             updates["completion_plan_owner_generation"] = generation
-        elif name == "write_file" and _owns_changed_final_report(args, state):
-            updates["completion_report_owned"] = True
+        elif name == "write_file":
+            fingerprint = _changed_final_report_fingerprint(args, state)
+            if fingerprint is not None:
+                updates["completion_report_owned"] = True
+                updates["completion_report_owned_fingerprint"] = fingerprint
 
     return updates or None
 
@@ -679,14 +745,20 @@ def _valid_nonempty_todos(todos: object) -> bool:
     )
 
 
-def _owns_changed_final_report(
+def _changed_final_report_fingerprint(
     args: Mapping[str, Any],
     state: CompletionState,
-) -> bool:
+) -> str | None:
     file_path = args.get("file_path", FINAL_REPORT_PATH)
     if file_path != FINAL_REPORT_PATH:
-        return False
-    return (
+        return None
+    fingerprint = _report_fingerprint(state.get("files"))
+    if fingerprint is None:
+        return None
+    baseline_fingerprint = state.get("completion_report_baseline_fingerprint")
+    if isinstance(baseline_fingerprint, str):
+        return fingerprint if fingerprint != baseline_fingerprint else None
+    if (
         _inspect_report(
             state.get("files"),
             report_owned=True,
@@ -694,8 +766,10 @@ def _owns_changed_final_report(
                 "completion_report_baseline_modified_at"
             ),
         )
-        is None
-    )
+        is not None
+    ):
+        return None
+    return fingerprint
 
 
 def inspect_completion(
@@ -777,3 +851,45 @@ def _inspect_report(
     if not report_owned or modified_at == baseline_modified_at:
         return "stale"
     return None
+
+
+def artifact_fingerprint(file_data: object) -> str | None:
+    """Return stable content/version identity for valid filesystem data."""
+    if not isinstance(file_data, Mapping):
+        return None
+    modified_at = file_data.get("modified_at")
+    if not isinstance(modified_at, str) or not modified_at:
+        return None
+    try:
+        content = file_data_to_string(file_data)  # type: ignore[arg-type]
+    except (KeyError, TypeError, ValueError):
+        return None
+    digest = hashlib.sha256()
+    for part in (modified_at, content):
+        encoded = part.encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+    return digest.hexdigest()
+
+
+def _report_fingerprint(files: object) -> str | None:
+    if not isinstance(files, Mapping):
+        return None
+    return artifact_fingerprint(files.get(FINAL_REPORT_PATH))
+
+
+def _snapshot_cited_fingerprints(files: object) -> dict[str, str]:
+    if not isinstance(files, Mapping):
+        return {}
+    fingerprints: dict[str, str] = {}
+    for path, file_data in files.items():
+        if (
+            not isinstance(path, str)
+            or not path.lstrip("/").startswith("cited_response")
+            or not path.endswith(".md")
+        ):
+            continue
+        fingerprint = artifact_fingerprint(file_data)
+        if fingerprint is not None:
+            fingerprints[path] = fingerprint
+    return fingerprints

@@ -40,6 +40,7 @@ from langgraph.config import get_config
 from research_agent.cli_utils import get_ssl_verify_config, str2bool
 from research_agent.completion_guard import (
     CompletionState,
+    artifact_fingerprint,
     completion_ready_for_finalization,
     finalize_accepted_report,
 )
@@ -170,7 +171,7 @@ def research_todos_complete(todos: object) -> bool:
 
 def _owned_report_for_verification(
     state: Mapping[str, Any],
-) -> tuple[str, str] | None:
+) -> tuple[str, str, str] | None:
     """Return current report text/version when this request owns it."""
     generation = state.get("completion_request_generation")
     if (
@@ -193,9 +194,6 @@ def _owned_report_for_verification(
         not isinstance(modified_at, str)
         or not modified_at
         or modified_at == state.get("completion_report_baseline_modified_at")
-        or modified_at == state.get("completion_verified_report_modified_at")
-        or modified_at
-        == state.get("completion_accepted_at_limit_report_modified_at")
     ):
         return None
     try:
@@ -204,7 +202,26 @@ def _owned_report_for_verification(
         return None
     if not report_text.strip():
         return None
-    return report_text, modified_at
+    fingerprint = artifact_fingerprint(report)
+    if fingerprint is None:
+        return None
+    owned_fingerprint = state.get("completion_report_owned_fingerprint")
+    has_fingerprint_ownership = "completion_report_owned_fingerprint" in state
+    if has_fingerprint_ownership and owned_fingerprint != fingerprint:
+        return None
+    already_verified = (
+        state.get("completion_verified_report_modified_at") == modified_at
+        and state.get("completion_verified_report_fingerprint") == fingerprint
+    )
+    already_accepted_at_limit = (
+        state.get("completion_accepted_at_limit_report_modified_at")
+        == modified_at
+        and state.get("completion_accepted_at_limit_report_fingerprint")
+        == fingerprint
+    )
+    if already_verified or already_accepted_at_limit:
+        return None
+    return report_text, modified_at, fingerprint
 
 
 def _verification_round(state: Mapping[str, Any]) -> int:
@@ -273,8 +290,10 @@ def _apply_verification_verdict(
     verdict: VerificationVerdict,
     verification_round: int,
     report_modified_at: str,
+    report_fingerprint: str,
 ) -> None:
     """Apply one verdict without consuming completion-guard attempts."""
+    updates["completion_report_owned_fingerprint"] = report_fingerprint
     updates["todos"] = filtered_todos + [
         _build_verification_todo(
             verdict_status=verdict.status,
@@ -286,7 +305,9 @@ def _apply_verification_verdict(
         updates["verification_round"] = verification_round
         updates["verification_feedback"] = None
         updates["completion_verified_report_modified_at"] = report_modified_at
+        updates["completion_verified_report_fingerprint"] = report_fingerprint
         updates["completion_accepted_at_limit_report_modified_at"] = None
+        updates["completion_accepted_at_limit_report_fingerprint"] = None
         return
 
     next_round = verification_round + 1
@@ -296,7 +317,11 @@ def _apply_verification_verdict(
         updates["completion_accepted_at_limit_report_modified_at"] = (
             report_modified_at
         )
+        updates["completion_accepted_at_limit_report_fingerprint"] = (
+            report_fingerprint
+        )
         updates["completion_verified_report_modified_at"] = None
+        updates["completion_verified_report_fingerprint"] = None
         return
 
     updates["verification_feedback"] = format_feedback(verdict)
@@ -326,6 +351,23 @@ def _merge_finalization_update(
             updates["messages"].extend(final_messages)
     updates["_streamed_files"] = finalization["_streamed_files"]
     return {**state, **updates}
+
+
+def _run_async_from_sync(
+    coroutine_factory: Callable[[], Awaitable[Any]],
+) -> Any:
+    """Run one coroutine to completion from either sync-loop context."""
+    try:
+        current_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        current_loop = None
+    if current_loop is None or not current_loop.is_running():
+        return asyncio.run(coroutine_factory())
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(
+            lambda: asyncio.run(coroutine_factory())
+        ).result(timeout=120)
 
 
 # Get current date
@@ -612,7 +654,7 @@ class ResearchStateMiddleware(AgentMiddleware):
         ):
             verification_round = _verification_round(state)
             if verification_round < MAX_VERIFICATION_ROUNDS:
-                report_text, report_modified_at = owned_report
+                report_text, report_modified_at, report_fingerprint = owned_report
                 user_question = _verification_question(state, state_files)
 
                 logger.info(
@@ -688,6 +730,7 @@ class ResearchStateMiddleware(AgentMiddleware):
                     verdict=verdict,
                     verification_round=verification_round,
                     report_modified_at=report_modified_at,
+                    report_fingerprint=report_fingerprint,
                 )
 
         effective_state = {**state, **updates}
@@ -710,9 +753,6 @@ class ResearchStateMiddleware(AgentMiddleware):
 
             # Check if already logged (use .get() with default False since TypedDict doesn't support defaults)
             if not effective_state.get("_eval_logged", False):
-                # Mark as logged to avoid duplicate logging
-                updates["_eval_logged"] = True
-
                 # Calculate runtime
                 runtime_seconds = 0.0
                 if isinstance(chat_start_time, (int, float)):
@@ -754,11 +794,9 @@ class ResearchStateMiddleware(AgentMiddleware):
                     "no_web": no_web,
                 }
 
-                # Call centralized logging function asynchronously (non-blocking)
                 try:
-                    # Create background task that won't block the main response
-                    asyncio.create_task(
-                        log_server_metrics(
+                    async def _log_metrics() -> None:
+                        await log_server_metrics(
                             messages=messages,
                             files=files,
                             runtime_seconds=runtime_seconds,
@@ -766,10 +804,13 @@ class ResearchStateMiddleware(AgentMiddleware):
                             context=context,
                             history_file=EVAL_HISTORY_FILE,
                         )
-                    )
-                    logger.info("✅ Metrics logging started in background")
+
+                    _run_async_from_sync(_log_metrics)
                 except Exception as e:
-                    logger.error(f"⚠️  Failed to start metrics logging: {e}")
+                    logger.error(f"⚠️  Failed metrics logging: {e}")
+                else:
+                    updates["_eval_logged"] = True
+                    logger.info("✅ Metrics logging completed")
 
         return updates if updates else None
 
@@ -801,7 +842,7 @@ class ResearchStateMiddleware(AgentMiddleware):
         ):
             verification_round = _verification_round(state)
             if verification_round < MAX_VERIFICATION_ROUNDS:
-                report_text, report_modified_at = owned_report
+                report_text, report_modified_at, report_fingerprint = owned_report
                 user_question = _verification_question(state, state_files)
 
                 logger.info(
@@ -857,6 +898,7 @@ class ResearchStateMiddleware(AgentMiddleware):
                     verdict=verdict,
                     verification_round=verification_round,
                     report_modified_at=report_modified_at,
+                    report_fingerprint=report_fingerprint,
                 )
 
         effective_state = {**state, **updates}
@@ -878,7 +920,6 @@ class ResearchStateMiddleware(AgentMiddleware):
                 return updates if updates else None
 
             if not effective_state.get("_eval_logged", False):
-                updates["_eval_logged"] = True
                 runtime_seconds = 0.0
                 if isinstance(chat_start_time, (int, float)):
                     runtime_seconds = time.time() - chat_start_time
@@ -925,6 +966,8 @@ class ResearchStateMiddleware(AgentMiddleware):
                     logger.info("✅ Metrics logging completed (async)")
                 except Exception as e:
                     logger.error(f"⚠️  Failed metrics logging: {e}")
+                else:
+                    updates["_eval_logged"] = True
 
         return updates if updates else None
 

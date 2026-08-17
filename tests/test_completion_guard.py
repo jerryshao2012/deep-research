@@ -116,6 +116,14 @@ def _file(content: Any, *, modified_at: Any = "current") -> dict[str, Any]:
     }
 
 
+def _fingerprint(file_data: object) -> str:
+    fingerprint = getattr(completion_guard, "artifact_fingerprint", None)
+    assert fingerprint is not None
+    value = fingerprint(file_data)
+    assert isinstance(value, str)
+    return value
+
+
 def _inspect(
     *,
     todos: object,
@@ -257,20 +265,26 @@ def test_finalization_acceptance_is_owned_by_exact_report_version(
         None,
     )
     assert readiness is not None
+    report = _file("Finished report", modified_at="report-v2")
+    current_fingerprint = _fingerprint(report)
     state = {
         "todos": [{"content": "Research", "status": "completed"}],
-        "files": {
-            "/final_report.md": _file(
-                "Finished report",
-                modified_at="report-v2",
-            )
-        },
+        "files": {"/final_report.md": report},
         "completion_request_generation": "generation-v1",
         "completion_plan_owner_generation": "generation-v1",
         "completion_report_owned": True,
         "completion_report_baseline_modified_at": "prior-report",
+        "completion_report_owned_fingerprint": current_fingerprint,
         "completion_verified_report_modified_at": verified,
+        "completion_verified_report_fingerprint": (
+            current_fingerprint if verified == "report-v2" else "old-fingerprint"
+        ),
         "completion_accepted_at_limit_report_modified_at": accepted_at_limit,
+        "completion_accepted_at_limit_report_fingerprint": (
+            current_fingerprint
+            if accepted_at_limit == "report-v2"
+            else "old-fingerprint"
+        ),
     }
 
     assert readiness(state, verification_enabled=True) is expected
@@ -283,21 +297,142 @@ def test_finalization_without_verification_still_requires_completion_readiness()
         None,
     )
     assert readiness is not None
+    report = _file("Premature report", modified_at="report-v1")
     state = {
         "todos": [{"content": "Research", "status": "pending"}],
-        "files": {
-            "/final_report.md": _file(
-                "Premature report",
-                modified_at="report-v1",
-            )
-        },
+        "files": {"/final_report.md": report},
         "completion_request_generation": "generation-v1",
         "completion_plan_owner_generation": "generation-v1",
         "completion_report_owned": True,
         "completion_report_baseline_modified_at": "prior-report",
+        "completion_report_owned_fingerprint": _fingerprint(report),
     }
 
     assert readiness(state, verification_enabled=False) is False
+
+
+@pytest.mark.parametrize(
+    "acceptance_prefix",
+    ["completion_verified_report", "completion_accepted_at_limit_report"],
+)
+def test_same_timestamp_report_replacement_invalidates_accepted_content(
+    acceptance_prefix: str,
+) -> None:
+    original = _file("Original report", modified_at="report-v1")
+    replacement = _file("Replaced report", modified_at="report-v1")
+    state = {
+        "todos": [{"content": "Research", "status": "completed"}],
+        "files": {"/final_report.md": replacement},
+        "completion_request_generation": "generation-v1",
+        "completion_plan_owner_generation": "generation-v1",
+        "completion_report_owned": True,
+        "completion_report_baseline_modified_at": "prior-report",
+        "completion_report_baseline_fingerprint": "prior-fingerprint",
+        "completion_report_owned_fingerprint": _fingerprint(original),
+        "completion_verified_report_modified_at": None,
+        "completion_verified_report_fingerprint": None,
+        "completion_accepted_at_limit_report_modified_at": None,
+        "completion_accepted_at_limit_report_fingerprint": None,
+    }
+    state[f"{acceptance_prefix}_modified_at"] = "report-v1"
+    state[f"{acceptance_prefix}_fingerprint"] = _fingerprint(original)
+
+    assert (
+        completion_guard.completion_ready_for_finalization(
+            state,
+            verification_enabled=True,
+        )
+        is False
+    )
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [{"unhashable": True}, ["unhashable"], {"nested": []}],
+)
+def test_malformed_acceptance_metadata_fails_closed(malformed: object) -> None:
+    report = _file("Finished report", modified_at="report-v1")
+    state = {
+        "todos": [{"content": "Research", "status": "completed"}],
+        "files": {"/final_report.md": report},
+        "completion_request_generation": "generation-v1",
+        "completion_plan_owner_generation": "generation-v1",
+        "completion_report_owned": True,
+        "completion_report_baseline_modified_at": "prior-report",
+        "completion_report_baseline_fingerprint": "prior-fingerprint",
+        "completion_report_owned_fingerprint": _fingerprint(report),
+        "completion_verified_report_modified_at": malformed,
+        "completion_verified_report_fingerprint": malformed,
+        "completion_accepted_at_limit_report_modified_at": malformed,
+        "completion_accepted_at_limit_report_fingerprint": malformed,
+    }
+
+    assert (
+        completion_guard.completion_ready_for_finalization(
+            state,
+            verification_enabled=True,
+        )
+        is False
+    )
+
+
+def test_ordinary_generation_snapshots_report_and_cited_artifact_fingerprints() -> None:
+    run_id = uuid4()
+    report = _file("Prior report", modified_at="report-v1")
+    cited = _file("Prior citation", modified_at="citation-v1")
+    state = {
+        "messages": [],
+        "files": {
+            "/final_report.md": report,
+            "/cited_response.md": cited,
+            "/notes.md": _file("Not a citation", modified_at="notes-v1"),
+        },
+    }
+
+    update = _middleware(run_id=run_id).before_agent(state, runtime=None)
+
+    assert update is not None
+    assert update["completion_report_baseline_fingerprint"] == _fingerprint(report)
+    assert update["completion_report_owned_fingerprint"] is None
+    assert update["completion_verified_report_fingerprint"] is None
+    assert update["completion_accepted_at_limit_report_fingerprint"] is None
+    assert update["completion_cited_baseline_fingerprints"] == {
+        "/cited_response.md": _fingerprint(cited)
+    }
+
+
+def test_explicit_resume_preserves_generation_artifact_fingerprints() -> None:
+    state = {
+        "messages": [],
+        "files": {},
+        "completion_current_run_id": "prior-run",
+        "completion_request_generation": "generation-b",
+        "completion_plan_owner_generation": "generation-b",
+        "completion_report_owned": True,
+        "completion_report_baseline_fingerprint": "baseline-report",
+        "completion_report_owned_fingerprint": "owned-report",
+        "completion_verified_report_fingerprint": "verified-report",
+        "completion_accepted_at_limit_report_fingerprint": None,
+        "completion_cited_baseline_fingerprints": {
+            "/cited_response.md": "generation-a-citation"
+        },
+    }
+
+    resumed = _apply(
+        state,
+        _middleware(run_id=uuid4(), resume=True).before_agent(
+            state,
+            runtime=None,
+        ),
+    )
+
+    assert resumed["completion_report_baseline_fingerprint"] == "baseline-report"
+    assert resumed["completion_report_owned_fingerprint"] == "owned-report"
+    assert resumed["completion_verified_report_fingerprint"] == "verified-report"
+    assert resumed["completion_accepted_at_limit_report_fingerprint"] is None
+    assert resumed["completion_cited_baseline_fingerprints"] == {
+        "/cited_response.md": "generation-a-citation"
+    }
 
 
 def test_completion_requires_an_active_plan() -> None:
@@ -352,8 +487,15 @@ def test_ordinary_generation_resets_request_scoped_completion_state(
         "completion_attempts": 0,
         "completion_attempt_limit": 2,
         "completion_report_baseline_modified_at": "prior",
+        "completion_report_baseline_fingerprint": _fingerprint(
+            state["files"]["/final_report.md"]
+        ),
+        "completion_report_owned_fingerprint": None,
         "completion_verified_report_modified_at": None,
+        "completion_verified_report_fingerprint": None,
         "completion_accepted_at_limit_report_modified_at": None,
+        "completion_accepted_at_limit_report_fingerprint": None,
+        "completion_cited_baseline_fingerprints": {},
         "completion_exhausted_run_id": None,
         "completion_exhausted_incomplete_todo_count": 0,
         "completion_exhausted_malformed_todo_count": 0,
@@ -721,8 +863,14 @@ def test_write_file_owns_changed_nonempty_final_report_after_matching_success(
     sync_update = middleware.before_model(state, runtime=None)
     async_update = asyncio.run(middleware.abefore_model(state, runtime=None))
 
-    assert sync_update == {"completion_report_owned": True}
-    assert async_update == {"completion_report_owned": True}
+    expected = {
+        "completion_report_owned": True,
+        "completion_report_owned_fingerprint": _fingerprint(
+            state["files"]["/final_report.md"]
+        ),
+    }
+    assert sync_update == expected
+    assert async_update == expected
 
 
 @pytest.mark.parametrize(

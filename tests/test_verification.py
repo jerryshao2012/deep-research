@@ -231,6 +231,8 @@ def _verification_state(
     baseline_modified_at: str | None = "prior-report",
     verification_round: int = 0,
 ) -> dict[str, Any]:
+    final_report = _report(modified_at=report_modified_at)
+    report_fingerprint = completion_guard.artifact_fingerprint(final_report)
     return {
         "messages": [
             HumanMessage(content="What is graph engineering?"),
@@ -244,7 +246,7 @@ def _verification_state(
             "/research_request.md": _report(
                 "What is graph engineering?", modified_at="request-v1"
             ),
-            "/final_report.md": _report(modified_at=report_modified_at),
+            "/final_report.md": final_report,
         },
         "todos": todos
         if todos is not None
@@ -261,8 +263,15 @@ def _verification_state(
         "completion_plan_owner_generation": "generation-v1",
         "completion_report_owned": report_owned,
         "completion_report_baseline_modified_at": baseline_modified_at,
+        "completion_report_baseline_fingerprint": "prior-report-fingerprint",
+        "completion_report_owned_fingerprint": (
+            report_fingerprint if report_owned else None
+        ),
         "completion_verified_report_modified_at": None,
+        "completion_verified_report_fingerprint": None,
         "completion_accepted_at_limit_report_modified_at": None,
+        "completion_accepted_at_limit_report_fingerprint": None,
+        "completion_cited_baseline_fingerprints": {},
         "completion_attempts": 2,
         "_streamed_files": ["/final_report.md"],
     }
@@ -303,7 +312,12 @@ def _needs_revision_verdict() -> VerificationVerdict:
             ]
         },
         {"completion_report_baseline_modified_at": "report-v1"},
-        {"completion_verified_report_modified_at": "report-v1"},
+        {
+            "completion_verified_report_modified_at": "report-v1",
+            "completion_verified_report_fingerprint": (
+                completion_guard.artifact_fingerprint(_report())
+            ),
+        },
     ],
 )
 def test_verification_runs_only_for_current_owned_report_after_research_completes(
@@ -759,6 +773,196 @@ def test_eval_logging_uses_same_accepted_report_readiness(
     assert accepted_result is not None
     assert accepted_result["_eval_logged"] is True
     assert logged_reports == [accepted["files"]]
+
+
+@pytest.mark.parametrize("async_", [False, True])
+def test_finalizer_excludes_unchanged_prior_generation_citations(
+    monkeypatch: pytest.MonkeyPatch,
+    async_: bool,
+) -> None:
+    monkeypatch.setattr(agent_module, "ENABLE_VERIFICATION", False)
+    monkeypatch.setattr(agent_module, "ENABLE_EVAL_TRACKING", False)
+    state = _streamable_state()
+    prior_citation = state["files"]["/cited_response.md"]
+    same_timestamp_changed = _report(
+        "Current-generation changed finding",
+        modified_at=state["files"]["/cited_response_2.md"]["modified_at"],
+    )
+    state["files"]["/cited_response_2.md"] = same_timestamp_changed
+    state["files"]["/cited_response_3.md"] = _report(
+        "Current-generation new finding",
+        modified_at="citation-v3",
+    )
+    state["completion_cited_baseline_fingerprints"] = {
+        "/cited_response.md": completion_guard.artifact_fingerprint(
+            prior_citation
+        ),
+        "/cited_response_2.md": completion_guard.artifact_fingerprint(
+            _report("Second finding", modified_at="citation-v2")
+        ),
+    }
+
+    result = _run_after_model(
+        agent_module.ResearchStateMiddleware(), state, async_=async_
+    )
+
+    assert _message_texts(result) == [
+        "**LLM Wiki Query Findings:**\n\nCurrent-generation changed finding",
+        "**LLM Wiki Query Findings:**\n\nCurrent-generation new finding",
+        "---",
+        "**Final Report:**\n\nFinal report",
+    ]
+    assert "First finding" not in "\n".join(_message_texts(result))
+
+
+@pytest.mark.parametrize("async_", [False, True])
+def test_explicit_resume_keeps_generation_baseline_and_never_emits_prior_citation(
+    monkeypatch: pytest.MonkeyPatch,
+    async_: bool,
+) -> None:
+    monkeypatch.setattr(agent_module, "ENABLE_VERIFICATION", False)
+    monkeypatch.setattr(agent_module, "ENABLE_EVAL_TRACKING", False)
+    prior = _report("Prior-generation finding", modified_at="citation-a")
+    ordinary_state = {
+        "messages": [AIMessage(content="Starting")],
+        "files": {"/cited_response.md": prior},
+    }
+    guard = completion_guard.CompletionGuardMiddleware(
+        config_getter=lambda: {"run_id": "run-b", "configurable": {}}
+    )
+    started = {**ordinary_state, **(guard.before_agent(ordinary_state, None) or {})}
+    current_citation = _report(
+        "Current-generation finding",
+        modified_at="citation-b",
+    )
+    started.update(
+        {
+            "messages": [HumanMessage(content="Research"), AIMessage(content="Done")],
+            "todos": [{"content": "Research", "status": "completed"}],
+            "files": {
+                **ordinary_state["files"],
+                "/cited_response_2.md": current_citation,
+                "/final_report.md": _report(
+                    "Current final report", modified_at="report-b"
+                ),
+            },
+            "completion_plan_owner_generation": started[
+                "completion_request_generation"
+            ],
+            "completion_report_owned": True,
+            "completion_report_owned_fingerprint": (
+                completion_guard.artifact_fingerprint(
+                    _report("Current final report", modified_at="report-b")
+                )
+            ),
+        }
+    )
+    resume_guard = completion_guard.CompletionGuardMiddleware(
+        config_getter=lambda: {
+            "run_id": "resume-b",
+            "configurable": {"resume_incomplete_todos": True},
+        }
+    )
+    resumed = {**started, **(resume_guard.before_agent(started, None) or {})}
+
+    result = _run_after_model(
+        agent_module.ResearchStateMiddleware(), resumed, async_=async_
+    )
+
+    assert _message_texts(result) == [
+        "**LLM Wiki Query Findings:**\n\nCurrent-generation finding",
+        "---",
+        "**Final Report:**\n\nCurrent final report",
+    ]
+    assert "Prior-generation finding" not in "\n".join(_message_texts(result))
+
+
+@pytest.mark.parametrize("async_", [False, True])
+def test_same_timestamp_report_edit_blocks_streaming_and_eval(
+    monkeypatch: pytest.MonkeyPatch,
+    async_: bool,
+) -> None:
+    calls = 0
+
+    async def fake_log_server_metrics(**kwargs: Any) -> None:
+        nonlocal calls
+        calls += 1
+
+    monkeypatch.setattr(agent_module, "ENABLE_VERIFICATION", True)
+    monkeypatch.setattr(agent_module, "ENABLE_EVAL_TRACKING", True)
+    monkeypatch.setattr(agent_module, "log_server_metrics", fake_log_server_metrics)
+    original = _report("Original report", modified_at="report-v1")
+    state = _streamable_state(report_modified_at="report-v1")
+    state["files"]["/final_report.md"] = _report(
+        "Mutated report", modified_at="report-v1"
+    )
+    original_fingerprint = completion_guard.artifact_fingerprint(original)
+    state["completion_report_owned_fingerprint"] = original_fingerprint
+    state["completion_verified_report_modified_at"] = "report-v1"
+    state["completion_verified_report_fingerprint"] = original_fingerprint
+
+    result = _run_after_model(
+        agent_module.ResearchStateMiddleware(), state, async_=async_
+    )
+
+    assert not _message_texts(result)
+    assert result is None or "_streamed_files" not in result
+    assert result is None or "_eval_logged" not in result
+    assert calls == 0
+
+
+@pytest.mark.parametrize("async_", [False, True])
+@pytest.mark.parametrize("should_fail", [False, True])
+def test_eval_logged_only_after_sync_and_async_logger_success(
+    monkeypatch: pytest.MonkeyPatch,
+    async_: bool,
+    should_fail: bool,
+) -> None:
+    calls = 0
+
+    async def fake_log_server_metrics(**kwargs: Any) -> None:
+        nonlocal calls
+        calls += 1
+        if should_fail:
+            raise RuntimeError("metrics unavailable")
+
+    monkeypatch.setattr(agent_module, "ENABLE_VERIFICATION", False)
+    monkeypatch.setattr(agent_module, "ENABLE_EVAL_TRACKING", True)
+    monkeypatch.setattr(agent_module, "log_server_metrics", fake_log_server_metrics)
+
+    result = _run_after_model(
+        agent_module.ResearchStateMiddleware(),
+        _streamable_state(),
+        async_=async_,
+    )
+
+    assert calls == 1
+    assert result is not None
+    assert result.get("_eval_logged", False) is (not should_fail)
+
+
+def test_sync_eval_logging_works_inside_running_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    async def fake_log_server_metrics(**kwargs: Any) -> None:
+        nonlocal calls
+        calls += 1
+
+    monkeypatch.setattr(agent_module, "ENABLE_VERIFICATION", False)
+    monkeypatch.setattr(agent_module, "ENABLE_EVAL_TRACKING", True)
+    monkeypatch.setattr(agent_module, "log_server_metrics", fake_log_server_metrics)
+    middleware = agent_module.ResearchStateMiddleware()
+
+    async def invoke_sync_hook() -> dict[str, Any] | None:
+        return middleware.after_model(_streamable_state(), runtime=None)
+
+    result = asyncio.run(invoke_sync_hook())
+
+    assert calls == 1
+    assert result is not None
+    assert result["_eval_logged"] is True
 
 
 def test_research_state_extends_completion_state() -> None:
