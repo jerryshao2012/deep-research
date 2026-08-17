@@ -68,7 +68,7 @@ def test_completed_plan_requires_every_item_to_be_valid_and_completed() -> None:
     inspection = _inspect(
         todos=[
             {"content": "Research", "status": "completed"},
-            {"content": "Write report", "status": " COMPLETED "},
+            {"content": "Write report", "status": "completed"},
         ],
         files={"/final_report.md": _file("Finished report")},
     )
@@ -88,6 +88,18 @@ def test_completed_plan_requires_every_item_to_be_valid_and_completed() -> None:
     assert pending.incomplete_todo_count == 1
     assert pending.malformed_todo_count == 0
     assert pending.ready is False
+
+
+@pytest.mark.parametrize("status", ["Completed", " COMPLETED ", "completed "])
+def test_completed_status_requires_an_exact_schema_value(status: str) -> None:
+    inspection = _inspect(
+        todos=[{"content": "Research", "status": status}],
+        files={"/final_report.md": _file("Finished report")},
+    )
+
+    assert inspection.incomplete_todo_count == 1
+    assert inspection.malformed_todo_count == 1
+    assert inspection.ready is False
 
 
 @pytest.mark.parametrize(

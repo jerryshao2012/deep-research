@@ -82,7 +82,7 @@ def _inspect_todos(todos: object) -> tuple[int, int]:
             incomplete_count += 1
             malformed_count += 1
             continue
-        if todo["status"].strip().lower() != "completed":
+        if todo["status"] != "completed":
             incomplete_count += 1
 
     return incomplete_count, malformed_count
@@ -95,9 +95,9 @@ def _is_valid_todo(todo: object) -> bool:
     status = todo.get("status")
     if not isinstance(content, str) or not content.strip():
         return False
-    if not isinstance(status, str) or not status.strip():
+    if not isinstance(status, str):
         return False
-    return status.strip().lower() in {"pending", "in_progress", "completed"}
+    return status in {"pending", "in_progress", "completed"}
 
 
 def _inspect_report(
