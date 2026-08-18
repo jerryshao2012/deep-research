@@ -383,10 +383,12 @@ Create the controlled files from the project-root `main` checkout:
 ```bash
 acceptance_env="$(mktemp "$PWD/.langgraph-acceptance-env.XXXXXX")"
 acceptance_config="$(mktemp "$PWD/.langgraph-acceptance-config.XXXXXX")"
+acceptance_key="$(.venv/bin/python -c 'import secrets; print(secrets.token_urlsafe(32))')"
 chmod 600 "$acceptance_env" "$acceptance_config"
 trap 'rm -f -- "$acceptance_env" "$acceptance_config"' EXIT
 
-ACCEPTANCE_ENV="$acceptance_env" .venv/bin/python - <<'PY'
+ACCEPTANCE_ENV="$acceptance_env" ACCEPTANCE_API_KEY="$acceptance_key" \
+  .venv/bin/python - <<'PY'
 import json
 import os
 
@@ -416,6 +418,8 @@ values = {
 values.update(
     MODEL_NAME="gemma4:latest",
     OLLAMA_API_BASE="http://localhost:11434",
+    UPLOAD_API_KEY=os.environ["ACCEPTANCE_API_KEY"],
+    ALLOW_ALL_THREADS="true",
 )
 with open(os.environ["ACCEPTANCE_ENV"], "w", encoding="utf-8") as stream:
     for key, value in values.items():
@@ -440,7 +444,8 @@ query the running server and fail unless its own diagnostics report the exact
 provider/model and a successful probe:
 
 ```bash
-curl -sS http://127.0.0.1:2024/storage/info | jq -e '
+curl -sS -H "X-API-Key: $acceptance_key" \
+  http://127.0.0.1:2024/storage/info | jq -e '
   .model_factory.detected_provider == "ollama" and
   .model_factory.configuration.MODEL_NAME == "gemma4:latest" and
   .model_factory.configuration.OLLAMA_API_BASE == "http://localhost:11434" and
@@ -457,7 +462,8 @@ submit `Help to do a research on graph engineering`, and capture the new thread
 ID from the URL. Before answering, inspect canonical interrupt state:
 
 ```bash
-curl -sS http://127.0.0.1:2024/threads/<THREAD_ID>/state | jq \
+curl -sS -H "X-API-Key: $acceptance_key" \
+  http://127.0.0.1:2024/threads/<THREAD_ID>/state | jq \
   '{interrupts, todos:.values.todos, messages:.values.messages[-4:]}'
 ```
 
@@ -465,7 +471,8 @@ Answer the clarification in the frontend so the same correlated call resumes.
 After the run reaches a terminal state, capture exact acceptance evidence:
 
 ```bash
-curl -sS http://127.0.0.1:2024/threads/<THREAD_ID>/state | jq -e '
+curl -sS -H "X-API-Key: $acceptance_key" \
+  http://127.0.0.1:2024/threads/<THREAD_ID>/state | jq -e '
   (.values.todos | length > 0) and
   (all(.values.todos[]; .status == "completed")) and
   (.values.files["/final_report.md"].content | type == "string" and length > 0) and
@@ -476,7 +483,8 @@ Also inspect the post-resume message tail and require at least one visible tool
 call before completion:
 
 ```bash
-curl -sS http://127.0.0.1:2024/threads/<THREAD_ID>/state | jq \
+curl -sS -H "X-API-Key: $acceptance_key" \
+  http://127.0.0.1:2024/threads/<THREAD_ID>/state | jq \
   '.values.messages | map({type,name,tool_calls,content}) | .[-20:]'
 ```
 
