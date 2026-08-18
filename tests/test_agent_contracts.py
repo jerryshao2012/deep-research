@@ -11,6 +11,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.tools import tool
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
+from langgraph.types import Command
 
 from research_agent.model_call_guard import (
     ModelCallGuardMiddleware,
@@ -573,7 +574,10 @@ def test_compiled_web_mode_detects_same_id_human_replacement_but_not_resume() ->
     assert resumed["strict_web_citations"] is True
 
 
-def test_markerless_checkpoint_defaults_web_then_accepts_new_human_directive() -> None:
+@pytest.mark.parametrize("resume_input", [None, Command(resume={})])
+def test_markerless_checkpoint_resume_defaults_web_then_accepts_new_human_directive(
+    resume_input: Command | None,
+) -> None:
     from research_agent.agent import _agent_kwargs
 
     scripted_model = _guarded_scripted_model(
@@ -590,22 +594,18 @@ def test_markerless_checkpoint_defaults_web_then_accepts_new_human_directive() -
     }
     graph = create_deep_agent(**production_kwargs)
     config = {"configurable": {"thread_id": "legacy-web-mode"}}
-    graph.invoke(
-        {"messages": [HumanMessage(id="legacy", content="Research with no web")]},
-        config=config,
-    )
     graph.update_state(
         config,
         {
+            "messages": [
+                HumanMessage(id="legacy", content="Research with no web")
+            ],
             "effective_no_web": True,
             "strict_web_citations": False,
-            "web_mode_last_human_id": None,
-            "web_mode_last_human_count": None,
-            "web_mode_last_human_fingerprint": None,
         },
     )
 
-    graph.invoke({}, config=config)
+    graph.invoke(resume_input, config=config)
     migrated = graph.get_state(config).values
     assert migrated["effective_no_web"] is False
     assert migrated["strict_web_citations"] is True
@@ -617,6 +617,73 @@ def test_markerless_checkpoint_defaults_web_then_accepts_new_human_directive() -
     updated = graph.get_state(config).values
     assert updated["effective_no_web"] is True
     assert updated["strict_web_citations"] is False
+
+
+def test_compiled_fresh_human_directive_applies_with_preloaded_files() -> None:
+    from deepagents.backends.utils import create_file_data
+
+    from research_agent.agent import _agent_kwargs
+
+    scripted_model = _guarded_scripted_model([AIMessage(content="complete")])
+    graph = create_deep_agent(
+        **{
+            **_agent_kwargs,
+            "model": scripted_model,
+            "checkpointer": InMemorySaver(),
+            "subagents": [
+                {**spec, "model": scripted_model}
+                for spec in _agent_kwargs["subagents"]
+            ],
+        }
+    )
+    config = {"configurable": {"thread_id": "fresh-files-web-mode"}}
+
+    graph.invoke(
+        {
+            "messages": [HumanMessage(content="Research this with no web")],
+            "files": {"/context.md": create_file_data("Preloaded context")},
+        },
+        config=config,
+    )
+
+    snapshot = graph.get_state(config).values
+    assert snapshot["effective_no_web"] is True
+    assert snapshot["strict_web_citations"] is False
+
+
+def test_markerless_checkpoint_applies_immediate_new_human_directive() -> None:
+    from research_agent.agent import _agent_kwargs
+
+    scripted_model = _guarded_scripted_model([AIMessage(content="complete")])
+    graph = create_deep_agent(
+        **{
+            **_agent_kwargs,
+            "model": scripted_model,
+            "checkpointer": InMemorySaver(),
+            "subagents": [
+                {**spec, "model": scripted_model}
+                for spec in _agent_kwargs["subagents"]
+            ],
+        }
+    )
+    config = {"configurable": {"thread_id": "legacy-new-human-web-mode"}}
+    graph.update_state(
+        config,
+        {
+            "messages": [HumanMessage(id="legacy", content="Research with web")],
+            "effective_no_web": False,
+            "strict_web_citations": True,
+        },
+    )
+
+    graph.invoke(
+        {"messages": [HumanMessage(id="new", content="Research with no web")]},
+        config=config,
+    )
+
+    snapshot = graph.get_state(config).values
+    assert snapshot["effective_no_web"] is True
+    assert snapshot["strict_web_citations"] is False
 
 
 def test_compiled_first_human_text_directive_applies_without_raw_mode() -> None:

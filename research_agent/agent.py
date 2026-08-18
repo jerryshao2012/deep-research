@@ -44,6 +44,11 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.channels.ephemeral_value import EphemeralValue
 from langgraph.config import get_config
 
+try:
+    from langgraph._internal._constants import CONFIG_KEY_RESUMING
+except ImportError:  # pragma: no cover - compatibility with older LangGraph.
+    CONFIG_KEY_RESUMING = "__pregel_resuming"
+
 from research_agent.cli_utils import get_ssl_verify_config, str2bool
 from research_agent.completion_guard import (
     CompletionGuardMiddleware,
@@ -600,28 +605,22 @@ class WebModeMiddleware(SkillsMiddleware):
             ).hexdigest()
         return latest_id, human_count, latest_text, latest_fingerprint
 
-    @staticmethod
-    def _has_legacy_checkpoint_evidence(state: ResearchState) -> bool:
-        """Identify a markerless restore when LangGraph exposes no input delta.
+    def _runtime_config(self) -> dict[str, Any]:
+        """Read LangGraph's injected config without coupling call sites to it."""
+        try:
+            config = self._config_getter()
+        except RuntimeError:
+            return {}
+        return dict(config) if isinstance(config, Mapping) else {}
 
-        Old checkpoints cannot distinguish a resumed human message from a fresh
-        request. Generated messages, files, or todos prove prior execution, so
-        default to web mode rather than reparse stale directive text. A later
-        human-count increase remains fresh once this invocation writes markers.
-        """
-        messages = state.get("messages", [])
-        if any(
-                not (
-                    isinstance(message, dict) and message.get("role") == "user"
-                )
-                and not (
-                    hasattr(message, "type")
-                    and getattr(message, "type", None) == "human"
-                )
-                for message in messages
-        ):
-            return True
-        return bool(state.get("files") or state.get("todos"))
+    @staticmethod
+    def _is_resuming(config: Mapping[str, Any]) -> bool:
+        """Return Pregel's first-step resume flag, with a safe default."""
+        configurable = config.get("configurable")
+        return bool(
+            isinstance(configurable, Mapping)
+            and configurable.get(CONFIG_KEY_RESUMING, False)
+        )
 
     def _mode_update(self, state: ResearchState) -> dict[str, Any]:
         """Resolve raw input while it is still available at graph entry."""
@@ -631,19 +630,19 @@ class WebModeMiddleware(SkillsMiddleware):
         previous_count = state.get("web_mode_last_human_count")
         previous_id = state.get("web_mode_last_human_id")
         previous_fingerprint = state.get("web_mode_last_human_fingerprint")
+        config = self._runtime_config()
         missing_markers = (
             previous_count is None
             and previous_id is None
             and previous_fingerprint is None
         )
-        if not isinstance(previous_count, int) or isinstance(previous_count, bool):
-            has_new_human = (
-                human_count > 0
-                and not (
-                    missing_markers
-                    and self._has_legacy_checkpoint_evidence(state)
-                )
-            )
+        if missing_markers:
+            # Markerless pre-migration checkpoints use Pregel's explicit
+            # first-step signal; unlike history heuristics this handles a
+            # human-only checkpoint and a fresh request with preloaded files.
+            has_new_human = human_count > 0 and not self._is_resuming(config)
+        elif not isinstance(previous_count, int) or isinstance(previous_count, bool):
+            has_new_human = human_count > 0
         elif human_count > previous_count:
             has_new_human = True
         elif human_count < previous_count:
@@ -670,11 +669,7 @@ class WebModeMiddleware(SkillsMiddleware):
         else:
             effective_no_web = False
 
-        try:
-            config = self._config_getter()
-        except RuntimeError:
-            config = {}
-        run_id = config.get("run_id") if isinstance(config, Mapping) else None
+        run_id = config.get("run_id")
         return {
             "effective_no_web": effective_no_web,
             "strict_web_citations": not effective_no_web,
