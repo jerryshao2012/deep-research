@@ -58,16 +58,24 @@ adapter accepts only the exact legacy shorthand used by Gemma:
 }
 ```
 
+Batch mode is exclusive: every question must be canonical, or every question
+must use the exact shorthand keys `question` and `options`. A hybrid batch or a
+single question containing mixed canonical/shorthand keys is rejected instead
+of guessed. Normalization builds a new mapping and never mutates raw tool-call
+arguments, which LangGraph may reuse when it re-executes an interrupted node.
+
 Each shorthand question is converted deterministically:
 
 - question ID: `question_1`, `question_2`, ...
 - prompt: original `question`
 - type: `single_select`
-- option IDs: `option_1`, `option_2`, ... within each question
+- option IDs: `option_1`, `option_2`, ... within each question, assigned after
+  any automatic-Other removal so IDs remain contiguous
 - option labels: original strings
-- a conventional standalone `Other` option is removed only when at least two
-  concrete options remain, because the clarification response already supports
-  free-form `other_text`
+- a conventional standalone Other option is recognized after trim and Unicode
+  case-fold when its complete label is `other` or `other (please specify)`; it
+  is removed only when at least two concrete options remain, because the
+  clarification response already supports free-form `other_text`
 
 After conversion, existing strict Pydantic validation still enforces batch,
 length, identifier, uniqueness, and extra-field limits. Any item containing a
@@ -93,24 +101,41 @@ canonical clarification result used by the continuing graph.
 `useThreadDocumentAvailability` keeps confirmed availability and documents in
 local React state but stops persisting them through `threads.updateState`.
 Upload, delete, and list refreshes therefore cannot create ambiguous graph
-checkpoints or conflict with active runs.
+checkpoints or conflict with active runs. The hook drops its state-write queue,
+busy-status deferral, and 409 retry logic; those mechanisms exist only to
+support the unsafe passive write.
 
-Run submission remains authoritative: every new research run includes
-`has_documents` and canonical `doc_folder` derived for the active LangGraph
-thread. Existing pending-upload fallback remains thread-owned until confirmed
-list/delete evidence supersedes it. Passive polling never mutates graph state.
+`ChatInterface` owns one thread-scoped pending upload folder. Every successful
+upload sets it unconditionally. A confirmed list or delete result for that same
+thread, whether empty or nonempty, supersedes and clears it. A same-thread send
+also clears it after the send function accepts the payload. Navigation does not
+apply one thread's pending folder to another thread; returning to the owner may
+still use it until one of those clearing events occurs.
 
-The hook drops its state-write queue, busy-status deferral, and 409 retry logic;
-those mechanisms exist only to support the unsafe passive write. Tests retain
-race, navigation, unmount, upload, deletion, and submit-boundary coverage while
+Run submission remains authoritative and follows this exact table:
+
+| Evidence at send | `has_documents` | `doc_folder` |
+|---|---:|---|
+| confirmed nonempty | `true` | `docs/threads/<active-thread-id>` |
+| confirmed empty | `false` | `null` |
+| unknown + same-thread pending upload | `true` | pending canonical folder |
+| unknown without same-thread pending upload | omitted | omitted |
+
+Unknown-without-pending deliberately preserves checkpoint state rather than
+inventing negative evidence. Confirmed empty explicitly clears a stale folder.
+Passive polling never mutates graph state. Tests retain race, navigation,
+unmount, upload, deletion, pending-owner, and submit-boundary coverage while
 asserting that no graph-state write occurs.
 
 ### Thread titles
 
 Thread search explicitly requests `values` along with identity, timestamps,
-status, and metadata. For a completed nonbusy item still lacking a custom title
-or first human message, the repository calls `threads.getState(threadId)` and
-recomputes the preview from checkpoint `values`.
+status, and metadata. The repository calls `threads.getState(threadId)` only
+when both a custom title and a first-human-message title are absent and
+`status !== "busy"`, then recomputes the preview from checkpoint `values`.
+Interrupted and error threads may use their stable latest checkpoint; busy
+threads skip fallback lookup and are retried by the existing list refresh.
+Lookup failure produces the stable ID fallback without blocking the list.
 
 Title priority remains:
 
@@ -135,6 +160,7 @@ This avoids model latency and preserves manual titles.
 - RED/GREEN contract tests for exact shorthand payload and mixed-shape rejection.
 - Tool invocation test proving shorthand arguments pass `args_schema`, interrupt,
   and resume into canonical result.
+- Repeat-validation/replay test proving normalization does not mutate raw input.
 - Existing canonical clarification, completion guard, and write-file tests.
 
 ### Frontend
@@ -144,8 +170,30 @@ This avoids model latency and preserves manual titles.
 - Submission tests proving document flags and canonical folder still reach each
   run payload.
 - Repository tests for explicit search selection, checkpoint title recovery,
-  manual-title precedence, and stable ID fallback.
+  no fallback call when selected values already contain a human message,
+  manual-title precedence, busy skip, interrupted/error recovery, and stable ID
+  fallback.
 - Focused tests, lint, formatting, and production build in the frontend branch.
+
+Exact focused commands:
+
+```bash
+# Backend
+uv run pytest tests/test_clarification.py tests/test_agent_contracts.py \
+  tests/test_completion_guard.py tests/test_write_file.py -q
+uv run ruff check research_agent/research_subagent/clarification \
+  tests/test_clarification.py tests/test_agent_contracts.py
+
+# Frontend
+yarn node --import tsx --test --test-isolation=none \
+  tests/thread-document-availability.test.tsx \
+  tests/submit-research-message.test.ts \
+  tests/chat-interface-document-state.test.tsx \
+  tests/langgraph-thread-repository.test.ts
+yarn lint
+yarn format:check
+yarn build
+```
 
 ## Delivery
 
