@@ -68,7 +68,8 @@ the Ollama branch after Ollama wins existing provider precedence:
 - Explicit input is stripped and case-folded. `1`, `true`, `yes`, and `on`
   mean true; `0`, `false`, `no`, and `off` mean false. Empty or any other value
   raises `ValueError("OLLAMA_REASONING must be a boolean")`; raw input is not
-  echoed.
+  echoed. Any valid explicit value is passed to every selected Ollama model,
+  regardless of model family.
 - Family matching strips/case-folds the model name, takes the final
   slash-delimited repository component, removes its final colon-delimited tag,
   and requires repository equality with `gemma4`. Thus `gemma4:latest`,
@@ -105,6 +106,8 @@ feeding that path during normal tool orchestration.
    observed Gemma shorthand on current code.
 2. GREEN: `tool_call_schema` and ToolNode interrupt/resume/replay normalize
    shorthand and preserve strict rejection cases and canonical output.
+   `tool_call_schema.model_json_schema()` must still advertise only canonical
+   fields; shorthand is an input-compatibility path, not a public wire schema.
 3. RED/GREEN: model-factory tests cover exact/tagged/namespaced/case-folded
    Gemma matches; false-positive names; every override literal; whitespace;
    fixed empty/invalid failures; unset non-Gemma keyword omission; provider
