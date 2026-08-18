@@ -271,6 +271,28 @@ def create_memory_saver():
     raise ValueError(f"Unsupported MEMORY_TYPE: {memory_type}")
 
 
+_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
+_FALSE_VALUES = frozenset({"0", "false", "no", "off"})
+
+
+def _is_gemma4_model(model_name: str) -> bool:
+    repository = model_name.strip().casefold().rsplit("/", 1)[-1].rsplit(":", 1)[0]
+    return repository == "gemma4"
+
+
+def _ollama_reasoning_kwargs(model_name: str) -> dict[str, bool]:
+    raw = os.getenv("OLLAMA_REASONING")
+    if raw is None:
+        return {"reasoning": False} if _is_gemma4_model(model_name) else {}
+
+    normalized = raw.strip().casefold()
+    if normalized in _TRUE_VALUES:
+        return {"reasoning": True}
+    if normalized in _FALSE_VALUES:
+        return {"reasoning": False}
+    raise ValueError("OLLAMA_REASONING must be a boolean")
+
+
 _cached_model = None
 
 
@@ -472,6 +494,7 @@ def _build_configured_model():
                 "client_kwargs": dict(native_client_kwargs),
                 "sync_client_kwargs": dict(native_client_kwargs),
                 "async_client_kwargs": dict(native_client_kwargs),
+                **_ollama_reasoning_kwargs(model_name),
             },
             ModelRuntimeMetadata(
                 provider="ollama",

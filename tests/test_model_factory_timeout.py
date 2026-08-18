@@ -42,6 +42,7 @@ _PROVIDER_ENV = {
     "ANTHROPIC_API_URL",
     "ANTHROPIC_BASE_URL",
     "OLLAMA_API_BASE",
+    "OLLAMA_REASONING",
     "MODEL_NAME",
     "MODEL_MAX_RETRIES",
 }
@@ -414,6 +415,130 @@ def test_cached_model_keeps_construction_policy_until_cache_is_cleared(
     assert cached._model_call_policy.timeout_seconds == 0.2
     assert bypassed is not first
     assert bypassed._model_call_policy.timeout_seconds == 0.01
+
+
+def _configure_ollama(
+    monkeypatch: pytest.MonkeyPatch,
+    model_name: str,
+) -> Any:
+    monkeypatch.setenv("OLLAMA_API_BASE", "http://localhost:11434")
+    monkeypatch.setenv("MODEL_NAME", model_name)
+    return model_factory.get_configured_model(bypass_cache=True)
+
+
+@pytest.mark.parametrize(
+    "model_name",
+    [
+        "gemma4",
+        "  GeMmA4  ",
+        "team/gemma4:27b",
+        " REGISTRY/TEAM/GEMMA4:LATEST ",
+    ],
+)
+def test_unset_reasoning_defaults_exact_gemma4_repository_to_false(
+    monkeypatch: pytest.MonkeyPatch,
+    model_name: str,
+) -> None:
+    model = _configure_ollama(monkeypatch, model_name)
+
+    assert "reasoning" in model.model_fields_set
+    assert model.reasoning is False
+    assert model._chat_params([])["think"] is False
+
+
+@pytest.mark.parametrize(
+    "model_name",
+    ["gemma40", "my-gemma4", "gemma4x", "qwen3:latest"],
+)
+def test_unset_reasoning_omits_keyword_for_non_gemma4_repositories(
+    monkeypatch: pytest.MonkeyPatch,
+    model_name: str,
+) -> None:
+    model = _configure_ollama(monkeypatch, model_name)
+
+    assert "reasoning" not in model.model_fields_set
+    assert "reasoning" not in model.model_dump(exclude_unset=True)
+
+
+@pytest.mark.parametrize(
+    ("configured_value", "expected", "model_name"),
+    [
+        ("1", True, "qwen3:latest"),
+        ("true", True, "gemma4"),
+        ("YES", True, "qwen3:latest"),
+        ("  On\t", True, "gemma4:27b"),
+        ("0", False, "qwen3:latest"),
+        ("false", False, "gemma4"),
+        ("NO", False, "qwen3:latest"),
+        ("  Off\t", False, "gemma4:27b"),
+    ],
+)
+def test_explicit_reasoning_boolean_overrides_apply_to_every_ollama_model(
+    monkeypatch: pytest.MonkeyPatch,
+    configured_value: str,
+    expected: bool,
+    model_name: str,
+) -> None:
+    monkeypatch.setenv("OLLAMA_REASONING", configured_value)
+
+    model = _configure_ollama(monkeypatch, model_name)
+
+    assert "reasoning" in model.model_fields_set
+    assert model.reasoning is expected
+    assert model._chat_params([])["think"] is expected
+
+
+@pytest.mark.parametrize("configured_value", ["", "   \t", "invalid", "2"])
+def test_invalid_explicit_reasoning_value_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+    configured_value: str,
+) -> None:
+    monkeypatch.setenv("OLLAMA_REASONING", configured_value)
+    monkeypatch.setenv("OLLAMA_API_BASE", "http://localhost:11434")
+    monkeypatch.setenv("MODEL_NAME", "gemma4")
+
+    with pytest.raises(ValueError) as exc_info:
+        model_factory.get_configured_model(bypass_cache=True)
+
+    assert str(exc_info.value) == "OLLAMA_REASONING must be a boolean"
+
+
+def test_higher_precedence_provider_does_not_validate_ollama_reasoning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AWS_BEDROCK_ENDPOINT", "https://bedrock.example.test/v1")
+    monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", "secret-test-value")
+    monkeypatch.setenv("MODEL_NAME", "bedrock-model")
+    monkeypatch.setenv("OLLAMA_API_BASE", "http://localhost:11434")
+    monkeypatch.setenv("OLLAMA_REASONING", "invalid")
+
+    model = model_factory.get_configured_model(bypass_cache=True)
+
+    assert model._runtime_metadata.provider == "aws_bedrock"
+
+
+def test_gemma_reasoning_policy_follows_model_cache_lifecycle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OLLAMA_API_BASE", "http://localhost:11434")
+    monkeypatch.setenv("MODEL_NAME", "gemma4")
+
+    first = model_factory.get_configured_model()
+    monkeypatch.setenv("OLLAMA_REASONING", "true")
+    cached = model_factory.get_configured_model()
+    bypassed = model_factory.get_configured_model(bypass_cache=True)
+    model_factory.clear_model_cache()
+    rebuilt = model_factory.get_configured_model()
+
+    assert cached is first
+    assert cached.reasoning is False
+    assert cached._chat_params([])["think"] is False
+    assert bypassed is not first
+    assert bypassed.reasoning is True
+    assert bypassed._chat_params([])["think"] is True
+    assert rebuilt is not first
+    assert rebuilt.reasoning is True
+    assert rebuilt._chat_params([])["think"] is True
 
 
 def test_skill_factory_delegates_to_shared_uncached_factory(
