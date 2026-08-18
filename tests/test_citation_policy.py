@@ -115,6 +115,20 @@ def test_rejects_terminal_dot_reserved_hosts(url: str) -> None:
 
 
 @pytest.mark.parametrize(
+    "url",
+    [
+        "https://alice@public.publisher.org/report",
+        "https://alice:secret@public.publisher.org/report",
+    ],
+)
+def test_rejects_credential_bearing_web_urls(url: str) -> None:
+    audit = audit_web_citations(f"## Sources\n[1] {url}")
+
+    assert "malformed_reference" in [defect.code for defect in audit.defects]
+    assert audit.urls == ()
+
+
+@pytest.mark.parametrize(
     "destination",
     [
         "mailto:author@publisher.org",

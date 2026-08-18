@@ -362,6 +362,8 @@ def _normalise_web_url(raw_url: str) -> str | None:
     try:
         parsed = urlsplit(value)
         port = parsed.port
+        if parsed.username is not None or parsed.password is not None:
+            return None
     except ValueError:
         return None
     if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:

@@ -832,6 +832,47 @@ def test_valid_strict_audit_is_required_before_optional_judges(
 
 
 @pytest.mark.parametrize("async_", [False, True])
+def test_credential_bearing_citation_never_reaches_finalization(
+    monkeypatch: pytest.MonkeyPatch,
+    async_: bool,
+) -> None:
+    credential = "alice:secret"
+    report = _report(
+        f"Claim [1].\n\n## Sources\n[1] https://{credential}@public.publisher.org/report"
+    )
+    fingerprint = completion_guard.artifact_fingerprint(report)
+    state = _verification_state()
+    state.update(
+        {
+            "files": {**state["files"], "/final_report.md": report},
+            "completion_report_owned_fingerprint": fingerprint,
+            "strict_web_citations": True,
+            "effective_no_web": False,
+        }
+    )
+    monkeypatch.setattr(agent_module, "ENABLE_VERIFICATION", False)
+    monkeypatch.setattr(agent_module, "ENABLE_EVAL_TRACKING", False)
+
+    result = _run_after_model(
+        agent_module.ResearchStateMiddleware(
+            config_getter=lambda: {"run_id": "run-v1"}
+        ),
+        state,
+        async_=async_,
+    )
+
+    assert result is not None
+    assert result["jump_to"] == "model"
+    assert result["citation_accepted_report_fingerprint"] is None
+    assert credential not in result["verification_feedback"]
+    assert all(credential not in text for text in _message_texts(result))
+    assert not completion_guard.completion_ready_for_finalization(
+        {**state, **result},
+        verification_enabled=False,
+    )
+
+
+@pytest.mark.parametrize("async_", [False, True])
 def test_document_only_finalization_skips_structural_audit(
     monkeypatch: pytest.MonkeyPatch,
     async_: bool,
