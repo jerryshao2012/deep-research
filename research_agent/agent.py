@@ -44,11 +44,6 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.channels.ephemeral_value import EphemeralValue
 from langgraph.config import get_config
 
-try:
-    from langgraph._internal._constants import CONFIG_KEY_RESUMING
-except ImportError:  # pragma: no cover - compatibility with older LangGraph.
-    CONFIG_KEY_RESUMING = "__pregel_resuming"
-
 from research_agent.cli_utils import get_ssl_verify_config, str2bool
 from research_agent.completion_guard import (
     CompletionGuardMiddleware,
@@ -108,6 +103,13 @@ from research_agent.research_subagent.utils.verification import (
     format_feedback,
     verify_report,
 )
+
+try:
+    from langgraph._internal._constants import CONFIG_KEY_RESUMING
+except ImportError:  # pragma: no cover - compatibility with older LangGraph.
+    CONFIG_KEY_RESUMING = "__pregel_resuming"
+
+WEB_MODE_HAS_NEW_HUMAN_INPUT = "web_mode_has_new_human_input"
 
 # Load environment variables
 load_dotenv()
@@ -622,6 +624,21 @@ class WebModeMiddleware(SkillsMiddleware):
             and configurable.get(CONFIG_KEY_RESUMING, False)
         )
 
+    @staticmethod
+    def _markerless_has_new_human(
+            config: Mapping[str, Any], human_count: int
+    ) -> bool:
+        """Resolve server-provided input freshness before Pregel's fallback."""
+        configurable = config.get("configurable")
+        signal = (
+            configurable.get(WEB_MODE_HAS_NEW_HUMAN_INPUT)
+            if isinstance(configurable, Mapping)
+            else None
+        )
+        if isinstance(signal, bool):
+            return human_count > 0 and signal
+        return human_count > 0 and not WebModeMiddleware._is_resuming(config)
+
     def _mode_update(self, state: ResearchState) -> dict[str, Any]:
         """Resolve raw input while it is still available at graph entry."""
         latest_id, human_count, latest_text, latest_fingerprint = self._latest_human_marker(
@@ -637,10 +654,10 @@ class WebModeMiddleware(SkillsMiddleware):
             and previous_fingerprint is None
         )
         if missing_markers:
-            # Markerless pre-migration checkpoints use Pregel's explicit
-            # first-step signal; unlike history heuristics this handles a
-            # human-only checkpoint and a fresh request with preloaded files.
-            has_new_human = human_count > 0 and not self._is_resuming(config)
+            # Markerless pre-migration checkpoints use an explicit server
+            # signal when reconstructing state, else Pregel's first-step flag.
+            # This handles a human-only checkpoint and fresh preloaded files.
+            has_new_human = self._markerless_has_new_human(config, human_count)
         elif not isinstance(previous_count, int) or isinstance(previous_count, bool):
             has_new_human = human_count > 0
         elif human_count > previous_count:

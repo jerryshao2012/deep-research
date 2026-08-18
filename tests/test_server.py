@@ -566,6 +566,7 @@ def test_background_resume_runs_until_todos_complete_and_hides_intermediate():
         assert configurable["resume_incomplete_todos"] is True
         assert configurable["resume_round"] == round_number
         assert configurable["resume_max_rounds"] == 3
+        assert configurable["web_mode_has_new_human_input"] is False
 
     thread = db.get_thread(thread_id)
     assert thread["values"]["todos"] == completed
@@ -931,6 +932,7 @@ def test_background_resume_uses_stored_candidate_after_later_message_append():
     configurable = mock_agent.ainvoke.await_args.kwargs["config"]["configurable"]
     assert configurable["resume_incomplete_todos"] is True
     assert configurable["resume_round"] == 1
+    assert configurable["web_mode_has_new_human_input"] is False
 
 
 def test_full_lifecycle(client):

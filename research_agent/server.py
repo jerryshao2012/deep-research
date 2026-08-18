@@ -48,7 +48,11 @@ from pydantic import BaseModel, Field
 from research_agent import db
 
 # Import the actual deep_research agent
-from research_agent.agent import RECURSION_LIMIT, agent
+from research_agent.agent import (
+    RECURSION_LIMIT,
+    WEB_MODE_HAS_NEW_HUMAN_INPUT,
+    agent,
+)
 
 # Import shared authentication logic
 from research_agent.auth import authenticate_credential
@@ -1371,6 +1375,7 @@ async def _stream_run_events(
                     "resume_incomplete_todos": True,
                     "resume_round": round_number,
                     "resume_max_rounds": max_rounds,
+                    WEB_MODE_HAS_NEW_HUMAN_INPUT: False,
                 },
                 "recursion_limit": recursion_limit,
             }
@@ -1756,6 +1761,7 @@ async def _execute_run(run_id: str, thread_id: str) -> None:
                         "resume_incomplete_todos": True,
                         "resume_round": round_number,
                         "resume_max_rounds": max_rounds,
+                        WEB_MODE_HAS_NEW_HUMAN_INPUT: False,
                     }
                 )
             config = {

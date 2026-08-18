@@ -686,6 +686,57 @@ def test_markerless_checkpoint_applies_immediate_new_human_directive() -> None:
     assert snapshot["strict_web_citations"] is False
 
 
+@pytest.mark.parametrize(
+    ("raw_no_web", "expected_no_web"),
+    [
+        pytest.param(None, False, id="reconstructed-history-ignores-stale-text"),
+        pytest.param(True, True, id="raw-mode-overrides-server-resume-signal"),
+    ],
+)
+def test_compiled_server_reconstructed_state_uses_explicit_human_input_signal(
+    raw_no_web: bool | None,
+    expected_no_web: bool,
+) -> None:
+    from research_agent.agent import WEB_MODE_HAS_NEW_HUMAN_INPUT, _agent_kwargs
+
+    scripted_model = _guarded_scripted_model([AIMessage(content="complete")])
+    graph = create_deep_agent(
+        **{
+            **_agent_kwargs,
+            "model": scripted_model,
+            "checkpointer": InMemorySaver(),
+            "subagents": [
+                {**spec, "model": scripted_model}
+                for spec in _agent_kwargs["subagents"]
+            ],
+        }
+    )
+    config = {
+        "configurable": {
+            "thread_id": f"server-reconstructed-{raw_no_web}",
+            WEB_MODE_HAS_NEW_HUMAN_INPUT: False,
+        }
+    }
+    history = [HumanMessage(id="legacy", content="Research with no web")]
+    graph.update_state(
+        config,
+        {
+            "messages": history,
+            "effective_no_web": True,
+            "strict_web_citations": False,
+        },
+    )
+    reconstructed_state: dict[str, Any] = {"messages": history, "files": {}}
+    if raw_no_web is not None:
+        reconstructed_state["no_web"] = raw_no_web
+
+    graph.invoke(reconstructed_state, config=config)
+
+    snapshot = graph.get_state(config).values
+    assert snapshot["effective_no_web"] is expected_no_web
+    assert snapshot["strict_web_citations"] is (not expected_no_web)
+
+
 def test_compiled_first_human_text_directive_applies_without_raw_mode() -> None:
     from research_agent.agent import _agent_kwargs
 
