@@ -9,6 +9,7 @@ import asyncio
 import concurrent.futures
 import contextvars
 import hashlib
+import math
 import os
 import re
 import threading
@@ -159,8 +160,11 @@ EVAL_HISTORY_FILE = os.environ.get(
 EVAL_LOG_QUESTIONS = str2bool(os.environ.get("EVAL_LOG_QUESTIONS"), False)
 SYNC_EVAL_LOG_TIMEOUT_SECONDS = 2.0
 _SYNC_AWAIT_TIMEOUT = object()
-_CITATION_CHECKPOINT_READ_ATTEMPTS = 20
-_CITATION_CHECKPOINT_READ_DELAY_SECONDS = 0.01
+_DEFAULT_CITATION_CHECKPOINT_CONFIRM_TIMEOUT_SECONDS = 5.0
+_MAX_CITATION_CHECKPOINT_CONFIRM_TIMEOUT_SECONDS = 30.0
+_CITATION_CHECKPOINT_INITIAL_POLL_SECONDS = 0.005
+_CITATION_CHECKPOINT_MAX_POLL_SECONDS = 0.1
+_CITATION_CHECKPOINT_READ_TIMEOUT = object()
 
 # Verification loop — post-generation quality review with iterative revision.
 # MAX_VERIFICATION_ROUNDS / ENABLE_VERIFICATION are defined in
@@ -170,6 +174,18 @@ _CITATION_CHECKPOINT_READ_DELAY_SECONDS = 0.01
 def _verification_is_enabled() -> bool:
     """Return whether verification has at least one configured pass."""
     return ENABLE_VERIFICATION and _normalized_verification_round_limit() > 0
+
+
+def _citation_checkpoint_confirm_timeout_seconds() -> float:
+    """Return safe finite deadline for terminal checkpoint confirmation."""
+    raw = os.environ.get("CITATION_CHECKPOINT_CONFIRM_TIMEOUT_SECONDS")
+    try:
+        configured = float(raw) if raw is not None else float("nan")
+    except (TypeError, ValueError):
+        configured = float("nan")
+    if not math.isfinite(configured) or configured <= 0:
+        return _DEFAULT_CITATION_CHECKPOINT_CONFIRM_TIMEOUT_SECONDS
+    return min(configured, _MAX_CITATION_CHECKPOINT_CONFIRM_TIMEOUT_SECONDS)
 
 
 def _normalized_verification_round_limit() -> int:
@@ -529,6 +545,59 @@ def _checkpoint_parent_config(checkpoint_tuple: object) -> Mapping[str, Any] | N
     return parent_config if isinstance(parent_config, Mapping) else None
 
 
+def _get_checkpoint_tuple_before_deadline(
+    get_tuple: Callable[[Mapping[str, Any]], object],
+    read_config: Mapping[str, Any],
+    deadline: float,
+) -> object:
+    """Run one blocking saver read without exceeding confirmation deadline."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return _CITATION_CHECKPOINT_READ_TIMEOUT
+    completed = threading.Event()
+    outcome: list[tuple[bool, object]] = []
+
+    def read() -> None:
+        try:
+            outcome.append((True, get_tuple(read_config)))
+        except BaseException as error:
+            outcome.append((False, error))
+        finally:
+            completed.set()
+
+    threading.Thread(target=read, daemon=True).start()
+    if not completed.wait(remaining):
+        return _CITATION_CHECKPOINT_READ_TIMEOUT
+    succeeded, value = outcome[0]
+    if not succeeded:
+        raise value  # type: ignore[misc]
+    return value
+
+
+def _consume_checkpoint_read_task(task: asyncio.Future[object]) -> None:
+    """Retrieve a late task exception after bounded confirmation stops waiting."""
+    if not task.cancelled():
+        task.exception()
+
+
+async def _aget_checkpoint_tuple_before_deadline(
+    aget_tuple: Callable[[Mapping[str, Any]], Awaitable[object]],
+    read_config: Mapping[str, Any],
+    deadline: float,
+) -> object:
+    """Run one asynchronous saver read without exceeding confirmation deadline."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return _CITATION_CHECKPOINT_READ_TIMEOUT
+    task = asyncio.ensure_future(aget_tuple(read_config))
+    done, _ = await asyncio.wait({task}, timeout=remaining)
+    if task not in done:
+        task.cancel()
+        task.add_done_callback(_consume_checkpoint_read_task)
+        return _CITATION_CHECKPOINT_READ_TIMEOUT
+    return task.result()
+
+
 def _read_durable_citation_state(
     config: Mapping[str, Any],
     runtime: object,
@@ -540,21 +609,40 @@ def _read_durable_citation_state(
     get_tuple = getattr(checkpointer, "get_tuple", None)
     if not callable(get_tuple):
         return None
-    for attempt in range(_CITATION_CHECKPOINT_READ_ATTEMPTS):
-        checkpoint_tuple = get_tuple(read_config)
+    deadline = time.monotonic() + _citation_checkpoint_confirm_timeout_seconds()
+    poll_seconds = _CITATION_CHECKPOINT_INITIAL_POLL_SECONDS
+    while True:
+        checkpoint_tuple = _get_checkpoint_tuple_before_deadline(
+            get_tuple,
+            read_config,
+            deadline,
+        )
+        if checkpoint_tuple is _CITATION_CHECKPOINT_READ_TIMEOUT:
+            return None
         if checkpoint_tuple is not None:
             durable_state = _checkpoint_channel_values(checkpoint_tuple)
             parent_config = _checkpoint_parent_config(checkpoint_tuple)
             if durable_state is not None and parent_config is not None:
-                parent_tuple = get_tuple(parent_config)
+                parent_tuple = _get_checkpoint_tuple_before_deadline(
+                    get_tuple,
+                    parent_config,
+                    deadline,
+                )
+                if parent_tuple is _CITATION_CHECKPOINT_READ_TIMEOUT:
+                    return None
                 if parent_tuple is not None and _checkpoint_has_matching_failure_writes(
                     parent_tuple,
                     durable_state,
                 ):
                     return durable_state
-        if attempt + 1 < _CITATION_CHECKPOINT_READ_ATTEMPTS:
-            time.sleep(_CITATION_CHECKPOINT_READ_DELAY_SECONDS)
-    return None
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        time.sleep(min(poll_seconds, remaining))
+        poll_seconds = min(
+            poll_seconds * 2,
+            _CITATION_CHECKPOINT_MAX_POLL_SECONDS,
+        )
 
 
 async def _aread_durable_citation_state(
@@ -568,21 +656,40 @@ async def _aread_durable_citation_state(
     aget_tuple = getattr(checkpointer, "aget_tuple", None)
     if not callable(aget_tuple):
         return None
-    for attempt in range(_CITATION_CHECKPOINT_READ_ATTEMPTS):
-        checkpoint_tuple = await aget_tuple(read_config)
+    deadline = time.monotonic() + _citation_checkpoint_confirm_timeout_seconds()
+    poll_seconds = _CITATION_CHECKPOINT_INITIAL_POLL_SECONDS
+    while True:
+        checkpoint_tuple = await _aget_checkpoint_tuple_before_deadline(
+            aget_tuple,
+            read_config,
+            deadline,
+        )
+        if checkpoint_tuple is _CITATION_CHECKPOINT_READ_TIMEOUT:
+            return None
         if checkpoint_tuple is not None:
             durable_state = _checkpoint_channel_values(checkpoint_tuple)
             parent_config = _checkpoint_parent_config(checkpoint_tuple)
             if durable_state is not None and parent_config is not None:
-                parent_tuple = await aget_tuple(parent_config)
+                parent_tuple = await _aget_checkpoint_tuple_before_deadline(
+                    aget_tuple,
+                    parent_config,
+                    deadline,
+                )
+                if parent_tuple is _CITATION_CHECKPOINT_READ_TIMEOUT:
+                    return None
                 if parent_tuple is not None and _checkpoint_has_matching_failure_writes(
                     parent_tuple,
                     durable_state,
                 ):
                     return durable_state
-        if attempt + 1 < _CITATION_CHECKPOINT_READ_ATTEMPTS:
-            await asyncio.sleep(_CITATION_CHECKPOINT_READ_DELAY_SECONDS)
-    return None
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        await asyncio.sleep(min(poll_seconds, remaining))
+        poll_seconds = min(
+            poll_seconds * 2,
+            _CITATION_CHECKPOINT_MAX_POLL_SECONDS,
+        )
 
 
 def _verification_round(state: Mapping[str, Any]) -> int:

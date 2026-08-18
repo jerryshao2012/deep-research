@@ -21,8 +21,13 @@ from dotenv import load_dotenv
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 
 from research_agent.agent import agent, model
-from research_agent.citation_failure import ReportCitationError
+from research_agent.citation_failure import (
+    ReportCitationError,
+    citation_failure_is_current,
+    raise_current_citation_failure,
+)
 from research_agent.cli_utils import format_messages, show_prompt, str2bool
+from research_agent.completion_guard import artifact_fingerprint
 from research_agent.model_call_guard import (
     ModelCallTimeoutError,
     cancel_model_call_scope,
@@ -172,6 +177,56 @@ def _cancel_configured_model_scope(config) -> None:
     scope_id = _model_call_scope_id(config)
     if scope_id is not None:
         cancel_model_call_scope(scope_id)
+
+
+def _citation_result_identity(
+    result: Mapping[str, object],
+    *,
+    run_id: object = None,
+) -> tuple[str | None, str | None]:
+    resolved_run_id = run_id
+    if not isinstance(resolved_run_id, (str, uuid.UUID)):
+        resolved_run_id = result.get("completion_current_run_id")
+    if isinstance(resolved_run_id, uuid.UUID):
+        resolved_run_id = str(resolved_run_id)
+    if not isinstance(resolved_run_id, str) or not resolved_run_id:
+        resolved_run_id = None
+
+    files = result.get("files")
+    report = files.get("/final_report.md") if isinstance(files, Mapping) else None
+    return resolved_run_id, artifact_fingerprint(report)
+
+
+def _citation_failure_pending(
+    result: Mapping[str, object],
+    *,
+    run_id: object = None,
+) -> bool:
+    resolved_run_id, report_fingerprint = _citation_result_identity(
+        result,
+        run_id=run_id,
+    )
+    return citation_failure_is_current(
+        result,
+        run_id=resolved_run_id,
+        report_fingerprint=report_fingerprint,
+    )
+
+
+def _raise_result_citation_failure(
+    result: Mapping[str, object],
+    *,
+    run_id: object = None,
+) -> None:
+    resolved_run_id, report_fingerprint = _citation_result_identity(
+        result,
+        run_id=run_id,
+    )
+    raise_current_citation_failure(
+        result,
+        run_id=resolved_run_id,
+        report_fingerprint=report_fingerprint,
+    )
 
 
 def generate_research_title(research_content, *, config):
@@ -345,8 +400,14 @@ def _last_stream_message_diagnostics(state: dict | None) -> tuple[str, str, str]
     return role, name, _truncate_for_log(content)
 
 
-def select_output_content(result: dict, skill: str | None = None) -> str:
+def select_output_content(
+    result: dict,
+    skill: str | None = None,
+    *,
+    run_id: object = None,
+) -> str:
     """Choose the best final content from files/messages for saving to disk."""
+    _raise_result_citation_failure(result, run_id=run_id)
     files = result.get("files", {})
     if "/final_report.md" in files:
         return file_data_to_string(files["/final_report.md"])
@@ -372,11 +433,18 @@ def select_output_content(result: dict, skill: str | None = None) -> str:
     return extract_message_content(last_message)
 
 
-def should_retry_with_invoke(result: dict, skill: str | None = None) -> bool:
+def should_retry_with_invoke(
+    result: dict,
+    skill: str | None = None,
+    *,
+    run_id: object = None,
+) -> bool:
     """Detect partial streamed states that should be retried via synchronous invoke."""
+    if _citation_failure_pending(result, run_id=run_id):
+        return False
     if inspect_todos(result.get("todos")).has_incomplete:
         return True
-    content = select_output_content(result, skill)
+    content = select_output_content(result, skill, run_id=run_id)
     return _looks_like_incomplete_delegation(content)
 
 
@@ -505,8 +573,10 @@ def main():
 
     # Generate or use provided thread_id for state tracking (enables wiki context, etc.)
     thread_id = args.thread_id or str(uuid.uuid4())
+    invocation_run_id = uuid.uuid4()
     model_call_scope_id = str(uuid.uuid4())
     config = {
+        "run_id": invocation_run_id,
         "configurable": {
             "thread_id": thread_id,
             "model_call_scope_id": model_call_scope_id,
@@ -552,6 +622,10 @@ def main():
                     config=config,
                     stream_mode="values",
             ):
+                _raise_result_citation_failure(
+                    state,
+                    run_id=invocation_run_id,
+                )
                 current_time = time.time()
                 step_time = current_time - last_time
                 last_time = current_time
@@ -643,6 +717,10 @@ def main():
                     messages,
                     config=config,
                 )
+                _raise_result_citation_failure(
+                    result,
+                    run_id=invocation_run_id,
+                )
             except BaseException as error:
                 spinner.stop()
                 citation_error = _find_report_citation_error(error)
@@ -664,6 +742,10 @@ def main():
                 messages,
                 config=config,
             )
+            _raise_result_citation_failure(
+                result,
+                run_id=invocation_run_id,
+            )
         except BaseException as error:
             citation_error = _find_report_citation_error(error)
             if citation_error is not None:
@@ -675,7 +757,12 @@ def main():
         total_time = time.time() - start_time
         print(f"\n✨ Research completed in {total_time:.1f}s!\n")
 
-    if should_retry_with_invoke(result, args.skill):
+    _raise_result_citation_failure(result, run_id=invocation_run_id)
+    if should_retry_with_invoke(
+        result,
+        args.skill,
+        run_id=invocation_run_id,
+    ):
         spinner = Spinner("Stream ended with incomplete output; running final synchronous pass...")
         spinner.start()
         start_invoke = time.time()
@@ -683,6 +770,10 @@ def main():
             result = agent.invoke(
                 messages,
                 config=config,
+            )
+            _raise_result_citation_failure(
+                result,
+                run_id=invocation_run_id,
             )
         except BaseException as error:
             spinner.stop()
@@ -702,7 +793,12 @@ def main():
     if result and "messages" in result:
         format_messages([wrap_as_message(m) for m in result["messages"]])
 
-    file_content = select_output_content(result, args.skill)
+    _raise_result_citation_failure(result, run_id=invocation_run_id)
+    file_content = select_output_content(
+        result,
+        args.skill,
+        run_id=invocation_run_id,
+    )
     filename = save_research_to_file(
         file_content,
         title,

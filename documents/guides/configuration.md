@@ -74,6 +74,7 @@ These controls bound agent work; they do not change model-provider RPM or TPM qu
 | --- | ---: | --- |
 | `ENABLE_VERIFICATION` | `true` | Run post-generation report verification. |
 | `MAX_VERIFICATION_ROUNDS` | `2` | Maximum feedback-and-revision rounds. |
+| `CITATION_CHECKPOINT_CONFIRM_TIMEOUT_SECONDS` | `5` | Bounded wait for a strict-citation terminal checkpoint to become durably readable; positive finite values are capped at 30 seconds. |
 
 Verification applies after a non-empty `/final_report.md` is written. It adds model and citation-check latency; see [Evaluation](evaluation.md#operate-the-verification-loop) for verdict rules and failure behavior.
 

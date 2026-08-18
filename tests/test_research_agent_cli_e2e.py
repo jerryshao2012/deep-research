@@ -18,7 +18,10 @@ from pydantic import PrivateAttr
 
 from research_agent import agent as agent_module
 from research_agent import cli as research_agent_cli
-from research_agent.citation_failure import ReportCitationError
+from research_agent.citation_failure import (
+    ReportCitationError,
+    build_citation_failure_update,
+)
 from research_agent.model_call_guard import (
     ModelCallPolicy,
     ModelCallTimeoutError,
@@ -384,6 +387,36 @@ def test_should_retry_with_invoke_delegates_incomplete_todos_to_shared_policy(
     assert inspected == [todos]
 
 
+def _checkpoint_free_citation_result(config: dict | None = None) -> dict[str, Any]:
+    report = agent_module.create_file_data("Invalid report without citations")
+    fingerprint = agent_module.artifact_fingerprint(report)
+    assert fingerprint is not None
+    config = config or {}
+    run_id = str(config.get("run_id") or "checkpoint-free-run")
+    failure = build_citation_failure_update(
+        run_id=run_id,
+        report_fingerprint=fingerprint,
+        defects=[agent_module.CitationDefect("missing_url", "web")],
+        terminal=AIMessage(content="Invalid report without citations"),
+    )
+    return {
+        **failure,
+        "files": {"/final_report.md": report},
+        "todos": [{"content": "Fix citations", "status": "pending"}],
+        "completion_current_run_id": run_id,
+        "completion_report_owned_fingerprint": fingerprint,
+        "_streamed_files": [],
+    }
+
+
+def test_cli_output_helpers_fail_closed_on_current_citation_failure() -> None:
+    result = _checkpoint_free_citation_result()
+
+    assert not research_agent_cli.should_retry_with_invoke(result)
+    with pytest.raises(ReportCitationError):
+        research_agent_cli.select_output_content(result)
+
+
 class _RecordingSpinner:
     instances: list["_RecordingSpinner"] = []
 
@@ -425,6 +458,41 @@ def _configure_timeout_cli(
     monkeypatch.setattr(research_agent_cli, "format_messages", lambda *args, **kwargs: None)
     monkeypatch.setattr(sys, "argv", ["research_agent/cli.py", *argv])
     return cancelled_scopes
+
+
+@pytest.mark.parametrize("verbose", [False, True])
+def test_cli_checkpoint_free_citation_state_stops_after_one_graph_call(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    verbose: bool,
+) -> None:
+    class CheckpointFreeFailureAgent(FakeAgent):
+        def invoke(self, messages, config=None):  # noqa: ANN001
+            self.invoke_calls += 1
+            self.last_config = config
+            return _checkpoint_free_citation_result(config)
+
+        def stream(self, messages, config=None, stream_mode="values"):  # noqa: ANN001
+            self.stream_calls += 1
+            self.last_config = config
+            yield _checkpoint_free_citation_result(config)
+
+    fake_agent = CheckpointFreeFailureAgent()
+    cancelled_scopes = _configure_timeout_cli(
+        monkeypatch,
+        tmp_path,
+        fake_agent,
+        argv=["topic", "--verbose", str(verbose)],
+    )
+
+    with pytest.raises(ReportCitationError) as caught:
+        research_agent_cli.main()
+
+    assert "Invalid report" not in str(caught.value)
+    assert fake_agent.stream_calls == (1 if verbose else 0)
+    assert fake_agent.invoke_calls == (0 if verbose else 1)
+    assert len(cancelled_scopes) == 1
+    assert list(tmp_path.glob("*.md")) == []
 
 
 @pytest.mark.parametrize(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from types import SimpleNamespace
 from typing import Any
 from uuid import UUID, uuid4
@@ -326,6 +327,34 @@ def test_citation_after_agent_requires_durable_checkpointer_confirmation(
         result = middleware.after_agent(state, _runtime("run-current"))
 
     assert result is None
+
+
+@pytest.mark.parametrize("raw", [None, "", "bad", "0", "-1", "nan", "inf"])
+def test_citation_checkpoint_confirmation_timeout_is_safe(
+    monkeypatch: pytest.MonkeyPatch,
+    raw: str | None,
+) -> None:
+    import research_agent.agent as agent_module
+
+    if raw is None:
+        monkeypatch.delenv(
+            "CITATION_CHECKPOINT_CONFIRM_TIMEOUT_SECONDS",
+            raising=False,
+        )
+    else:
+        monkeypatch.setenv("CITATION_CHECKPOINT_CONFIRM_TIMEOUT_SECONDS", raw)
+
+    assert agent_module._citation_checkpoint_confirm_timeout_seconds() >= 5.0
+
+
+def test_citation_checkpoint_confirmation_timeout_accepts_bounded_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import research_agent.agent as agent_module
+
+    monkeypatch.setenv("CITATION_CHECKPOINT_CONFIRM_TIMEOUT_SECONDS", "0.45")
+
+    assert agent_module._citation_checkpoint_confirm_timeout_seconds() == 0.45
 
 
 def _inspect(
@@ -1932,6 +1961,69 @@ class _CitationProbeSaver(InMemorySaver):
         return super().put_writes(config, writes, task_id, task_path)
 
 
+class _DelayedCitationSaver(_CitationProbeSaver):
+    """Delay only terminal failure checkpoint persistence."""
+
+    def __init__(self, delay_seconds: float) -> None:
+        super().__init__()
+        self.delay_seconds = delay_seconds
+
+    def put(self, config, checkpoint, metadata, new_versions):  # noqa: ANN001
+        if self._failure_values(checkpoint):
+            time.sleep(self.delay_seconds)
+        return InMemorySaver.put(self, config, checkpoint, metadata, new_versions)
+
+    async def aput(self, config, checkpoint, metadata, new_versions):  # noqa: ANN001
+        if self._failure_values(checkpoint):
+            await asyncio.sleep(self.delay_seconds)
+        return InMemorySaver.put(self, config, checkpoint, metadata, new_versions)
+
+
+class _MissingCitationConfirmationSaver(_CitationProbeSaver):
+    """Persist terminal state but hide its exact checkpoint from confirmation."""
+
+    def get_tuple(self, config):  # noqa: ANN001
+        result = super().get_tuple(config)
+        configurable = config.get("configurable", {})
+        if (
+            configurable.get("checkpoint_id")
+            and result is not None
+            and self._failure_values(result.checkpoint)
+        ):
+            return None
+        return result
+
+
+class _StalledCitationConfirmationSaver(_CitationProbeSaver):
+    """Make the exact terminal checkpoint read exceed its deadline."""
+
+    def __init__(self, delay_seconds: float) -> None:
+        super().__init__()
+        self.delay_seconds = delay_seconds
+
+    def get_tuple(self, config):  # noqa: ANN001
+        result = InMemorySaver.get_tuple(self, config)
+        configurable = config.get("configurable", {})
+        if (
+            configurable.get("checkpoint_id")
+            and result is not None
+            and self._failure_values(result.checkpoint)
+        ):
+            time.sleep(self.delay_seconds)
+        return result
+
+    async def aget_tuple(self, config):  # noqa: ANN001
+        result = InMemorySaver.get_tuple(self, config)
+        configurable = config.get("configurable", {})
+        if (
+            configurable.get("checkpoint_id")
+            and result is not None
+            and self._failure_values(result.checkpoint)
+        ):
+            await asyncio.sleep(self.delay_seconds)
+        return result
+
+
 def _compiled_graph(
     *,
     responses: list[str],
@@ -2107,6 +2199,7 @@ def test_compiled_strict_citation_failure_never_masks_saver_error(
     monkeypatch.setattr(agent_module, "ENABLE_VERIFICATION", False)
     monkeypatch.setattr(agent_module, "MAX_VERIFICATION_ROUNDS", 0)
     monkeypatch.setattr(agent_module, "ENABLE_EVAL_TRACKING", False)
+    monkeypatch.setenv("CITATION_CHECKPOINT_CONFIRM_TIMEOUT_SECONDS", "0.05")
     saver = _CitationProbeSaver(fail_operation)
     graph = create_agent(
         FakeListChatModel(responses=["First invalid", "Still invalid"]),
@@ -2154,6 +2247,124 @@ def test_compiled_strict_citation_failure_never_masks_saver_error(
             channel == "citation_failure_run_id" and value == str(run_id)
             for _task_id, channel, value in parent_tuple.pending_writes
         )
+
+
+@pytest.mark.parametrize("async_", [False, True])
+def test_compiled_strict_citation_waits_for_slow_successful_saver(
+    monkeypatch: pytest.MonkeyPatch,
+    async_: bool,
+) -> None:
+    import research_agent.agent as agent_module
+
+    monkeypatch.setattr(agent_module, "ENABLE_VERIFICATION", False)
+    monkeypatch.setattr(agent_module, "MAX_VERIFICATION_ROUNDS", 0)
+    monkeypatch.setattr(agent_module, "ENABLE_EVAL_TRACKING", False)
+    monkeypatch.setenv("CITATION_CHECKPOINT_CONFIRM_TIMEOUT_SECONDS", "1.5")
+    saver = _DelayedCitationSaver(0.45)
+    graph = create_agent(
+        FakeListChatModel(responses=["First invalid", "Still invalid"]),
+        tools=[],
+        middleware=[
+            _OwnedCitationReportGuard(),
+            agent_module.ResearchStateMiddleware(),
+        ],
+        checkpointer=saver,
+    )
+    config = {
+        "run_id": uuid4(),
+        "configurable": {"thread_id": f"citation-slow-{async_}"},
+    }
+
+    started = time.monotonic()
+    with pytest.raises(citation_failure.ReportCitationError):
+        _invoke_compiled(graph, config, async_=async_)
+    elapsed = time.monotonic() - started
+
+    assert elapsed >= 0.4
+    assert elapsed < 1.5
+    assert saver.confirmed_failure_reads >= 1
+
+
+@pytest.mark.parametrize("async_", [False, True])
+def test_compiled_missing_citation_confirmation_is_bounded_and_blocked(
+    monkeypatch: pytest.MonkeyPatch,
+    async_: bool,
+) -> None:
+    import research_agent.agent as agent_module
+
+    monkeypatch.setattr(agent_module, "ENABLE_VERIFICATION", False)
+    monkeypatch.setattr(agent_module, "MAX_VERIFICATION_ROUNDS", 0)
+    monkeypatch.setattr(agent_module, "ENABLE_EVAL_TRACKING", False)
+    monkeypatch.setenv("CITATION_CHECKPOINT_CONFIRM_TIMEOUT_SECONDS", "0.05")
+    graph = create_agent(
+        FakeListChatModel(responses=["First invalid", "Still invalid"]),
+        tools=[],
+        middleware=[
+            _OwnedCitationReportGuard(),
+            agent_module.ResearchStateMiddleware(),
+        ],
+        checkpointer=_MissingCitationConfirmationSaver(),
+    )
+    run_id = uuid4()
+    config = {
+        "run_id": run_id,
+        "configurable": {"thread_id": f"citation-missing-{async_}"},
+    }
+
+    started = time.monotonic()
+    result = _invoke_compiled(graph, config, async_=async_)
+    elapsed = time.monotonic() - started
+    fingerprint = result["completion_report_owned_fingerprint"]
+
+    assert elapsed < 0.5
+    assert citation_failure.citation_failure_is_current(
+        result,
+        run_id=str(run_id),
+        report_fingerprint=fingerprint,
+    )
+    assert result["citation_accepted_report_fingerprint"] is None
+    assert result["_streamed_files"] == []
+
+
+@pytest.mark.parametrize("async_", [False, True])
+def test_compiled_stalled_citation_confirmation_read_is_bounded_and_blocked(
+    monkeypatch: pytest.MonkeyPatch,
+    async_: bool,
+) -> None:
+    import research_agent.agent as agent_module
+
+    monkeypatch.setattr(agent_module, "ENABLE_VERIFICATION", False)
+    monkeypatch.setattr(agent_module, "MAX_VERIFICATION_ROUNDS", 0)
+    monkeypatch.setattr(agent_module, "ENABLE_EVAL_TRACKING", False)
+    monkeypatch.setenv("CITATION_CHECKPOINT_CONFIRM_TIMEOUT_SECONDS", "0.05")
+    graph = create_agent(
+        FakeListChatModel(responses=["First invalid", "Still invalid"]),
+        tools=[],
+        middleware=[
+            _OwnedCitationReportGuard(),
+            agent_module.ResearchStateMiddleware(),
+        ],
+        checkpointer=_StalledCitationConfirmationSaver(0.45),
+    )
+    run_id = uuid4()
+    config = {
+        "run_id": run_id,
+        "configurable": {"thread_id": f"citation-stalled-{async_}"},
+    }
+
+    started = time.monotonic()
+    result = _invoke_compiled(graph, config, async_=async_)
+    elapsed = time.monotonic() - started
+    fingerprint = result["completion_report_owned_fingerprint"]
+
+    assert elapsed < 0.3
+    assert citation_failure.citation_failure_is_current(
+        result,
+        run_id=str(run_id),
+        report_fingerprint=fingerprint,
+    )
+    assert result["citation_accepted_report_fingerprint"] is None
+    assert result["_streamed_files"] == []
 
 
 class _DeterministicToolModel(FakeMessagesListChatModel):
