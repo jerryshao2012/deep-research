@@ -383,9 +383,18 @@ Create the controlled files from the project-root `main` checkout:
 ```bash
 acceptance_env="$(mktemp "$PWD/.langgraph-acceptance-env.XXXXXX")"
 acceptance_config="$(mktemp "$PWD/.langgraph-acceptance-config.XXXXXX")"
+acceptance_log="$(mktemp "$PWD/.langgraph-acceptance-log.XXXXXX")"
 acceptance_key="$(.venv/bin/python -c 'import secrets; print(secrets.token_urlsafe(32))')"
-chmod 600 "$acceptance_env" "$acceptance_config"
-trap 'rm -f -- "$acceptance_env" "$acceptance_config"' EXIT
+acceptance_server_pid=""
+chmod 600 "$acceptance_env" "$acceptance_config" "$acceptance_log"
+cleanup_acceptance() {
+  if [ -n "$acceptance_server_pid" ] && kill -0 "$acceptance_server_pid" 2>/dev/null; then
+    kill "$acceptance_server_pid"
+    wait "$acceptance_server_pid" 2>/dev/null || true
+  fi
+  rm -f -- "$acceptance_env" "$acceptance_config" "$acceptance_log"
+}
+trap cleanup_acceptance EXIT INT TERM
 
 ACCEPTANCE_ENV="$acceptance_env" ACCEPTANCE_API_KEY="$acceptance_key" \
   .venv/bin/python - <<'PY'
@@ -431,12 +440,25 @@ jq --arg env "$acceptance_env" '.env = $env' \
 ```
 
 The generated temporary config otherwise equals `langgraph.json`; only its
-absolute `.env` path changes. Start:
+absolute `.env` path changes. Run the remaining commands and browser flow from
+this same dedicated terminal so the unprinted credential and cleanup trap stay
+in scope. Start the server in background and retain its exact PID:
 
 ```bash
 env -i PATH="$PATH" HOME="$HOME" TMPDIR="${TMPDIR:-/tmp}" \
   .venv/bin/langgraph dev --config "$acceptance_config" \
-  --no-reload --no-browser
+  --no-reload --no-browser >"$acceptance_log" 2>&1 &
+acceptance_server_pid=$!
+
+for _ in $(seq 1 120); do
+  curl -fsS http://127.0.0.1:2024/docs >/dev/null && break
+  kill -0 "$acceptance_server_pid" 2>/dev/null || {
+    tail -100 "$acceptance_log"
+    false
+  }
+  sleep 0.5
+done
+curl -fsS http://127.0.0.1:2024/docs >/dev/null
 ```
 
 Verify `http://127.0.0.1:2024/docs` returns HTTP 200. Before creating a thread,
