@@ -433,6 +433,9 @@ def _configure_ollama(
         "  GeMmA4  ",
         "team/gemma4:27b",
         " REGISTRY/TEAM/GEMMA4:LATEST ",
+        "gemma4@sha256:abc",
+        "team/gemma4:27b@sha256:abc",
+        " registry:5000/team/GEMMA4:latest@sha256:ABC ",
     ],
 )
 def test_unset_reasoning_defaults_exact_gemma4_repository_to_false(
@@ -448,7 +451,22 @@ def test_unset_reasoning_defaults_exact_gemma4_repository_to_false(
 
 @pytest.mark.parametrize(
     "model_name",
-    ["gemma40", "my-gemma4", "gemma4x", "qwen3:latest"],
+    [
+        "gemma40",
+        "my-gemma4",
+        "gemma4x",
+        "qwen3:latest",
+        "gemma40@sha256:abc",
+        "my-gemma4:27b@sha256:abc",
+        "gemma4x@sha256:abc",
+        "qwen3:latest@sha256:abc",
+        "   ",
+        "@sha256:abc",
+        "gemma4@",
+        "gemma4@sha256:",
+        "/gemma4@sha256:abc",
+        "gemma4:@sha256:abc",
+    ],
 )
 def test_unset_reasoning_omits_keyword_for_non_gemma4_repositories(
     monkeypatch: pytest.MonkeyPatch,
@@ -458,6 +476,10 @@ def test_unset_reasoning_omits_keyword_for_non_gemma4_repositories(
 
     assert "reasoning" not in model.model_fields_set
     assert "reasoning" not in model.model_dump(exclude_unset=True)
+
+
+def test_empty_model_name_is_not_classified_as_gemma4() -> None:
+    assert model_factory._is_gemma4_model("") is False
 
 
 @pytest.mark.parametrize(
@@ -527,6 +549,7 @@ def test_gemma_reasoning_policy_follows_model_cache_lifecycle(
     monkeypatch.setenv("OLLAMA_REASONING", "true")
     cached = model_factory.get_configured_model()
     bypassed = model_factory.get_configured_model(bypass_cache=True)
+    still_cached = model_factory.get_configured_model()
     model_factory.clear_model_cache()
     rebuilt = model_factory.get_configured_model()
 
@@ -536,6 +559,9 @@ def test_gemma_reasoning_policy_follows_model_cache_lifecycle(
     assert bypassed is not first
     assert bypassed.reasoning is True
     assert bypassed._chat_params([])["think"] is True
+    assert still_cached is first
+    assert still_cached.reasoning is False
+    assert still_cached._chat_params([])["think"] is False
     assert rebuilt is not first
     assert rebuilt.reasoning is True
     assert rebuilt._chat_params([])["think"] is True

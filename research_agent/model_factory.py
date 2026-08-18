@@ -276,7 +276,25 @@ _FALSE_VALUES = frozenset({"0", "false", "no", "off"})
 
 
 def _is_gemma4_model(model_name: str) -> bool:
-    repository = model_name.strip().casefold().rsplit("/", 1)[-1].rsplit(":", 1)[0]
+    normalized = model_name.strip().casefold()
+    model, digest_separator, digest = normalized.partition("@")
+    if not model or any(not segment for segment in model.split("/")):
+        return False
+    if digest_separator:
+        algorithm, algorithm_separator, digest_value = digest.partition(":")
+        if (
+            not algorithm_separator
+            or not algorithm
+            or not digest_value
+            or ":" in digest_value
+            or "@" in digest_value
+        ):
+            return False
+
+    repository_with_tag = model.rsplit("/", 1)[-1]
+    repository, tag_separator, tag = repository_with_tag.partition(":")
+    if tag_separator and (not tag or ":" in tag):
+        return False
     return repository == "gemma4"
 
 
