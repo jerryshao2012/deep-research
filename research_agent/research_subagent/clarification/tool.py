@@ -83,9 +83,13 @@ def clarify_requirements(
       deliverable, timeframe, or source constraints.
     - Ask 1-3 non-overlapping questions with 2-5 concrete options each.
 
+    Canonical input example:
+    {"questions":[{"id":"target_audience","prompt":"Who is this for?","type":"single_select","options":[{"id":"executives","label":"Executives"},{"id":"engineers","label":"Engineers"}]}]}
+    Do not add an Other option; the interface provides it automatically.
+
     Do not use when the request is clear enough, when optional details can be
     inferred safely, or after this tool has already run for the current user
-    turn. The interface automatically supports an Other answer.
+    turn.
     """
     return run_clarification(
         ClarificationBatch(questions=questions),

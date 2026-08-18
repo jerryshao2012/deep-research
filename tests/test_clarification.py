@@ -29,7 +29,10 @@ from research_agent.research_subagent.clarification.policy import (
     ClarificationMode,
     evaluate_clarification_policy,
 )
-from research_agent.research_subagent.clarification.tool import run_clarification
+from research_agent.research_subagent.clarification.tool import (
+    clarify_requirements,
+    run_clarification,
+)
 from research_agent.research_subagent.clarification.use_case import (
     complete_clarification,
 )
@@ -565,6 +568,21 @@ def test_run_clarification_rejects_missing_or_stale_request_id() -> None:
         )
 
 
+def test_clarification_tool_description_documents_canonical_schema() -> None:
+    description = clarify_requirements.description
+
+    assert (
+        '{"questions":[{"id":"target_audience","prompt":"Who is this for?",'
+        '"type":"single_select","options":[{"id":"executives",'
+        '"label":"Executives"},{"id":"engineers","label":"Engineers"}]}]}'
+        in description
+    )
+    assert (
+        "Do not add an Other option; the interface provides it automatically."
+        in description
+    )
+
+
 class _InterruptState(TypedDict):
     messages: Annotated[list[Any], operator.add]
 
@@ -608,6 +626,110 @@ def test_interrupt_pauses_and_resumes_same_checkpoint() -> None:
     tool_message = resumed["messages"][-1]
     assert isinstance(tool_message, ToolMessage)
     assert json.loads(tool_message.content)["status"] == "answered"
+
+
+def test_real_checkpointed_clarification_replays_node_and_preserves_shorthand(
+    gemma_shorthand_batch: dict[str, Any],
+) -> None:
+    raw = deepcopy(gemma_shorthand_batch)
+    execution_count = 0
+
+    def clarify_node(state: _InterruptState) -> Command:
+        nonlocal execution_count
+        execution_count += 1
+        batch = clarify_requirements.args_schema.model_validate(raw)
+        return run_clarification(batch, tool_call_id="tool-call-1")
+
+    graph = (
+        StateGraph(_InterruptState)
+        .add_node("clarify", clarify_node)
+        .add_edge(START, "clarify")
+        .add_edge("clarify", END)
+        .compile(checkpointer=InMemorySaver())
+    )
+    config = {"configurable": {"thread_id": "clarification-shorthand-thread"}}
+
+    interrupted = graph.invoke({"messages": []}, config)
+    interrupt_payload = interrupted["__interrupt__"][0].value
+    assert interrupt_payload == {
+        "kind": "requirement_clarification",
+        "version": 1,
+        "request_id": "tool-call-1",
+        "questions": [
+            {
+                "id": "question_1",
+                "prompt": "Who is this report for?",
+                "type": "single_select",
+                "options": [
+                    {"id": "option_1", "label": "Executives", "description": None},
+                    {"id": "option_2", "label": "Engineers", "description": None},
+                ],
+            },
+            {
+                "id": "question_2",
+                "prompt": "What is the primary goal?",
+                "type": "single_select",
+                "options": [
+                    {"id": "option_1", "label": "Planning", "description": None},
+                    {
+                        "id": "option_2",
+                        "label": "Other (please specify)",
+                        "description": None,
+                    },
+                ],
+            },
+            {
+                "id": "question_3",
+                "prompt": "What depth should the report use?",
+                "type": "single_select",
+                "options": [
+                    {"id": "option_1", "label": "Overview", "description": None},
+                    {
+                        "id": "option_2",
+                        "label": "Implementation",
+                        "description": None,
+                    },
+                ],
+            },
+        ],
+    }
+
+    resumed = graph.invoke(
+        Command(
+            resume={
+                "kind": "requirement_clarification_response",
+                "version": 1,
+                "request_id": "tool-call-1",
+                "skipped": False,
+                "answers": [
+                    {
+                        "question_id": question["id"],
+                        "selected_option_ids": [question["options"][0]["id"]],
+                        "other_text": None,
+                    }
+                    for question in interrupt_payload["questions"]
+                ],
+            }
+        ),
+        config,
+    )
+
+    tool_message = resumed["messages"][-1]
+    assert isinstance(tool_message, ToolMessage)
+    assert tool_message.tool_call_id == "tool-call-1"
+    assert tool_message.name == "clarify_requirements"
+    result = json.loads(tool_message.content)
+    assert result["kind"] == "requirement_clarification_result"
+    assert result["version"] == 1
+    assert result["request_id"] == "tool-call-1"
+    assert result["status"] == "answered"
+    assert [requirement["selected_labels"] for requirement in result["requirements"]] == [
+        ["Executives"],
+        ["Planning"],
+        ["Overview"],
+    ]
+    assert execution_count == 2
+    assert raw == gemma_shorthand_batch
 
 
 def test_agent_registers_clarification_tool_and_middleware() -> None:
