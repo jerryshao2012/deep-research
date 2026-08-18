@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from types import SimpleNamespace
 from typing import Any
@@ -2044,6 +2045,44 @@ def _invoke_compiled(graph: Any, config: dict[str, Any], *, async_: bool) -> Any
     return graph.invoke(input_state, config=config)
 
 
+def _stream_compiled_values(
+    graph: Any,
+    config: dict[str, Any],
+    *,
+    async_: bool,
+) -> tuple[list[dict[str, Any]], BaseException | None]:
+    input_state = {"messages": [HumanMessage(content="Research privately")]}
+    states: list[dict[str, Any]] = []
+    caught: BaseException | None = None
+
+    if async_:
+        async def consume() -> None:
+            nonlocal caught
+            try:
+                async for state in graph.astream(
+                    input_state,
+                    config=config,
+                    stream_mode="values",
+                ):
+                    states.append(state)
+            except BaseException as error:
+                caught = error
+
+        asyncio.run(consume())
+    else:
+        try:
+            states.extend(
+                graph.stream(
+                    input_state,
+                    config=config,
+                    stream_mode="values",
+                )
+            )
+        except BaseException as error:
+            caught = error
+    return states, caught
+
+
 @pytest.mark.parametrize("async_", [False, True])
 def test_compiled_inactive_plan_terminal_passes_through_untouched(
     async_: bool,
@@ -2185,6 +2224,93 @@ def test_compiled_strict_citation_failure_checkpoints_before_raise_and_recovers(
         "**Final Report:**\n\nCorrected report" in str(message.content)
         for message in corrected["messages"]
     )
+
+
+@pytest.mark.parametrize("async_", [False, True])
+def test_compiled_web_stream_never_renders_pre_acceptance_model_content(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    async_: bool,
+) -> None:
+    import research_agent.agent as agent_module
+    from research_agent import cli as cli_module
+
+    monkeypatch.setattr(agent_module, "ENABLE_VERIFICATION", False)
+    monkeypatch.setattr(agent_module, "MAX_VERIFICATION_ROUNDS", 0)
+    monkeypatch.setattr(agent_module, "ENABLE_EVAL_TRACKING", False)
+    secret = "SECRET MODEL EVENT BEFORE CITATION AFTER_MODEL"
+    graph = create_agent(
+        FakeListChatModel(
+            responses=[secret, f"{secret} AGAIN", "Accepted terminal"]
+        ),
+        tools=[],
+        middleware=[
+            _OwnedCitationReportGuard(),
+            agent_module.ResearchStateMiddleware(),
+        ],
+        checkpointer=_CitationProbeSaver(),
+    )
+    rendered: list[str] = []
+    monkeypatch.setattr(
+        cli_module,
+        "format_messages",
+        lambda messages: rendered.extend(
+            cli_module.extract_message_content(message) for message in messages
+        ),
+    )
+    thread_id = f"citation-stream-privacy-{async_}"
+    failed_config = {
+        "run_id": uuid4(),
+        "configurable": {"thread_id": thread_id},
+    }
+
+    failed_states, failure = _stream_compiled_values(
+        graph,
+        failed_config,
+        async_=async_,
+    )
+    for state in failed_states:
+        messages = state.get("messages", [])
+        if messages:
+            cli_module._render_live_stream_message(messages[-1], no_web=False)
+
+    assert isinstance(failure, citation_failure.ReportCitationError)
+    assert any(
+        secret in str(message.content)
+        for state in failed_states
+        for message in state.get("messages", [])
+        if isinstance(message, AIMessage)
+    )
+    assert rendered == []
+
+    accepted_config = {
+        "run_id": uuid4(),
+        "configurable": {"thread_id": thread_id},
+    }
+    accepted_states, accepted_error = _stream_compiled_values(
+        graph,
+        accepted_config,
+        async_=async_,
+    )
+    for state in accepted_states:
+        messages = state.get("messages", [])
+        if messages:
+            cli_module._render_live_stream_message(messages[-1], no_web=False)
+    accepted_result = accepted_states[-1]
+    accepted_report = accepted_result["files"]["/final_report.md"]
+    cli_module._render_final_result(
+        accepted_result,
+        agent_module.file_data_to_string(accepted_report),
+        no_web=False,
+    )
+
+    captured = capsys.readouterr()
+    assert accepted_error is None
+    assert secret not in captured.out
+    assert secret not in captured.err
+    assert rendered == [
+        "Corrected report https://public.publisher.org/report"
+    ]
 
 
 @pytest.mark.parametrize("async_", [False, True])
@@ -2365,6 +2491,125 @@ def test_compiled_stalled_citation_confirmation_read_is_bounded_and_blocked(
     )
     assert result["citation_accepted_report_fingerprint"] is None
     assert result["_streamed_files"] == []
+
+
+def test_sync_checkpoint_confirmation_stalls_have_fixed_resource_bound() -> None:
+    import research_agent.agent as agent_module
+
+    release = threading.Event()
+    lock = threading.Lock()
+    started = 0
+    finished = 0
+
+    def stalled_read(_config: Any) -> None:
+        nonlocal started, finished
+        with lock:
+            started += 1
+        release.wait(timeout=2.0)
+        with lock:
+            finished += 1
+
+    try:
+        for _ in range(20):
+            result = agent_module._get_checkpoint_tuple_before_deadline(
+                stalled_read,
+                {},
+                time.monotonic() + 0.01,
+            )
+            assert result is agent_module._CITATION_CHECKPOINT_READ_TIMEOUT
+
+        assert started <= 2
+        unrelated = threading.Event()
+        threading.Thread(target=unrelated.set).start()
+        assert unrelated.wait(timeout=0.2)
+    finally:
+        release.set()
+        deadline = time.monotonic() + 0.5
+        while finished < started and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert finished == started
+
+
+def test_async_checkpoint_confirmation_stalls_have_process_wide_bound() -> None:
+    import research_agent.agent as agent_module
+
+    async def scenario() -> None:
+        release = asyncio.Event()
+        started = 0
+        finished = 0
+
+        async def cancellation_resistant_read(_config: Any) -> None:
+            nonlocal started, finished
+            started += 1
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                await release.wait()
+            finally:
+                finished += 1
+
+        try:
+            for _ in range(20):
+                result = await agent_module._aget_checkpoint_tuple_before_deadline(
+                    cancellation_resistant_read,
+                    {},
+                    time.monotonic() + 0.01,
+                )
+                assert result is agent_module._CITATION_CHECKPOINT_READ_TIMEOUT
+
+            assert started <= 4
+            await asyncio.wait_for(asyncio.sleep(0), timeout=0.1)
+        finally:
+            release.set()
+            deadline = time.monotonic() + 0.5
+            while finished < started and time.monotonic() < deadline:
+                await asyncio.sleep(0.005)
+            assert finished == started
+
+    asyncio.run(scenario())
+
+
+def test_async_checkpoint_confirmation_outer_cancel_cleans_up_boundedly() -> None:
+    import research_agent.agent as agent_module
+
+    async def scenario() -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+        cancellation_seen = asyncio.Event()
+        finished = asyncio.Event()
+
+        async def cancellation_resistant_read(_config: Any) -> None:
+            started.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                cancellation_seen.set()
+                await release.wait()
+            finally:
+                finished.set()
+
+        confirmation = asyncio.create_task(
+            agent_module._aget_checkpoint_tuple_before_deadline(
+                cancellation_resistant_read,
+                {},
+                time.monotonic() + 5.0,
+            )
+        )
+        await asyncio.wait_for(started.wait(), timeout=0.2)
+        before_cancel = time.monotonic()
+        confirmation.cancel()
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await confirmation
+
+            assert time.monotonic() - before_cancel < 0.2
+            await asyncio.wait_for(cancellation_seen.wait(), timeout=0.2)
+            assert not finished.is_set()
+        finally:
+            release.set()
+            await asyncio.wait_for(finished.wait(), timeout=0.2)
+
+    asyncio.run(scenario())
 
 
 class _DeterministicToolModel(FakeMessagesListChatModel):

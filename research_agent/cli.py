@@ -22,6 +22,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMe
 
 from research_agent.agent import agent, model
 from research_agent.citation_failure import (
+    ReportCitationAggregateError,
     ReportCitationError,
     citation_failure_is_current,
     raise_current_citation_failure,
@@ -173,6 +174,33 @@ def _find_report_citation_error(
     return None
 
 
+def _citation_control_categories(error: BaseException) -> set[str]:
+    """Return fixed safe categories without inspecting exception messages."""
+    if isinstance(error, ReportCitationError):
+        return {"citation"}
+    if isinstance(error, ModelCallTimeoutError):
+        return {"timeout"}
+    if isinstance(error, asyncio.CancelledError):
+        return {"cancellation"}
+    if isinstance(error, KeyboardInterrupt):
+        return {"interrupt"}
+    if isinstance(error, BaseExceptionGroup):
+        categories: set[str] = set()
+        for item in error.exceptions:
+            categories.update(_citation_control_categories(item))
+        return categories
+    return {"persistence"}
+
+
+def _raise_safe_citation_control(error: BaseException) -> None:
+    """Raise citation control without formatting group or sibling messages."""
+    if isinstance(error, ReportCitationError):
+        raise error from None
+    raise ReportCitationAggregateError(
+        _citation_control_categories(error)
+    ) from None
+
+
 def _cancel_configured_model_scope(config) -> None:
     scope_id = _model_call_scope_id(config)
     if scope_id is not None:
@@ -229,6 +257,35 @@ def _raise_result_citation_failure(
     )
 
 
+def _render_live_stream_message(message: object, *, no_web: bool) -> None:
+    """Render live model/tool content only when web generation is disabled."""
+    if no_web:
+        format_messages([wrap_as_message(message)])
+
+
+def _render_final_result(
+    result: Mapping[str, object],
+    content: str,
+    *,
+    no_web: bool,
+) -> None:
+    """Render one accepted web result, without replaying rejected generations."""
+    if no_web:
+        messages = result.get("messages")
+        if isinstance(messages, list):
+            format_messages([wrap_as_message(message) for message in messages])
+        return
+
+    files = result.get("files")
+    report = files.get("/final_report.md") if isinstance(files, Mapping) else None
+    if report is None:
+        return
+    fingerprint = artifact_fingerprint(report)
+    if result.get("citation_accepted_report_fingerprint") != fingerprint:
+        return
+    format_messages([AIMessage(content=content)])
+
+
 def generate_research_title(research_content, *, config):
     """Generate a concise title for the research content using the configured LLM."""
     config = _normalize_model_call_config(config)
@@ -256,7 +313,7 @@ def generate_research_title(research_content, *, config):
         citation_error = _find_report_citation_error(error)
         if citation_error is not None:
             _cancel_configured_model_scope(config)
-            raise
+            _raise_safe_citation_control(error)
         if _contains_model_control_error(error):
             _cancel_configured_model_scope(config)
             raise
@@ -639,8 +696,9 @@ def main():
                 if msgs:
                     last = msgs[-1]
                     last_stream_state = state
-                    # Display the latest message using rich formatting if verbose
-                    format_messages([wrap_as_message(last)])
+                    # Web-capable runs suppress raw model/tool content until citation
+                    # acceptance. Safe status text below remains live.
+                    _render_live_stream_message(last, no_web=args.no_web)
 
                     # Handle both dict-based and object-based messages
                     if isinstance(last, dict):
@@ -685,7 +743,7 @@ def main():
             citation_error = _find_report_citation_error(error)
             if citation_error is not None:
                 cancel_model_call_scope(model_call_scope_id)
-                raise
+                _raise_safe_citation_control(error)
             if _contains_model_control_error(error):
                 cancel_model_call_scope(model_call_scope_id)
                 raise
@@ -701,13 +759,18 @@ def main():
                 print("⚠️  Streaming interrupted by Azure Content Filtering."
                       f"Switching to fallback invoke... (failed after {total_time:.1f}s)"
                       )
+            elif not args.no_web:
+                print(
+                    "⚠️  Web-capable stream interrupted; running normally... "
+                    f"(failed after {total_time:.1f}s)"
+                )
             else:
                 print(f"⚠️  Streaming not fully supported ({e}), running normally... (failed after {total_time:.1f}s)")
 
             print(f"🔎  Stream diagnostics: "
                   f"last_tool=`{diagnostic_tool_name}`, last_role=`{role or 'unknown'}`"
                   )
-            if preview:
+            if preview and args.no_web:
                 print(f"🔎  Preview of last message (truncated): {preview}")
 
             spinner.start("Running fallback synchronous invoke...")
@@ -726,7 +789,7 @@ def main():
                 citation_error = _find_report_citation_error(error)
                 if citation_error is not None:
                     cancel_model_call_scope(model_call_scope_id)
-                    raise
+                    _raise_safe_citation_control(error)
                 if _contains_model_control_error(error):
                     cancel_model_call_scope(model_call_scope_id)
                 raise
@@ -750,7 +813,7 @@ def main():
             citation_error = _find_report_citation_error(error)
             if citation_error is not None:
                 cancel_model_call_scope(model_call_scope_id)
-                raise
+                _raise_safe_citation_control(error)
             if _contains_model_control_error(error):
                 cancel_model_call_scope(model_call_scope_id)
             raise
@@ -780,7 +843,7 @@ def main():
             citation_error = _find_report_citation_error(error)
             if citation_error is not None:
                 cancel_model_call_scope(model_call_scope_id)
-                raise
+                _raise_safe_citation_control(error)
             if _contains_model_control_error(error):
                 cancel_model_call_scope(model_call_scope_id)
             raise
@@ -789,16 +852,18 @@ def main():
         invoke_time = time.time() - start_invoke
         print(f"\n🔁 Finalization pass completed in {invoke_time:.1f}s!\n")
 
-    # Display messages from the result if verbose
-    if result and "messages" in result:
-        format_messages([wrap_as_message(m) for m in result["messages"]])
-
     _raise_result_citation_failure(result, run_id=invocation_run_id)
     file_content = select_output_content(
         result,
         args.skill,
         run_id=invocation_run_id,
     )
+    if args.verbose:
+        _render_final_result(
+            result,
+            file_content,
+            no_web=args.no_web,
+        )
     filename = save_research_to_file(
         file_content,
         title,

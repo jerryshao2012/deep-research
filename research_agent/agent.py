@@ -11,6 +11,7 @@ import contextvars
 import hashlib
 import math
 import os
+import queue
 import re
 import threading
 import time
@@ -165,6 +166,10 @@ _MAX_CITATION_CHECKPOINT_CONFIRM_TIMEOUT_SECONDS = 30.0
 _CITATION_CHECKPOINT_INITIAL_POLL_SECONDS = 0.005
 _CITATION_CHECKPOINT_MAX_POLL_SECONDS = 0.1
 _CITATION_CHECKPOINT_READ_TIMEOUT = object()
+_CITATION_CHECKPOINT_SYNC_WORKERS = 2
+_CITATION_CHECKPOINT_SYNC_MAX_OUTSTANDING = 4
+_CITATION_CHECKPOINT_ASYNC_MAX_OUTSTANDING = 4
+_CITATION_CHECKPOINT_ASYNC_CANCEL_CLEANUP_SECONDS = 0.05
 
 # Verification loop — post-generation quality review with iterative revision.
 # MAX_VERIFICATION_ROUNDS / ENABLE_VERIFICATION are defined in
@@ -545,6 +550,152 @@ def _checkpoint_parent_config(checkpoint_tuple: object) -> Mapping[str, Any] | N
     return parent_config if isinstance(parent_config, Mapping) else None
 
 
+class _CitationCheckpointReadWork:
+    """One revocable synchronous saver read owned by bounded runtime."""
+
+    def __init__(
+        self,
+        get_tuple: Callable[[Mapping[str, Any]], object],
+        read_config: Mapping[str, Any],
+    ) -> None:
+        self.get_tuple = get_tuple
+        self.read_config = read_config
+        self.done = threading.Event()
+        self._lock = threading.Lock()
+        self._revoked = False
+        self._outcome: tuple[bool, object] | None = None
+
+    def revoke(self) -> None:
+        """Discard any result delivered after caller deadline."""
+        with self._lock:
+            self._revoked = True
+
+    def run(self) -> None:
+        """Execute unless already revoked, then publish only live delivery."""
+        with self._lock:
+            if self._revoked:
+                self.done.set()
+                return
+        try:
+            outcome = (True, self.get_tuple(self.read_config))
+        except BaseException as error:
+            outcome = (False, error)
+        with self._lock:
+            if not self._revoked:
+                self._outcome = outcome
+            self.done.set()
+
+    def outcome(self) -> tuple[bool, object] | None:
+        """Return published outcome, or none after revocation."""
+        with self._lock:
+            return self._outcome
+
+
+class _CitationCheckpointSyncRuntime:
+    """Fixed daemon workers and bounded queue for blocking saver reads."""
+
+    def __init__(self) -> None:
+        self.pid = os.getpid()
+        self._queue: queue.Queue[_CitationCheckpointReadWork] = queue.Queue(
+            maxsize=_CITATION_CHECKPOINT_SYNC_MAX_OUTSTANDING
+        )
+        self._admission = threading.BoundedSemaphore(
+            _CITATION_CHECKPOINT_SYNC_MAX_OUTSTANDING
+        )
+        self._workers = tuple(
+            threading.Thread(
+                target=self._worker,
+                daemon=True,
+                name=f"citation-checkpoint-confirm-{index}",
+            )
+            for index in range(_CITATION_CHECKPOINT_SYNC_WORKERS)
+        )
+        for worker in self._workers:
+            worker.start()
+
+    def submit(
+        self,
+        get_tuple: Callable[[Mapping[str, Any]], object],
+        read_config: Mapping[str, Any],
+    ) -> _CitationCheckpointReadWork | None:
+        """Admit work without blocking when process capacity is exhausted."""
+        if not self._admission.acquire(blocking=False):
+            return None
+        work = _CitationCheckpointReadWork(get_tuple, read_config)
+        try:
+            self._queue.put_nowait(work)
+        except queue.Full:
+            self._admission.release()
+            return None
+        return work
+
+    def _worker(self) -> None:
+        while True:
+            work = self._queue.get()
+            try:
+                work.run()
+            finally:
+                self._admission.release()
+                self._queue.task_done()
+
+
+class _CitationCheckpointAsyncAdmission:
+    """Process-wide bound held until asynchronous saver work truly ends."""
+
+    def __init__(self) -> None:
+        self.pid = os.getpid()
+        self._semaphore = threading.BoundedSemaphore(
+            _CITATION_CHECKPOINT_ASYNC_MAX_OUTSTANDING
+        )
+
+    def acquire(self) -> bool:
+        return self._semaphore.acquire(blocking=False)
+
+    def release(self) -> None:
+        self._semaphore.release()
+
+
+_CITATION_CHECKPOINT_RUNTIME_LOCK = threading.Lock()
+_citation_checkpoint_sync_runtime: _CitationCheckpointSyncRuntime | None = None
+_citation_checkpoint_async_admission: _CitationCheckpointAsyncAdmission | None = None
+
+
+def _reset_citation_checkpoint_runtime_after_fork() -> None:
+    """Drop inherited locks and thread owners in a forked child."""
+    global _CITATION_CHECKPOINT_RUNTIME_LOCK
+    global _citation_checkpoint_async_admission
+    global _citation_checkpoint_sync_runtime
+    _CITATION_CHECKPOINT_RUNTIME_LOCK = threading.Lock()
+    _citation_checkpoint_sync_runtime = None
+    _citation_checkpoint_async_admission = None
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_citation_checkpoint_runtime_after_fork)
+
+
+def _get_citation_checkpoint_sync_runtime() -> _CitationCheckpointSyncRuntime:
+    global _citation_checkpoint_sync_runtime
+    pid = os.getpid()
+    with _CITATION_CHECKPOINT_RUNTIME_LOCK:
+        runtime = _citation_checkpoint_sync_runtime
+        if runtime is None or runtime.pid != pid:
+            runtime = _CitationCheckpointSyncRuntime()
+            _citation_checkpoint_sync_runtime = runtime
+        return runtime
+
+
+def _get_citation_checkpoint_async_admission() -> _CitationCheckpointAsyncAdmission:
+    global _citation_checkpoint_async_admission
+    pid = os.getpid()
+    with _CITATION_CHECKPOINT_RUNTIME_LOCK:
+        admission = _citation_checkpoint_async_admission
+        if admission is None or admission.pid != pid:
+            admission = _CitationCheckpointAsyncAdmission()
+            _citation_checkpoint_async_admission = admission
+        return admission
+
+
 def _get_checkpoint_tuple_before_deadline(
     get_tuple: Callable[[Mapping[str, Any]], object],
     read_config: Mapping[str, Any],
@@ -554,30 +705,43 @@ def _get_checkpoint_tuple_before_deadline(
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         return _CITATION_CHECKPOINT_READ_TIMEOUT
-    completed = threading.Event()
-    outcome: list[tuple[bool, object]] = []
-
-    def read() -> None:
-        try:
-            outcome.append((True, get_tuple(read_config)))
-        except BaseException as error:
-            outcome.append((False, error))
-        finally:
-            completed.set()
-
-    threading.Thread(target=read, daemon=True).start()
-    if not completed.wait(remaining):
+    work = _get_citation_checkpoint_sync_runtime().submit(get_tuple, read_config)
+    if work is None:
         return _CITATION_CHECKPOINT_READ_TIMEOUT
-    succeeded, value = outcome[0]
+    if not work.done.wait(remaining):
+        work.revoke()
+        return _CITATION_CHECKPOINT_READ_TIMEOUT
+    outcome = work.outcome()
+    if outcome is None:
+        return _CITATION_CHECKPOINT_READ_TIMEOUT
+    succeeded, value = outcome
     if not succeeded:
         raise value  # type: ignore[misc]
     return value
 
 
-def _consume_checkpoint_read_task(task: asyncio.Future[object]) -> None:
-    """Retrieve a late task exception after bounded confirmation stops waiting."""
+def _finish_checkpoint_read_task(
+    task: asyncio.Future[object],
+    admission: _CitationCheckpointAsyncAdmission,
+) -> None:
+    """Release admission only when task ends and consume late exceptions."""
     if not task.cancelled():
         task.exception()
+    admission.release()
+
+
+async def _bounded_cancel_checkpoint_read_task(
+    task: asyncio.Future[object],
+) -> None:
+    """Request child cancellation and wait briefly without owning its lifetime."""
+    task.cancel()
+    try:
+        await asyncio.wait(
+            {task},
+            timeout=_CITATION_CHECKPOINT_ASYNC_CANCEL_CLEANUP_SECONDS,
+        )
+    except asyncio.CancelledError:
+        pass
 
 
 async def _aget_checkpoint_tuple_before_deadline(
@@ -589,11 +753,25 @@ async def _aget_checkpoint_tuple_before_deadline(
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         return _CITATION_CHECKPOINT_READ_TIMEOUT
-    task = asyncio.ensure_future(aget_tuple(read_config))
-    done, _ = await asyncio.wait({task}, timeout=remaining)
+    admission = _get_citation_checkpoint_async_admission()
+    if not admission.acquire():
+        return _CITATION_CHECKPOINT_READ_TIMEOUT
+    try:
+        read = aget_tuple(read_config)
+        task = asyncio.ensure_future(read)
+    except BaseException:
+        admission.release()
+        raise
+    task.add_done_callback(
+        lambda completed: _finish_checkpoint_read_task(completed, admission)
+    )
+    try:
+        done, _ = await asyncio.wait({task}, timeout=remaining)
+    except asyncio.CancelledError:
+        await _bounded_cancel_checkpoint_read_task(task)
+        raise
     if task not in done:
         task.cancel()
-        task.add_done_callback(_consume_checkpoint_read_task)
         return _CITATION_CHECKPOINT_READ_TIMEOUT
     return task.result()
 

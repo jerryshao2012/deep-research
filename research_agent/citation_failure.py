@@ -65,6 +65,45 @@ class ReportCitationError(RuntimeError):
         )
 
 
+class ReportCitationAggregateError(RuntimeError):
+    """Safe replacement for a citation-containing exception group."""
+
+    _SAFE_CATEGORIES = (
+        "citation",
+        "persistence",
+        "timeout",
+        "cancellation",
+        "interrupt",
+    )
+    _PRIORITY = (
+        "persistence",
+        "interrupt",
+        "timeout",
+        "cancellation",
+        "citation",
+    )
+
+    def __init__(self, categories: Iterable[object]) -> None:
+        """Retain fixed categories while discarding all original messages."""
+        present = frozenset(
+            category
+            for category in categories
+            if isinstance(category, str) and category in self._SAFE_CATEGORIES
+        )
+        present = present or frozenset({"citation"})
+        self.categories = tuple(
+            category for category in self._SAFE_CATEGORIES if category in present
+        )
+        self.primary_category = next(
+            category for category in self._PRIORITY if category in present
+        )
+        super().__init__(
+            "Strict citation processing stopped safely "
+            f"(primary={self.primary_category}; "
+            f"categories={','.join(self.categories)})."
+        )
+
+
 def serialize_citation_defects(defects: Iterable[object]) -> list[dict[str, str]]:
     """Return deterministic, bounded defects safe for checkpoint history."""
     serialized: set[tuple[str, str]] = set()

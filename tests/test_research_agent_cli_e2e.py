@@ -6,6 +6,7 @@ import asyncio
 import sys
 import threading
 import time
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,7 @@ from pydantic import PrivateAttr
 from research_agent import agent as agent_module
 from research_agent import cli as research_agent_cli
 from research_agent.citation_failure import (
+    ReportCitationAggregateError,
     ReportCitationError,
     build_citation_failure_update,
 )
@@ -495,6 +497,111 @@ def test_cli_checkpoint_free_citation_state_stops_after_one_graph_call(
     assert list(tmp_path.glob("*.md")) == []
 
 
+def test_cli_web_stream_renders_only_accepted_final_report(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    secret = "SECRET INVALID MODEL REPORT"
+    accepted = "Accepted final https://public.publisher.org/report"
+    report = agent_module.create_file_data(accepted)
+    fingerprint = agent_module.artifact_fingerprint(report)
+    assert fingerprint is not None
+    invalid_state = {
+        "messages": [AIMessage(content=secret)],
+        "todos": [{"content": "Correct citations", "status": "pending"}],
+    }
+    accepted_state = {
+        "messages": [
+            AIMessage(content=secret),
+            AIMessage(content=accepted),
+        ],
+        "files": {"/final_report.md": report},
+        "todos": [{"content": "Correct citations", "status": "completed"}],
+        "citation_accepted_report_fingerprint": fingerprint,
+    }
+    fake_agent = FakeAgent(stream_states=[invalid_state, accepted_state])
+    _configure_timeout_cli(
+        monkeypatch,
+        tmp_path,
+        fake_agent,
+        argv=["topic", "--verbose", "True", "--title", "accepted"],
+    )
+    rendered: list[str] = []
+
+    def capture_render(messages) -> None:  # noqa: ANN001
+        rendered.extend(
+            research_agent_cli.extract_message_content(message)
+            for message in messages
+        )
+
+    monkeypatch.setattr(research_agent_cli, "format_messages", capture_render)
+
+    research_agent_cli.main()
+
+    captured = capsys.readouterr()
+    assert secret not in captured.out
+    assert secret not in captured.err
+    assert rendered == [accepted]
+    assert (tmp_path / "accepted").is_file()
+
+
+def test_cli_web_stream_error_diagnostics_do_not_echo_unaccepted_content(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    secret = "SECRET UNACCEPTED STREAM DIAGNOSTIC"
+    accepted = "Accepted final https://public.publisher.org/report"
+    report = agent_module.create_file_data(accepted)
+    fingerprint = agent_module.artifact_fingerprint(report)
+    assert fingerprint is not None
+    accepted_state = {
+        "messages": [AIMessage(content=accepted)],
+        "files": {"/final_report.md": report},
+        "todos": [{"content": "Research", "status": "completed"}],
+        "citation_accepted_report_fingerprint": fingerprint,
+    }
+
+    class InterruptedStreamAgent(FakeAgent):
+        def stream(self, messages, config=None, stream_mode="values"):  # noqa: ANN001
+            self.stream_calls += 1
+            self.last_config = config
+            yield {"messages": [AIMessage(content=secret)]}
+            raise RuntimeError(secret)
+
+        def invoke(self, messages, config=None):  # noqa: ANN001
+            self.invoke_calls += 1
+            self.last_config = config
+            return accepted_state
+
+    fake_agent = InterruptedStreamAgent()
+    _configure_timeout_cli(
+        monkeypatch,
+        tmp_path,
+        fake_agent,
+        argv=["topic", "--verbose", "True", "--title", "accepted"],
+    )
+    rendered: list[str] = []
+    monkeypatch.setattr(
+        research_agent_cli,
+        "format_messages",
+        lambda messages: rendered.extend(
+            research_agent_cli.extract_message_content(message)
+            for message in messages
+        ),
+    )
+
+    research_agent_cli.main()
+
+    captured = capsys.readouterr()
+    assert secret not in captured.out
+    assert secret not in captured.err
+    assert rendered == [accepted]
+    assert fake_agent.stream_calls == 1
+    assert fake_agent.invoke_calls == 1
+
+
 @pytest.mark.parametrize(
     "error",
     [ModelCallTimeoutError("ollama", 1.0, False), asyncio.CancelledError()],
@@ -629,11 +736,15 @@ def test_cli_citation_failure_is_terminal_without_fallback_or_save(
         argv=["topic", "--verbose", str(verbose)],
     )
 
-    expected_error = BaseExceptionGroup if nested else ReportCitationError
+    expected_error = ReportCitationAggregateError if nested else ReportCitationError
     with pytest.raises(expected_error) as raised:
         research_agent_cli.main()
 
-    assert raised.value is error
+    if nested:
+        assert raised.value.primary_category == "persistence"
+        assert "secret report prose" not in str(raised.value)
+    else:
+        assert raised.value is error
     assert fake_agent.stream_calls == (1 if verbose else 0)
     assert fake_agent.invoke_calls == (0 if verbose else 1)
     assert len(cancelled_scopes) == 1
@@ -643,6 +754,50 @@ def test_cli_citation_failure_is_terminal_without_fallback_or_save(
         assert "do-not-echo" not in str(raised.value)
     if verbose:
         assert all(spinner.stops >= 1 for spinner in _RecordingSpinner.instances)
+
+
+def test_cli_citation_exception_group_is_sanitized_without_masking_persistence(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    secret = "SECRET REPORT PROSE FROM SAVER"
+    error = ExceptionGroup(
+        secret,
+        [
+            ReportCitationError(),
+            RuntimeError(f"checkpoint failed: {secret}"),
+        ],
+    )
+
+    class CitationGroupAgent(FakeAgent):
+        def invoke(self, messages, config=None):  # noqa: ANN001
+            self.invoke_calls += 1
+            self.last_config = config
+            raise error
+
+    fake_agent = CitationGroupAgent()
+    _configure_timeout_cli(
+        monkeypatch,
+        tmp_path,
+        fake_agent,
+        argv=["topic", "--verbose", "False"],
+    )
+
+    with pytest.raises(BaseException) as caught:
+        research_agent_cli.main()
+
+    rendered_error = "".join(traceback.format_exception(caught.value))
+    assert not isinstance(caught.value, BaseExceptionGroup)
+    assert getattr(caught.value, "primary_category", None) == "persistence"
+    assert getattr(caught.value, "categories", ()) == (
+        "citation",
+        "persistence",
+    )
+    assert secret not in str(caught.value)
+    assert secret not in repr(caught.value)
+    assert secret not in rendered_error
+    assert fake_agent.invoke_calls == 1
+    assert list(tmp_path.glob("*.md")) == []
 
 
 @pytest.mark.parametrize("nested", [False, True])
@@ -680,11 +835,14 @@ def test_cli_citation_failure_during_finalization_stops_without_save(
         argv=["topic", "--verbose", "False"],
     )
 
-    expected_error = BaseExceptionGroup if nested else ReportCitationError
+    expected_error = ReportCitationAggregateError if nested else ReportCitationError
     with pytest.raises(expected_error) as raised:
         research_agent_cli.main()
 
-    assert raised.value is error
+    if nested:
+        assert raised.value.primary_category == "persistence"
+    else:
+        assert raised.value is error
     assert fake_agent.invoke_calls == 2
     assert len(cancelled_scopes) == 1
     assert list(tmp_path.glob("*.md")) == []
@@ -712,7 +870,9 @@ def test_title_citation_failure_cancels_scope_without_default(nested: bool) -> N
     try:
         research_agent_cli.model = CitationTitleModel()
         research_agent_cli.cancel_model_call_scope = cancelled_scopes.append
-        expected_error = BaseExceptionGroup if nested else ReportCitationError
+        expected_error = (
+            ReportCitationAggregateError if nested else ReportCitationError
+        )
         with pytest.raises(expected_error) as raised:
             research_agent_cli.generate_research_title(
                 "content",
@@ -722,7 +882,10 @@ def test_title_citation_failure_cancels_scope_without_default(nested: bool) -> N
         research_agent_cli.model = original_model
         research_agent_cli.cancel_model_call_scope = original_cancel
 
-    assert raised.value is error
+    if nested:
+        assert raised.value.primary_category == "interrupt"
+    else:
+        assert raised.value is error
     assert cancelled_scopes == ["citation-scope"]
 
 
