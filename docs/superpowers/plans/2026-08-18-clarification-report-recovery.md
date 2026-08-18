@@ -25,8 +25,11 @@
 
 - [ ] **Step 1: Add failing exact-shorthand and replay tests**
 
-Add a fixture matching the observed Gemma call, including three questions and
-string options. Preserve a deep copy and validate twice:
+Add a fixture matching the complete observed Gemma call, with all three
+questions and string options. Preserve a deep copy and validate twice. Assert
+deterministic `question_1`/`question_2`/`question_3` IDs and per-question option
+IDs, including removal of the standalone Other choice only where at least two
+concrete choices remain:
 
 ```python
 def _gemma_shorthand() -> dict[str, object]:
@@ -39,7 +42,23 @@ def _gemma_shorthand() -> dict[str, object]:
                     "Industry professionals",
                     "Other (please specify)",
                 ],
-            }
+            },
+            {
+                "question": "What is the primary focus?",
+                "options": [
+                    "Theory and algorithms",
+                    "Practical implementation",
+                    "Other (please specify)",
+                ],
+            },
+            {
+                "question": "What depth is required?",
+                "options": [
+                    "Comprehensive review",
+                    "Executive summary",
+                    "Other (please specify)",
+                ],
+            },
         ]
     }
 
@@ -53,31 +72,28 @@ def test_gemma_shorthand_normalizes_without_mutating_replay_input() -> None:
 
     assert raw == original
     assert first == second
-    assert first.model_dump() == {
-        "questions": [
-            {
-                "id": "question_1",
-                "prompt": "What is the intended audience?",
-                "type": "single_select",
-                "options": [
-                    {"id": "option_1", "label": "Researchers", "description": None},
-                    {
-                        "id": "option_2",
-                        "label": "Industry professionals",
-                        "description": None,
-                    },
-                ],
-            }
-        ]
-    }
+    dumped = first.model_dump()
+    assert [question["id"] for question in dumped["questions"]] == [
+        "question_1", "question_2", "question_3"
+    ]
+    assert [option["id"] for option in dumped["questions"][0]["options"]] == [
+        "option_1", "option_2"
+    ]
+    assert all(
+        option["label"] != "Other (please specify)"
+        for question in dumped["questions"]
+        for option in question["options"]
+    )
 ```
 
 - [ ] **Step 2: Add failing rejection tests for ambiguous shapes**
 
 Cover a hybrid batch containing one canonical and one shorthand question, a
-single item mixing `question` with canonical keys, non-string options, and
-shorthand extras. Each must raise `ValidationError`. Add parametrized exact
-Other matching for whitespace/case and prove `Another option` is retained.
+single item mixing `question` with canonical keys, non-string options,
+shorthand item extras, and an unexpected top-level batch field. Each must raise
+`ValidationError`; normalization must never hide `extra="forbid"` errors. Add
+parametrized exact Other matching for whitespace/case and prove `Another
+option` is retained.
 
 - [ ] **Step 3: Run tests and verify RED**
 
@@ -103,6 +119,8 @@ _OTHER_LABELS = {"other", "other (please specify)"}
 
 def _normalise_shorthand_batch(value: Any) -> Any:
     if not isinstance(value, Mapping):
+        return value
+    if set(value) != {"questions"}:
         return value
     raw_questions = value.get("questions")
     if not isinstance(raw_questions, list) or not raw_questions:
@@ -167,54 +185,58 @@ git add research_agent/research_subagent/clarification/contracts.py \
 git commit -m "fix: normalize local clarification tool calls"
 ```
 
-### Task 2: Prove model schema, interrupt, and resume boundary
+### Task 2: Prove model schema and real checkpointed interrupt/resume boundary
 
 **Files:**
 - Modify: `tests/test_clarification.py`
 - Modify: `research_agent/research_subagent/clarification/tool.py:72-96`
 
-- [ ] **Step 1: Add failing tool-boundary regression**
+- [ ] **Step 1: Add failing real LangGraph interrupt/resume regression**
 
-Validate observed shorthand through the actual decorated tool schema, pass the
-normalized batch to `run_clarification`, capture the interrupt payload, and
-return a matching response:
+Build on `test_interrupt_pauses_and_resumes_same_checkpoint`: compile a real
+`StateGraph` with `InMemorySaver`, and make its node validate the same preserved
+shorthand object through `clarify_requirements.args_schema` before calling
+`run_clarification`. Invoke once to obtain the real `__interrupt__`, then resume
+the same checkpoint with `Command(resume=...)`:
 
 ```python
-def test_shorthand_args_schema_interrupts_and_resumes_canonically() -> None:
+def test_shorthand_replays_and_resumes_same_checkpoint_canonically() -> None:
     raw = _gemma_shorthand()
-    batch = clarify_requirements.args_schema.model_validate(raw)
-    seen: list[dict[str, object]] = []
+    original = copy.deepcopy(raw)
+    executions = 0
 
-    def interrupt_fn(payload: dict[str, object]) -> dict[str, object]:
-        seen.append(payload)
-        return {
-            "kind": "requirement_clarification_response",
-            "version": 1,
-            "request_id": "tool-call-1",
-            "skipped": False,
-            "answers": [
-                {
-                    "question_id": "question_1",
-                    "selected_option_ids": ["option_1"],
-                    "other_text": None,
-                }
-            ],
-        }
+    def clarify_node(state: _InterruptState) -> Command:
+        nonlocal executions
+        executions += 1
+        batch = clarify_requirements.args_schema.model_validate(raw)
+        return run_clarification(batch, tool_call_id="tool-call-1")
 
-    command = run_clarification(
-        batch,
-        tool_call_id="tool-call-1",
-        interrupt_fn=interrupt_fn,
+    graph = (
+        StateGraph(_InterruptState)
+        .add_node("clarify", clarify_node)
+        .add_edge(START, "clarify")
+        .add_edge("clarify", END)
+        .compile(checkpointer=InMemorySaver())
     )
+    config = {"configurable": {"thread_id": "shorthand-clarification"}}
 
-    assert seen[0]["questions"][0]["id"] == "question_1"
-    result = json.loads(command.update["messages"][0].content)
+    interrupted = graph.invoke({"messages": []}, config)
+    payload = interrupted["__interrupt__"][0].value
+    assert payload["questions"][0]["id"] == "question_1"
+
+    resumed = graph.invoke(Command(resume=_matching_response(payload)), config)
+    result = json.loads(resumed["messages"][-1].content)
     assert result["status"] == "answered"
     assert result["requirements"][0]["selected_labels"] == ["Researchers"]
+    assert executions == 2
+    assert raw == original
 ```
 
-Adapt indexing to the concrete typed payload returned by Pydantic. Assert raw
-input still equals its pre-call copy.
+Use a small response helper to answer every question in the three-question
+payload. Adapt indexing to the concrete typed payload returned by LangGraph.
+This is intentionally not a fake `interrupt_fn`: it proves node replay,
+checkpoint correlation, canonical payload serialization, and immutable raw
+tool-call args together.
 
 - [ ] **Step 2: Add failing model-facing description test**
 
@@ -299,4 +321,3 @@ Expected: Ruff/compile/diff exit 0; status is clean.
 
 Record `contracts.py` as the deterministic local-model compatibility boundary
 and `tool.py` as the canonical model-facing schema example.
-
