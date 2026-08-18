@@ -45,7 +45,11 @@ in the `questions` annotation. LangChain's subset-model construction preserves
 annotated field metadata, so both `get_input_schema()` and the actual
 `tool_call_schema` normalize before nested `ClarificationQuestion` validation.
 Keep `ClarificationBatch` as the explicit `args_schema`; the tool body and
-interrupt contract continue to receive canonical question objects.
+interrupt contract continue to receive canonical question objects. Replace the
+unused `ToolRuntime` parameter with an explicit
+`Annotated[str, InjectedToolCallId]` parameter. This preserves stable tool-call
+correlation while allowing ToolNode to inject the ID even though the strict
+explicit schema intentionally contains only `questions`.
 
 The existing policy remains authoritative:
 
@@ -59,6 +63,8 @@ Tests must validate `clarify_requirements.tool_call_schema`, not only
 `ClarificationBatch.model_validate()` or `get_input_schema()`. A real ToolNode
 invoke/interrupt/resume/replay test must pass the exact observed shorthand,
 prove the interrupt contains canonical objects, and prove replay is stable.
+The same boundary must accept an ordinary canonical tool call before shorthand
+compatibility is considered.
 
 ### 2. Gemma Ollama reasoning policy
 
@@ -108,6 +114,8 @@ feeding that path during normal tool orchestration.
    shorthand and preserve strict rejection cases and canonical output.
    `tool_call_schema.model_json_schema()` must still advertise only canonical
    fields; shorthand is an input-compatibility path, not a public wire schema.
+   A canonical ToolNode call must also interrupt successfully, proving injected
+   correlation does not enter strict public validation.
 3. RED/GREEN: model-factory tests cover exact/tagged/namespaced/case-folded
    Gemma matches; false-positive names; every override literal; whitespace;
    fixed empty/invalid failures; unset non-Gemma keyword omission; provider
@@ -115,7 +123,8 @@ feeding that path during normal tool orchestration.
    isolation by adding `OLLAMA_REASONING` to `_PROVIDER_ENV`.
 4. Run focused clarification, model-factory, agent-contract, completion-guard,
    and write-file suites plus Ruff/compile/diff checks.
-5. Document `OLLAMA_REASONING` in environment example/configuration docs.
+5. Correct the Ollama environment example to the factory's maintained names
+   (`OLLAMA_API_BASE`, `MODEL_NAME`) and document `OLLAMA_REASONING`.
 6. Restart local LangGraph from merged `main`, verify port health, then use a
    fresh thread with unset override and exact `gemma4:latest`. Acceptance
    requires shorthand crossing the actual tool boundary, a canonical

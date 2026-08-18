@@ -13,6 +13,7 @@
 ## File map
 
 - `research_agent/research_subagent/clarification/contracts.py`: canonical clarification contracts plus exact legacy-shorthand normalization.
+- `research_agent/research_subagent/clarification/tool.py`: ToolNode adapter and injected tool-call correlation.
 - `tests/test_clarification.py`: real `tool_call_schema`, ToolNode, interrupt/resume, replay, immutability, and advertised-schema regressions.
 - `research_agent/model_factory.py`: provider selection and Ollama constructor policy.
 - `tests/test_model_factory_timeout.py`: isolated provider environment and constructor/runtime policy tests.
@@ -23,6 +24,7 @@
 **Files:**
 - Modify: `tests/test_clarification.py:631-700`
 - Modify: `research_agent/research_subagent/clarification/contracts.py:1-105`
+- Modify: `research_agent/research_subagent/clarification/tool.py:1-95`
 
 - [ ] **Step 1: Write failing real-boundary tests**
 
@@ -52,9 +54,11 @@ def test_tool_call_json_schema_advertises_only_canonical_contract() -> None:
 
 Update `test_real_checkpointed_clarification_replays_node_and_preserves_shorthand`
 to validate with `clarify_requirements.tool_call_schema`, not `args_schema`.
-Add a compiled ToolNode/StateGraph test whose AI tool call contains exact
-shorthand; assert the first run interrupts with canonical questions, resume
-returns the correlated ToolMessage, and replay does not mutate raw arguments.
+First add a compiled ToolNode/StateGraph test whose AI tool call is canonical;
+assert it interrupts rather than returning a strict-schema error for injected
+`runtime`. Add the same test with exact shorthand;
+assert the first run interrupts with canonical questions, resume returns the
+correlated ToolMessage, and replay does not mutate raw arguments.
 
 - [ ] **Step 2: Run tests and verify RED**
 
@@ -124,6 +128,27 @@ class ClarificationBatch(StrictContract):
 Remove only the old batch-level `normalize_shorthand` model validator. Keep the
 after-validator for unique canonical question IDs unchanged.
 
+In `tool.py`, replace `ToolRuntime` injection with the only injected value the
+adapter consumes:
+
+```python
+from typing import Annotated, Any
+
+from langchain_core.tools import InjectedToolCallId, tool
+
+
+@tool(args_schema=ClarificationBatch)
+def clarify_requirements(
+    questions: list[ClarificationQuestion],
+    tool_call_id: Annotated[str, InjectedToolCallId],
+) -> Command:
+    ...
+    return run_clarification(
+        ClarificationBatch(questions=questions),
+        tool_call_id=tool_call_id,
+    )
+```
+
 - [ ] **Step 4: Run clarification tests and verify GREEN**
 
 Run the command from Step 2. Expected: all clarification tests pass, including
@@ -133,6 +158,7 @@ real ToolNode interrupt/resume/replay and canonical JSON schema assertions.
 
 ```bash
 git add research_agent/research_subagent/clarification/contracts.py \
+  research_agent/research_subagent/clarification/tool.py \
   tests/test_clarification.py
 git commit -m "fix: normalize clarification at tool call boundary"
 ```
@@ -186,7 +212,11 @@ def test_invalid_ollama_reasoning_fails_safely(monkeypatch, raw):
 Add a mixed-provider test with valid AWS configuration plus invalid
 `OLLAMA_REASONING`; assert AWS is selected and no Ollama parsing occurs. Include
 explicit override tests on a non-Gemma Ollama name to prove family-independent
-override precedence.
+override precedence. Add a cache-lifecycle test: construct cached unset Gemma,
+change `OLLAMA_REASONING`, prove cached object/setting remains unchanged, then
+prove bypass and `clear_model_cache()` reconstruct with the override. For the
+Gemma default assertion, also call `model._chat_params([])` and require the
+actual Ollama SDK request params to contain `"think": False`.
 
 - [ ] **Step 2: Run tests and verify RED**
 
@@ -249,7 +279,8 @@ git commit -m "fix: disable Gemma reasoning for tool orchestration"
 
 - [ ] **Step 1: Document operator behavior**
 
-Add near Ollama configuration:
+Replace stale `OLLAMA_BASE_URL`/`OLLAMA_MODEL` example names with the factory's
+maintained `OLLAMA_API_BASE`/`MODEL_NAME`, then add:
 
 ```dotenv
 # Optional Ollama reasoning override. When unset, exact gemma4 repositories
@@ -282,8 +313,9 @@ Expected: all tests pass.
   tests/test_model_factory_timeout.py
 /Users/jerryshao/Documents/projects/IBM/ai/deep-research/.venv/bin/python -m compileall -q \
   research_agent/research_subagent/clarification/contracts.py \
+  research_agent/research_subagent/clarification/tool.py \
   research_agent/model_factory.py
-git diff --check main...HEAD
+git diff --check
 ```
 
 If Ruff is not installed, record that exact environment limitation; do not call
@@ -295,6 +327,9 @@ the check successful.
 git add -f .env.example
 git commit -m "docs: describe Ollama reasoning override"
 ```
+
+Rerun `git diff --check main...HEAD` after this commit so documentation is
+included in cumulative verification.
 
 - [ ] **Step 5: Independent code review**
 
@@ -318,18 +353,57 @@ confirm clean `git status --short --branch`.
 
 - [ ] **Step 3: Restart LangGraph from merged main**
 
-Stop the existing localhost:2024 process, start:
+Resolve the listener before stopping anything:
 
 ```bash
-.venv/bin/langgraph dev --no-reload --no-browser
+lsof -nP -iTCP:2024 -sTCP:LISTEN
+ps -p <PID> -o pid=,ppid=,etime=,command=
+lsof -a -p <PID> -d cwd -Fn
+```
+
+Stop it only if command is LangGraph and cwd is this backend project. Then start
+with exact local acceptance configuration:
+
+```bash
+env -u OLLAMA_REASONING \
+  MODEL_NAME=gemma4:latest \
+  OLLAMA_API_BASE=http://localhost:11434 \
+  .venv/bin/langgraph dev --no-reload --no-browser
 ```
 
 Verify `http://127.0.0.1:2024/docs` returns HTTP 200.
 
 - [ ] **Step 4: Run fresh Gemma acceptance flow**
 
-Use exact `MODEL_NAME=gemma4:latest` with `OLLAMA_REASONING` unset. In a fresh
-thread, require:
+Open `http://localhost:3000/chat?assistantId=research`, create a fresh thread,
+submit `Help to do a research on graph engineering`, and capture the new thread
+ID from the URL. Before answering, inspect canonical interrupt state:
+
+```bash
+curl -sS http://127.0.0.1:2024/threads/<THREAD_ID>/state | jq \
+  '{interrupts, todos:.values.todos, messages:.values.messages[-4:]}'
+```
+
+Answer the clarification in the frontend so the same correlated call resumes.
+After the run reaches a terminal state, capture exact acceptance evidence:
+
+```bash
+curl -sS http://127.0.0.1:2024/threads/<THREAD_ID>/state | jq -e '
+  (.values.todos | length > 0) and
+  (all(.values.todos[]; .status == "completed")) and
+  (.values.files["/final_report.md"].content | type == "string" and length > 0) and
+  (.values.completion_report_owned == true)'
+```
+
+Also inspect the post-resume message tail and require at least one visible tool
+call before completion:
+
+```bash
+curl -sS http://127.0.0.1:2024/threads/<THREAD_ID>/state | jq \
+  '.values.messages | map({type,name,tool_calls,content}) | .[-20:]'
+```
+
+Use exact `MODEL_NAME=gemma4:latest` with `OLLAMA_REASONING` unset. Require:
 
 1. exact shorthand crosses the real tool boundary;
 2. interrupt payload is canonical;
