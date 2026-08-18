@@ -259,7 +259,14 @@ def test_cli_main_saves_expected_report_for_every_skill(
     output_file = _run_cli(
         monkeypatch,
         tmp_path,
-        ["Research Claude Code Memory Management", "--skill", skill, "--verbose", "False"],
+        [
+            "Research Claude Code Memory Management",
+            "--skill",
+            skill,
+            "--verbose",
+            "False",
+            "--no-web",
+        ],
         FakeAgent(invoke_result=result),
         f"{skill.replace('-', '_')}_report",
     )
@@ -417,6 +424,26 @@ def test_cli_output_helpers_fail_closed_on_current_citation_failure() -> None:
     assert not research_agent_cli.should_retry_with_invoke(result)
     with pytest.raises(ReportCitationError):
         research_agent_cli.select_output_content(result)
+
+
+def test_cli_output_helpers_fail_closed_on_malformed_report() -> None:
+    report = agent_module.create_file_data("private malformed report")
+    report.pop("modified_at")
+    result = {
+        "files": {"/final_report.md": report},
+        "citation_accepted_report_fingerprint": None,
+    }
+
+    with pytest.raises(ReportCitationError):
+        research_agent_cli.should_retry_with_invoke(result)
+    with pytest.raises(ReportCitationError):
+        research_agent_cli.select_output_content(result)
+    with pytest.raises(ReportCitationError):
+        research_agent_cli._render_final_result(
+            result,
+            "private malformed report",
+            no_web=False,
+        )
 
 
 class _RecordingSpinner:
@@ -591,13 +618,141 @@ def test_cli_web_stream_error_diagnostics_do_not_echo_unaccepted_content(
             for message in messages
         ),
     )
-
     research_agent_cli.main()
 
     captured = capsys.readouterr()
     assert secret not in captured.out
     assert secret not in captured.err
     assert rendered == [accepted]
+    assert fake_agent.stream_calls == 1
+    assert fake_agent.invoke_calls == 1
+
+
+@pytest.mark.parametrize("verbose", [False, True])
+def test_cli_malformed_report_fingerprint_fails_closed_before_output(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    verbose: bool,
+) -> None:
+    secret = "SECRET MALFORMED REPORT CONTENT"
+    malformed_report = agent_module.create_file_data(secret)
+    malformed_report.pop("modified_at")
+    result = {
+        "messages": [AIMessage(content=secret)],
+        "files": {"/final_report.md": malformed_report},
+        "todos": [{"content": "Research", "status": "completed"}],
+        "citation_accepted_report_fingerprint": None,
+        "citation_failure_run_id": None,
+        "citation_failure_report_fingerprint": None,
+        "citation_failure_defects": [],
+    }
+    fake_agent = FakeAgent(invoke_result=result, stream_states=[result])
+    _configure_timeout_cli(
+        monkeypatch,
+        tmp_path,
+        fake_agent,
+        argv=["topic", "--verbose", str(verbose), "--title", "malformed"],
+    )
+    rendered: list[str] = []
+    title_calls: list[str] = []
+    monkeypatch.setattr(
+        research_agent_cli,
+        "format_messages",
+        lambda messages: rendered.extend(
+            research_agent_cli.extract_message_content(message)
+            for message in messages
+        ),
+    )
+    monkeypatch.setattr(
+        research_agent_cli,
+        "generate_research_title",
+        lambda content, *, config: title_calls.append(str(content)) or "unsafe",
+    )
+
+    with pytest.raises(ReportCitationError) as caught:
+        research_agent_cli.main()
+
+    captured = capsys.readouterr()
+    assert secret not in str(caught.value)
+    assert secret not in captured.out
+    assert secret not in captured.err
+    assert rendered == []
+    assert title_calls == []
+    assert fake_agent.stream_calls == (1 if verbose else 0)
+    assert fake_agent.invoke_calls == (0 if verbose else 1)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_cli_web_progress_never_prints_model_controlled_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    secret_tool = "SECRET_TOOL_NAME"
+    secret_role = "SECRET_ROLE"
+    secret_preview = "SECRET_PREVIEW_AND_ARGUMENT"
+    accepted = "Accepted final https://public.publisher.org/report"
+    report = agent_module.create_file_data(accepted)
+    fingerprint = agent_module.artifact_fingerprint(report)
+    assert fingerprint is not None
+    accepted_state = {
+        "messages": [AIMessage(content=accepted)],
+        "files": {"/final_report.md": report},
+        "todos": [{"content": "Research", "status": "completed"}],
+        "citation_accepted_report_fingerprint": fingerprint,
+    }
+
+    class MaliciousProgressAgent(FakeAgent):
+        def stream(self, messages, config=None, stream_mode="values"):  # noqa: ANN001
+            self.stream_calls += 1
+            self.last_config = config
+            yield {
+                "messages": [
+                    AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "name": secret_tool,
+                                "args": {"query": secret_preview},
+                                "id": "malicious-tool-call",
+                            }
+                        ],
+                    )
+                ]
+            }
+            yield {
+                "messages": [
+                    {
+                        "role": secret_role,
+                        "name": secret_tool,
+                        "content": secret_preview,
+                    }
+                ]
+            }
+            raise RuntimeError(secret_preview)
+
+        def invoke(self, messages, config=None):  # noqa: ANN001
+            self.invoke_calls += 1
+            self.last_config = config
+            return accepted_state
+
+    fake_agent = MaliciousProgressAgent()
+    _configure_timeout_cli(
+        monkeypatch,
+        tmp_path,
+        fake_agent,
+        argv=["topic", "--verbose", "True", "--title", "accepted"],
+    )
+    monkeypatch.setattr(research_agent_cli, "format_messages", lambda _messages: None)
+
+    research_agent_cli.main()
+
+    captured = capsys.readouterr()
+    combined = captured.out + captured.err
+    assert secret_tool not in combined
+    assert secret_role not in combined
+    assert secret_preview not in combined
     assert fake_agent.stream_calls == 1
     assert fake_agent.invoke_calls == 1
 

@@ -257,6 +257,26 @@ def _raise_result_citation_failure(
     )
 
 
+def _raise_unaccepted_report(
+    result: Mapping[str, object],
+    *,
+    strict_required: bool,
+) -> None:
+    """Fail closed for malformed or unaccepted reports in strict CLI mode."""
+    if not strict_required:
+        return
+    files = result.get("files")
+    if not isinstance(files, Mapping) or "/final_report.md" not in files:
+        return
+    fingerprint = artifact_fingerprint(files.get("/final_report.md"))
+    if (
+        not isinstance(fingerprint, str)
+        or not fingerprint
+        or result.get("citation_accepted_report_fingerprint") != fingerprint
+    ):
+        raise ReportCitationError()
+
+
 def _render_live_stream_message(message: object, *, no_web: bool) -> None:
     """Render live model/tool content only when web generation is disabled."""
     if no_web:
@@ -276,6 +296,7 @@ def _render_final_result(
             format_messages([wrap_as_message(message) for message in messages])
         return
 
+    _raise_unaccepted_report(result, strict_required=True)
     files = result.get("files")
     report = files.get("/final_report.md") if isinstance(files, Mapping) else None
     if report is None:
@@ -462,9 +483,14 @@ def select_output_content(
     skill: str | None = None,
     *,
     run_id: object = None,
+    strict_citations_required: bool = True,
 ) -> str:
     """Choose the best final content from files/messages for saving to disk."""
     _raise_result_citation_failure(result, run_id=run_id)
+    _raise_unaccepted_report(
+        result,
+        strict_required=strict_citations_required,
+    )
     files = result.get("files", {})
     if "/final_report.md" in files:
         return file_data_to_string(files["/final_report.md"])
@@ -495,13 +521,23 @@ def should_retry_with_invoke(
     skill: str | None = None,
     *,
     run_id: object = None,
+    strict_citations_required: bool = True,
 ) -> bool:
     """Detect partial streamed states that should be retried via synchronous invoke."""
     if _citation_failure_pending(result, run_id=run_id):
         return False
+    _raise_unaccepted_report(
+        result,
+        strict_required=strict_citations_required,
+    )
     if inspect_todos(result.get("todos")).has_incomplete:
         return True
-    content = select_output_content(result, skill, run_id=run_id)
+    content = select_output_content(
+        result,
+        skill,
+        run_id=run_id,
+        strict_citations_required=strict_citations_required,
+    )
     return _looks_like_incomplete_delegation(content)
 
 
@@ -712,8 +748,18 @@ def main():
                         name = getattr(last, "name", "")
                         tool_calls = getattr(last, "tool_calls", [])
 
-                    # Output meaningful progress based on the last message type
-                    if role == "ai" and tool_calls:
+                    # Web-capable progress contains fixed trusted text only.
+                    if not args.no_web:
+                        if role == "ai" and tool_calls:
+                            print(f"⚙️  Research tool running (⏱️  {step_time:.1f}s)")
+                            next_spinner_msg = "Research tool running..."
+                        elif role in {"ai", "tool"}:
+                            print(f"✅ Research step completed (⏱️  {step_time:.1f}s)")
+                            next_spinner_msg = "Research step completed..."
+                        elif role in {"human", "user"}:
+                            print(f"🚀 Research started (⏱️  {step_time:.1f}s)")
+                            next_spinner_msg = "Research in progress..."
+                    elif role == "ai" and tool_calls:
                         for tc in tool_calls:
                             tc_name = tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", "unknown")
                             last_tool_name = tc_name
@@ -752,9 +798,6 @@ def main():
             e = error
             spinner.stop()
             total_time = time.time() - start_time
-            role, name, preview = _last_stream_message_diagnostics(last_stream_state)
-            diagnostic_tool_name = name or last_tool_name or "unknown"
-
             if _is_azure_content_filter_error(e):
                 print("⚠️  Streaming interrupted by Azure Content Filtering."
                       f"Switching to fallback invoke... (failed after {total_time:.1f}s)"
@@ -767,11 +810,16 @@ def main():
             else:
                 print(f"⚠️  Streaming not fully supported ({e}), running normally... (failed after {total_time:.1f}s)")
 
-            print(f"🔎  Stream diagnostics: "
-                  f"last_tool=`{diagnostic_tool_name}`, last_role=`{role or 'unknown'}`"
-                  )
-            if preview and args.no_web:
-                print(f"🔎  Preview of last message (truncated): {preview}")
+            if args.no_web:
+                role, name, preview = _last_stream_message_diagnostics(
+                    last_stream_state
+                )
+                diagnostic_tool_name = name or last_tool_name or "unknown"
+                print(f"🔎  Stream diagnostics: "
+                      f"last_tool=`{diagnostic_tool_name}`, last_role=`{role or 'unknown'}`"
+                      )
+                if preview:
+                    print(f"🔎  Preview of last message (truncated): {preview}")
 
             spinner.start("Running fallback synchronous invoke...")
             start_invoke = time.time()
@@ -821,11 +869,17 @@ def main():
         print(f"\n✨ Research completed in {total_time:.1f}s!\n")
 
     _raise_result_citation_failure(result, run_id=invocation_run_id)
-    if should_retry_with_invoke(
-        result,
-        args.skill,
-        run_id=invocation_run_id,
-    ):
+    try:
+        retry_with_invoke = should_retry_with_invoke(
+            result,
+            args.skill,
+            run_id=invocation_run_id,
+            strict_citations_required=not args.no_web,
+        )
+    except ReportCitationError:
+        cancel_model_call_scope(model_call_scope_id)
+        raise
+    if retry_with_invoke:
         spinner = Spinner("Stream ended with incomplete output; running final synchronous pass...")
         spinner.start()
         start_invoke = time.time()
@@ -853,11 +907,16 @@ def main():
         print(f"\n🔁 Finalization pass completed in {invoke_time:.1f}s!\n")
 
     _raise_result_citation_failure(result, run_id=invocation_run_id)
-    file_content = select_output_content(
-        result,
-        args.skill,
-        run_id=invocation_run_id,
-    )
+    try:
+        file_content = select_output_content(
+            result,
+            args.skill,
+            run_id=invocation_run_id,
+            strict_citations_required=not args.no_web,
+        )
+    except ReportCitationError:
+        cancel_model_call_scope(model_call_scope_id)
+        raise
     if args.verbose:
         _render_final_result(
             result,
