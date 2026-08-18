@@ -569,16 +569,16 @@ def test_run_clarification_rejects_missing_or_stale_request_id() -> None:
 
 
 def test_clarification_tool_description_documents_canonical_schema() -> None:
-    description = clarify_requirements.description
+    description = re.sub(r"\s+", "", clarify_requirements.description)
 
     assert (
-        '{"questions":[{"id":"target_audience","prompt":"Who is this for?",'
+        '{"questions":[{"id":"target_audience","prompt":"Whoisthisfor?",'
         '"type":"single_select","options":[{"id":"executives",'
         '"label":"Executives"},{"id":"engineers","label":"Engineers"}]}]}'
         in description
     )
     assert (
-        "Do not add an Other option; the interface provides it automatically."
+        "DonotaddanOtheroption;theinterfaceprovidesitautomatically."
         in description
     )
 
@@ -723,7 +723,10 @@ def test_real_checkpointed_clarification_replays_node_and_preserves_shorthand(
     assert result["version"] == 1
     assert result["request_id"] == "tool-call-1"
     assert result["status"] == "answered"
-    assert [requirement["selected_labels"] for requirement in result["requirements"]] == [
+    selected_labels = [
+        requirement["selected_labels"] for requirement in result["requirements"]
+    ]
+    assert selected_labels == [
         ["Executives"],
         ["Planning"],
         ["Overview"],

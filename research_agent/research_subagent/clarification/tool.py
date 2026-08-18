@@ -84,7 +84,9 @@ def clarify_requirements(
     - Ask 1-3 non-overlapping questions with 2-5 concrete options each.
 
     Canonical input example:
-    {"questions":[{"id":"target_audience","prompt":"Who is this for?","type":"single_select","options":[{"id":"executives","label":"Executives"},{"id":"engineers","label":"Engineers"}]}]}
+    {"questions":[{"id":"target_audience","prompt":"Who is this for?",
+    "type":"single_select","options":[{"id":"executives","label":"Executives"},
+    {"id":"engineers","label":"Engineers"}]}]}
     Do not add an Other option; the interface provides it automatically.
 
     Do not use when the request is clear enough, when optional details can be
