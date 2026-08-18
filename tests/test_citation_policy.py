@@ -300,7 +300,7 @@ def test_rejects_any_explicit_non_http_uri_scheme(destination: str) -> None:
     assert "malformed_reference" in [defect.code for defect in audit_web_citations(report).defects]
 
 
-@pytest.mark.parametrize("token", ["s3://bucket/source", "file:///tmp/source", "mailto:author@publisher.org", "javascript:void", "data:text/plain,source", "ftp://publisher.org/source"])
+@pytest.mark.parametrize("token", ["s3://bucket/source", "file:///tmp/source", "mailto:author@publisher.org", "javascript:void", "data:text/plain,source", "ftp://publisher.org/source", "custom:**"])
 def test_rejects_explicit_non_http_bare_source_token(token: str) -> None:
     audit = audit_web_citations(f"## Sources\n[1] {token}\n[2] https://valid.publisher.org/a")
 
@@ -333,6 +333,12 @@ def test_ignores_bold_list_label_colon_as_markdown_not_uri() -> None:
 
     assert audit.urls == ("https://valid.publisher.org/a",)
     assert audit.defects == ()
+
+
+def test_prior_closed_markdown_does_not_hide_explicit_non_http_uri() -> None:
+    audit = audit_web_citations("**Note** custom:** https://valid.publisher.org/a")
+
+    assert "malformed_reference" in [defect.code for defect in audit.defects]
 
 
 def _unmatched_backtick_runs(size: int) -> str:

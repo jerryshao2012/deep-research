@@ -736,7 +736,11 @@ def _scan_uri_tokens(text: str) -> tuple[tuple[str, tuple[int, int]], ...]:
                     break
                 parenthesis_depth -= 1
             end += 1
-        if end > content_start and _is_clear_bare_uri(text[start:index], text[content_start:end]):
+        if (
+            end > content_start
+            and _is_clear_bare_uri(text[start:index], text[content_start:end])
+            and not _is_markdown_label_closer(text, start, text[content_start:end])
+        ):
             tokens.append((text[start:end], (start, end)))
         index = max(end, content_start)
     return tuple(tokens)
@@ -749,12 +753,21 @@ def _is_scheme_character(character: str) -> bool:
 def _is_clear_bare_uri(scheme: str, content: str) -> bool:
     if not content:
         return False
-    if all(character in "*_~" for character in content):
-        return False
     normalized_scheme = scheme.lower()
     if normalized_scheme in {"isbn", "doi"}:
         return False
     return not (len(scheme) == 1 and content[0] in "\\/")
+
+
+def _is_markdown_label_closer(text: str, start: int, content: str) -> bool:
+    if not (
+        1 <= len(content) <= 3
+        and len(set(content)) == 1
+        and content[0] in "*_~"
+    ):
+        return False
+    line_start = text.rfind("\n", 0, start) + 1
+    return text[line_start:start].count(content) % 2 == 1
 
 
 def _is_explicit_uri(value: str) -> bool:
