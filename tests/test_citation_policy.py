@@ -319,6 +319,22 @@ def test_ignores_prose_word_colon_without_uri_content() -> None:
     assert audit.defects == ()
 
 
+def test_ignores_bold_list_label_colon_as_markdown_not_uri() -> None:
+    report = """Claim supported by source [1].
+
+*   **Attributes:** These are properties associated with nodes and edges [1].
+*   **Message Passing:** Information is aggregated from neighboring nodes [1].
+
+### Sources
+1. Publisher: Graph overview (https://valid.publisher.org/a)
+"""
+
+    audit = audit_web_citations(report)
+
+    assert audit.urls == ("https://valid.publisher.org/a",)
+    assert audit.defects == ()
+
+
 def _unmatched_backtick_runs(size: int) -> str:
     chunks: list[str] = []
     length = 1

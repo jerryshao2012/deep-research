@@ -749,6 +749,8 @@ def _is_scheme_character(character: str) -> bool:
 def _is_clear_bare_uri(scheme: str, content: str) -> bool:
     if not content:
         return False
+    if all(character in "*_~" for character in content):
+        return False
     normalized_scheme = scheme.lower()
     if normalized_scheme in {"isbn", "doi"}:
         return False
