@@ -277,6 +277,8 @@ _FALSE_VALUES = frozenset({"0", "false", "no", "off"})
 
 def _is_gemma4_model(model_name: str) -> bool:
     normalized = model_name.strip().casefold()
+    if normalized.count("@") > 1:
+        return False
     model, digest_separator, digest = normalized.partition("@")
     if not model or any(not segment for segment in model.split("/")):
         return False
@@ -286,6 +288,7 @@ def _is_gemma4_model(model_name: str) -> bool:
             not algorithm_separator
             or not algorithm
             or not digest_value
+            or "@" in algorithm
             or ":" in digest_value
             or "@" in digest_value
         ):
