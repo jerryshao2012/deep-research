@@ -378,6 +378,7 @@ def test_stream_resume_runs_hidden_rounds_and_emits_only_new_final(caplog):
             "resume_incomplete_todos": True,
             "resume_round": round_number,
             "resume_max_rounds": 3,
+            "web_mode_has_new_human_input": False,
         }
     assert any(
         values["todos"] == pending
@@ -585,6 +586,7 @@ def test_stream_resume_uses_stored_candidate_not_latest_thread_message():
     assert len(agent.stream_calls) == 2
     assert all(
         call[1]["configurable"]["resume_incomplete_todos"] is True
+        and call[1]["configurable"]["web_mode_has_new_human_input"] is False
         for call in agent.stream_calls
     )
 
