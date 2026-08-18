@@ -341,6 +341,12 @@ def test_prior_closed_markdown_does_not_hide_explicit_non_http_uri() -> None:
     assert "malformed_reference" in [defect.code for defect in audit.defects]
 
 
+def test_escaped_markdown_opener_does_not_hide_explicit_non_http_uri() -> None:
+    audit = audit_web_citations(r"\**fake custom:** https://valid.publisher.org/a")
+
+    assert "malformed_reference" in [defect.code for defect in audit.defects]
+
+
 @pytest.mark.parametrize(
     "prefix, suffix",
     [("* ", "*"), ("~ ", "~"), ("** ", "**"), ("__ ", "__")],

@@ -769,6 +769,13 @@ def _is_markdown_label_closer(text: str, start: int, content: str) -> bool:
     opening = text.rfind(content, window_start, start)
     if opening < window_start:
         return False
+    escape_index = opening - 1
+    backslashes = 0
+    while escape_index >= window_start and text[escape_index] == "\\":
+        backslashes += 1
+        escape_index -= 1
+    if backslashes % 2:
+        return False
     label_start = opening + len(content)
     if label_start > start or text[label_start].isspace():
         return False
