@@ -54,7 +54,12 @@ def test_compiled_agent_registers_write_todos_tool() -> None:
 def test_compiled_agent_registers_completion_middleware_in_required_order() -> None:
     from langchain.agents.middleware import TodoListMiddleware
 
-    from research_agent.agent import ResearchStateMiddleware, _agent_kwargs, agent
+    from research_agent.agent import (
+        ResearchStateMiddleware,
+        WebModeMiddleware,
+        _agent_kwargs,
+        agent,
+    )
     from research_agent.completion_guard import CompletionGuardMiddleware
     from research_agent.research_subagent.clarification.middleware import (
         ClarificationMiddleware,
@@ -62,14 +67,15 @@ def test_compiled_agent_registers_completion_middleware_in_required_order() -> N
     from research_agent.research_subagent.resume.middleware import ResumeMiddleware
 
     assert agent.get_graph().nodes["model"]
-    assert [type(item) for item in _agent_kwargs["middleware"][:5]] == [
+    assert [type(item) for item in _agent_kwargs["middleware"][:6]] == [
+        WebModeMiddleware,
         TodoListMiddleware,
         ClarificationMiddleware,
         CompletionGuardMiddleware,
         ResumeMiddleware,
         ResearchStateMiddleware,
     ]
-    assert isinstance(_agent_kwargs["middleware"][5], ModelCallGuardMiddleware)
+    assert isinstance(_agent_kwargs["middleware"][6], ModelCallGuardMiddleware)
 
 
 def test_root_and_explicit_subagents_share_guarded_model_and_guard_middleware() -> None:
@@ -225,9 +231,9 @@ def test_all_model_boundaries_guard_known_and_reject_unknown_late_overrides() ->
 
 
 def test_web_mode_is_scoped_to_current_visible_generation() -> None:
-    from research_agent.agent import ResearchStateMiddleware
+    from research_agent.agent import WebModeMiddleware
 
-    middleware = ResearchStateMiddleware(
+    middleware = WebModeMiddleware(
         config_getter=lambda: {"run_id": "first", "configurable": {}}
     )
     first_state = {
@@ -258,10 +264,10 @@ def test_web_mode_is_scoped_to_current_visible_generation() -> None:
 
 
 def test_web_mode_does_not_reparse_stale_text_during_explicit_resume() -> None:
-    from research_agent.agent import ResearchStateMiddleware
+    from research_agent.agent import WebModeMiddleware
 
     message = HumanMessage(id="original", content="Research this with no web")
-    middleware = ResearchStateMiddleware(
+    middleware = WebModeMiddleware(
         config_getter=lambda: {
             "run_id": "resume", "configurable": {"resume_incomplete_todos": True}
         }
@@ -283,9 +289,9 @@ def test_web_mode_does_not_reparse_stale_text_during_explicit_resume() -> None:
 
 
 def test_web_mode_treats_appended_idless_identical_human_as_new() -> None:
-    from research_agent.agent import ResearchStateMiddleware
+    from research_agent.agent import WebModeMiddleware
 
-    middleware = ResearchStateMiddleware(
+    middleware = WebModeMiddleware(
         config_getter=lambda: {"run_id": "second", "configurable": {}}
     )
     message = HumanMessage(content="Research with no web")
@@ -303,12 +309,103 @@ def test_web_mode_treats_appended_idless_identical_human_as_new() -> None:
     assert update["web_mode_last_human_count"] == 2
 
 
+@pytest.mark.parametrize(
+    ("messages", "previous_id", "previous_count", "expected_no_web"),
+    [
+        pytest.param(
+            [
+                HumanMessage(id="same", content="Research with web"),
+                HumanMessage(id="same", content="Research with web"),
+                HumanMessage(id="same", content="Research with no web"),
+            ],
+            "same",
+            2,
+            True,
+            id="count-increase-wins-over-duplicate-id",
+        ),
+        pytest.param(
+            [HumanMessage(id="older", content="Research with no web")],
+            "newer",
+            2,
+            False,
+            id="count-decrease-is-not-fresh",
+        ),
+        pytest.param(
+            [HumanMessage(id="replacement", content="Research with no web")],
+            "original",
+            1,
+            True,
+            id="equal-count-stable-id-replacement-is-fresh",
+        ),
+        pytest.param(
+            [HumanMessage(content="Research with no web")],
+            None,
+            1,
+            False,
+            id="equal-count-idless-is-not-fresh",
+        ),
+        pytest.param(
+            [
+                HumanMessage(id="same", content="Research with no web"),
+                AIMessage(content="internal progress"),
+            ],
+            "same",
+            1,
+            False,
+            id="nonhuman-append-is-not-fresh",
+        ),
+    ],
+)
+def test_web_mode_human_freshness_uses_count_before_identity(
+    messages: list[HumanMessage | AIMessage],
+    previous_id: str | None,
+    previous_count: int,
+    expected_no_web: bool,
+) -> None:
+    from research_agent.agent import WebModeMiddleware
+
+    update = WebModeMiddleware().before_agent(
+        {
+            "messages": messages,
+            "web_mode_last_human_id": previous_id,
+            "web_mode_last_human_count": previous_count,
+        },
+        runtime=None,
+    )
+
+    assert update["effective_no_web"] is expected_no_web
+
+
+@pytest.mark.parametrize(
+    ("raw_no_web", "expected_no_web"),
+    [
+        pytest.param("true", True, id="accepted-true-string"),
+        pytest.param("false", False, id="accepted-false-string"),
+        pytest.param("not-a-boolean", False, id="invalid-fails-safe"),
+    ],
+)
+def test_raw_web_mode_uses_shared_boolean_normalization(
+    raw_no_web: str, expected_no_web: bool
+) -> None:
+    from research_agent.agent import WebModeMiddleware
+
+    update = WebModeMiddleware().before_agent(
+        {
+            "messages": [HumanMessage(content="Research with no web")],
+            "no_web": raw_no_web,
+        },
+        runtime=None,
+    )
+
+    assert update["effective_no_web"] is expected_no_web
+
+
 def test_raw_no_web_channel_is_ephemeral_and_not_checkpointed() -> None:
-    from research_agent.agent import ResearchState, ResearchStateMiddleware
+    from research_agent.agent import ResearchState, WebModeMiddleware
 
     hints = get_type_hints(ResearchState, include_extras=True)
     assert "EphemeralValue" in repr(hints["no_web"])
-    middleware = ResearchStateMiddleware(
+    middleware = WebModeMiddleware(
         config_getter=lambda: {"run_id": "checkpointed", "configurable": {}}
     )
 
@@ -346,3 +443,44 @@ def test_raw_no_web_channel_is_ephemeral_and_not_checkpointed() -> None:
     assert "no_web" not in resumed_snapshot
     assert resumed_snapshot["effective_no_web"] is False
     assert resumed_snapshot["strict_web_citations"] is True
+
+
+@pytest.mark.parametrize(
+    ("raw_no_web", "expected_no_web"),
+    [
+        pytest.param(True, True, id="raw-true"),
+        pytest.param(False, False, id="raw-false"),
+        pytest.param(None, False, id="raw-omitted"),
+    ],
+)
+def test_compiled_production_agent_captures_raw_web_mode_before_checkpoint(
+    raw_no_web: bool | None, expected_no_web: bool
+) -> None:
+    from research_agent.agent import _agent_kwargs
+
+    scripted_model = _guarded_scripted_model([AIMessage(content="complete")])
+    production_kwargs = {
+        **_agent_kwargs,
+        "model": scripted_model,
+        "checkpointer": InMemorySaver(),
+        "subagents": [
+            {**spec, "model": scripted_model}
+            for spec in _agent_kwargs["subagents"]
+        ],
+    }
+    graph = create_deep_agent(**production_kwargs)
+    config = {
+        "configurable": {"thread_id": f"production-web-mode-{raw_no_web}"}
+    }
+    input_state: dict[str, Any] = {
+        "messages": [HumanMessage(id="production-human", content="Research topic")]
+    }
+    if raw_no_web is not None:
+        input_state["no_web"] = raw_no_web
+
+    graph.invoke(input_state, config=config)
+
+    checkpointed = graph.get_state(config).values
+    assert checkpointed["effective_no_web"] is expected_no_web
+    assert checkpointed["strict_web_citations"] is (not expected_no_web)
+    assert "no_web" not in checkpointed

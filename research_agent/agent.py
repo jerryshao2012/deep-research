@@ -20,10 +20,12 @@ from pathlib import Path
 from typing import Annotated, Any, NotRequired
 
 from deepagents import SubAgent, create_deep_agent
+from deepagents.backends import StateBackend
 from deepagents.backends.utils import (
     create_file_data,
     file_data_to_string,
 )
+from deepagents.middleware.skills import SkillsMiddleware
 from deepagents.middleware.subagents import GENERAL_PURPOSE_SUBAGENT
 from dotenv import load_dotenv
 from langchain.agents.middleware import (
@@ -506,8 +508,137 @@ class ResearchState(CompletionState):
     research_pass: int
 
 
+def _extract_no_web(user_message: str) -> bool | None:
+    """Extract a web-mode directive from one newly supplied human message."""
+    message_lower = user_message.lower()
+
+    disable_patterns = [
+        r"without\s+web",
+        r"no\s+web",
+        r"disable\s+web",
+        r"offline",
+        r"no\s+internet",
+        r"no\s+search",
+        r"disable\s+search",
+        r"--no-web",
+        r"-n(?:\s|$)",
+    ]
+    if any(re.search(pattern, message_lower) for pattern in disable_patterns):
+        return True
+
+    enable_patterns = [
+        r"with\s+web",
+        r"with\s+search",
+        r"enable\s+search",
+        r"search\s+the\s+web",
+    ]
+    if any(re.search(pattern, message_lower) for pattern in enable_patterns):
+        return False
+    return None
+
+
+class WebModeMiddleware(SkillsMiddleware):
+    """Resolve raw web mode before skills middleware writes its first update."""
+
+    def __init__(
+            self,
+            *,
+            backend: StateBackend | None = None,
+            sources: list[str] | None = None,
+            config_getter: Callable[[], dict[str, Any]] = get_config,
+    ) -> None:
+        """Create first-stack mode resolver backed by the skills source set."""
+        super().__init__(backend=backend or StateBackend(), sources=sources or [])
+        self._config_getter = config_getter
+
+    @property
+    def name(self) -> str:
+        """Replace deepagents' generated skills middleware at stack head."""
+        return "SkillsMiddleware"
+
+    @staticmethod
+    def _latest_human_marker(messages: list) -> tuple[str | None, int, str | None]:
+        """Return latest human identity, count, and text without parsing intent."""
+        latest_id: str | None = None
+        latest_text: str | None = None
+        human_count = 0
+        for message in messages:
+            is_human = (
+                isinstance(message, dict) and message.get("role") == "user"
+            ) or (
+                hasattr(message, "type") and getattr(message, "type", None) == "human"
+            )
+            if not is_human:
+                continue
+            human_count += 1
+            if isinstance(message, dict):
+                latest_text = str(message.get("content", ""))
+                message_id = message.get("id")
+            else:
+                latest_text = str(getattr(message, "content", ""))
+                message_id = getattr(message, "id", None)
+            latest_id = (
+                message_id.strip()
+                if isinstance(message_id, str) and message_id.strip()
+                else None
+            )
+        return latest_id, human_count, latest_text
+
+    def _mode_update(self, state: ResearchState) -> dict[str, Any]:
+        """Resolve raw input while it is still available at graph entry."""
+        latest_id, human_count, latest_text = self._latest_human_marker(
+            state.get("messages", [])
+        )
+        previous_count = state.get("web_mode_last_human_count")
+        previous_id = state.get("web_mode_last_human_id")
+        if not isinstance(previous_count, int) or isinstance(previous_count, bool):
+            has_new_human = human_count > 0
+        elif human_count > previous_count:
+            has_new_human = True
+        elif human_count < previous_count:
+            has_new_human = False
+        elif latest_id is not None and isinstance(previous_id, str):
+            has_new_human = latest_id != previous_id
+        else:
+            has_new_human = False
+
+        if "no_web" in state:
+            effective_no_web = str2bool(state.get("no_web"), False)
+        elif has_new_human and latest_text is not None:
+            effective_no_web = _extract_no_web(latest_text) is True
+        else:
+            effective_no_web = False
+
+        try:
+            config = self._config_getter()
+        except RuntimeError:
+            config = {}
+        run_id = config.get("run_id") if isinstance(config, Mapping) else None
+        return {
+            "effective_no_web": effective_no_web,
+            "strict_web_citations": not effective_no_web,
+            "web_mode_run_id": str(run_id) if run_id is not None else None,
+            "web_mode_last_human_id": latest_id,
+            "web_mode_last_human_count": human_count,
+        }
+
+    def before_agent(
+            self, state: ResearchState, runtime: Any, config: RunnableConfig | None = None
+    ) -> dict[str, Any]:
+        """Persist effective mode and human marker before resume handling."""
+        skill_update = super().before_agent(state, runtime, config or {}) or {}
+        return {**skill_update, **self._mode_update(state)}
+
+    async def abefore_agent(
+            self, state: ResearchState, runtime: Any, config: RunnableConfig | None = None
+    ) -> dict[str, Any]:
+        """Async counterpart that preserves same first-step mode resolution."""
+        skill_update = await super().abefore_agent(state, runtime, config or {}) or {}
+        return {**skill_update, **self._mode_update(state)}
+
+
 class ResearchStateMiddleware(AgentMiddleware):
-    """Middleware to configure state variables like DOC_FOLDER before the agent runs."""
+    """Configure non-web request state before model execution."""
 
     # Ensure middleware state update are validated against the standard state schema.
     state_schema = ResearchState
@@ -545,67 +676,6 @@ class ResearchStateMiddleware(AgentMiddleware):
         return last_user_content
 
     @staticmethod
-    def _latest_human_marker(messages: list) -> tuple[str | None, int, str | None]:
-        """Return latest human identity, count, and text without parsing intent."""
-        latest_id: str | None = None
-        latest_text: str | None = None
-        human_count = 0
-        for message in messages:
-            is_human = (
-                isinstance(message, dict) and message.get("role") == "user"
-            ) or (
-                hasattr(message, "type") and getattr(message, "type", None) == "human"
-            )
-            if not is_human:
-                continue
-            human_count += 1
-            if isinstance(message, dict):
-                latest_text = str(message.get("content", ""))
-                message_id = message.get("id")
-            else:
-                latest_text = str(getattr(message, "content", ""))
-                message_id = getattr(message, "id", None)
-            latest_id = (
-                message_id.strip()
-                if isinstance(message_id, str) and message_id.strip()
-                else None
-            )
-        return latest_id, human_count, latest_text
-
-    def _web_mode_updates(
-            self, state: ResearchState, messages: list
-    ) -> dict[str, Any]:
-        """Derive request-scoped web mode before normal or resumed generation."""
-        latest_id, human_count, latest_text = self._latest_human_marker(messages)
-        previous_id = state.get("web_mode_last_human_id")
-        previous_count = state.get("web_mode_last_human_count")
-        if latest_id is not None:
-            has_new_human = latest_id != previous_id
-        else:
-            has_new_human = human_count != previous_count
-
-        raw_no_web = state.get("no_web")
-        if "no_web" in state and isinstance(raw_no_web, bool):
-            effective_no_web = raw_no_web
-        elif has_new_human and latest_text is not None:
-            effective_no_web = self._extract_no_web(latest_text) is True
-        else:
-            effective_no_web = False
-
-        try:
-            config = self._config_getter()
-        except RuntimeError:
-            config = {}
-        run_id = config.get("run_id") if isinstance(config, Mapping) else None
-        return {
-            "effective_no_web": effective_no_web,
-            "strict_web_citations": not effective_no_web,
-            "web_mode_run_id": str(run_id) if run_id is not None else None,
-            "web_mode_last_human_id": latest_id,
-            "web_mode_last_human_count": human_count,
-        }
-
-    @staticmethod
     def _seed_research_request_file(
             user_message: str | None, state: ResearchState
     ) -> dict[str, Any]:
@@ -634,7 +704,6 @@ class ResearchStateMiddleware(AgentMiddleware):
         """
         messages = state.get("messages", [])
         current_user_message = self._get_current_user_message(messages)
-        web_mode_updates = self._web_mode_updates(state, messages)
         is_resume_round = self._is_resume_round(state)
         if is_resume_round:
             extracted_updates: dict[str, Any] = {}
@@ -643,9 +712,9 @@ class ResearchStateMiddleware(AgentMiddleware):
                 state,
                 messages,
             )
-        effective_state = {**state, **web_mode_updates, **extracted_updates}
+        effective_state = {**state, **extracted_updates}
 
-        updates: dict[str, Any] = dict(web_mode_updates)
+        updates: dict[str, Any] = {}
         if not is_resume_round:
             # Seed the research request file with the latest user message.
             updates.update(
@@ -1307,39 +1376,8 @@ class ResearchStateMiddleware(AgentMiddleware):
 
     @staticmethod
     def _extract_no_web(user_message: str) -> bool | None:
-        """Extract no_web flag from user message patterns."""
-        message_lower = user_message.lower()
-
-        # Patterns that indicate no_web should be True
-        disable_patterns = [
-            r"without\s+web",
-            r"no\s+web",
-            r"disable\s+web",
-            r"offline",
-            r"no\s+internet",
-            r"no\s+search",
-            r"disable\s+search",
-            r"--no-web",
-            r"-n(?:\s|$)",
-        ]
-
-        for pattern in disable_patterns:
-            if re.search(pattern, message_lower):
-                return True
-
-        # Patterns that indicate no_web should be False (explicit enable)
-        enable_patterns = [
-            r"with\s+web",
-            r"with\s+search",
-            r"enable\s+search",
-            r"search\s+the\s+web",
-        ]
-
-        for pattern in enable_patterns:
-            if re.search(pattern, message_lower):
-                return False
-
-        return None
+        """Backward-compatible wrapper for shared web-mode extraction."""
+        return _extract_no_web(user_message)
 
     @staticmethod
     def _build_system_instruction(
@@ -1498,8 +1536,16 @@ RECURSION_LIMIT = int(os.environ.get("GRAPH_RECURSION_LIMIT", "200"))
 # When unset (default for langgraph dev / LangGraph Platform), the graph is
 # created without a checkpointer and the platform injects its own persistence.
 checkpointer = create_memory_saver()
+backend = StateBackend()
+SKILL_SOURCES = [
+    ".deepagents/skills/",
+    "./doc/.deepagents/skills/",
+    "./docs/.deepagents/skills/",
+]
 _agent_kwargs: dict[str, Any] = dict(
     model=model,
+    backend=backend,
+    state_schema=ResearchState,
     tools=[
         clarify_requirements,
         think_tool,
@@ -1513,6 +1559,7 @@ _agent_kwargs: dict[str, Any] = dict(
     system_prompt=INSTRUCTIONS,
     subagents=[research_sub_agent, general_purpose_sub_agent],
     middleware=[
+        WebModeMiddleware(backend=backend, sources=SKILL_SOURCES),
         TodoListMiddleware(system_prompt=""),
         ClarificationMiddleware(),
         CompletionGuardMiddleware(),
@@ -1520,11 +1567,7 @@ _agent_kwargs: dict[str, Any] = dict(
         ResearchStateMiddleware(),
         ModelCallGuardMiddleware(policy=model._model_call_policy),
     ],
-    skills=[
-        ".deepagents/skills/",
-        "./doc/.deepagents/skills/",
-        "./docs/.deepagents/skills/",
-    ],
+    skills=SKILL_SOURCES,
 )
 if checkpointer is not None:
     _agent_kwargs["checkpointer"] = checkpointer

@@ -150,7 +150,7 @@ def test_read_docs_folder_does_not_suggest_web_when_disabled(
         state={
             "has_documents": False,
             "doc_folder": str(tmp_path / "stale-upload"),
-            "no_web": "true",
+            "effective_no_web": "true",
         },
     )
 
@@ -485,7 +485,7 @@ def test_llm_wiki_query_does_not_suggest_web_when_disabled(
         state={
             "has_documents": False,
             "doc_folder": str(tmp_path / "stale-upload"),
-            "no_web": True,
+            "effective_no_web": True,
         },
     )
 
@@ -564,7 +564,7 @@ def test_configure_request_preserves_unknown_tool_order_tool_choice_and_input_to
 
 
 @pytest.mark.parametrize(
-    ("no_web", "expected_guidance"),
+    ("effective_no_web", "expected_guidance"),
     [
         pytest.param(
             False,
@@ -611,13 +611,13 @@ def test_configure_request_preserves_unknown_tool_order_tool_choice_and_input_to
     ],
 )
 def test_configure_request_adds_no_document_source_guidance(
-        no_web: bool | str, expected_guidance: str
+        effective_no_web: bool | str, expected_guidance: str
 ) -> None:
     middleware = ResearchStateMiddleware()
 
     configured = middleware.configure_request(
         _model_request(
-            state={"has_documents": False, "no_web": no_web},
+                state={"has_documents": False, "effective_no_web": effective_no_web},
             tools=[_NamedTool("task")],
         )
     )

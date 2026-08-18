@@ -18,7 +18,7 @@ from langgraph.prebuilt import InjectedState
 from markdownify import markdownify
 from tavily import TavilyClient
 
-from research_agent.cli_utils import get_ssl_verify_config
+from research_agent.cli_utils import get_ssl_verify_config, str2bool
 
 verify_ssl = get_ssl_verify_config()
 tavily_session = requests.Session()
@@ -94,13 +94,13 @@ def fetch_webpage_content_impl(
     Args:
         url: The URL of the webpage to fetch.
         timeout: Request timeout in seconds (default: 10.0).
-        state: LangGraph state containing no_web flag (injected automatically).
+        state: LangGraph state containing effective_no_web flag (injected automatically).
 
     Returns:
         The webpage content converted to markdown format, or an error message if the fetch fails.
     """
     # Check if web access is disabled
-    if state and state.get("no_web", False):
+    if str2bool((state or {}).get("effective_no_web"), False):
         return "Note: Web access is disabled for this research task. Cannot fetch webpage content. Please use local documents or internal knowledge only."
 
     headers = {
@@ -153,21 +153,9 @@ def tavily_search_impl(
     Returns:
         Formatted search results with full webpage content
     """
-    # Check if web search is disabled via state flag
-    if state and state.get("no_web", False):
+    # WebModeMiddleware resolves this flag before any research middleware runs.
+    if str2bool((state or {}).get("effective_no_web"), False):
         return "Note: Web search is disabled for this research task. Please use local documents or internal knowledge only."
-
-    # Legacy check: also respect the instruction text pattern
-    if state:
-        messages = state.get("messages", [])
-        for msg in messages:
-            content = (
-                getattr(msg, "content", "")
-                if not isinstance(msg, dict)
-                else msg.get("content", "")
-            )
-            if isinstance(content, str) and "Do NOT use web search" in content:
-                return "Note: Web search is disabled for this research task. Please use local documents or internal knowledge only."
 
     try:
         search_results = _run_tavily_search(

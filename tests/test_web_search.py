@@ -1,4 +1,4 @@
-"""Tests for Tavily web search functionality.
+r"""Tests for Tavily web search functionality.
 
 $env:TAVILY_API_KEY="your_tavily_api_key_here"
 $username = [uri]::EscapeDataString("office\your_username")
@@ -15,7 +15,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 import requests
 
-from research_agent.research_subagent.utils.web_search import _run_tavily_search, tavily_search_impl
+from research_agent.research_subagent.utils.web_search import (
+    _run_tavily_search,
+    fetch_webpage_content_impl,
+    tavily_search_impl,
+)
 
 
 class TestRunTavilySearch:
@@ -164,29 +168,57 @@ class TestTavilySearchImpl:
             query="test query",
             max_results=1,
             topic="general",
-            state={"no_web": True},
+            state={"effective_no_web": True},
         )
 
         assert "Web search is disabled" in result
 
-    def test_tavily_search_impl_no_web_instruction(self):
-        """Test tavily_search_impl when web search is disabled via instruction."""
-        from langchain_core.messages import HumanMessage
+    def test_effective_no_web_blocks_tavily_and_page_fetch(self):
+        state = {"effective_no_web": True}
 
-        state = {
-            "messages": [
-                HumanMessage(content="Do NOT use web search for this task.")
-            ]
-        }
+        with patch(
+            "research_agent.research_subagent.utils.web_search._run_tavily_search"
+        ) as mock_search, patch(
+            "research_agent.research_subagent.utils.web_search.httpx.get"
+        ) as mock_get:
+            search_result = tavily_search_impl("test query", state=state)
+            fetch_result = fetch_webpage_content_impl(
+                "https://example.com", state=state
+            )
 
-        result = tavily_search_impl(
-            query="test query",
-            max_results=1,
-            topic="general",
-            state=state,
-        )
+        assert "Web search is disabled" in search_result
+        assert "Web access is disabled" in fetch_result
+        mock_search.assert_not_called()
+        mock_get.assert_not_called()
 
-        assert "Web search is disabled" in result
+    def test_effective_web_mode_allows_tavily(self):
+        with patch(
+            "research_agent.research_subagent.utils.web_search._run_tavily_search",
+            return_value={"results": []},
+        ) as mock_search:
+            result = tavily_search_impl(
+                "test query", state={"effective_no_web": False}
+            )
+
+        assert "Found 0 result(s)" in result
+        mock_search.assert_called_once()
+
+    def test_tavily_search_impl_ignores_stale_instruction_text(self):
+        """Only effective mode, not persisted prompt text, controls web access."""
+        state = {"messages": [{"role": "user", "content": "no web"}]}
+
+        with patch(
+            "research_agent.research_subagent.utils.web_search._run_tavily_search",
+            return_value={"results": []},
+        ):
+            result = tavily_search_impl(
+                query="test query",
+                max_results=1,
+                topic="general",
+                state=state,
+            )
+
+        assert "Web search is disabled" not in result
 
     def test_tavily_search_impl_http_401_error(self):
         """Test handling of 401 authentication error."""

@@ -57,7 +57,7 @@ def fetch_webpage_content(
     Args:
         url: The URL of the webpage to fetch.
         timeout: Request timeout in seconds (default: 10.0).
-        state: LangGraph state containing no_web flag (injected automatically).
+        state: LangGraph state containing effective_no_web flag (injected automatically).
 
     Returns:
         The webpage content converted to markdown format, or an error message if the fetch fails.
@@ -198,7 +198,7 @@ def read_docs_folder(
         Extracted text from supported documents, a summary for large folders, or an error message.
     """
     if not has_document_context(state):
-        if str2bool((state or {}).get("no_web"), False):
+        if str2bool((state or {}).get("effective_no_web"), False):
             return (
                 "No uploaded documents are available for this session. "
                 "Web research is disabled, so use only the available local "
@@ -519,7 +519,7 @@ def llm_wiki_query(
         the final report, not output directly.
     """
     if not has_document_context(state):
-        if str2bool((state or {}).get("no_web"), False):
+        if str2bool((state or {}).get("effective_no_web"), False):
             return (
                 "No uploaded documents are available for this session. "
                 "Web research is disabled, so use only the available local "
