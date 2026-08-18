@@ -164,8 +164,25 @@ def test_tool_call_json_schema_advertises_only_canonical_contract() -> None:
     schema = clarify_requirements.tool_call_schema.model_json_schema()
     question = schema["$defs"]["ClarificationQuestion"]["properties"]
 
+    assert schema["additionalProperties"] is False
     assert set(question) == {"id", "prompt", "type", "options"}
     assert "question" not in question
+
+
+@pytest.mark.parametrize("payload_kind", ["canonical", "shorthand"])
+def test_tool_call_schema_rejects_unexpected_root_fields(
+    payload_kind: str,
+    gemma_shorthand_batch: dict[str, Any],
+) -> None:
+    raw = (
+        {"questions": [_question().model_dump(mode="json")]}
+        if payload_kind == "canonical"
+        else deepcopy(gemma_shorthand_batch)
+    )
+    raw["unexpected"] = True
+
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        clarify_requirements.tool_call_schema.model_validate(raw)
 
 
 def test_batch_normalizes_only_exact_standalone_other_labels() -> None:
@@ -724,6 +741,49 @@ def test_shorthand_tool_call_interrupts_resumes_and_replays_without_mutation(
     assert tool_message.tool_call_id == "shorthand-tool-call"
     assert json.loads(tool_message.content)["request_id"] == "shorthand-tool-call"
     assert raw == gemma_shorthand_batch
+
+
+@pytest.mark.parametrize("payload_kind", ["canonical", "shorthand"])
+def test_compiled_tool_node_rejects_unexpected_root_fields(
+    payload_kind: str,
+    gemma_shorthand_batch: dict[str, Any],
+) -> None:
+    graph = _compile_clarification_tool_graph()
+    raw = (
+        {"questions": [_question().model_dump(mode="json")]}
+        if payload_kind == "canonical"
+        else deepcopy(gemma_shorthand_batch)
+    )
+    raw["unexpected"] = True
+
+    result = graph.invoke(
+        {
+            "messages": [
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "clarify_requirements",
+                            "args": raw,
+                            "id": f"{payload_kind}-invalid-tool-call",
+                            "type": "tool_call",
+                        }
+                    ],
+                )
+            ]
+        },
+        {
+            "configurable": {
+                "thread_id": f"{payload_kind}-invalid-tool-node-thread"
+            }
+        },
+    )
+
+    assert "__interrupt__" not in result
+    tool_message = result["messages"][-1]
+    assert isinstance(tool_message, ToolMessage)
+    assert tool_message.status == "error"
+    assert "unexpected: Extra inputs are not permitted" in tool_message.content
 
 
 def test_interrupt_pauses_and_resumes_same_checkpoint() -> None:

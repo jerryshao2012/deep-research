@@ -5,7 +5,8 @@ from collections.abc import Callable
 from typing import Annotated, Any
 
 from langchain_core.messages import ToolMessage
-from langchain_core.tools import InjectedToolCallId, tool
+from langchain_core.tools import InjectedToolCallId
+from langchain_core.tools.structured import StructuredTool
 from langgraph.types import Command, interrupt
 
 from research_agent.research_subagent.clarification.contracts import (
@@ -67,8 +68,16 @@ def run_clarification(
     )
 
 
-@tool(args_schema=ClarificationBatch)
-def clarify_requirements(
+class _StrictClarificationTool(StructuredTool):
+    """Expose the complete strict contract instead of a permissive subset."""
+
+    @property
+    def tool_call_schema(self) -> type[ClarificationBatch]:
+        """Return model-facing schema without dropping strict model config."""
+        return ClarificationBatch
+
+
+def _clarify_requirements(
         questions: list[ClarificationQuestion],
         tool_call_id: Annotated[str, InjectedToolCallId],
 ) -> Command:
@@ -94,3 +103,10 @@ def clarify_requirements(
         ClarificationBatch(questions=questions),
         tool_call_id=tool_call_id,
     )
+
+
+clarify_requirements = _StrictClarificationTool.from_function(
+    func=_clarify_requirements,
+    name="clarify_requirements",
+    args_schema=ClarificationBatch,
+)
