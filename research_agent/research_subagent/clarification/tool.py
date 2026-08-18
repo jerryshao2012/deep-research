@@ -1,14 +1,11 @@
 """LangGraph adapter for durable requirement clarification."""
 
-from __future__ import annotations
-
 import json
 from collections.abc import Callable
-from typing import Any
+from typing import Annotated, Any
 
-from langchain.tools import ToolRuntime
 from langchain_core.messages import ToolMessage
-from langchain_core.tools import tool
+from langchain_core.tools import InjectedToolCallId, tool
 from langgraph.types import Command, interrupt
 
 from research_agent.research_subagent.clarification.contracts import (
@@ -73,7 +70,7 @@ def run_clarification(
 @tool(args_schema=ClarificationBatch)
 def clarify_requirements(
         questions: list[ClarificationQuestion],
-        runtime: ToolRuntime,
+        tool_call_id: Annotated[str, InjectedToolCallId],
 ) -> Command:
     """Pause once to clarify materially ambiguous user requirements.
 
@@ -95,5 +92,5 @@ def clarify_requirements(
     """
     return run_clarification(
         ClarificationBatch(questions=questions),
-        tool_call_id=runtime.tool_call_id,
+        tool_call_id=tool_call_id,
     )

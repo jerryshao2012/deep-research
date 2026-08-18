@@ -12,6 +12,7 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
+from langgraph.prebuilt import ToolNode
 from langgraph.types import Command
 from pydantic import ValidationError
 
@@ -124,6 +125,47 @@ def test_batch_normalizes_gemma_shorthand_deterministically_without_mutation(
         [("option_1", "Planning"), ("option_2", "Other (please specify)")],
         [("option_1", "Overview"), ("option_2", "Implementation")],
     ]
+
+
+def test_tool_call_schema_normalizes_exact_gemma_shorthand_without_mutation(
+    gemma_shorthand_batch: dict[str, Any],
+) -> None:
+    raw = deepcopy(gemma_shorthand_batch)
+
+    parsed = clarify_requirements.tool_call_schema.model_validate(raw)
+
+    assert raw == gemma_shorthand_batch
+    assert [question.id for question in parsed.questions] == [
+        "question_1",
+        "question_2",
+        "question_3",
+    ]
+    assert [question.prompt for question in parsed.questions] == [
+        "Who is this report for?",
+        "What is the primary goal?",
+        "What depth should the report use?",
+    ]
+    assert [question.type for question in parsed.questions] == [
+        "single_select",
+        "single_select",
+        "single_select",
+    ]
+    assert [
+        [(option.id, option.label) for option in question.options]
+        for question in parsed.questions
+    ] == [
+        [("option_1", "Executives"), ("option_2", "Engineers")],
+        [("option_1", "Planning"), ("option_2", "Other (please specify)")],
+        [("option_1", "Overview"), ("option_2", "Implementation")],
+    ]
+
+
+def test_tool_call_json_schema_advertises_only_canonical_contract() -> None:
+    schema = clarify_requirements.tool_call_schema.model_json_schema()
+    question = schema["$defs"]["ClarificationQuestion"]["properties"]
+
+    assert set(question) == {"id", "prompt", "type", "options"}
+    assert "question" not in question
 
 
 def test_batch_normalizes_only_exact_standalone_other_labels() -> None:
@@ -587,6 +629,103 @@ class _InterruptState(TypedDict):
     messages: Annotated[list[Any], operator.add]
 
 
+def _compile_clarification_tool_graph() -> Any:
+    return (
+        StateGraph(_InterruptState)
+        .add_node("tools", ToolNode([clarify_requirements]))
+        .add_edge(START, "tools")
+        .add_edge("tools", END)
+        .compile(checkpointer=InMemorySaver())
+    )
+
+
+def test_canonical_tool_call_interrupts_through_compiled_tool_node() -> None:
+    graph = _compile_clarification_tool_graph()
+    raw = {"questions": [_question().model_dump(mode="json")]}
+    config = {"configurable": {"thread_id": "canonical-tool-node-thread"}}
+
+    interrupted = graph.invoke(
+        {
+            "messages": [
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "clarify_requirements",
+                            "args": raw,
+                            "id": "canonical-tool-call",
+                            "type": "tool_call",
+                        }
+                    ],
+                )
+            ]
+        },
+        config,
+    )
+
+    payload = interrupted["__interrupt__"][0].value
+    assert payload["request_id"] == "canonical-tool-call"
+    assert payload["questions"] == raw["questions"]
+
+
+def test_shorthand_tool_call_interrupts_resumes_and_replays_without_mutation(
+    gemma_shorthand_batch: dict[str, Any],
+) -> None:
+    graph = _compile_clarification_tool_graph()
+    raw = deepcopy(gemma_shorthand_batch)
+    config = {"configurable": {"thread_id": "shorthand-tool-node-thread"}}
+
+    interrupted = graph.invoke(
+        {
+            "messages": [
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "clarify_requirements",
+                            "args": raw,
+                            "id": "shorthand-tool-call",
+                            "type": "tool_call",
+                        }
+                    ],
+                )
+            ]
+        },
+        config,
+    )
+
+    interrupt_payload = interrupted["__interrupt__"][0].value
+    assert interrupt_payload["request_id"] == "shorthand-tool-call"
+    assert [question["id"] for question in interrupt_payload["questions"]] == [
+        "question_1",
+        "question_2",
+        "question_3",
+    ]
+    assert [
+        question["prompt"] for question in interrupt_payload["questions"]
+    ] == [item["question"] for item in gemma_shorthand_batch["questions"]]
+    assert raw == gemma_shorthand_batch
+
+    resumed = graph.invoke(
+        Command(
+            resume={
+                "kind": "requirement_clarification_response",
+                "version": 1,
+                "request_id": "shorthand-tool-call",
+                "skipped": True,
+                "answers": [],
+            }
+        ),
+        config,
+    )
+
+    tool_message = resumed["messages"][-1]
+    assert isinstance(tool_message, ToolMessage)
+    assert tool_message.tool_call_id == "shorthand-tool-call"
+    assert json.loads(tool_message.content)["request_id"] == "shorthand-tool-call"
+    assert raw == gemma_shorthand_batch
+
+
 def test_interrupt_pauses_and_resumes_same_checkpoint() -> None:
     batch = ClarificationBatch(questions=[_question()])
 
@@ -637,7 +776,7 @@ def test_real_checkpointed_clarification_replays_node_and_preserves_shorthand(
     def clarify_node(state: _InterruptState) -> Command:
         nonlocal execution_count
         execution_count += 1
-        batch = clarify_requirements.args_schema.model_validate(raw)
+        batch = clarify_requirements.tool_call_schema.model_validate(raw)
         return run_clarification(batch, tool_call_id="tool-call-1")
 
     graph = (
