@@ -69,8 +69,10 @@ Run:
   tests/test_clarification.py -q
 ```
 
-Expected: new `tool_call_schema` and ToolNode tests fail with missing canonical
-question fields; existing direct `args_schema` tests still pass.
+Expected: shorthand `tool_call_schema` and ToolNode tests fail with missing
+canonical question fields. The canonical ToolNode test separately fails because
+injected `runtime` enters strict argument validation. Existing direct
+`args_schema` tests still pass.
 
 - [ ] **Step 3: Implement field-level normalization**
 
@@ -308,6 +310,7 @@ Expected: all tests pass.
 ```bash
 /Users/jerryshao/Documents/projects/IBM/ai/deep-research/.venv/bin/ruff check \
   research_agent/research_subagent/clarification/contracts.py \
+  research_agent/research_subagent/clarification/tool.py \
   research_agent/model_factory.py \
   tests/test_clarification.py \
   tests/test_model_factory_timeout.py
@@ -361,21 +364,95 @@ ps -p <PID> -o pid=,ppid=,etime=,command=
 lsof -a -p <PID> -d cwd -Fn
 ```
 
-Stop it only if command is LangGraph and cwd is this backend project. Then start
-with exact local acceptance configuration:
+Stop it only if command is LangGraph and cwd is this backend project.
+
+Do not rely on exported shell variables: `langgraph.json` loads `.env` and can
+replace them. Build a temporary config beside `langgraph.json` so relative graph
+paths remain valid, and point it at a permission-restricted temporary env file.
+Copy existing non-provider settings (including Tavily/auth settings), remove all
+AWS/Azure/Google/Anthropic/OpenAI/Ollama provider selectors, then add only
+`MODEL_NAME=gemma4:latest` and
+`OLLAMA_API_BASE=http://localhost:11434`. Deliberately omit
+`OLLAMA_REASONING`. Launch the CLI under `env -i` with only `PATH`, `HOME`, and
+`TMPDIR` inherited, using `--config <TEMP_CONFIG>`. Register a shell trap that
+deletes both temporary files on exit; do not print their contents because they
+can contain credentials.
+
+Create the controlled files from the project-root `main` checkout:
 
 ```bash
-env -u OLLAMA_REASONING \
-  MODEL_NAME=gemma4:latest \
-  OLLAMA_API_BASE=http://localhost:11434 \
-  .venv/bin/langgraph dev --no-reload --no-browser
+acceptance_env="$(mktemp "$PWD/.langgraph-acceptance-env.XXXXXX")"
+acceptance_config="$(mktemp "$PWD/.langgraph-acceptance-config.XXXXXX")"
+chmod 600 "$acceptance_env" "$acceptance_config"
+trap 'rm -f -- "$acceptance_env" "$acceptance_config"' EXIT
+
+ACCEPTANCE_ENV="$acceptance_env" .venv/bin/python - <<'PY'
+import json
+import os
+
+from dotenv import dotenv_values
+
+provider_keys = {
+    "AWS_BEDROCK_ENDPOINT",
+    "AWS_BEARER_TOKEN_BEDROCK",
+    "AZURE_OPENAI_ENDPOINT",
+    "AZURE_OPENAI_DEPLOYMENT",
+    "AZURE_OPENAI_API_KEY",
+    "AZURE_CLIENT_ID",
+    "AZURE_OPENAI_SCOPE",
+    "AZURE_OPENAI_API_VERSION",
+    "GOOGLE_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "OLLAMA_API_BASE",
+    "OLLAMA_REASONING",
+    "MODEL_NAME",
+}
+values = {
+    key: value
+    for key, value in dotenv_values(".env").items()
+    if key not in provider_keys and value is not None
+}
+values.update(
+    MODEL_NAME="gemma4:latest",
+    OLLAMA_API_BASE="http://localhost:11434",
+)
+with open(os.environ["ACCEPTANCE_ENV"], "w", encoding="utf-8") as stream:
+    for key, value in values.items():
+        stream.write(f"{key}={json.dumps(value, ensure_ascii=False)}\n")
+PY
+
+jq --arg env "$acceptance_env" '.env = $env' \
+  langgraph.json > "$acceptance_config"
 ```
 
-Verify `http://127.0.0.1:2024/docs` returns HTTP 200.
+The generated temporary config otherwise equals `langgraph.json`; only its
+absolute `.env` path changes. Start:
+
+```bash
+env -i PATH="$PATH" HOME="$HOME" TMPDIR="${TMPDIR:-/tmp}" \
+  .venv/bin/langgraph dev --config "$acceptance_config" \
+  --no-reload --no-browser
+```
+
+Verify `http://127.0.0.1:2024/docs` returns HTTP 200. Before creating a thread,
+query the running server and fail unless its own diagnostics report the exact
+provider/model and a successful probe:
+
+```bash
+curl -sS http://127.0.0.1:2024/storage/info | jq -e '
+  .model_factory.detected_provider == "ollama" and
+  .model_factory.configuration.MODEL_NAME == "gemma4:latest" and
+  .model_factory.configuration.OLLAMA_API_BASE == "http://localhost:11434" and
+  .model_factory.test_request.success == true'
+```
 
 - [ ] **Step 4: Run fresh Gemma acceptance flow**
 
-Open `http://localhost:3000/chat?assistantId=research`, create a fresh thread,
+Preflight the frontend with
+`lsof -nP -iTCP:3000 -sTCP:LISTEN`. If absent, start `yarn dev` from
+`/Users/jerryshao/Documents/projects/IBM/ai/bmo-deepagent-ui` and wait for HTTP
+200 before continuing. Open `http://localhost:3000/chat?assistantId=research`, create a fresh thread,
 submit `Help to do a research on graph engineering`, and capture the new thread
 ID from the URL. Before answering, inspect canonical interrupt state:
 
