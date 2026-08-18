@@ -288,7 +288,7 @@ def test_web_mode_does_not_reparse_stale_text_during_explicit_resume() -> None:
     assert update["strict_web_citations"] is True
 
 
-def test_web_mode_treats_appended_idless_identical_human_as_new() -> None:
+def test_web_mode_unit_treats_appended_idless_identical_human_as_new() -> None:
     from research_agent.agent import WebModeMiddleware
 
     middleware = WebModeMiddleware(
@@ -307,6 +307,26 @@ def test_web_mode_treats_appended_idless_identical_human_as_new() -> None:
     assert update["effective_no_web"] is True
     assert update["strict_web_citations"] is False
     assert update["web_mode_last_human_count"] == 2
+
+
+def test_web_mode_unit_detects_idless_equal_count_content_replacement() -> None:
+    from research_agent.agent import WebModeMiddleware
+
+    middleware = WebModeMiddleware()
+    initial = middleware.before_agent(
+        {"messages": [HumanMessage(content="Research with web")]}, runtime=None
+    )
+
+    replacement = middleware.before_agent(
+        {
+            "messages": [HumanMessage(content="Research with no web")],
+            **initial,
+        },
+        runtime=None,
+    )
+
+    assert replacement["effective_no_web"] is True
+    assert replacement["strict_web_citations"] is False
 
 
 @pytest.mark.parametrize(
@@ -484,3 +504,44 @@ def test_compiled_production_agent_captures_raw_web_mode_before_checkpoint(
     assert checkpointed["effective_no_web"] is expected_no_web
     assert checkpointed["strict_web_citations"] is (not expected_no_web)
     assert "no_web" not in checkpointed
+
+
+def test_compiled_web_mode_detects_same_id_human_replacement_but_not_resume() -> None:
+    from research_agent.agent import _agent_kwargs
+
+    scripted_model = _guarded_scripted_model(
+        [AIMessage(content="complete") for _ in range(3)]
+    )
+    production_kwargs = {
+        **_agent_kwargs,
+        "model": scripted_model,
+        "checkpointer": InMemorySaver(),
+        "subagents": [
+            {**spec, "model": scripted_model}
+            for spec in _agent_kwargs["subagents"]
+        ],
+    }
+    graph = create_deep_agent(**production_kwargs)
+    config = {"configurable": {"thread_id": "same-id-web-mode"}}
+
+    graph.invoke(
+        {"messages": [HumanMessage(id="same", content="Research with web")]},
+        config=config,
+    )
+    first = graph.get_state(config).values
+    assert first["effective_no_web"] is False
+
+    graph.invoke(
+        {"messages": [HumanMessage(id="same", content="Research with no web")]},
+        config=config,
+    )
+    replaced = graph.get_state(config).values
+    assert replaced["effective_no_web"] is True
+    assert replaced["strict_web_citations"] is False
+    assert isinstance(replaced["web_mode_last_human_fingerprint"], str)
+    assert "Research with no web" not in replaced["web_mode_last_human_fingerprint"]
+
+    graph.invoke({}, config=config)
+    resumed = graph.get_state(config).values
+    assert resumed["effective_no_web"] is False
+    assert resumed["strict_web_citations"] is True

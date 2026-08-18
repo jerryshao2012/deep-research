@@ -501,6 +501,7 @@ class ResearchState(CompletionState):
     web_mode_run_id: Annotated[NotRequired[str | None], OmitFromInput]
     web_mode_last_human_id: Annotated[NotRequired[str | None], OmitFromInput]
     web_mode_last_human_count: Annotated[NotRequired[int], OmitFromInput]
+    web_mode_last_human_fingerprint: Annotated[NotRequired[str | None], OmitFromInput]
     chat_start_time: float | None
     chat_elapsed_seconds: float | None
     _last_user_msg_hash: str | None
@@ -557,10 +558,13 @@ class WebModeMiddleware(SkillsMiddleware):
         return "SkillsMiddleware"
 
     @staticmethod
-    def _latest_human_marker(messages: list) -> tuple[str | None, int, str | None]:
-        """Return latest human identity, count, and text without parsing intent."""
+    def _latest_human_marker(
+            messages: list,
+    ) -> tuple[str | None, int, str | None, str | None]:
+        """Return latest human marker and safe content fingerprint."""
         latest_id: str | None = None
         latest_text: str | None = None
+        latest_fingerprint: str | None = None
         human_count = 0
         for message in messages:
             is_human = (
@@ -577,28 +581,47 @@ class WebModeMiddleware(SkillsMiddleware):
             else:
                 latest_text = str(getattr(message, "content", ""))
                 message_id = getattr(message, "id", None)
+            message_type = (
+                str(message.get("role", "user"))
+                if isinstance(message, dict)
+                else str(getattr(message, "type", type(message).__name__))
+            )
+            latest_fingerprint = hashlib.sha256(
+                f"{message_type}\0{latest_text}".encode()
+            ).hexdigest()
             latest_id = (
                 message_id.strip()
                 if isinstance(message_id, str) and message_id.strip()
                 else None
             )
-        return latest_id, human_count, latest_text
+        return latest_id, human_count, latest_text, latest_fingerprint
 
     def _mode_update(self, state: ResearchState) -> dict[str, Any]:
         """Resolve raw input while it is still available at graph entry."""
-        latest_id, human_count, latest_text = self._latest_human_marker(
+        latest_id, human_count, latest_text, latest_fingerprint = self._latest_human_marker(
             state.get("messages", [])
         )
         previous_count = state.get("web_mode_last_human_count")
         previous_id = state.get("web_mode_last_human_id")
+        previous_fingerprint = state.get("web_mode_last_human_fingerprint")
         if not isinstance(previous_count, int) or isinstance(previous_count, bool):
             has_new_human = human_count > 0
         elif human_count > previous_count:
             has_new_human = True
         elif human_count < previous_count:
             has_new_human = False
-        elif latest_id is not None and isinstance(previous_id, str):
-            has_new_human = latest_id != previous_id
+        elif (
+                latest_id is not None
+                and isinstance(previous_id, str)
+                and latest_id != previous_id
+        ):
+            has_new_human = True
+        elif (
+                isinstance(previous_fingerprint, str)
+                and latest_fingerprint is not None
+                and latest_fingerprint != previous_fingerprint
+        ):
+            has_new_human = True
         else:
             has_new_human = False
 
@@ -620,6 +643,7 @@ class WebModeMiddleware(SkillsMiddleware):
             "web_mode_run_id": str(run_id) if run_id is not None else None,
             "web_mode_last_human_id": latest_id,
             "web_mode_last_human_count": human_count,
+            "web_mode_last_human_fingerprint": latest_fingerprint,
         }
 
     def before_agent(
