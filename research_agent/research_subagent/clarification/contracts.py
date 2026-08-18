@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from collections.abc import Mapping
+from typing import Any, Literal
 
 from pydantic import (
     BaseModel,
@@ -54,6 +55,54 @@ class ClarificationBatch(StrictContract):
     """Questions proposed by the agent in a single clarification batch."""
 
     questions: list[ClarificationQuestion] = Field(min_length=1, max_length=3)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_shorthand(cls, value: Any) -> Any:
+        """Normalize Gemma's shorthand payload without changing its input."""
+        if not isinstance(value, Mapping) or set(value) != {"questions"}:
+            return value
+
+        raw_questions = value["questions"]
+        if not isinstance(raw_questions, list) or not raw_questions:
+            return value
+
+        normalized_questions: list[dict[str, Any]] = []
+        for question_index, raw_question in enumerate(raw_questions, start=1):
+            if not isinstance(raw_question, Mapping) or set(raw_question) != {
+                "question",
+                "options",
+            }:
+                return value
+
+            raw_options = raw_question["options"]
+            if not isinstance(raw_options, list) or not all(
+                isinstance(option, str) for option in raw_options
+            ):
+                return value
+
+            concrete_options = [
+                option
+                for option in raw_options
+                if option.strip().casefold()
+                not in {"other", "other (please specify)"}
+            ]
+            options = (
+                concrete_options if len(concrete_options) >= 2 else list(raw_options)
+            )
+            normalized_questions.append(
+                {
+                    "id": f"question_{question_index}",
+                    "prompt": raw_question["question"],
+                    "type": "single_select",
+                    "options": [
+                        {"id": f"option_{option_index}", "label": option}
+                        for option_index, option in enumerate(options, start=1)
+                    ],
+                }
+            )
+
+        return {"questions": normalized_questions}
 
     @model_validator(mode="after")
     def question_ids_are_unique(self) -> ClarificationBatch:

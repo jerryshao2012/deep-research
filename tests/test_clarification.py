@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 import operator
 import re
@@ -66,6 +67,137 @@ def _capable_config(mode: str = "auto") -> dict[str, Any]:
             "client_capabilities": {"requirement_clarification": 1},
         }
     }
+
+
+@pytest.fixture
+def gemma_shorthand_batch() -> dict[str, Any]:
+    """Complete shorthand clarification call observed from Gemma."""
+    return {
+        "questions": [
+            {
+                "question": "Who is this report for?",
+                "options": ["Executives", "Engineers", "Other (please specify)"],
+            },
+            {
+                "question": "What is the primary goal?",
+                "options": ["Planning", "Other (please specify)"],
+            },
+            {
+                "question": "What depth should the report use?",
+                "options": ["Overview", "Implementation", "Other (please specify)"],
+            },
+        ]
+    }
+
+
+def test_batch_normalizes_gemma_shorthand_deterministically_without_mutation(
+    gemma_shorthand_batch: dict[str, Any],
+) -> None:
+    original = deepcopy(gemma_shorthand_batch)
+
+    first = ClarificationBatch.model_validate(gemma_shorthand_batch)
+    second = ClarificationBatch.model_validate(gemma_shorthand_batch)
+
+    assert gemma_shorthand_batch == original
+    assert first == second
+    assert [question.id for question in first.questions] == [
+        "question_1",
+        "question_2",
+        "question_3",
+    ]
+    assert [question.type for question in first.questions] == [
+        "single_select",
+        "single_select",
+        "single_select",
+    ]
+    assert [question.prompt for question in first.questions] == [
+        item["question"] for item in gemma_shorthand_batch["questions"]
+    ]
+    assert [
+        [(option.id, option.label) for option in question.options]
+        for question in first.questions
+    ] == [
+        [("option_1", "Executives"), ("option_2", "Engineers")],
+        [("option_1", "Planning"), ("option_2", "Other (please specify)")],
+        [("option_1", "Overview"), ("option_2", "Implementation")],
+    ]
+
+
+def test_batch_normalizes_only_exact_standalone_other_labels() -> None:
+    batch = {
+        "questions": [
+            {
+                "question": "What should this include?",
+                "options": [
+                    "First",
+                    "  OTHER  ",
+                    "Second",
+                    " Other (PLEASE SPECIFY) ",
+                    "Another option",
+                ],
+            }
+        ]
+    }
+
+    question = ClarificationBatch.model_validate(batch).questions[0]
+
+    assert [(option.id, option.label) for option in question.options] == [
+        ("option_1", "First"),
+        ("option_2", "Second"),
+        ("option_3", "Another option"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "invalid_batch",
+    [
+        {
+            "questions": [
+                {
+                    "id": "question_1",
+                    "prompt": "Canonical",
+                    "type": "single_select",
+                    "options": [
+                        {"id": "option_1", "label": "One"},
+                        {"id": "option_2", "label": "Two"},
+                    ],
+                },
+                {"question": "Shorthand", "options": ["One", "Two"]},
+            ]
+        },
+        {
+            "questions": [
+                {
+                    "question": "Mixed",
+                    "prompt": "Unexpected canonical key",
+                    "options": ["One", "Two"],
+                }
+            ]
+        },
+        {"questions": [{"question": "Bad option", "options": ["One", 2]}]},
+        {
+            "questions": [
+                {"question": "Extra", "options": ["One", "Two"], "extra": True}
+            ]
+        },
+        {
+            "questions": [{"question": "Valid", "options": ["One", "Two"]}],
+            "unexpected": True,
+        },
+    ],
+    ids=[
+        "hybrid_batch",
+        "mixed_item_keys",
+        "non_string_option",
+        "shorthand_item_extra",
+        "unexpected_top_level_field",
+    ],
+)
+def test_batch_rejects_non_exact_shorthand_shapes(
+    invalid_batch: dict[str, Any],
+) -> None:
+    with pytest.raises(ValidationError):
+        ClarificationBatch.model_validate(invalid_batch)
 
 
 def test_batch_requires_one_to_three_questions() -> None:
