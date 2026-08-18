@@ -703,6 +703,19 @@ def test_strict_structural_failures_use_independent_correction_budget(
             "strict_web_citations": True,
             "effective_no_web": False,
             "_streamed_files": [],
+            "completion_verified_report_fingerprint": (
+                completion_guard.artifact_fingerprint(
+                    state["files"]["/final_report.md"]
+                )
+            ),
+            "completion_verified_report_run_id": "run-v1",
+            "completion_accepted_at_limit_report_fingerprint": (
+                completion_guard.artifact_fingerprint(
+                    state["files"]["/final_report.md"]
+                )
+            ),
+            "completion_accepted_at_limit_report_run_id": "run-v1",
+            "citation_accepted_report_fingerprint": "legacy-citation-acceptance",
         }
     )
 
@@ -723,6 +736,11 @@ def test_strict_structural_failures_use_independent_correction_budget(
         assert update["messages"][0].response_metadata["resume_intermediate"] is True
         assert "_streamed_files" not in update
         assert "_eval_logged" not in update
+        assert update["completion_verified_report_fingerprint"] is None
+        assert update["completion_verified_report_run_id"] is None
+        assert update["completion_accepted_at_limit_report_fingerprint"] is None
+        assert update["completion_accepted_at_limit_report_run_id"] is None
+        assert update["citation_accepted_report_fingerprint"] is None
         state = {**state, **update}
 
     terminal = _run_after_model(middleware, state, async_=async_)
@@ -739,9 +757,11 @@ def test_strict_structural_failures_use_independent_correction_budget(
     assert terminal["messages"][0].response_metadata["resume_intermediate"] is True
     assert "_streamed_files" not in terminal
     assert "_eval_logged" not in terminal
-    assert "completion_verified_report_fingerprint" not in terminal
-    assert "completion_accepted_at_limit_report_fingerprint" not in terminal
-    assert "citation_accepted_report_fingerprint" not in terminal
+    assert terminal["completion_verified_report_fingerprint"] is None
+    assert terminal["completion_verified_report_run_id"] is None
+    assert terminal["completion_accepted_at_limit_report_fingerprint"] is None
+    assert terminal["completion_accepted_at_limit_report_run_id"] is None
+    assert terminal["citation_accepted_report_fingerprint"] is None
     assert audit_calls == expected_limit + 1
     assert judge_calls == 0
     assert metric_calls == 0

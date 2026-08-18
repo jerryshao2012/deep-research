@@ -177,8 +177,11 @@ def test_citation_failure_helpers_fail_closed_without_leaking_report_data() -> N
     ]
     assert update["messages"][0].response_metadata["resume_intermediate"] is True
     assert "_streamed_files" not in update
-    assert "completion_verified_report_fingerprint" not in update
-    assert "completion_accepted_at_limit_report_fingerprint" not in update
+    assert update["completion_verified_report_fingerprint"] is None
+    assert update["completion_verified_report_run_id"] is None
+    assert update["completion_accepted_at_limit_report_fingerprint"] is None
+    assert update["completion_accepted_at_limit_report_run_id"] is None
+    assert update["citation_accepted_report_fingerprint"] is None
 
     state = {
         **update,
@@ -291,6 +294,38 @@ def test_citation_run_id_resolution_prefers_runtime_then_config_then_state() -> 
         _runtime(None),
         fallback="checkpoint",
     ) == "checkpoint"
+
+
+@pytest.mark.parametrize("async_", [False, True])
+def test_citation_after_agent_requires_durable_checkpointer_confirmation(
+    async_: bool,
+) -> None:
+    import research_agent.agent as agent_module
+
+    report = _file("Invalid report")
+    fingerprint = _fingerprint(report)
+    state = {
+        "files": {"/final_report.md": report},
+        "completion_current_run_id": "run-current",
+        "citation_failure_run_id": "run-current",
+        "citation_failure_report_fingerprint": fingerprint,
+        "citation_failure_defects": [
+            {"code": "missing_url", "detail": "web"}
+        ],
+    }
+    middleware = agent_module.ResearchStateMiddleware(
+        config_getter=lambda: {
+            "run_id": "run-current",
+            "configurable": {"thread_id": "no-checkpointer"},
+        }
+    )
+
+    if async_:
+        result = asyncio.run(middleware.aafter_agent(state, _runtime("run-current")))
+    else:
+        result = middleware.after_agent(state, _runtime("run-current"))
+
+    assert result is None
 
 
 def _inspect(
@@ -778,8 +813,10 @@ def test_ordinary_generation_resets_request_scoped_completion_state(
         "completion_report_owned_fingerprint": None,
         "completion_verified_report_modified_at": None,
         "completion_verified_report_fingerprint": None,
+        "completion_verified_report_run_id": None,
         "completion_accepted_at_limit_report_modified_at": None,
         "completion_accepted_at_limit_report_fingerprint": None,
+        "completion_accepted_at_limit_report_run_id": None,
         "completion_cited_baseline_fingerprints": {},
         "completion_exhausted_run_id": None,
         "completion_exhausted_incomplete_todo_count": 0,
@@ -1814,16 +1851,85 @@ class _OwnedCitationReportGuard(completion_guard.CompletionGuardMiddleware):
         )
         report = create_file_data(content)
         generation = update["completion_request_generation"]
+        fingerprint = _fingerprint(report)
         return {
             **update,
             "files": {"/final_report.md": report},
             "todos": [{"content": "Research", "status": "completed"}],
             "completion_plan_owner_generation": generation,
             "completion_report_owned": True,
-            "completion_report_owned_fingerprint": _fingerprint(report),
+            "completion_report_owned_fingerprint": fingerprint,
+            "completion_verified_report_fingerprint": fingerprint,
+            "completion_verified_report_run_id": generation,
+            "completion_accepted_at_limit_report_fingerprint": fingerprint,
+            "completion_accepted_at_limit_report_run_id": generation,
+            "citation_accepted_report_fingerprint": "legacy-citation-acceptance",
             "strict_web_citations": True,
             "effective_no_web": False,
         }
+
+
+class _CitationPersistenceError(RuntimeError):
+    """Sentinel saver error used to prove citation failures cannot mask it."""
+
+
+class _CitationProbeSaver(InMemorySaver):
+    """Observe exact durable reads and fail selected persistence operations."""
+
+    def __init__(self, fail_operation: str | None = None) -> None:
+        super().__init__()
+        self.fail_operation = fail_operation
+        self.confirmed_failure_reads = 0
+        self.exact_read_observations: list[tuple[object, object, tuple[str, ...]]] = []
+
+    @staticmethod
+    def _failure_values(checkpoint: Any) -> bool:
+        if not isinstance(checkpoint, dict):
+            return False
+        values = checkpoint.get("channel_values")
+        return isinstance(values, dict) and bool(
+            values.get("citation_failure_run_id")
+        )
+
+    def get_tuple(self, config):  # noqa: ANN001
+        result = super().get_tuple(config)
+        configurable = config.get("configurable", {})
+        is_exact_read = bool(configurable.get("checkpoint_id"))
+        if is_exact_read:
+            values = (
+                result.checkpoint.get("channel_values", {})
+                if result is not None
+                else {}
+            )
+            self.exact_read_observations.append(
+                (
+                    configurable.get("checkpoint_ns"),
+                    configurable.get("checkpoint_id"),
+                    tuple(sorted(values)),
+                )
+            )
+        if (
+            is_exact_read
+            and result is not None
+            and self._failure_values(result.checkpoint)
+        ):
+            self.confirmed_failure_reads += 1
+            if self.fail_operation == "get":
+                raise _CitationPersistenceError("checkpoint get failed")
+        return result
+
+    def put(self, config, checkpoint, metadata, new_versions):  # noqa: ANN001
+        if self.fail_operation == "put" and self._failure_values(checkpoint):
+            raise _CitationPersistenceError("checkpoint put failed")
+        return super().put(config, checkpoint, metadata, new_versions)
+
+    def put_writes(self, config, writes, task_id, task_path=""):  # noqa: ANN001
+        if self.fail_operation == "put_writes" and any(
+            channel == "citation_failure_run_id" and value
+            for channel, value in writes
+        ):
+            raise _CitationPersistenceError("checkpoint put_writes failed")
+        return super().put_writes(config, writes, task_id, task_path)
 
 
 def _compiled_graph(
@@ -1926,13 +2032,14 @@ def test_compiled_strict_citation_failure_checkpoints_before_raise_and_recovers(
     monkeypatch.setattr(agent_module, "MAX_VERIFICATION_ROUNDS", 0)
     monkeypatch.setattr(agent_module, "ENABLE_EVAL_TRACKING", False)
     guard = _OwnedCitationReportGuard()
+    saver = _CitationProbeSaver()
     graph = create_agent(
         FakeListChatModel(
             responses=["First invalid", "Still invalid", "Corrected terminal"]
         ),
         tools=[],
         middleware=[guard, agent_module.ResearchStateMiddleware()],
-        checkpointer=InMemorySaver(),
+        checkpointer=saver,
     )
     thread_id = f"citation-failure-{async_}"
     first_run = uuid4()
@@ -1945,6 +2052,7 @@ def test_compiled_strict_citation_failure_checkpoints_before_raise_and_recovers(
         _invoke_compiled(graph, first_config, async_=async_)
 
     assert "Invalid report" not in str(caught.value)
+    assert saver.confirmed_failure_reads >= 1, saver.exact_read_observations
     snapshot = graph.get_state(first_config).values
     failed_report = snapshot["files"]["/final_report.md"]
     failed_fingerprint = _fingerprint(failed_report)
@@ -1956,7 +2064,9 @@ def test_compiled_strict_citation_failure_checkpoints_before_raise_and_recovers(
     assert snapshot["citation_corrections_used"] == 1
     assert snapshot["citation_accepted_report_fingerprint"] is None
     assert snapshot["completion_verified_report_fingerprint"] is None
+    assert snapshot["completion_verified_report_run_id"] is None
     assert snapshot["completion_accepted_at_limit_report_fingerprint"] is None
+    assert snapshot["completion_accepted_at_limit_report_run_id"] is None
     assert snapshot["_streamed_files"] == []
     assert snapshot["_eval_logged"] is False
     assert all(
@@ -1983,6 +2093,67 @@ def test_compiled_strict_citation_failure_checkpoints_before_raise_and_recovers(
         "**Final Report:**\n\nCorrected report" in str(message.content)
         for message in corrected["messages"]
     )
+
+
+@pytest.mark.parametrize("async_", [False, True])
+@pytest.mark.parametrize("fail_operation", ["put_writes", "put", "get"])
+def test_compiled_strict_citation_failure_never_masks_saver_error(
+    monkeypatch: pytest.MonkeyPatch,
+    async_: bool,
+    fail_operation: str,
+) -> None:
+    import research_agent.agent as agent_module
+
+    monkeypatch.setattr(agent_module, "ENABLE_VERIFICATION", False)
+    monkeypatch.setattr(agent_module, "MAX_VERIFICATION_ROUNDS", 0)
+    monkeypatch.setattr(agent_module, "ENABLE_EVAL_TRACKING", False)
+    saver = _CitationProbeSaver(fail_operation)
+    graph = create_agent(
+        FakeListChatModel(responses=["First invalid", "Still invalid"]),
+        tools=[],
+        middleware=[
+            _OwnedCitationReportGuard(),
+            agent_module.ResearchStateMiddleware(),
+        ],
+        checkpointer=saver,
+    )
+    run_id = uuid4()
+    config = {
+        "run_id": run_id,
+        "configurable": {
+            "thread_id": f"citation-saver-{fail_operation}-{async_}",
+        },
+    }
+
+    with pytest.raises(_CitationPersistenceError) as caught:
+        _invoke_compiled(graph, config, async_=async_)
+
+    assert not isinstance(caught.value, citation_failure.ReportCitationError)
+    saver.fail_operation = None
+    restored_tuple = saver.get_tuple(config)
+    assert restored_tuple is not None
+    restored = restored_tuple.checkpoint["channel_values"]
+    failed_fingerprint = restored.get("completion_report_owned_fingerprint")
+    if fail_operation in {"get", "put_writes"}:
+        assert citation_failure.citation_failure_is_current(
+            restored,
+            run_id=str(run_id),
+            report_fingerprint=failed_fingerprint,
+        )
+    else:
+        assert not citation_failure.citation_failure_is_current(
+            restored,
+            run_id=str(run_id),
+            report_fingerprint=failed_fingerprint,
+        )
+    if fail_operation == "put_writes":
+        assert restored_tuple.parent_config is not None
+        parent_tuple = saver.get_tuple(restored_tuple.parent_config)
+        assert parent_tuple is not None
+        assert not any(
+            channel == "citation_failure_run_id" and value == str(run_id)
+            for _task_id, channel, value in parent_tuple.pending_writes
+        )
 
 
 class _DeterministicToolModel(FakeMessagesListChatModel):

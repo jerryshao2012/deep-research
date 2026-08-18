@@ -65,10 +65,16 @@ class CompletionState(FilesystemState, PlanningState):
     completion_verified_report_fingerprint: Annotated[
         NotRequired[str | None], OmitFromInput
     ]
+    completion_verified_report_run_id: Annotated[
+        NotRequired[str | None], OmitFromInput
+    ]
     completion_accepted_at_limit_report_modified_at: Annotated[
         NotRequired[str | None], OmitFromInput
     ]
     completion_accepted_at_limit_report_fingerprint: Annotated[
+        NotRequired[str | None], OmitFromInput
+    ]
+    completion_accepted_at_limit_report_run_id: Annotated[
         NotRequired[str | None], OmitFromInput
     ]
     completion_cited_baseline_fingerprints: Annotated[
@@ -181,8 +187,10 @@ class CompletionGuardMiddleware(AgentMiddleware):
             "completion_report_owned_fingerprint": None,
             "completion_verified_report_modified_at": None,
             "completion_verified_report_fingerprint": None,
+            "completion_verified_report_run_id": None,
             "completion_accepted_at_limit_report_modified_at": None,
             "completion_accepted_at_limit_report_fingerprint": None,
+            "completion_accepted_at_limit_report_run_id": None,
             "citation_accepted_report_fingerprint": None,
             "citation_corrections_used": 0,
             "completion_cited_baseline_fingerprints": (

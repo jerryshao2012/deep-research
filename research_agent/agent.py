@@ -46,9 +46,11 @@ from langgraph.config import get_config
 
 from research_agent.citation_failure import (
     CITATION_FAILURE_CLEAR_UPDATE,
+    STRUCTURAL_CITATION_REJECTION_CLEAR_UPDATE,
     ReportCitationError,
     build_citation_failure_update,
     citation_acceptance_ready,
+    citation_failure_is_current,
     raise_current_citation_failure,
     resolve_citation_run_id,
 )
@@ -117,9 +119,21 @@ from research_agent.research_subagent.utils.verification import (
 )
 
 try:
-    from langgraph._internal._constants import CONFIG_KEY_RESUMING
+    from langgraph._internal._constants import (
+        CONFIG_KEY_CHECKPOINT_ID,
+        CONFIG_KEY_CHECKPOINT_MAP,
+        CONFIG_KEY_CHECKPOINT_NS,
+        CONFIG_KEY_CHECKPOINTER,
+        CONFIG_KEY_RESUMING,
+        NS_SEP,
+    )
 except ImportError:  # pragma: no cover - compatibility with older LangGraph.
+    CONFIG_KEY_CHECKPOINT_ID = "checkpoint_id"
+    CONFIG_KEY_CHECKPOINT_MAP = "checkpoint_map"
+    CONFIG_KEY_CHECKPOINT_NS = "checkpoint_ns"
+    CONFIG_KEY_CHECKPOINTER = "__pregel_checkpointer"
     CONFIG_KEY_RESUMING = "__pregel_resuming"
+    NS_SEP = "|"
 
 WEB_MODE_HAS_NEW_HUMAN_INPUT = "web_mode_has_new_human_input"
 
@@ -145,6 +159,8 @@ EVAL_HISTORY_FILE = os.environ.get(
 EVAL_LOG_QUESTIONS = str2bool(os.environ.get("EVAL_LOG_QUESTIONS"), False)
 SYNC_EVAL_LOG_TIMEOUT_SECONDS = 2.0
 _SYNC_AWAIT_TIMEOUT = object()
+_CITATION_CHECKPOINT_READ_ATTEMPTS = 20
+_CITATION_CHECKPOINT_READ_DELAY_SECONDS = 0.01
 
 # Verification loop — post-generation quality review with iterative revision.
 # MAX_VERIFICATION_ROUNDS / ENABLE_VERIFICATION are defined in
@@ -247,6 +263,7 @@ def _apply_structural_citation_policy(
 
     used = _citation_corrections_used(state)
     limit = _citation_correction_limit()
+    updates.update(STRUCTURAL_CITATION_REJECTION_CLEAR_UPDATE)
     if used < limit:
         correction = used + 1
         updates.update(CITATION_FAILURE_CLEAR_UPDATE)
@@ -414,6 +431,158 @@ def _current_report_fingerprint(state: Mapping[str, Any]) -> str | None:
     if not isinstance(files, Mapping):
         return None
     return artifact_fingerprint(files.get("/final_report.md"))
+
+
+def _execution_info_value(runtime: object, key: str) -> object:
+    execution_info = getattr(runtime, "execution_info", None)
+    if isinstance(execution_info, Mapping):
+        return execution_info.get(key)
+    return getattr(execution_info, key, None)
+
+
+def _citation_checkpoint_reader(
+    config: Mapping[str, Any],
+    runtime: object,
+) -> tuple[object, dict[str, Any]] | None:
+    """Return saver and exact parent-checkpoint config for current hook task."""
+    configurable = config.get("configurable")
+    if not isinstance(configurable, Mapping):
+        return None
+    checkpointer = configurable.get(CONFIG_KEY_CHECKPOINTER)
+    if checkpointer is None:
+        return None
+
+    checkpoint_id = _execution_info_value(runtime, "checkpoint_id")
+    task_checkpoint_ns = _execution_info_value(runtime, "checkpoint_ns")
+    if not isinstance(checkpoint_id, str) or not checkpoint_id:
+        checkpoint_id = configurable.get(CONFIG_KEY_CHECKPOINT_ID)
+    if not isinstance(task_checkpoint_ns, str):
+        task_checkpoint_ns = configurable.get(CONFIG_KEY_CHECKPOINT_NS)
+    if not isinstance(checkpoint_id, str) or not checkpoint_id:
+        return None
+    if not isinstance(task_checkpoint_ns, str):
+        return None
+
+    parent_checkpoint_ns = (
+        task_checkpoint_ns.rsplit(NS_SEP, 1)[0]
+        if NS_SEP in task_checkpoint_ns
+        else ""
+    )
+    checkpoint_map = configurable.get(CONFIG_KEY_CHECKPOINT_MAP)
+    if not isinstance(checkpoint_map, Mapping):
+        return None
+    if checkpoint_map.get(parent_checkpoint_ns) != checkpoint_id:
+        return None
+
+    read_config = {
+        **config,
+        "configurable": {
+            **configurable,
+            CONFIG_KEY_CHECKPOINT_ID: checkpoint_id,
+            CONFIG_KEY_CHECKPOINT_NS: parent_checkpoint_ns,
+        },
+    }
+    return checkpointer, read_config
+
+
+def _checkpoint_channel_values(checkpoint_tuple: object) -> Mapping[str, Any] | None:
+    checkpoint = getattr(checkpoint_tuple, "checkpoint", None)
+    if not isinstance(checkpoint, Mapping):
+        return None
+    values = checkpoint.get("channel_values")
+    return values if isinstance(values, Mapping) else None
+
+
+def _checkpoint_has_matching_failure_writes(
+    checkpoint_tuple: object,
+    durable_state: Mapping[str, Any],
+) -> bool:
+    """Confirm one prior task durably wrote all terminal failure metadata."""
+    pending_writes = getattr(checkpoint_tuple, "pending_writes", None)
+    if not isinstance(pending_writes, (list, tuple)):
+        return False
+    expected = {
+        "citation_failure_run_id": durable_state.get("citation_failure_run_id"),
+        "citation_failure_report_fingerprint": durable_state.get(
+            "citation_failure_report_fingerprint"
+        ),
+        "citation_failure_defects": durable_state.get("citation_failure_defects"),
+    }
+    if any(value in (None, [], "") for value in expected.values()):
+        return False
+    writes_by_task: dict[str, dict[str, Any]] = {}
+    for pending_write in pending_writes:
+        if not isinstance(pending_write, (list, tuple)) or len(pending_write) != 3:
+            continue
+        task_id, channel, value = pending_write
+        if not isinstance(task_id, str) or channel not in expected:
+            continue
+        writes_by_task.setdefault(task_id, {})[channel] = value
+    return any(
+        all(task_writes.get(channel) == value for channel, value in expected.items())
+        for task_writes in writes_by_task.values()
+    )
+
+
+def _checkpoint_parent_config(checkpoint_tuple: object) -> Mapping[str, Any] | None:
+    parent_config = getattr(checkpoint_tuple, "parent_config", None)
+    return parent_config if isinstance(parent_config, Mapping) else None
+
+
+def _read_durable_citation_state(
+    config: Mapping[str, Any],
+    runtime: object,
+) -> Mapping[str, Any] | None:
+    reader = _citation_checkpoint_reader(config, runtime)
+    if reader is None:
+        return None
+    checkpointer, read_config = reader
+    get_tuple = getattr(checkpointer, "get_tuple", None)
+    if not callable(get_tuple):
+        return None
+    for attempt in range(_CITATION_CHECKPOINT_READ_ATTEMPTS):
+        checkpoint_tuple = get_tuple(read_config)
+        if checkpoint_tuple is not None:
+            durable_state = _checkpoint_channel_values(checkpoint_tuple)
+            parent_config = _checkpoint_parent_config(checkpoint_tuple)
+            if durable_state is not None and parent_config is not None:
+                parent_tuple = get_tuple(parent_config)
+                if parent_tuple is not None and _checkpoint_has_matching_failure_writes(
+                    parent_tuple,
+                    durable_state,
+                ):
+                    return durable_state
+        if attempt + 1 < _CITATION_CHECKPOINT_READ_ATTEMPTS:
+            time.sleep(_CITATION_CHECKPOINT_READ_DELAY_SECONDS)
+    return None
+
+
+async def _aread_durable_citation_state(
+    config: Mapping[str, Any],
+    runtime: object,
+) -> Mapping[str, Any] | None:
+    reader = _citation_checkpoint_reader(config, runtime)
+    if reader is None:
+        return None
+    checkpointer, read_config = reader
+    aget_tuple = getattr(checkpointer, "aget_tuple", None)
+    if not callable(aget_tuple):
+        return None
+    for attempt in range(_CITATION_CHECKPOINT_READ_ATTEMPTS):
+        checkpoint_tuple = await aget_tuple(read_config)
+        if checkpoint_tuple is not None:
+            durable_state = _checkpoint_channel_values(checkpoint_tuple)
+            parent_config = _checkpoint_parent_config(checkpoint_tuple)
+            if durable_state is not None and parent_config is not None:
+                parent_tuple = await aget_tuple(parent_config)
+                if parent_tuple is not None and _checkpoint_has_matching_failure_writes(
+                    parent_tuple,
+                    durable_state,
+                ):
+                    return durable_state
+        if attempt + 1 < _CITATION_CHECKPOINT_READ_ATTEMPTS:
+            await asyncio.sleep(_CITATION_CHECKPOINT_READ_DELAY_SECONDS)
+    return None
 
 
 def _verification_round(state: Mapping[str, Any]) -> int:
@@ -1494,19 +1663,40 @@ class ResearchStateMiddleware(AgentMiddleware):
         state: ResearchState,
         runtime: Any,
     ) -> dict[str, Any] | None:
-        """Raise strict citation failure only after its update is checkpointed."""
+        """Raise only after saver confirms current failure checkpoint."""
+        config = self._config()
         fingerprint = _current_report_fingerprint(state)
         fallback_run_id = state.get("completion_current_run_id") or state.get(
             "completion_request_generation"
         )
-        raise_current_citation_failure(
+        run_id = resolve_citation_run_id(
+            config,
+            runtime,
+            fallback=fallback_run_id,
+        )
+        if not citation_failure_is_current(
             state,
-            run_id=resolve_citation_run_id(
-                self._config(),
-                runtime,
-                fallback=fallback_run_id,
-            ),
+            run_id=run_id,
             report_fingerprint=fingerprint,
+        ):
+            return None
+        durable_state = _read_durable_citation_state(config, runtime)
+        if durable_state is None:
+            return None
+        durable_fingerprint = durable_state.get(
+            "completion_report_owned_fingerprint"
+        )
+        durable_fallback_run_id = durable_state.get(
+            "completion_current_run_id"
+        ) or durable_state.get("completion_request_generation")
+        raise_current_citation_failure(
+            durable_state,
+            run_id=resolve_citation_run_id(
+                config,
+                runtime,
+                fallback=durable_fallback_run_id,
+            ),
+            report_fingerprint=durable_fingerprint,
         )
         return None
 
@@ -1515,8 +1705,42 @@ class ResearchStateMiddleware(AgentMiddleware):
         state: ResearchState,
         runtime: Any,
     ) -> dict[str, Any] | None:
-        """Async equivalent of checkpoint-aware strict citation failure."""
-        return self.after_agent(state, runtime)
+        """Raise only after async saver confirms current failure checkpoint."""
+        config = self._config()
+        fingerprint = _current_report_fingerprint(state)
+        fallback_run_id = state.get("completion_current_run_id") or state.get(
+            "completion_request_generation"
+        )
+        run_id = resolve_citation_run_id(
+            config,
+            runtime,
+            fallback=fallback_run_id,
+        )
+        if not citation_failure_is_current(
+            state,
+            run_id=run_id,
+            report_fingerprint=fingerprint,
+        ):
+            return None
+        durable_state = await _aread_durable_citation_state(config, runtime)
+        if durable_state is None:
+            return None
+        durable_fingerprint = durable_state.get(
+            "completion_report_owned_fingerprint"
+        )
+        durable_fallback_run_id = durable_state.get(
+            "completion_current_run_id"
+        ) or durable_state.get("completion_request_generation")
+        raise_current_citation_failure(
+            durable_state,
+            run_id=resolve_citation_run_id(
+                config,
+                runtime,
+                fallback=durable_fallback_run_id,
+            ),
+            report_fingerprint=durable_fingerprint,
+        )
+        return None
 
     def _extract_parameters_from_user_input(
             self, state: ResearchState, messages: list

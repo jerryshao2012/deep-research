@@ -201,7 +201,7 @@ def generate_research_title(research_content, *, config):
         citation_error = _find_report_citation_error(error)
         if citation_error is not None:
             _cancel_configured_model_scope(config)
-            raise citation_error from None
+            raise
         if _contains_model_control_error(error):
             _cancel_configured_model_scope(config)
             raise
@@ -611,7 +611,7 @@ def main():
             citation_error = _find_report_citation_error(error)
             if citation_error is not None:
                 cancel_model_call_scope(model_call_scope_id)
-                raise citation_error from None
+                raise
             if _contains_model_control_error(error):
                 cancel_model_call_scope(model_call_scope_id)
                 raise
@@ -648,7 +648,7 @@ def main():
                 citation_error = _find_report_citation_error(error)
                 if citation_error is not None:
                     cancel_model_call_scope(model_call_scope_id)
-                    raise citation_error from None
+                    raise
                 if _contains_model_control_error(error):
                     cancel_model_call_scope(model_call_scope_id)
                 raise
@@ -668,7 +668,7 @@ def main():
             citation_error = _find_report_citation_error(error)
             if citation_error is not None:
                 cancel_model_call_scope(model_call_scope_id)
-                raise citation_error from None
+                raise
             if _contains_model_control_error(error):
                 cancel_model_call_scope(model_call_scope_id)
             raise
@@ -689,7 +689,7 @@ def main():
             citation_error = _find_report_citation_error(error)
             if citation_error is not None:
                 cancel_model_call_scope(model_call_scope_id)
-                raise citation_error from None
+                raise
             if _contains_model_control_error(error):
                 cancel_model_call_scope(model_call_scope_id)
             raise

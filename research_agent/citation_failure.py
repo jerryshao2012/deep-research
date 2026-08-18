@@ -33,6 +33,15 @@ CITATION_FAILURE_CLEAR_UPDATE: dict[str, Any] = {
     "citation_failure_report_fingerprint": None,
     "citation_failure_defects": [],
 }
+STRUCTURAL_CITATION_REJECTION_CLEAR_UPDATE: dict[str, Any] = {
+    "completion_verified_report_modified_at": None,
+    "completion_verified_report_fingerprint": None,
+    "completion_verified_report_run_id": None,
+    "completion_accepted_at_limit_report_modified_at": None,
+    "completion_accepted_at_limit_report_fingerprint": None,
+    "completion_accepted_at_limit_report_run_id": None,
+    "citation_accepted_report_fingerprint": None,
+}
 
 
 @dataclass(frozen=True, order=True, slots=True)
@@ -88,10 +97,12 @@ def build_citation_failure_update(
     metadata = {**terminal.response_metadata, "resume_intermediate": True}
     tagged = terminal.model_copy(update={"response_metadata": metadata})
     return {
+        **STRUCTURAL_CITATION_REJECTION_CLEAR_UPDATE,
         "messages": [tagged],
         "citation_failure_run_id": run_id,
         "citation_failure_report_fingerprint": report_fingerprint,
         "citation_failure_defects": serialized,
+        "completion_report_owned_fingerprint": report_fingerprint,
         "jump_to": "end",
     }
 
