@@ -18,6 +18,7 @@ from pydantic import PrivateAttr
 
 from research_agent import agent as agent_module
 from research_agent import cli as research_agent_cli
+from research_agent.citation_failure import ReportCitationError
 from research_agent.model_call_guard import (
     ModelCallPolicy,
     ModelCallTimeoutError,
@@ -518,6 +519,120 @@ def test_cli_timeout_during_nonverbose_invoke_cancels_scope_without_retry(
     assert raised.value is error
     assert fake_agent.invoke_calls == 1
     assert cancelled_scopes == [fake_agent.last_config["configurable"]["model_call_scope_id"]]
+
+
+@pytest.mark.parametrize("verbose", [False, True])
+@pytest.mark.parametrize("nested", [False, True])
+def test_cli_citation_failure_is_terminal_without_fallback_or_save(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    verbose: bool,
+    nested: bool,
+) -> None:
+    citation_error = ReportCitationError(
+        [{"code": "missing_url", "detail": "web"}]
+    )
+    error: BaseException = (
+        ExceptionGroup(
+            "outer",
+            [RuntimeError("secret report prose do-not-echo"), citation_error],
+        )
+        if nested
+        else citation_error
+    )
+
+    class CitationFailureAgent(FakeAgent):
+        def invoke(self, messages, config=None):  # noqa: ANN001
+            self.invoke_calls += 1
+            self.last_config = config
+            raise error
+
+        def stream(self, messages, config=None, stream_mode="values"):  # noqa: ANN001
+            self.stream_calls += 1
+            self.last_config = config
+            raise error
+            yield  # pragma: no cover
+
+    fake_agent = CitationFailureAgent()
+    cancelled_scopes = _configure_timeout_cli(
+        monkeypatch,
+        tmp_path,
+        fake_agent,
+        argv=["topic", "--verbose", str(verbose)],
+    )
+
+    with pytest.raises(ReportCitationError) as raised:
+        research_agent_cli.main()
+
+    assert raised.value is citation_error
+    assert fake_agent.stream_calls == (1 if verbose else 0)
+    assert fake_agent.invoke_calls == (0 if verbose else 1)
+    assert len(cancelled_scopes) == 1
+    assert list(tmp_path.glob("*.md")) == []
+    assert "secret" not in str(raised.value)
+    assert "do-not-echo" not in str(raised.value)
+    if verbose:
+        assert all(spinner.stops >= 1 for spinner in _RecordingSpinner.instances)
+
+
+def test_cli_citation_failure_during_finalization_stops_without_save(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    citation_error = ReportCitationError()
+
+    class FinalizationFailureAgent(FakeAgent):
+        def invoke(self, messages, config=None):  # noqa: ANN001
+            self.invoke_calls += 1
+            self.last_config = config
+            if self.invoke_calls == 1:
+                return {
+                    "messages": [AIMessage(content="Partial")],
+                    "todos": [{"content": "Research", "status": "pending"}],
+                }
+            raise citation_error
+
+    fake_agent = FinalizationFailureAgent()
+    cancelled_scopes = _configure_timeout_cli(
+        monkeypatch,
+        tmp_path,
+        fake_agent,
+        argv=["topic", "--verbose", "False"],
+    )
+
+    with pytest.raises(ReportCitationError) as raised:
+        research_agent_cli.main()
+
+    assert raised.value is citation_error
+    assert fake_agent.invoke_calls == 2
+    assert len(cancelled_scopes) == 1
+    assert list(tmp_path.glob("*.md")) == []
+
+
+def test_title_citation_failure_cancels_scope_without_default() -> None:
+    citation_error = ReportCitationError()
+    cancelled_scopes: list[str] = []
+
+    class CitationTitleModel:
+        def invoke(self, messages, config=None):  # noqa: ANN001
+            raise citation_error
+
+    original_model = research_agent_cli.model
+    original_cancel = research_agent_cli.cancel_model_call_scope
+    try:
+        research_agent_cli.model = CitationTitleModel()
+        research_agent_cli.cancel_model_call_scope = cancelled_scopes.append
+        with pytest.raises(ReportCitationError) as raised:
+            research_agent_cli.generate_research_title(
+                "content",
+                config={"configurable": {"model_call_scope_id": "citation-scope"}},
+            )
+    finally:
+        research_agent_cli.model = original_model
+        research_agent_cli.cancel_model_call_scope = original_cancel
+
+    assert raised.value is citation_error
+    assert cancelled_scopes == ["citation-scope"]
 
 
 @pytest.mark.parametrize(

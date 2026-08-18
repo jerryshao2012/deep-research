@@ -56,6 +56,20 @@ def test_build_verification_todo_reflects_terminal_state(
     }
 
 
+def test_citation_correction_progress_is_not_labeled_verified() -> None:
+    todo = agent_module._build_citation_correction_todo(
+        correction=1,
+        limit=1,
+    )
+
+    assert todo == {
+        "id": "verification_pass",
+        "content": "Citation correction 1/1 requested",
+        "status": "in_progress",
+    }
+    assert "Verified" not in todo["content"]
+
+
 @pytest.mark.parametrize("middleware_path", ["sync", "async"])
 @pytest.mark.parametrize(
     ("verdict_status", "verification_round", "expected_status", "expected_content"),
@@ -69,7 +83,9 @@ def test_middleware_paths_publish_verification_progress_policy(
     expected_status: str,
     expected_content: str,
 ) -> None:
-    async def fake_verify_report(*, question: str, report: str) -> VerificationVerdict:
+    async def fake_verify_report(
+        *, question: str, report: str, **_kwargs: Any
+    ) -> VerificationVerdict:
         assert question == "What is graph engineering?"
         assert report == "Final report"
         return VerificationVerdict(
@@ -125,7 +141,9 @@ def test_second_verification_round_excludes_only_internal_verification_todo(
 ) -> None:
     calls = 0
 
-    async def fake_verify_report(*, question: str, report: str) -> VerificationVerdict:
+    async def fake_verify_report(
+        *, question: str, report: str, **_kwargs: Any
+    ) -> VerificationVerdict:
         nonlocal calls
         calls += 1
         return VerificationVerdict(status="complete", sufficiency_score=1.0)

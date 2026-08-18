@@ -9,6 +9,7 @@ from uuid import UUID, uuid4
 
 import pytest
 from deepagents import create_deep_agent
+from deepagents.backends.utils import create_file_data
 from langchain.agents import create_agent
 from langchain.agents.middleware import AgentMiddleware, TodoListMiddleware, hook_config
 from langchain.agents.middleware.types import ModelRequest
@@ -26,6 +27,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph_api.serde import default as serialize_default
 
 import research_agent.completion_guard as completion_guard
+from research_agent import citation_failure
 from research_agent.completion_guard import (
     CompletionInspection,
     get_max_completion_attempts,
@@ -84,6 +86,7 @@ def test_compiled_guard_schema_hides_and_drops_forged_completion_controls() -> N
     input_properties = graph.get_input_jsonschema()["properties"]
 
     assert not any(name.startswith("completion_") for name in input_properties)
+    assert not any(name.startswith("citation_") for name in input_properties)
     assert "_eval_pending" not in input_properties
 
     forged = graph.get_input_schema().model_validate(
@@ -92,6 +95,9 @@ def test_compiled_guard_schema_hides_and_drops_forged_completion_controls() -> N
             "completion_request_generation": "forged-generation",
             "completion_plan_owner_generation": "forged-generation",
             "completion_report_owned": True,
+            "citation_failure_run_id": "forged-run",
+            "citation_accepted_report_fingerprint": "forged-report",
+            "citation_corrections_used": 99,
             "_eval_pending": True,
         }
     )
@@ -140,6 +146,151 @@ def _fingerprint(file_data: object) -> str:
     value = fingerprint(file_data)
     assert isinstance(value, str)
     return value
+
+
+def test_citation_failure_helpers_fail_closed_without_leaking_report_data() -> None:
+    report = _file("Private claim https://secret.invalid/token=do-not-echo")
+    fingerprint = _fingerprint(report)
+    terminal = AIMessage(content="Private terminal report", id="terminal")
+    update = citation_failure.build_citation_failure_update(
+        run_id="run-current",
+        report_fingerprint=fingerprint,
+        defects=[
+            citation_failure.CitationFailureDefect(
+                code="missing_url",
+                detail="https://secret.invalid/token=do-not-echo",
+            ),
+            citation_failure.CitationFailureDefect(
+                code="unresolved_reference",
+                detail="source:7",
+            ),
+        ],
+        terminal=terminal,
+    )
+
+    assert update["jump_to"] == "end"
+    assert update["citation_failure_run_id"] == "run-current"
+    assert update["citation_failure_report_fingerprint"] == fingerprint
+    assert update["citation_failure_defects"] == [
+        {"code": "missing_url", "detail": "redacted"},
+        {"code": "unresolved_reference", "detail": "source:7"},
+    ]
+    assert update["messages"][0].response_metadata["resume_intermediate"] is True
+    assert "_streamed_files" not in update
+    assert "completion_verified_report_fingerprint" not in update
+    assert "completion_accepted_at_limit_report_fingerprint" not in update
+
+    state = {
+        **update,
+        "files": {"/final_report.md": report},
+        "completion_current_run_id": "run-current",
+    }
+    assert citation_failure.citation_failure_is_current(
+        state,
+        run_id="run-current",
+        report_fingerprint=fingerprint,
+    )
+    assert citation_failure.citation_failure_blocks_finalization(
+        state,
+        report_fingerprint=fingerprint,
+    )
+    assert not citation_failure.citation_acceptance_ready(
+        state,
+        report_fingerprint=fingerprint,
+        strict_required=True,
+    )
+
+    with pytest.raises(citation_failure.ReportCitationError) as caught:
+        citation_failure.raise_current_citation_failure(
+            state,
+            run_id="run-current",
+            report_fingerprint=fingerprint,
+        )
+    serialized = serialize_default(caught.value)
+    assert serialized["error"] == "ReportCitationError"
+    assert "secret.invalid" not in repr(serialized)
+    assert "do-not-echo" not in repr(serialized)
+    assert "Private" not in repr(serialized)
+
+
+@pytest.mark.parametrize(
+    "state_update",
+    [
+        {"citation_failure_run_id": "stale-run"},
+        {"citation_failure_report_fingerprint": "changed-report"},
+        {"citation_failure_defects": [{"code": "unknown", "detail": "web"}]},
+        {"citation_failure_defects": "malformed"},
+    ],
+)
+def test_stale_or_malformed_citation_failure_is_ignored_and_cleared(
+    state_update: dict[str, object],
+) -> None:
+    state = {
+        "citation_failure_run_id": "run-current",
+        "citation_failure_report_fingerprint": "report-current",
+        "citation_failure_defects": [
+            {"code": "missing_url", "detail": "web"}
+        ],
+        **state_update,
+    }
+
+    assert not citation_failure.citation_failure_is_current(
+        state,
+        run_id="run-current",
+        report_fingerprint="report-current",
+    )
+    assert citation_failure.clear_stale_citation_failure(
+        state,
+        run_id="run-current",
+        report_fingerprint="report-current",
+    ) == {
+        "citation_failure_run_id": None,
+        "citation_failure_report_fingerprint": None,
+        "citation_failure_defects": [],
+    }
+    assert citation_failure.raise_current_citation_failure(
+        state,
+        run_id="run-current",
+        report_fingerprint="report-current",
+    ) is None
+
+
+def test_citation_acceptance_requires_exact_fingerprint_only_in_strict_mode() -> None:
+    state = {"citation_accepted_report_fingerprint": "report-current"}
+
+    assert citation_failure.citation_acceptance_ready(
+        state,
+        report_fingerprint="report-current",
+        strict_required=True,
+    )
+    assert not citation_failure.citation_acceptance_ready(
+        state,
+        report_fingerprint="report-changed",
+        strict_required=True,
+    )
+    assert citation_failure.citation_acceptance_ready(
+        {},
+        report_fingerprint="report-current",
+        strict_required=False,
+    )
+
+
+def test_citation_run_id_resolution_prefers_runtime_then_config_then_state() -> None:
+    assert citation_failure.resolve_citation_run_id(
+        {"run_id": "configured"},
+        _runtime("actual"),
+        fallback="checkpoint",
+    ) == "actual"
+    assert citation_failure.resolve_citation_run_id(
+        {"run_id": "configured"},
+        _runtime(None),
+        fallback="checkpoint",
+    ) == "configured"
+    assert citation_failure.resolve_citation_run_id(
+        {},
+        _runtime(None),
+        fallback="checkpoint",
+    ) == "checkpoint"
 
 
 def _inspect(
@@ -329,6 +480,48 @@ def test_finalization_without_verification_still_requires_completion_readiness()
     assert readiness(state, verification_enabled=False) is False
 
 
+def test_strict_finalization_requires_current_structural_acceptance() -> None:
+    report = _file("Finished report", modified_at="report-v2")
+    fingerprint = _fingerprint(report)
+    state = {
+        "todos": [{"content": "Research", "status": "completed"}],
+        "files": {"/final_report.md": report},
+        "completion_current_run_id": "run-current",
+        "completion_request_generation": "generation-v1",
+        "completion_plan_owner_generation": "generation-v1",
+        "completion_report_owned": True,
+        "completion_report_baseline_modified_at": "prior-report",
+        "completion_report_owned_fingerprint": fingerprint,
+        "strict_web_citations": True,
+    }
+
+    assert not completion_guard.completion_ready_for_finalization(
+        state,
+        verification_enabled=False,
+    )
+
+    state["citation_accepted_report_fingerprint"] = fingerprint
+    assert completion_guard.completion_ready_for_finalization(
+        state,
+        verification_enabled=False,
+    )
+
+    state.update(
+        {
+            "citation_failure_run_id": "run-current",
+            "citation_failure_report_fingerprint": fingerprint,
+            "citation_failure_defects": [
+                {"code": "missing_url", "detail": "web"}
+            ],
+        }
+    )
+    assert not completion_guard.completion_ready_for_finalization(
+        state,
+        verification_enabled=False,
+    )
+    assert not completion_guard._inspect_state_completion(state).ready
+
+
 @pytest.mark.parametrize(
     "acceptance_prefix",
     ["completion_verified_report", "completion_accepted_at_limit_report"],
@@ -454,9 +647,42 @@ def test_ordinary_generation_snapshots_report_and_cited_artifact_fingerprints() 
     assert update["completion_report_owned_fingerprint"] is None
     assert update["completion_verified_report_fingerprint"] is None
     assert update["completion_accepted_at_limit_report_fingerprint"] is None
+    assert update["citation_failure_run_id"] is None
+    assert update["citation_failure_report_fingerprint"] is None
+    assert update["citation_failure_defects"] == []
+    assert update["citation_accepted_report_fingerprint"] is None
+    assert update["citation_corrections_used"] == 0
     assert update["completion_cited_baseline_fingerprints"] == {
         "/cited_response.md": _fingerprint(cited)
     }
+
+
+def test_new_resume_run_clears_failure_but_preserves_generation_correction_budget() -> None:
+    report = _file("Invalid report", modified_at="report-v1")
+    fingerprint = _fingerprint(report)
+    state = {
+        "messages": [],
+        "files": {"/final_report.md": report},
+        "completion_current_run_id": "prior-run",
+        "completion_request_generation": "generation-v1",
+        "citation_failure_run_id": "prior-run",
+        "citation_failure_report_fingerprint": fingerprint,
+        "citation_failure_defects": [{"code": "missing_url", "detail": "web"}],
+        "citation_accepted_report_fingerprint": "prior-report",
+        "citation_corrections_used": 2,
+    }
+
+    update = _middleware(run_id="new-run", resume=True).before_agent(
+        state,
+        runtime=None,
+    )
+
+    assert update is not None
+    assert update["citation_failure_run_id"] is None
+    assert update["citation_failure_report_fingerprint"] is None
+    assert update["citation_failure_defects"] == []
+    assert "citation_accepted_report_fingerprint" not in update
+    assert "citation_corrections_used" not in update
 
 
 def test_explicit_resume_preserves_generation_artifact_fingerprints() -> None:
@@ -559,6 +785,11 @@ def test_ordinary_generation_resets_request_scoped_completion_state(
         "completion_exhausted_incomplete_todo_count": 0,
         "completion_exhausted_malformed_todo_count": 0,
         "completion_exhausted_report_reason": None,
+        "citation_failure_run_id": None,
+        "citation_failure_report_fingerprint": None,
+        "citation_failure_defects": [],
+        "citation_accepted_report_fingerprint": None,
+        "citation_corrections_used": 0,
         "todos": [],
         "verification_round": 0,
         "verification_feedback": None,
@@ -1561,6 +1792,40 @@ class _OwnedPlanCompletionGuard(completion_guard.CompletionGuardMiddleware):
         }
 
 
+class _OwnedCitationReportGuard(completion_guard.CompletionGuardMiddleware):
+    """Seed invalid first-run report, then corrected next-run report."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.visible_runs = 0
+
+    def before_agent(
+        self,
+        state: completion_guard.CompletionState,
+        runtime: Any,
+    ) -> dict[str, Any] | None:
+        update = super().before_agent(state, runtime)
+        assert update is not None
+        self.visible_runs += 1
+        content = (
+            "Invalid report without citations"
+            if self.visible_runs == 1
+            else "Corrected report https://public.publisher.org/report"
+        )
+        report = create_file_data(content)
+        generation = update["completion_request_generation"]
+        return {
+            **update,
+            "files": {"/final_report.md": report},
+            "todos": [{"content": "Research", "status": "completed"}],
+            "completion_plan_owner_generation": generation,
+            "completion_report_owned": True,
+            "completion_report_owned_fingerprint": _fingerprint(report),
+            "strict_web_citations": True,
+            "effective_no_web": False,
+        }
+
+
 def _compiled_graph(
     *,
     responses: list[str],
@@ -1647,6 +1912,76 @@ def test_compiled_owned_plan_replaces_then_appends_and_checkpoints_exhaustion(
     assert all(
         message.response_metadata.get("resume_intermediate") is True
         for message in messages[1:]
+    )
+
+
+@pytest.mark.parametrize("async_", [False, True])
+def test_compiled_strict_citation_failure_checkpoints_before_raise_and_recovers(
+    monkeypatch: pytest.MonkeyPatch,
+    async_: bool,
+) -> None:
+    import research_agent.agent as agent_module
+
+    monkeypatch.setattr(agent_module, "ENABLE_VERIFICATION", False)
+    monkeypatch.setattr(agent_module, "MAX_VERIFICATION_ROUNDS", 0)
+    monkeypatch.setattr(agent_module, "ENABLE_EVAL_TRACKING", False)
+    guard = _OwnedCitationReportGuard()
+    graph = create_agent(
+        FakeListChatModel(
+            responses=["First invalid", "Still invalid", "Corrected terminal"]
+        ),
+        tools=[],
+        middleware=[guard, agent_module.ResearchStateMiddleware()],
+        checkpointer=InMemorySaver(),
+    )
+    thread_id = f"citation-failure-{async_}"
+    first_run = uuid4()
+    first_config = {
+        "run_id": first_run,
+        "configurable": {"thread_id": thread_id},
+    }
+
+    with pytest.raises(citation_failure.ReportCitationError) as caught:
+        _invoke_compiled(graph, first_config, async_=async_)
+
+    assert "Invalid report" not in str(caught.value)
+    snapshot = graph.get_state(first_config).values
+    failed_report = snapshot["files"]["/final_report.md"]
+    failed_fingerprint = _fingerprint(failed_report)
+    assert snapshot["citation_failure_run_id"] == str(first_run)
+    assert snapshot["citation_failure_report_fingerprint"] == failed_fingerprint
+    assert snapshot["citation_failure_defects"] == [
+        {"code": "missing_url", "detail": "web"}
+    ]
+    assert snapshot["citation_corrections_used"] == 1
+    assert snapshot["citation_accepted_report_fingerprint"] is None
+    assert snapshot["completion_verified_report_fingerprint"] is None
+    assert snapshot["completion_accepted_at_limit_report_fingerprint"] is None
+    assert snapshot["_streamed_files"] == []
+    assert snapshot["_eval_logged"] is False
+    assert all(
+        "**Final Report:**" not in str(message.content)
+        for message in snapshot["messages"]
+    )
+    assert snapshot["messages"][-1].response_metadata["resume_intermediate"] is True
+
+    second_run = uuid4()
+    second_config = {
+        "run_id": second_run,
+        "configurable": {"thread_id": thread_id},
+    }
+    corrected = _invoke_compiled(graph, second_config, async_=async_)
+    corrected_report = corrected["files"]["/final_report.md"]
+    corrected_fingerprint = _fingerprint(corrected_report)
+
+    assert corrected["citation_failure_run_id"] is None
+    assert corrected["citation_failure_report_fingerprint"] is None
+    assert corrected["citation_failure_defects"] == []
+    assert corrected["citation_accepted_report_fingerprint"] == corrected_fingerprint
+    assert corrected["citation_corrections_used"] == 0
+    assert any(
+        "**Final Report:**\n\nCorrected report" in str(message.content)
+        for message in corrected["messages"]
     )
 
 

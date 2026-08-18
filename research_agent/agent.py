@@ -44,6 +44,14 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.channels.ephemeral_value import EphemeralValue
 from langgraph.config import get_config
 
+from research_agent.citation_failure import (
+    CITATION_FAILURE_CLEAR_UPDATE,
+    ReportCitationError,
+    build_citation_failure_update,
+    citation_acceptance_ready,
+    raise_current_citation_failure,
+    resolve_citation_run_id,
+)
 from research_agent.cli_utils import get_ssl_verify_config, str2bool
 from research_agent.completion_guard import (
     CompletionGuardMiddleware,
@@ -87,6 +95,10 @@ from research_agent.research_subagent.tools import (
     tavily_search,
     think_tool,
     write_file,
+)
+from research_agent.research_subagent.utils.citation_policy import (
+    CitationDefect,
+    audit_web_citations,
 )
 from research_agent.research_subagent.utils.cli import (
     build_instruction,
@@ -141,7 +153,131 @@ _SYNC_AWAIT_TIMEOUT = object()
 
 def _verification_is_enabled() -> bool:
     """Return whether verification has at least one configured pass."""
-    return ENABLE_VERIFICATION and MAX_VERIFICATION_ROUNDS > 0
+    return ENABLE_VERIFICATION and _normalized_verification_round_limit() > 0
+
+
+def _normalized_verification_round_limit() -> int:
+    """Return optional judge rounds as a non-negative integer."""
+    if (
+        isinstance(MAX_VERIFICATION_ROUNDS, int)
+        and not isinstance(MAX_VERIFICATION_ROUNDS, bool)
+        and MAX_VERIFICATION_ROUNDS > 0
+    ):
+        return MAX_VERIFICATION_ROUNDS
+    return 0
+
+
+def _citation_correction_limit() -> int:
+    """Structural citation enforcement always permits at least one correction."""
+    configured = (
+        _normalized_verification_round_limit() if ENABLE_VERIFICATION else 0
+    )
+    return max(configured, 1)
+
+
+def _citation_corrections_used(state: Mapping[str, Any]) -> int:
+    value = state.get("citation_corrections_used")
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return 0
+
+
+def _build_citation_correction_todo(*, correction: int, limit: int) -> dict[str, str]:
+    """Build exact client-visible progress for a structural correction."""
+    return {
+        "id": "verification_pass",
+        "content": f"Citation correction {correction}/{limit} requested",
+        "status": "in_progress",
+    }
+
+
+def _format_citation_correction_feedback(
+    defects: tuple[CitationDefect, ...],
+) -> str:
+    """Build bounded correction guidance from fixed defect categories."""
+    verdict = VerificationVerdict(
+        status="needs_revision",
+        sufficiency_score=0.0,
+        sufficiency_reason="Citation structure must be corrected.",
+        citation_blocking=True,
+        citation_defects=defects,
+    )
+    return format_feedback(verdict)
+
+
+def _filtered_verification_todos(state: Mapping[str, Any]) -> list[Any]:
+    return [
+        todo
+        for todo in list(state.get("todos") or [])
+        if not (
+            isinstance(todo, Mapping)
+            and todo.get("id") == "verification_pass"
+        )
+    ]
+
+
+def _apply_structural_citation_policy(
+    *,
+    updates: dict[str, Any],
+    state: Mapping[str, Any],
+    terminal: AIMessage,
+    filtered_todos: list[Any],
+    report_text: str,
+    report_fingerprint: str,
+    run_id: str | None,
+) -> bool:
+    """Apply mandatory structural audit; return whether later checks may run."""
+    if state.get("strict_web_citations") is not True:
+        return True
+    if citation_acceptance_ready(
+        state,
+        report_fingerprint=report_fingerprint,
+        strict_required=True,
+    ):
+        return True
+
+    audit = audit_web_citations(report_text)
+    if not audit.defects:
+        updates.update(CITATION_FAILURE_CLEAR_UPDATE)
+        updates["citation_accepted_report_fingerprint"] = report_fingerprint
+        updates["citation_corrections_used"] = 0
+        if len(filtered_todos) != len(list(state.get("todos") or [])):
+            updates["todos"] = filtered_todos
+        return True
+
+    used = _citation_corrections_used(state)
+    limit = _citation_correction_limit()
+    if used < limit:
+        correction = used + 1
+        updates.update(CITATION_FAILURE_CLEAR_UPDATE)
+        updates["completion_report_owned_fingerprint"] = report_fingerprint
+        updates["citation_corrections_used"] = correction
+        updates["verification_feedback"] = _format_citation_correction_feedback(
+            audit.defects
+        )
+        updates["todos"] = filtered_todos + [
+            _build_citation_correction_todo(
+                correction=correction,
+                limit=limit,
+            )
+        ]
+        updates.setdefault("messages", [])
+        if isinstance(updates["messages"], list):
+            updates["messages"].append(_tag_verification_intermediate(terminal))
+        updates["jump_to"] = "model"
+        return False
+
+    if run_id is None:
+        return False
+    updates.update(
+        build_citation_failure_update(
+            run_id=run_id,
+            report_fingerprint=report_fingerprint,
+            defects=audit.defects,
+            terminal=terminal,
+        )
+    )
+    return False
 
 
 def _is_legacy_generated_system_message(message: object) -> bool:
@@ -262,9 +398,22 @@ def _owned_report_for_verification(
         and state.get("completion_accepted_at_limit_report_fingerprint")
         == fingerprint
     )
-    if already_verified or already_accepted_at_limit:
+    if (
+        already_verified or already_accepted_at_limit
+    ) and citation_acceptance_ready(
+        state,
+        report_fingerprint=fingerprint,
+        strict_required=state.get("strict_web_citations") is True,
+    ):
         return None
     return report_text, modified_at, fingerprint
+
+
+def _current_report_fingerprint(state: Mapping[str, Any]) -> str | None:
+    files = state.get("files")
+    if not isinstance(files, Mapping):
+        return None
+    return artifact_fingerprint(files.get("/final_report.md"))
 
 
 def _verification_round(state: Mapping[str, Any]) -> int:
@@ -726,6 +875,13 @@ class ResearchStateMiddleware(AgentMiddleware):
         super().__init__()
         self._config_getter = config_getter
 
+    def _config(self) -> Mapping[str, Any]:
+        try:
+            config = self._config_getter()
+        except RuntimeError:
+            return {}
+        return config if isinstance(config, Mapping) else {}
+
     def _is_resume_round(self, state: ResearchState) -> bool:
         try:
             config = self._config_getter()
@@ -963,40 +1119,50 @@ class ResearchStateMiddleware(AgentMiddleware):
         # configure_request so strict Ollama templates keep system-first order.
         owned_report = _owned_report_for_verification(state)
         if (
-                _verification_is_enabled()
-                and isinstance(last_msg, AIMessage)
-                and not last_tool_calls
-                and isinstance(state_files, dict)
-                and owned_report is not None
+            isinstance(last_msg, AIMessage)
+            and not last_tool_calls
+            and isinstance(state_files, dict)
+            and owned_report is not None
         ):
+            report_text, report_modified_at, report_fingerprint = owned_report
+            filtered_todos = _filtered_verification_todos(state)
+            fallback_run_id = state.get("completion_current_run_id") or state.get(
+                "completion_request_generation"
+            )
+            structural_accepted = _apply_structural_citation_policy(
+                updates=updates,
+                state=state,
+                terminal=last_msg,
+                filtered_todos=filtered_todos,
+                report_text=report_text,
+                report_fingerprint=report_fingerprint,
+                run_id=resolve_citation_run_id(
+                    self._config(),
+                    runtime,
+                    fallback=fallback_run_id,
+                ),
+            )
             verification_round = _verification_round(state)
-            if verification_round < MAX_VERIFICATION_ROUNDS:
-                report_text, report_modified_at, report_fingerprint = owned_report
+            if (
+                structural_accepted
+                and _verification_is_enabled()
+                and verification_round < _normalized_verification_round_limit()
+            ):
                 user_question = _verification_question(state, state_files)
 
                 logger.info(
                     "Verification round %d/%d — reviewing /final_report.md",
                     verification_round + 1,
-                    MAX_VERIFICATION_ROUNDS,
+                    _normalized_verification_round_limit(),
                 )
-
-                existing_todos = list(state.get("todos") or [])
-                filtered_todos = [
-                    todo
-                    for todo in existing_todos
-                    if not (
-                        isinstance(todo, Mapping)
-                        and todo.get("id") == "verification_pass"
-                    )
-                ]
 
                 try:
                     async def _verify():
                         return await verify_report(
                             question=user_question,
                             report=report_text,
-                            strict_web_citations=state.get(
-                                "strict_web_citations", True
+                            strict_web_citations=(
+                                state.get("strict_web_citations") is True
                             ),
                         )
 
@@ -1018,7 +1184,11 @@ class ResearchStateMiddleware(AgentMiddleware):
                         ),
                         len(verdict.adversarial_gaps),
                     )
-                except (ModelCallTimeoutError, asyncio.CancelledError):
+                except (
+                    ModelCallTimeoutError,
+                    ReportCitationError,
+                    asyncio.CancelledError,
+                ):
                     raise
                 except Exception as exc:
                     logger.warning(
@@ -1157,38 +1327,50 @@ class ResearchStateMiddleware(AgentMiddleware):
         # ── Post-generation verification hook ────────────────────────────
         owned_report = _owned_report_for_verification(state)
         if (
-                _verification_is_enabled()
-                and isinstance(last_msg, AIMessage)
-                and not last_tool_calls
-                and isinstance(state_files, dict)
-                and owned_report is not None
+            isinstance(last_msg, AIMessage)
+            and not last_tool_calls
+            and isinstance(state_files, dict)
+            and owned_report is not None
         ):
+            report_text, report_modified_at, report_fingerprint = owned_report
+            filtered_todos = _filtered_verification_todos(state)
+            fallback_run_id = state.get("completion_current_run_id") or state.get(
+                "completion_request_generation"
+            )
+            structural_accepted = _apply_structural_citation_policy(
+                updates=updates,
+                state=state,
+                terminal=last_msg,
+                filtered_todos=filtered_todos,
+                report_text=report_text,
+                report_fingerprint=report_fingerprint,
+                run_id=resolve_citation_run_id(
+                    self._config(),
+                    runtime,
+                    fallback=fallback_run_id,
+                ),
+            )
             verification_round = _verification_round(state)
-            if verification_round < MAX_VERIFICATION_ROUNDS:
-                report_text, report_modified_at, report_fingerprint = owned_report
+            if (
+                structural_accepted
+                and _verification_is_enabled()
+                and verification_round < _normalized_verification_round_limit()
+            ):
                 user_question = _verification_question(state, state_files)
 
                 logger.info(
                     "Verification round %d/%d — reviewing /final_report.md (async)",
                     verification_round + 1,
-                    MAX_VERIFICATION_ROUNDS,
+                    _normalized_verification_round_limit(),
                 )
-
-                existing_todos = list(state.get("todos") or [])
-                filtered_todos = [
-                    todo
-                    for todo in existing_todos
-                    if not (
-                        isinstance(todo, Mapping)
-                        and todo.get("id") == "verification_pass"
-                    )
-                ]
 
                 try:
                     verdict = await verify_report(
                         question=user_question,
                         report=report_text,
-                        strict_web_citations=state.get("strict_web_citations", True),
+                        strict_web_citations=(
+                            state.get("strict_web_citations") is True
+                        ),
                     )
                     logger.info(
                         "Verification verdict: %s (score=%.2f, "
@@ -1202,7 +1384,11 @@ class ResearchStateMiddleware(AgentMiddleware):
                         ),
                         len(verdict.adversarial_gaps),
                     )
-                except (ModelCallTimeoutError, asyncio.CancelledError):
+                except (
+                    ModelCallTimeoutError,
+                    ReportCitationError,
+                    asyncio.CancelledError,
+                ):
                     raise
                 except Exception as exc:
                     logger.warning(
@@ -1302,6 +1488,35 @@ class ResearchStateMiddleware(AgentMiddleware):
                         updates["_eval_logged"] = True
 
         return updates if updates else None
+
+    def after_agent(
+        self,
+        state: ResearchState,
+        runtime: Any,
+    ) -> dict[str, Any] | None:
+        """Raise strict citation failure only after its update is checkpointed."""
+        fingerprint = _current_report_fingerprint(state)
+        fallback_run_id = state.get("completion_current_run_id") or state.get(
+            "completion_request_generation"
+        )
+        raise_current_citation_failure(
+            state,
+            run_id=resolve_citation_run_id(
+                self._config(),
+                runtime,
+                fallback=fallback_run_id,
+            ),
+            report_fingerprint=fingerprint,
+        )
+        return None
+
+    async def aafter_agent(
+        self,
+        state: ResearchState,
+        runtime: Any,
+    ) -> dict[str, Any] | None:
+        """Async equivalent of checkpoint-aware strict citation failure."""
+        return self.after_agent(state, runtime)
 
     def _extract_parameters_from_user_input(
             self, state: ResearchState, messages: list

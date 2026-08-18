@@ -27,6 +27,14 @@ export OLLAMA_FORCE_UNLOAD_ON_CANCEL=true
 
 After changing either setting, restart the CLI or server and clear any model/runtime cache so newly created calls use updated policy.
 
+### Fail closed on unresolved web citations
+
+Web-enabled generations must pass deterministic citation-structure audit before `/final_report.md` can stream or operational metrics can be recorded. This gate remains active when `ENABLE_VERIFICATION=false`; that variable controls optional grounding and LLM judges, not structural citation acceptance. Effective no-web generations, including document-only runs that disable web search, are exempt.
+
+Structural failures request bounded report corrections. With optional verification disabled or `MAX_VERIFICATION_ROUNDS<=0`, one correction is requested and a second invalid check fails. With verification enabled and `MAX_VERIFICATION_ROUNDS=2`, two corrections are requested and a third invalid check fails. Structural failures are never accepted at the limit.
+
+Final failure checkpoints only run ID, report fingerprint, and bounded safe defect categories, then raises `ReportCitationError`. It does not stream report prose, record evaluation metrics, or expose source URLs in error text. Correct report and start an explicit new run; stale failure metadata is cleared before current report is audited again.
+
 Operational order matters:
 
 1. configure actual deployment quotas rather than account-wide guesses;

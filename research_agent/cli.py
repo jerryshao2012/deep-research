@@ -21,6 +21,7 @@ from dotenv import load_dotenv
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 
 from research_agent.agent import agent, model
+from research_agent.citation_failure import ReportCitationError
 from research_agent.cli_utils import format_messages, show_prompt, str2bool
 from research_agent.model_call_guard import (
     ModelCallTimeoutError,
@@ -140,12 +141,31 @@ def _contains_model_control_error(error: BaseException) -> bool:
     """Detect timeout/cancellation controls, including nested exception groups."""
     if isinstance(
         error,
-        (ModelCallTimeoutError, asyncio.CancelledError, KeyboardInterrupt),
+        (
+            ModelCallTimeoutError,
+            ReportCitationError,
+            asyncio.CancelledError,
+            KeyboardInterrupt,
+        ),
     ):
         return True
     if isinstance(error, BaseExceptionGroup):
         return any(_contains_model_control_error(item) for item in error.exceptions)
     return False
+
+
+def _find_report_citation_error(
+    error: BaseException,
+) -> ReportCitationError | None:
+    """Extract a safe citation control from nested exception groups."""
+    if isinstance(error, ReportCitationError):
+        return error
+    if isinstance(error, BaseExceptionGroup):
+        for item in error.exceptions:
+            found = _find_report_citation_error(item)
+            if found is not None:
+                return found
+    return None
 
 
 def _cancel_configured_model_scope(config) -> None:
@@ -178,6 +198,10 @@ def generate_research_title(research_content, *, config):
         title = title.strip('_')  # Remove leading/trailing underscores
         return title if title else "research-report"
     except BaseException as error:
+        citation_error = _find_report_citation_error(error)
+        if citation_error is not None:
+            _cancel_configured_model_scope(config)
+            raise citation_error from None
         if _contains_model_control_error(error):
             _cancel_configured_model_scope(config)
             raise
@@ -584,6 +608,10 @@ def main():
             print(f"\n✨ Research completed in {total_time:.1f}s!\n")
         except BaseException as error:
             spinner.stop()
+            citation_error = _find_report_citation_error(error)
+            if citation_error is not None:
+                cancel_model_call_scope(model_call_scope_id)
+                raise citation_error from None
             if _contains_model_control_error(error):
                 cancel_model_call_scope(model_call_scope_id)
                 raise
@@ -617,6 +645,10 @@ def main():
                 )
             except BaseException as error:
                 spinner.stop()
+                citation_error = _find_report_citation_error(error)
+                if citation_error is not None:
+                    cancel_model_call_scope(model_call_scope_id)
+                    raise citation_error from None
                 if _contains_model_control_error(error):
                     cancel_model_call_scope(model_call_scope_id)
                 raise
@@ -633,6 +665,10 @@ def main():
                 config=config,
             )
         except BaseException as error:
+            citation_error = _find_report_citation_error(error)
+            if citation_error is not None:
+                cancel_model_call_scope(model_call_scope_id)
+                raise citation_error from None
             if _contains_model_control_error(error):
                 cancel_model_call_scope(model_call_scope_id)
             raise
@@ -650,6 +686,10 @@ def main():
             )
         except BaseException as error:
             spinner.stop()
+            citation_error = _find_report_citation_error(error)
+            if citation_error is not None:
+                cancel_model_call_scope(model_call_scope_id)
+                raise citation_error from None
             if _contains_model_control_error(error):
                 cancel_model_call_scope(model_call_scope_id)
             raise

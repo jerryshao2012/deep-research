@@ -29,7 +29,7 @@ Historical README referenced [A Trace-Based Assurance Framework for Agentic AI O
 | Golden-dataset scoring | `.deepagents/skills/golden-dataset/scripts/score_dataset.py` | Score an existing CSV, render artifacts, and record a simple baseline or candidate. |
 | Agent-run regression utilities | `research_agent.research_subagent.utils.eval_tracking` | Collect orchestration metrics and compare records with thresholds. |
 | Operational tracking | Agent middleware plus `ENABLE_EVAL_TRACKING` | Append facts from diverse server runs without baseline comparison. |
-| Report verification | Agent middleware plus `ENABLE_VERIFICATION` | Ground citations, judge sufficiency, find gaps, and request revision. |
+| Report verification | Agent middleware | Enforce web-citation structure, then optionally ground citations, judge sufficiency, find gaps, and request revision. |
 
 The `research_agent.cli` module does not accept `--eval-golden-dataset`, `--eval-mode`, or `--eval-history-file`. Generate a golden dataset with that CLI if needed, then use the scoring script for its supported baseline/candidate workflow.
 
@@ -169,7 +169,7 @@ EVAL_HISTORY_FILE=./output/eval_history/server_runs.jsonl
 EVAL_LOG_QUESTIONS=false
 ```
 
-On the first middleware observation of `/final_report.md`, `_eval_logged` is set and the current state snapshot supplies tool execution, parameter quality, self-correction, token usage, latency, model, selected skill, document folder, web mode, and output file names. This snapshot can occur in the same middleware pass that requests a verification revision, so later revision messages, tokens, and latency may be omitted; no second record is written after `_eval_logged` becomes true.
+Metrics are logged only after current owned report is eligible for final exposure. Web-enabled reports therefore need structural citation acceptance for exact current report fingerprint; a pending citation failure blocks `_eval_logged`. Accepted snapshot supplies tool execution, parameter quality, self-correction, token usage, latency, model, selected skill, document folder, web mode, and output file names.
 
 Operational JSONL records describe diverse production-like runs and are not automatically comparable baselines. A typical record contains timestamp, model, redacted or recorded context, runtime, aggregate metrics, output files, experiment labels, and optional Git metadata. Keep this history separate from `golden_dataset_runs.jsonl`, whose records require matching manifests and explicit baseline/candidate intent.
 
@@ -200,21 +200,26 @@ For programmatic records, `make_run_record` also accepts `experiment_id`, `varia
 
 ## Operate the verification loop
 
-Verification runs after the model writes a non-empty `/final_report.md` and stops emitting tool calls:
+Verification runs after model writes an owned, non-empty `/final_report.md` and stops emitting tool calls:
 
-1. citation grounding parses numbered web sources and validates reachability and claim support;
-2. an LLM judge scores completeness, factual consistency, citation coverage, and depth;
-3. an adversarial LLM review finds substantial missing perspectives or unsupported reasoning;
-4. a failing verdict injects structured feedback and asks the model to overwrite `/final_report.md`.
+1. for web-enabled generation, deterministic structural preflight rejects missing URLs, placeholders, unresolved references, and malformed references;
+2. when optional verification is enabled, citation grounding validates reachability and claim support;
+3. an LLM judge scores completeness, factual consistency, citation coverage, and depth;
+4. an adversarial LLM review finds substantial missing perspectives or unsupported reasoning;
+5. a failing check injects structured feedback and asks model to overwrite `/final_report.md`.
 
 ```dotenv
 ENABLE_VERIFICATION=true
 MAX_VERIFICATION_ROUNDS=2
 ```
 
-A checked report version receives a `complete` verdict when no checked citation fails, sufficiency is at least `0.7`, and adversarial review returns at most one gap. To bound cost, at most five citations are randomly spot-checked and evaluator prompts inspect at most the first 8,000 report characters.
+`ENABLE_VERIFICATION` controls optional network/model checks only. Structural preflight is mandatory whenever effective web mode was enabled for generation, including when optional verification is disabled or configured for zero rounds. Effective no-web and document-only generations that disable web search keep legacy finalization behavior.
 
-Verification is a bounded best-effort guard, not certification. Each threshold verdict applies only to the version checked: when the final permitted check requests another revision, the model can produce that last revision after `MAX_VERIFICATION_ROUNDS` is reached and deliver it without another verification pass. If the composite check raises or times out, middleware logs a warning and allows the report through; individual evaluator fallbacks can also be conservative or incomplete. Lower the round cap to reduce latency, or disable the loop for controlled measurements that must exclude revision cost.
+Structural correction budget is one when optional verification is disabled or configured for zero rounds; failure occurs on next invalid check. With enabled positive `MAX_VERIFICATION_ROUNDS=N`, budget is `N` corrections and failure occurs on invalid check `N+1`. Client progress says `Citation correction 1/1 requested`; structural acceptance is never labeled as verified. Exhaustion checkpoints bounded defect metadata, then raises safe `ReportCitationError` without report prose or URLs.
+
+After structural acceptance, checked report version receives optional `complete` verdict when no grounded citation fails, sufficiency is at least `0.7`, and adversarial review returns at most one gap. To bound cost, at most five citations are randomly spot-checked and evaluator prompts inspect at most first 8,000 report characters.
+
+Optional grounding and LLM verification remain bounded best-effort guard, not certification. Existing nonstructural verdict can still accept current report at optional round limit, and ordinary optional-check failures can fall back conservatively. Neither behavior bypasses current-fingerprint structural citation acceptance. Lower round cap to reduce latency, or disable optional loop for controlled measurements that must exclude judge cost.
 
 Run its focused tests with:
 

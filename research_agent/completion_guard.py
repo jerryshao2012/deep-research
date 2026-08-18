@@ -21,6 +21,13 @@ from langchain.agents.middleware.types import (
 from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 from langgraph.config import get_config
 
+from research_agent.citation_failure import (
+    CITATION_FAILURE_CLEAR_UPDATE,
+    citation_acceptance_ready,
+    citation_failure_blocks_finalization,
+    clear_stale_citation_failure,
+)
+
 DEFAULT_MAX_COMPLETION_ATTEMPTS = 3
 MAX_ALLOWED_COMPLETION_ATTEMPTS = 3
 FINAL_REPORT_PATH = "/final_report.md"
@@ -79,6 +86,17 @@ class CompletionState(FilesystemState, PlanningState):
     completion_exhausted_report_reason: Annotated[
         NotRequired[ReportFailureReason | None], OmitFromInput
     ]
+    citation_failure_run_id: Annotated[NotRequired[str | None], OmitFromInput]
+    citation_failure_report_fingerprint: Annotated[
+        NotRequired[str | None], OmitFromInput
+    ]
+    citation_failure_defects: Annotated[
+        NotRequired[list[dict[str, str]]], OmitFromInput
+    ]
+    citation_accepted_report_fingerprint: Annotated[
+        NotRequired[str | None], OmitFromInput
+    ]
+    citation_corrections_used: Annotated[NotRequired[int], OmitFromInput]
     verification_round: Annotated[NotRequired[int], OmitFromInput]
     verification_feedback: Annotated[NotRequired[str | None], OmitFromInput]
     _eval_logged: Annotated[NotRequired[bool], OmitFromInput]
@@ -115,8 +133,13 @@ class CompletionGuardMiddleware(AgentMiddleware):
             generate_fallback=True,
         )
         assert current_run_id is not None
+        stale_failure_update = clear_stale_citation_failure(
+            state,
+            run_id=current_run_id,
+            report_fingerprint=_report_fingerprint(state.get("files")),
+        )
         if state.get("completion_current_run_id") == current_run_id:
-            return None
+            return stale_failure_update
 
         common: dict[str, Any] = {
             "completion_current_run_id": current_run_id,
@@ -126,6 +149,7 @@ class CompletionGuardMiddleware(AgentMiddleware):
             "completion_exhausted_incomplete_todo_count": 0,
             "completion_exhausted_malformed_todo_count": 0,
             "completion_exhausted_report_reason": None,
+            **CITATION_FAILURE_CLEAR_UPDATE,
         }
         configurable = config.get("configurable")
         is_resume = (
@@ -159,6 +183,8 @@ class CompletionGuardMiddleware(AgentMiddleware):
             "completion_verified_report_fingerprint": None,
             "completion_accepted_at_limit_report_modified_at": None,
             "completion_accepted_at_limit_report_fingerprint": None,
+            "citation_accepted_report_fingerprint": None,
+            "citation_corrections_used": 0,
             "completion_cited_baseline_fingerprints": (
                 _snapshot_cited_fingerprints(state.get("files"))
             ),
@@ -315,11 +341,17 @@ def completion_ready_for_finalization(
     """Return whether this exact owned report version may be exposed."""
     if not _inspect_state_completion(state).ready:
         return False
+    fingerprint = _report_fingerprint(state.get("files"))
+    if not citation_acceptance_ready(
+        state,
+        report_fingerprint=fingerprint,
+        strict_required=state.get("strict_web_citations") is True,
+    ):
+        return False
     if not verification_enabled:
         return True
 
     modified_at = _report_modified_at(state.get("files"))
-    fingerprint = _report_fingerprint(state.get("files"))
     owned_fingerprint = state.get("completion_report_owned_fingerprint")
     if (
         modified_at is None
@@ -496,6 +528,16 @@ def _inspect_state_completion(
         return inspection
 
     report_fingerprint = _report_fingerprint(state.get("files"))
+    if citation_failure_blocks_finalization(
+        state,
+        report_fingerprint=report_fingerprint,
+    ):
+        return CompletionInspection(
+            plan_active=inspection.plan_active,
+            incomplete_todo_count=inspection.incomplete_todo_count,
+            malformed_todo_count=inspection.malformed_todo_count,
+            report_reason="malformed",
+        )
     owned_fingerprint = state.get("completion_report_owned_fingerprint")
     if (
         report_fingerprint is not None

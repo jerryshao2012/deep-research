@@ -610,6 +610,14 @@ def _verification_state(
         "completion_accepted_at_limit_report_fingerprint": None,
         "completion_cited_baseline_fingerprints": {},
         "completion_attempts": 2,
+        "completion_current_run_id": "run-v1",
+        "strict_web_citations": False,
+        "effective_no_web": True,
+        "citation_failure_run_id": None,
+        "citation_failure_report_fingerprint": None,
+        "citation_failure_defects": [],
+        "citation_accepted_report_fingerprint": None,
+        "citation_corrections_used": 0,
         "_streamed_files": ["/final_report.md"],
     }
 
@@ -631,6 +639,248 @@ def _needs_revision_verdict() -> VerificationVerdict:
         sufficiency_score=0.5,
         sufficiency_reason="Add missing evidence.",
     )
+
+
+@pytest.mark.parametrize("async_", [False, True])
+@pytest.mark.parametrize(
+    ("verification_enabled", "max_rounds", "expected_limit"),
+    [
+        (False, 0, 1),
+        (False, 2, 1),
+        (True, 0, 1),
+        (True, 1, 1),
+        (True, 2, 2),
+    ],
+)
+def test_strict_structural_failures_use_independent_correction_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    async_: bool,
+    verification_enabled: bool,
+    max_rounds: int,
+    expected_limit: int,
+) -> None:
+    audit_calls = 0
+    judge_calls = 0
+    metric_calls = 0
+    secret = "https://secret.invalid/token=do-not-echo"
+
+    def invalid_audit(report: str) -> CitationAudit:
+        nonlocal audit_calls
+        audit_calls += 1
+        assert report == "Final report"
+        return CitationAudit(
+            urls=(),
+            defects=(CitationDefect("missing_url", secret),),
+        )
+
+    async def forbidden_judge(**_kwargs: Any) -> VerificationVerdict:
+        nonlocal judge_calls
+        judge_calls += 1
+        return VerificationVerdict(status="complete", sufficiency_score=1.0)
+
+    async def forbidden_metrics(**_kwargs: Any) -> dict[str, bool]:
+        nonlocal metric_calls
+        metric_calls += 1
+        return {"logged": True}
+
+    monkeypatch.setattr(agent_module, "ENABLE_VERIFICATION", verification_enabled)
+    monkeypatch.setattr(agent_module, "MAX_VERIFICATION_ROUNDS", max_rounds)
+    monkeypatch.setattr(agent_module, "ENABLE_EVAL_TRACKING", True)
+    monkeypatch.setattr(
+        agent_module,
+        "audit_web_citations",
+        invalid_audit,
+        raising=False,
+    )
+    monkeypatch.setattr(agent_module, "verify_report", forbidden_judge)
+    monkeypatch.setattr(agent_module, "log_server_metrics", forbidden_metrics)
+    middleware = agent_module.ResearchStateMiddleware(
+        config_getter=lambda: {"run_id": "run-v1"}
+    )
+    state = _verification_state()
+    state.update(
+        {
+            "strict_web_citations": True,
+            "effective_no_web": False,
+            "_streamed_files": [],
+        }
+    )
+
+    for correction in range(1, expected_limit + 1):
+        update = _run_after_model(middleware, state, async_=async_)
+        assert update is not None
+        assert update["jump_to"] == "model"
+        assert update["citation_corrections_used"] == correction
+        assert update["todos"][-1] == {
+            "id": "verification_pass",
+            "content": (
+                f"Citation correction {correction}/{expected_limit} requested"
+            ),
+            "status": "in_progress",
+        }
+        assert "Verified" not in update["todos"][-1]["content"]
+        assert secret not in update["verification_feedback"]
+        assert update["messages"][0].response_metadata["resume_intermediate"] is True
+        assert "_streamed_files" not in update
+        assert "_eval_logged" not in update
+        state = {**state, **update}
+
+    terminal = _run_after_model(middleware, state, async_=async_)
+
+    assert terminal is not None
+    assert terminal["jump_to"] == "end"
+    assert terminal["citation_failure_run_id"] == "run-v1"
+    assert terminal["citation_failure_report_fingerprint"] == (
+        completion_guard.artifact_fingerprint(state["files"]["/final_report.md"])
+    )
+    assert terminal["citation_failure_defects"] == [
+        {"code": "missing_url", "detail": "redacted"}
+    ]
+    assert terminal["messages"][0].response_metadata["resume_intermediate"] is True
+    assert "_streamed_files" not in terminal
+    assert "_eval_logged" not in terminal
+    assert "completion_verified_report_fingerprint" not in terminal
+    assert "completion_accepted_at_limit_report_fingerprint" not in terminal
+    assert "citation_accepted_report_fingerprint" not in terminal
+    assert audit_calls == expected_limit + 1
+    assert judge_calls == 0
+    assert metric_calls == 0
+
+
+@pytest.mark.parametrize("async_", [False, True])
+@pytest.mark.parametrize(
+    ("verification_enabled", "max_rounds", "expected_judges"),
+    [(False, 0, 0), (False, 2, 0), (True, 0, 0), (True, 2, 1)],
+)
+def test_valid_strict_audit_is_required_before_optional_judges(
+    monkeypatch: pytest.MonkeyPatch,
+    async_: bool,
+    verification_enabled: bool,
+    max_rounds: int,
+    expected_judges: int,
+) -> None:
+    audit_calls = 0
+    judge_calls = 0
+
+    def valid_audit(report: str) -> CitationAudit:
+        nonlocal audit_calls
+        audit_calls += 1
+        return CitationAudit(
+            urls=("https://public.publisher.org/report",),
+            defects=(),
+        )
+
+    async def complete_judge(**_kwargs: Any) -> VerificationVerdict:
+        nonlocal judge_calls
+        judge_calls += 1
+        return VerificationVerdict(status="complete", sufficiency_score=1.0)
+
+    monkeypatch.setattr(agent_module, "ENABLE_VERIFICATION", verification_enabled)
+    monkeypatch.setattr(agent_module, "MAX_VERIFICATION_ROUNDS", max_rounds)
+    monkeypatch.setattr(agent_module, "ENABLE_EVAL_TRACKING", False)
+    monkeypatch.setattr(
+        agent_module,
+        "audit_web_citations",
+        valid_audit,
+        raising=False,
+    )
+    monkeypatch.setattr(agent_module, "verify_report", complete_judge)
+    state = _streamable_state()
+    state.update(
+        {
+            "strict_web_citations": True,
+            "effective_no_web": False,
+            "citation_corrections_used": 2,
+        }
+    )
+
+    result = _run_after_model(
+        agent_module.ResearchStateMiddleware(),
+        state,
+        async_=async_,
+    )
+
+    fingerprint = completion_guard.artifact_fingerprint(
+        state["files"]["/final_report.md"]
+    )
+    assert result is not None
+    assert result["citation_accepted_report_fingerprint"] == fingerprint
+    assert result["citation_corrections_used"] == 0
+    assert audit_calls == 1
+    assert judge_calls == expected_judges
+    assert "**Final Report:**\n\nFinal report" in _message_texts(result)
+
+
+@pytest.mark.parametrize("async_", [False, True])
+def test_document_only_finalization_skips_structural_audit(
+    monkeypatch: pytest.MonkeyPatch,
+    async_: bool,
+) -> None:
+    audit_calls = 0
+
+    def audit(report: str) -> CitationAudit:
+        nonlocal audit_calls
+        audit_calls += 1
+        return CitationAudit(urls=(), defects=(CitationDefect("missing_url", "web"),))
+
+    monkeypatch.setattr(agent_module, "ENABLE_VERIFICATION", False)
+    monkeypatch.setattr(agent_module, "ENABLE_EVAL_TRACKING", False)
+    monkeypatch.setattr(agent_module, "audit_web_citations", audit, raising=False)
+    state = _streamable_state()
+    state.update({"strict_web_citations": False, "effective_no_web": True})
+
+    result = _run_after_model(
+        agent_module.ResearchStateMiddleware(),
+        state,
+        async_=async_,
+    )
+
+    assert audit_calls == 0
+    assert result is not None
+    assert "**Final Report:**\n\nFinal report" in _message_texts(result)
+
+
+@pytest.mark.parametrize("async_", [False, True])
+@pytest.mark.parametrize(
+    "optional_acceptance_prefix",
+    ["completion_verified_report", "completion_accepted_at_limit_report"],
+)
+def test_optional_acceptance_never_bypasses_missing_strict_audit_marker(
+    monkeypatch: pytest.MonkeyPatch,
+    async_: bool,
+    optional_acceptance_prefix: str,
+) -> None:
+    calls = 0
+
+    def invalid_audit(report: str) -> CitationAudit:
+        nonlocal calls
+        calls += 1
+        return CitationAudit(
+            urls=(),
+            defects=(CitationDefect("missing_url", "web"),),
+        )
+
+    monkeypatch.setattr(agent_module, "ENABLE_VERIFICATION", False)
+    monkeypatch.setattr(agent_module, "MAX_VERIFICATION_ROUNDS", 0)
+    monkeypatch.setattr(agent_module, "ENABLE_EVAL_TRACKING", False)
+    monkeypatch.setattr(agent_module, "audit_web_citations", invalid_audit)
+    state = _verification_state()
+    state.update({"strict_web_citations": True, "effective_no_web": False})
+    report = state["files"]["/final_report.md"]
+    fingerprint = completion_guard.artifact_fingerprint(report)
+    state[f"{optional_acceptance_prefix}_modified_at"] = report["modified_at"]
+    state[f"{optional_acceptance_prefix}_fingerprint"] = fingerprint
+
+    result = _run_after_model(
+        agent_module.ResearchStateMiddleware(),
+        state,
+        async_=async_,
+    )
+
+    assert calls == 1
+    assert result is not None
+    assert result["jump_to"] == "model"
+    assert result["citation_corrections_used"] == 1
 
 
 def test_sync_verifier_bridge_interrupt_cancels_before_coroutine_can_register(
@@ -669,7 +919,11 @@ def test_sync_verifier_bridge_interrupt_cancels_before_coroutine_can_register(
 @pytest.mark.parametrize("async_", [False, True])
 @pytest.mark.parametrize(
     "error",
-    [ModelCallTimeoutError("ollama", 1.0, False), asyncio.CancelledError()],
+    [
+        ModelCallTimeoutError("ollama", 1.0, False),
+        asyncio.CancelledError(),
+        ReportCitationError(),
+    ],
 )
 def test_verification_control_errors_propagate_without_completion_update(
     monkeypatch: pytest.MonkeyPatch,
@@ -817,6 +1071,12 @@ def test_verification_uses_request_scoped_strict_citation_mode(
             "strict_web_citations": not effective_no_web,
         }
     )
+    if not effective_no_web:
+        report = _report("Final report https://public.publisher.org/report")
+        state["files"]["/final_report.md"] = report
+        state["completion_report_owned_fingerprint"] = (
+            completion_guard.artifact_fingerprint(report)
+        )
 
     result = _run_after_model(
         agent_module.ResearchStateMiddleware(), state, async_=async_
