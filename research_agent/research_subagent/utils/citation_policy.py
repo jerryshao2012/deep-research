@@ -774,6 +774,12 @@ def _is_markdown_label_closer(text: str, start: int, content: str) -> bool:
     while escape_index >= window_start and text[escape_index] == "\\":
         backslashes += 1
         escape_index -= 1
+    if (
+        escape_index < window_start
+        and window_start > 0
+        and text[window_start - 1] == "\\"
+    ):
+        return False
     if backslashes % 2:
         return False
     label_start = opening + len(content)
