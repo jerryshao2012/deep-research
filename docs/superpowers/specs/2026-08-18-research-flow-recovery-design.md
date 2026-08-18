@@ -105,12 +105,14 @@ checkpoints or conflict with active runs. The hook drops its state-write queue,
 busy-status deferral, and 409 retry logic; those mechanisms exist only to
 support the unsafe passive write.
 
-`ChatInterface` owns one thread-scoped pending upload folder. Every successful
-upload sets it unconditionally. A confirmed list or delete result for that same
-thread, whether empty or nonempty, supersedes and clears it. A same-thread send
-also clears it after the send function accepts the payload. Navigation does not
-apply one thread's pending folder to another thread; returning to the owner may
-still use it until one of those clearing events occurs.
+`ChatInterface` owns a per-thread map of unsent positive document evidence.
+Every successful upload and every confirmed nonempty list/delete result sets the
+entry to that thread's canonical folder. Confirmed empty/delete-to-empty removes
+the entry. A same-thread send removes it only after the send function accepts a
+payload containing `has_documents: true` and that canonical folder. Navigation
+does not clear the map, so a failed refresh after returning to a thread cannot
+lose earlier positive evidence; entries for multiple unsent threads coexist and
+never apply across thread IDs.
 
 Run submission remains authoritative and follows this exact table:
 
@@ -125,7 +127,10 @@ Unknown-without-pending deliberately preserves checkpoint state rather than
 inventing negative evidence. Confirmed empty explicitly clears a stale folder.
 Passive polling never mutates graph state. Tests retain race, navigation,
 unmount, upload, deletion, pending-owner, and submit-boundary coverage while
-asserting that no graph-state write occurs.
+asserting that no graph-state write occurs. An exact regression covers upload,
+positive refresh, navigation away and back, failed refresh, then submission with
+the preserved positive folder. A second case proves two unsent thread entries do
+not overwrite or leak into each other.
 
 ### Thread titles
 
