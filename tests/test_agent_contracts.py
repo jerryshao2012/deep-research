@@ -329,6 +329,32 @@ def test_web_mode_unit_detects_idless_equal_count_content_replacement() -> None:
     assert replacement["strict_web_citations"] is False
 
 
+def test_web_mode_hashes_only_latest_human_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import research_agent.agent as agent_module
+    from research_agent.agent import WebModeMiddleware
+
+    calls = 0
+    original_sha256 = agent_module.hashlib.sha256
+
+    def count_sha256(*args: object, **kwargs: object):
+        nonlocal calls
+        calls += 1
+        return original_sha256(*args, **kwargs)
+
+    monkeypatch.setattr(agent_module.hashlib, "sha256", count_sha256)
+    messages = [
+        HumanMessage(id=str(index), content=f"Research {index}")
+        for index in range(100)
+    ]
+
+    update = WebModeMiddleware().before_agent({"messages": messages}, runtime=None)
+
+    assert update["web_mode_last_human_count"] == 100
+    assert calls == 1
+
+
 @pytest.mark.parametrize(
     ("messages", "previous_id", "previous_count", "expected_no_web"),
     [
@@ -545,3 +571,188 @@ def test_compiled_web_mode_detects_same_id_human_replacement_but_not_resume() ->
     resumed = graph.get_state(config).values
     assert resumed["effective_no_web"] is False
     assert resumed["strict_web_citations"] is True
+
+
+def test_markerless_checkpoint_defaults_web_then_accepts_new_human_directive() -> None:
+    from research_agent.agent import _agent_kwargs
+
+    scripted_model = _guarded_scripted_model(
+        [AIMessage(content="complete") for _ in range(3)]
+    )
+    production_kwargs = {
+        **_agent_kwargs,
+        "model": scripted_model,
+        "checkpointer": InMemorySaver(),
+        "subagents": [
+            {**spec, "model": scripted_model}
+            for spec in _agent_kwargs["subagents"]
+        ],
+    }
+    graph = create_deep_agent(**production_kwargs)
+    config = {"configurable": {"thread_id": "legacy-web-mode"}}
+    graph.invoke(
+        {"messages": [HumanMessage(id="legacy", content="Research with no web")]},
+        config=config,
+    )
+    graph.update_state(
+        config,
+        {
+            "effective_no_web": True,
+            "strict_web_citations": False,
+            "web_mode_last_human_id": None,
+            "web_mode_last_human_count": None,
+            "web_mode_last_human_fingerprint": None,
+        },
+    )
+
+    graph.invoke({}, config=config)
+    migrated = graph.get_state(config).values
+    assert migrated["effective_no_web"] is False
+    assert migrated["strict_web_citations"] is True
+
+    graph.invoke(
+        {"messages": [HumanMessage(id="new", content="Research with no web")]},
+        config=config,
+    )
+    updated = graph.get_state(config).values
+    assert updated["effective_no_web"] is True
+    assert updated["strict_web_citations"] is False
+
+
+def test_compiled_first_human_text_directive_applies_without_raw_mode() -> None:
+    from research_agent.agent import _agent_kwargs
+
+    scripted_model = _guarded_scripted_model([AIMessage(content="complete")])
+    graph = create_deep_agent(
+        **{
+            **_agent_kwargs,
+            "model": scripted_model,
+            "checkpointer": InMemorySaver(),
+            "subagents": [
+                {**spec, "model": scripted_model}
+                for spec in _agent_kwargs["subagents"]
+            ],
+        }
+    )
+    config = {"configurable": {"thread_id": "initial-text-web-mode"}}
+
+    graph.invoke(
+        {"messages": [HumanMessage(content="Research this with no web")]},
+        config=config,
+    )
+
+    snapshot = graph.get_state(config).values
+    assert snapshot["effective_no_web"] is True
+    assert snapshot["strict_web_citations"] is False
+
+
+def test_compiled_raw_mode_overwrites_client_effective_mode() -> None:
+    from research_agent.agent import _agent_kwargs
+
+    scripted_model = _guarded_scripted_model([AIMessage(content="complete")])
+    graph = create_deep_agent(
+        **{
+            **_agent_kwargs,
+            "model": scripted_model,
+            "checkpointer": InMemorySaver(),
+            "subagents": [
+                {**spec, "model": scripted_model}
+                for spec in _agent_kwargs["subagents"]
+            ],
+        }
+    )
+    config = {"configurable": {"thread_id": "raw-overwrites-effective"}}
+
+    graph.invoke(
+        {
+            "messages": [HumanMessage(content="Research with web")],
+            "no_web": False,
+            "effective_no_web": True,
+        },
+        config=config,
+    )
+
+    snapshot = graph.get_state(config).values
+    assert snapshot["effective_no_web"] is False
+    assert snapshot["strict_web_citations"] is True
+
+
+@pytest.mark.parametrize("async_", [False, True])
+@pytest.mark.parametrize("raw_no_web", [False, True])
+def test_compiled_delegation_propagates_effective_web_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    async_: bool,
+    raw_no_web: bool,
+) -> None:
+    from research_agent.agent import _agent_kwargs
+    from research_agent.research_subagent.utils import web_search
+
+    calls = {"search": 0, "fetch": 0}
+
+    def fake_search(**_kwargs: object) -> dict[str, object]:
+        calls["search"] += 1
+        return {
+            "results": [{"title": "Example", "url": "https://example.com"}]
+        }
+
+    def fake_fetch(*_args: object, **_kwargs: object) -> str:
+        calls["fetch"] += 1
+        return "Example page"
+
+    monkeypatch.setattr(web_search, "_run_tavily_search", fake_search)
+    monkeypatch.setattr(web_search, "fetch_webpage_content_impl", fake_fetch)
+    scripted_model = _guarded_scripted_model(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "task",
+                        "args": {
+                            "description": "Find one source.",
+                            "subagent_type": "research-agent",
+                        },
+                        "id": "delegate",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "tavily_search",
+                        "args": {"query": "effective mode"},
+                        "id": "search",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="Subagent complete"),
+            AIMessage(content="Root complete"),
+        ]
+    )
+    production_kwargs = {
+        **_agent_kwargs,
+        "model": scripted_model,
+        "checkpointer": InMemorySaver(),
+        "subagents": [
+            {**spec, "model": scripted_model}
+            for spec in _agent_kwargs["subagents"]
+        ],
+    }
+    graph = create_deep_agent(**production_kwargs)
+    config = {"configurable": {"thread_id": f"delegate-web-{async_}-{raw_no_web}"}}
+    input_state = {
+        "messages": [HumanMessage(content="Delegate research")],
+        "no_web": raw_no_web,
+    }
+
+    if async_:
+        import asyncio
+
+        asyncio.run(graph.ainvoke(input_state, config=config))
+    else:
+        graph.invoke(input_state, config=config)
+
+    assert calls == ({"search": 0, "fetch": 0} if raw_no_web else {"search": 1, "fetch": 1})

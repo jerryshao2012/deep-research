@@ -496,7 +496,9 @@ class ResearchState(CompletionState):
     has_documents: bool | None
     skill: str | None
     no_web: Annotated[NotRequired[bool | None], EphemeralValue(bool | None)]
-    effective_no_web: Annotated[NotRequired[bool], OmitFromInput]
+    # Deliberately visible to declarative subagents; WebModeMiddleware replaces
+    # client values at the root graph boundary before any model or tool runs.
+    effective_no_web: NotRequired[bool]
     strict_web_citations: Annotated[NotRequired[bool], OmitFromInput]
     web_mode_run_id: Annotated[NotRequired[str | None], OmitFromInput]
     web_mode_last_human_id: Annotated[NotRequired[str | None], OmitFromInput]
@@ -564,6 +566,7 @@ class WebModeMiddleware(SkillsMiddleware):
         """Return latest human marker and safe content fingerprint."""
         latest_id: str | None = None
         latest_text: str | None = None
+        latest_type: str | None = None
         latest_fingerprint: str | None = None
         human_count = 0
         for message in messages:
@@ -581,20 +584,44 @@ class WebModeMiddleware(SkillsMiddleware):
             else:
                 latest_text = str(getattr(message, "content", ""))
                 message_id = getattr(message, "id", None)
-            message_type = (
+            latest_type = (
                 str(message.get("role", "user"))
                 if isinstance(message, dict)
                 else str(getattr(message, "type", type(message).__name__))
             )
-            latest_fingerprint = hashlib.sha256(
-                f"{message_type}\0{latest_text}".encode()
-            ).hexdigest()
             latest_id = (
                 message_id.strip()
                 if isinstance(message_id, str) and message_id.strip()
                 else None
             )
+        if latest_text is not None and latest_type is not None:
+            latest_fingerprint = hashlib.sha256(
+                f"{latest_type}\0{latest_text}".encode()
+            ).hexdigest()
         return latest_id, human_count, latest_text, latest_fingerprint
+
+    @staticmethod
+    def _has_legacy_checkpoint_evidence(state: ResearchState) -> bool:
+        """Identify a markerless restore when LangGraph exposes no input delta.
+
+        Old checkpoints cannot distinguish a resumed human message from a fresh
+        request. Generated messages, files, or todos prove prior execution, so
+        default to web mode rather than reparse stale directive text. A later
+        human-count increase remains fresh once this invocation writes markers.
+        """
+        messages = state.get("messages", [])
+        if any(
+                not (
+                    isinstance(message, dict) and message.get("role") == "user"
+                )
+                and not (
+                    hasattr(message, "type")
+                    and getattr(message, "type", None) == "human"
+                )
+                for message in messages
+        ):
+            return True
+        return bool(state.get("files") or state.get("todos"))
 
     def _mode_update(self, state: ResearchState) -> dict[str, Any]:
         """Resolve raw input while it is still available at graph entry."""
@@ -604,8 +631,19 @@ class WebModeMiddleware(SkillsMiddleware):
         previous_count = state.get("web_mode_last_human_count")
         previous_id = state.get("web_mode_last_human_id")
         previous_fingerprint = state.get("web_mode_last_human_fingerprint")
+        missing_markers = (
+            previous_count is None
+            and previous_id is None
+            and previous_fingerprint is None
+        )
         if not isinstance(previous_count, int) or isinstance(previous_count, bool):
-            has_new_human = human_count > 0
+            has_new_human = (
+                human_count > 0
+                and not (
+                    missing_markers
+                    and self._has_legacy_checkpoint_evidence(state)
+                )
+            )
         elif human_count > previous_count:
             has_new_human = True
         elif human_count < previous_count:
