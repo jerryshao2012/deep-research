@@ -760,14 +760,19 @@ def _is_clear_bare_uri(scheme: str, content: str) -> bool:
 
 
 def _is_markdown_label_closer(text: str, start: int, content: str) -> bool:
-    if not (
-        1 <= len(content) <= 3
-        and len(set(content)) == 1
-        and content[0] in "*_~"
-    ):
+    if content not in {"**", "__"}:
         return False
-    line_start = text.rfind("\n", 0, start) + 1
-    return text[line_start:start].count(content) % 2 == 1
+    window_start = max(0, start - _MAX_LINK_LABEL_LENGTH)
+    line_break = text.rfind("\n", window_start, start)
+    if line_break >= 0:
+        window_start = line_break + 1
+    opening = text.rfind(content, window_start, start)
+    if opening < window_start:
+        return False
+    label_start = opening + len(content)
+    if label_start > start or text[label_start].isspace():
+        return False
+    return opening == 0 or not text[opening - 1].isalnum()
 
 
 def _is_explicit_uri(value: str) -> bool:

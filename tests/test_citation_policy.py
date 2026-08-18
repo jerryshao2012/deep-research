@@ -341,6 +341,30 @@ def test_prior_closed_markdown_does_not_hide_explicit_non_http_uri() -> None:
     assert "malformed_reference" in [defect.code for defect in audit.defects]
 
 
+@pytest.mark.parametrize(
+    "prefix, suffix",
+    [("* ", "*"), ("~ ", "~"), ("** ", "**"), ("__ ", "__")],
+)
+def test_invalid_markdown_openers_do_not_hide_explicit_non_http_uri(
+    prefix: str,
+    suffix: str,
+) -> None:
+    audit = audit_web_citations(f"{prefix}custom:{suffix} https://valid.publisher.org/a")
+
+    assert "malformed_reference" in [defect.code for defect in audit.defects]
+
+
+def test_markdown_label_detection_scales_with_dense_uri_candidates() -> None:
+    started = perf_counter()
+    audit_web_citations("** " + "a:** " * 2_000 + "https://valid.publisher.org/a")
+    small = perf_counter() - started
+    started = perf_counter()
+    audit_web_citations("** " + "a:** " * 16_000 + "https://valid.publisher.org/a")
+    large = perf_counter() - started
+
+    assert large < small * 24 + 0.2
+
+
 def _unmatched_backtick_runs(size: int) -> str:
     chunks: list[str] = []
     length = 1
