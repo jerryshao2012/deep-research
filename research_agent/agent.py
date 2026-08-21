@@ -36,7 +36,7 @@ from langchain.agents.middleware import (
     TodoListMiddleware,
     hook_config,
 )
-from langchain.agents.middleware.types import OmitFromInput
+from langchain.agents.middleware.types import OmitFromInput, OmitFromOutput
 from langchain_core.messages import (
     AIMessage,
     HumanMessage,
@@ -1102,23 +1102,23 @@ skill_registry = get_skill_registry()
 class ResearchState(CompletionState):
     """Runtime state for the research agent."""
 
-    doc_folder: str | None
-    has_documents: bool | None
-    skill: str | None
+    # Root-owned scalar state remains visible inside declarative subagents,
+    # but must not be merged back by parallel task calls.
+    doc_folder: Annotated[str | None, OmitFromOutput]
+    has_documents: Annotated[bool | None, OmitFromOutput]
+    skill: Annotated[str | None, OmitFromOutput]
     no_web: Annotated[NotRequired[bool | None], EphemeralValue(bool | None)]
-    # Deliberately visible to declarative subagents; WebModeMiddleware replaces
-    # client values at the root graph boundary before any model or tool runs.
-    effective_no_web: NotRequired[bool]
+    effective_no_web: Annotated[NotRequired[bool], OmitFromOutput]
     strict_web_citations: Annotated[NotRequired[bool], OmitFromInput]
     web_mode_run_id: Annotated[NotRequired[str | None], OmitFromInput]
     web_mode_last_human_id: Annotated[NotRequired[str | None], OmitFromInput]
     web_mode_last_human_count: Annotated[NotRequired[int], OmitFromInput]
     web_mode_last_human_fingerprint: Annotated[NotRequired[str | None], OmitFromInput]
-    chat_start_time: float | None
-    chat_elapsed_seconds: float | None
-    _last_user_msg_hash: str | None
+    chat_start_time: Annotated[float | None, OmitFromOutput]
+    chat_elapsed_seconds: Annotated[float | None, OmitFromOutput]
+    _last_user_msg_hash: Annotated[str | None, OmitFromOutput]
     # Multi-pass research (Wave 2: Plan + Execute)
-    research_pass: int
+    research_pass: Annotated[int, OmitFromOutput]
 
 
 def _extract_no_web(user_message: str) -> bool | None:

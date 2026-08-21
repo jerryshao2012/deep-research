@@ -874,3 +874,68 @@ def test_compiled_delegation_propagates_effective_web_mode(
         graph.invoke(input_state, config=config)
 
     assert calls == ({"search": 0, "fetch": 0} if raw_no_web else {"search": 1, "fetch": 1})
+
+
+@pytest.mark.parametrize("raw_no_web", [False, True])
+def test_compiled_parallel_delegation_does_not_merge_effective_web_mode_back(
+    raw_no_web: bool,
+) -> None:
+    from research_agent.agent import _agent_kwargs
+
+    scripted_model = _guarded_scripted_model(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "task",
+                        "args": {
+                            "description": "Research the first topic.",
+                            "subagent_type": "general-purpose",
+                        },
+                        "id": "delegate-first",
+                        "type": "tool_call",
+                    },
+                    {
+                        "name": "task",
+                        "args": {
+                            "description": "Research the second topic.",
+                            "subagent_type": "general-purpose",
+                        },
+                        "id": "delegate-second",
+                        "type": "tool_call",
+                    },
+                ],
+            ),
+            AIMessage(content="First subagent complete"),
+            AIMessage(content="Second subagent complete"),
+            AIMessage(content="Root complete"),
+        ]
+    )
+    graph = create_deep_agent(
+        **{
+            **_agent_kwargs,
+            "model": scripted_model,
+            "checkpointer": InMemorySaver(),
+            "subagents": [
+                {**spec, "model": scripted_model}
+                for spec in _agent_kwargs["subagents"]
+            ],
+        }
+    )
+    config = {
+        "configurable": {
+            "thread_id": f"parallel-delegate-web-{raw_no_web}",
+        }
+    }
+
+    graph.invoke(
+        {
+            "messages": [HumanMessage(content="Delegate two research tasks")],
+            "no_web": raw_no_web,
+        },
+        config=config,
+    )
+
+    snapshot = graph.get_state(config).values
+    assert snapshot["effective_no_web"] is raw_no_web
