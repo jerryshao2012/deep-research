@@ -24,6 +24,7 @@ _PNG = b"\x89PNG\r\n\x1a\n" + b"png-payload"
 _JPEG = b"\xff\xd8\xff\xe0" + b"jpeg-payload"
 _GIF = b"GIF89a" + b"gif-payload"
 _WEBP = b"RIFF" + (12).to_bytes(4, "little") + b"WEBPVP8 " + b"webp"
+_PDF = b"%PDF-1.4\n" + b"pdf-payload"
 
 
 def _zip_bytes(filename: str = "report.txt", content: bytes = b"report") -> bytes:
@@ -2041,3 +2042,93 @@ def test_cleanup_counts_only_supported_metadata_and_removes_whole_namespace(
     assert response.status_code == 200
     assert response.json()["deleted_count"] == 1
     assert not images_root.exists()
+
+
+def test_upload_and_download_pdf_document(tmp_path, monkeypatch):
+    docs_root = tmp_path / "docs"
+    monkeypatch.setattr(webapp, "DOCS_ROOT", docs_root)
+    client = TestClient(webapp.app)
+
+    uploaded = _upload(
+        client,
+        "123456",
+        [
+            ("quarterly-report.pdf", _PDF, "application/pdf"),
+            ("MANUAL.PDF", _PDF, "application/octet-stream"),
+        ],
+    )
+
+    assert uploaded.status_code == 200
+    data = uploaded.json()
+    assert len(data["assets"]) == 2
+    assert data["errors"] == []
+    assert data["assets"][0]["filename"] == "quarterly-report.pdf"
+    assert data["assets"][0]["content_type"] == "application/pdf"
+    assert data["assets"][1]["filename"] == "MANUAL.PDF"
+    assert data["assets"][1]["content_type"] == "application/pdf"
+
+    asset_id = data["assets"][0]["id"]
+
+    view_resp = client.get(
+        f"/markdown-threads/123456/images/{asset_id}",
+        headers=_AUTH_HEADERS,
+    )
+    assert view_resp.status_code == 200
+    assert view_resp.content == _PDF
+    assert view_resp.headers["content-type"] == "application/pdf"
+    assert "attachment" in view_resp.headers["content-disposition"]
+
+    download_resp = client.get(
+        f"/markdown-threads/123456/images/{asset_id}/download",
+        headers=_AUTH_HEADERS,
+    )
+    assert download_resp.status_code == 200
+    assert download_resp.content == _PDF
+    assert download_resp.headers["content-type"] == "application/pdf"
+    assert "attachment" in download_resp.headers["content-disposition"]
+
+
+def test_upload_rejects_corrupt_pdf_signature(tmp_path, monkeypatch):
+    monkeypatch.setattr(webapp, "DOCS_ROOT", tmp_path / "docs")
+    client = TestClient(webapp.app)
+
+    response = _upload(
+        client,
+        "123456",
+        [("bad.pdf", b"not-a-pdf-header", "application/pdf")],
+    )
+
+    assert response.status_code == 200
+    assert response.json()["assets"] == []
+    assert response.json()["errors"] == [
+        {
+            "filename": "bad.pdf",
+            "code": "unsupported_or_mismatched_pdf",
+            "message": "Only valid PDF documents are supported",
+        }
+    ]
+
+
+def test_feature_gate_disables_pdf_upload(tmp_path, monkeypatch):
+    monkeypatch.setattr(webapp, "DOCS_ROOT", tmp_path / "docs")
+    monkeypatch.setenv("MARKDOWN_EXTENDED_ATTACHMENT_UPLOADS_ENABLED", "false")
+    client = TestClient(webapp.app)
+
+    response = _upload(
+        client,
+        "123456",
+        [
+            ("chart.png", _PNG, "image/png"),
+            ("document.pdf", _PDF, "application/pdf"),
+        ],
+    )
+
+    assert response.status_code == 200
+    assert [asset["filename"] for asset in response.json()["assets"]] == ["chart.png"]
+    assert response.json()["errors"] == [
+        {
+            "filename": "document.pdf",
+            "code": "extended_attachment_upload_disabled",
+            "message": "Extended archive and Microsoft Office uploads are disabled",
+        }
+    ]

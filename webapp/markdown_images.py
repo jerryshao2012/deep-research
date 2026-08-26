@@ -54,8 +54,9 @@ _ALLOWED_IMAGES: dict[str, tuple[str, frozenset[str]]] = {
 _ALLOWED_IMAGE_EXTENSIONS = frozenset(
     suffix for _, suffixes in _ALLOWED_IMAGES.values() for suffix in suffixes
 )
+PDF_CONTENT_TYPE = "application/pdf"
 _STORED_CONTENT_TYPES = frozenset(
-    (*_ALLOWED_IMAGES, *ARCHIVE_CONTENT_TYPES, OFFICE_CONTENT_TYPE)
+    (*_ALLOWED_IMAGES, *ARCHIVE_CONTENT_TYPES, OFFICE_CONTENT_TYPE, PDF_CONTENT_TYPE)
 )
 _ARCHIVE_ERROR_MESSAGE = (
     "Only valid ZIP, 7Z, TAR, TAR.GZ, and TGZ archives are supported"
@@ -261,9 +262,25 @@ def _validate_image(filename: str, content_type: str | None, data: bytes) -> str
     return declared_type
 
 
+def is_pdf_upload(filename: str, content_type: str | None = None) -> bool:
+    if "/" in filename or "\\" in filename:
+        return False
+    return Path(filename).suffix.lower() == ".pdf"
+
+
+def _validate_pdf(filename: str, content_type: str | None, data: bytes) -> str:
+    if not is_pdf_upload(filename, content_type):
+        raise ValueError("filename must have .pdf extension")
+    if not data.startswith(b"%PDF-"):
+        raise ValueError("PDF signature invalid")
+    return PDF_CONTENT_TYPE
+
+
 def _validate_asset(filename: str, content_type: str | None, data: bytes) -> str:
     if is_office_upload(filename):
         return OFFICE_CONTENT_TYPE
+    if is_pdf_upload(filename, content_type):
+        return _validate_pdf(filename, content_type, data)
     if is_archive_upload(filename, content_type):
         return validate_archive(filename, content_type, data)
     return _validate_image(filename, content_type, data)
@@ -284,7 +301,11 @@ def _extended_attachment_uploads_enabled() -> bool:
 
 
 def _is_archive_candidate(filename: str, content_type: str | None) -> bool:
-    return not is_office_upload(filename) and is_archive_upload(filename, content_type)
+    return (
+        not is_office_upload(filename)
+        and not is_pdf_upload(filename, content_type)
+        and is_archive_upload(filename, content_type)
+    )
 
 
 async def _run_worker_to_completion[T](
@@ -502,6 +523,21 @@ async def _load_asset(
                 _ARCHIVE_BATCH_LIMITER.release()
         return payload, metadata, validation_data
 
+    if stored_content_type == PDF_CONTENT_TYPE:
+        if not is_pdf_upload(filename):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="Image not found"
+            )
+        try:
+            with payload.open("rb") as payload_file:
+                validation_data = payload_file.read(1024)
+                _validate_pdf(filename, stored_content_type, validation_data)
+        except (OSError, ValueError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="Image not found"
+            ) from exc
+        return payload, metadata, None
+
     try:
         with payload.open("rb") as payload_file:
             validation_data = payload_file.read(261)
@@ -655,11 +691,14 @@ def register_markdown_image_routes(app) -> None:
                         )
                         continue
                     office_candidate = is_office_upload(display_name)
+                    pdf_candidate = is_pdf_upload(display_name, upload.content_type)
                     archive_candidate = _is_archive_candidate(
                         display_name, upload.content_type
                     )
                     if not extended_uploads_enabled and (
-                        office_candidate or is_extended_archive_filename(display_name)
+                        office_candidate
+                        or pdf_candidate
+                        or is_extended_archive_filename(display_name)
                     ):
                         errors.append(
                             {
@@ -672,6 +711,10 @@ def register_markdown_image_routes(app) -> None:
                     try:
                         if office_candidate:
                             verified_type = OFFICE_CONTENT_TYPE
+                        elif pdf_candidate:
+                            verified_type = _validate_pdf(
+                                display_name, upload.content_type, data
+                            )
                         elif archive_candidate:
                             verified_type = await _run_worker_to_completion(
                                 validate_archive,
@@ -703,6 +746,14 @@ def register_markdown_image_routes(app) -> None:
                                     "filename": display_name,
                                     "code": "unsupported_or_mismatched_archive",
                                     "message": _ARCHIVE_ERROR_MESSAGE,
+                                }
+                            )
+                        elif pdf_candidate:
+                            errors.append(
+                                {
+                                    "filename": display_name,
+                                    "code": "unsupported_or_mismatched_pdf",
+                                    "message": "Only valid PDF documents are supported",
                                 }
                             )
                         elif _is_image_upload(display_name, upload.content_type):
@@ -753,6 +804,7 @@ def register_markdown_image_routes(app) -> None:
             markdown_id, asset_id
         )
         is_office = metadata["content_type"] == OFFICE_CONTENT_TYPE
+        is_pdf = metadata["content_type"] == PDF_CONTENT_TYPE
         headers = {"Cache-Control": "private, no-store"}
         if is_office:
             headers["X-Content-Type-Options"] = "nosniff"
@@ -774,6 +826,7 @@ def register_markdown_image_routes(app) -> None:
                 if download
                 or is_stored_archive_content_type(metadata["content_type"])
                 or is_office
+                or is_pdf
                 else "inline"
             ),
             headers=headers,
