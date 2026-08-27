@@ -53,6 +53,21 @@ The CLI option `--ssl-ca-files` is parsed but not applied by the current TLS res
 
 These controls bound agent work; they do not change model-provider RPM or TPM quotas. See [Reliability](reliability.md) for request shaping and retries.
 
+### Requirement clarification and checkpoints
+
+Requirement clarification is a LangGraph human-in-the-loop interrupt. LangGraph
+Platform owns production checkpoint persistence when `MEMORY_TYPE` is unset, so
+the exported graph does not inject an in-process saver. Direct graph callers
+that advertise `requirement_clarification` must compile with an explicit
+checkpointer, pass a stable `configurable.thread_id`, and reuse the identical
+`thread_id` and config when resuming.
+
+Resume by inspecting the interrupt payload and sending
+`Command(resume={"kind": "requirement_clarification_response", ...})`; do not
+start a second `agent.invoke()` run with a human chat message. The response
+`request_id` must match the interrupt `request_id`, which is the clarification
+tool-call ID.
+
 ## Limit file input and output
 
 | Variable | Runtime default | Purpose |

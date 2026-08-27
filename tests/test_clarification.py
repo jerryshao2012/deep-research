@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from copy import deepcopy
 import json
 import operator
 import re
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Annotated, Any, TypedDict
@@ -825,6 +825,49 @@ def test_interrupt_pauses_and_resumes_same_checkpoint() -> None:
     tool_message = resumed["messages"][-1]
     assert isinstance(tool_message, ToolMessage)
     assert json.loads(tool_message.content)["status"] == "answered"
+
+
+def test_checkpoint_free_direct_graph_cannot_resume_clarification() -> None:
+    batch = ClarificationBatch(questions=[_question()])
+
+    def clarify_node(state: _InterruptState) -> Command:
+        return run_clarification(batch, tool_call_id="tool-call-1")
+
+    graph = (
+        StateGraph(_InterruptState)
+        .add_node("clarify", clarify_node)
+        .add_edge(START, "clarify")
+        .add_edge("clarify", END)
+        .compile()
+    )
+
+    config = {"configurable": {"thread_id": "checkpoint-free-clarification"}}
+
+    interrupted = graph.invoke({"messages": []}, config)
+    assert interrupted["__interrupt__"][0].value["request_id"] == "tool-call-1"
+
+    with pytest.raises(RuntimeError, match="Command\\(resume=.*without checkpointer"):
+        graph.invoke(
+            Command(
+                resume={
+                    "kind": "requirement_clarification_response",
+                    "version": 1,
+                    "request_id": "tool-call-1",
+                    "skipped": True,
+                    "answers": [],
+                }
+            ),
+            config,
+        )
+
+
+def test_configuration_guide_documents_direct_hitl_checkpointer_requirement() -> None:
+    guide = Path("documents/guides/configuration.md").read_text(encoding="utf-8")
+
+    assert "advertise `requirement_clarification`" in guide
+    assert "reuse the identical" in guide
+    assert "`thread_id`" in guide
+    assert "Command(resume=" in guide
 
 
 def test_real_checkpointed_clarification_replays_node_and_preserves_shorthand(
