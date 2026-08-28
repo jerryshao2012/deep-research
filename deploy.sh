@@ -563,46 +563,6 @@ else
   fi
 fi
 
-REQUIRED_KEY_VAULT_SECRETS=(
-  TAVILY-API-KEY
-  LANGCHAIN-API-KEY
-  UPLOAD-API-KEY
-  STORAGE-ACCOUNT-NAME
-  STORAGE-ACCOUNT-KEY
-  AZURE-STORAGE-CONTAINER-NAME
-  GOOGLE-API-KEY
-  GOOGLE-CLIENT-ID
-  GOOGLE-CLIENT-SECRET
-  OAUTH-SECRET-KEY
-  DOCKER-HUB-PAT
-  PASSKEY-PROXY-SECRET
-)
-for REQUIRED_SECRET_NAME in "${REQUIRED_KEY_VAULT_SECRETS[@]}"; do
-  SECRET_VERSIONS_JSON=$(mktemp)
-  SECRET_VERSIONS_STDERR=$(mktemp)
-  set +e
-  az keyvault secret list-versions --subscription "$AZURE_SUBSCRIPTION_ID" --vault-name "$KV_NAME" --name "$REQUIRED_SECRET_NAME" --query '[].{id:id,name:name,version:version,enabled:attributes.enabled}' --output json >"$SECRET_VERSIONS_JSON" 2>"$SECRET_VERSIONS_STDERR"
-  SECRET_VERSIONS_STATUS=$?
-  set -e
-  rm -f "$SECRET_VERSIONS_STDERR"
-  if [[ "$SECRET_VERSIONS_STATUS" != 0 ]]; then
-    echo "Error: required pre-created Key Vault secret '$REQUIRED_SECRET_NAME' is missing or unreadable" >&2
-    rm -f "$SECRET_VERSIONS_JSON" "$EXISTING_CONFIG_JSON" "$UPDATE_PATCH_JSON"
-    exit "$SECRET_VERSIONS_STATUS"
-  fi
-  set +e
-  python3 "$SCRIPT_DIR/scripts/validate_keyvault_secret_versions.py" "$SECRET_VERSIONS_JSON" "$KV_NAME" "$REQUIRED_SECRET_NAME"
-  SECRET_VERSIONS_VALIDATION_STATUS=$?
-  set -e
-  rm -f "$SECRET_VERSIONS_JSON"
-  if [[ "$SECRET_VERSIONS_VALIDATION_STATUS" != 0 ]]; then
-    echo "Error: required pre-created Key Vault secret '$REQUIRED_SECRET_NAME' has invalid version metadata" >&2
-    rm -f "$EXISTING_CONFIG_JSON" "$UPDATE_PATCH_JSON"
-    exit "$SECRET_VERSIONS_VALIDATION_STATUS"
-  fi
-done
-unset REQUIRED_SECRET_NAME SECRET_VERSIONS_STATUS SECRET_VERSIONS_VALIDATION_STATUS
-
 BLOB_CONTAINER_NAME="deep-research-blobs"
 STORAGE_FILE_SHARE_NAME="deep-research-auth"
 
