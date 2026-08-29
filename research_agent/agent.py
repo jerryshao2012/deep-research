@@ -68,6 +68,10 @@ from research_agent.document_context import (
     configure_document_tools,
     has_document_context,
 )
+from research_agent.report_catalog import (
+    archive_report_to_state,
+    get_archived_reports,
+)
 from research_agent.logger_utils import setup_logger
 from research_agent.model_call_guard import (
     ModelCallGuardMiddleware,
@@ -996,6 +1000,14 @@ def _merge_finalization_update(
         if isinstance(updates["messages"], list):
             updates["messages"].extend(final_messages)
     updates["_streamed_files"] = finalization["_streamed_files"]
+
+    # Archive the accepted final report and request into /reports/
+    archival = archive_report_to_state(effective_state)
+    if archival and "files" in archival:
+        updates.setdefault("files", {})
+        if isinstance(updates["files"], dict) and isinstance(archival["files"], dict):
+            updates["files"].update(archival["files"])
+
     return {**state, **updates}
 
 
@@ -1400,13 +1412,22 @@ class ResearchStateMiddleware(AgentMiddleware):
 
         updates: dict[str, Any] = {}
         if not is_resume_round:
+            # Archive prior report if not yet archived before overwriting /research_request.md
+            archival_updates = archive_report_to_state(effective_state)
+            if archival_updates and "files" in archival_updates:
+                updates.setdefault("files", {})
+                if isinstance(updates["files"], dict) and isinstance(archival_updates["files"], dict):
+                    updates["files"].update(archival_updates["files"])
+
             # Seed the research request file with the latest user message.
-            updates.update(
-                self._seed_research_request_file(
-                    current_user_message,
-                    effective_state,
-                )
+            request_file_updates = self._seed_research_request_file(
+                current_user_message,
+                effective_state,
             )
+            if request_file_updates and "files" in request_file_updates:
+                updates.setdefault("files", {})
+                if isinstance(updates["files"], dict) and isinstance(request_file_updates["files"], dict):
+                    updates["files"].update(request_file_updates["files"])
             updates.update(extracted_updates)
 
         # ── Instant progress feedback ──────────────────────────────────────
