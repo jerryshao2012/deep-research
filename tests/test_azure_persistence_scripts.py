@@ -1142,23 +1142,33 @@ def test_azure_build_strictly_decodes_quoted_resolver_assignments(tmp_path):
     assert not argv_log.exists()
 
 
-def test_azure_build_ignores_root_dotenv_docker_credentials(tmp_path):
+def test_azure_build_loads_root_dotenv_credentials_without_leaking_pat(tmp_path):
     fixture, argv_log = _install_azure_script_fixture(tmp_path, "build.sh")
-    login_capture = fixture / "login-pat"
+    login_args = fixture / "login-args"
+    login_stdin = fixture / "login-stdin"
     (fixture / "scripts/container_runtime.sh").write_text(
         'select_container_runtime() { CONTAINER_RUNTIME="fake"; }\n'
         "ensure_container_runtime_ready() { :; }\n"
-        f"container_runtime_login() {{ cat > '{login_capture}'; return 73; }}\n",
+        "container_runtime_login() {\n"
+        f"  printf '%s\\n' \"$1\" \"$2\" > '{login_args}'\n"
+        f"  cat > '{login_stdin}'\n"
+        "  return 73\n"
+        "}\n",
         encoding="utf-8",
     )
     (fixture / ".env.docker").write_text("OTHER=value\n", encoding="utf-8")
     pat_canary = "private-build-pat-canary"
     (fixture / ".env").write_text(
-        "DOCKER_HUB_USERNAME=dotenv-user\n"
+        "DOCKER_HUB_USERNAME=jerryshao2013\n"
         f"DOCKER_HUB_PAT='{pat_canary}'\n"
         "UNRELATED=value\n",
         encoding="utf-8",
     )
+    credential_dirs_before = {
+        path
+        for path in Path("/tmp").glob("deep-research-docker-credentials.*")
+        if path.is_dir()
+    }
     env = os.environ.copy()
     env.pop("DOCKER_HUB_USERNAME", None)
     env.pop("DOCKER_HUB_PAT", None)
@@ -1178,35 +1188,58 @@ def test_azure_build_ignores_root_dotenv_docker_credentials(tmp_path):
         text=True,
     )
 
-    assert result.returncode == 1
-    assert not login_capture.exists()
-    assert "Please set DOCKER_HUB_USERNAME" in result.stdout
-    assert "dotenv-user" not in result.stdout + result.stderr
-    assert pat_canary not in result.stdout + result.stderr
+    assert result.returncode == 73
+    assert login_args.exists()
+    assert login_args.read_text(encoding="utf-8").splitlines() == [
+        "jerryshao2013",
+        "docker.io",
+    ]
+    assert login_stdin.exists()
+    stdin_matches_pat = login_stdin.read_text(encoding="utf-8") == pat_canary
+    assert stdin_matches_pat
+    combined_output = result.stdout + result.stderr
+    assert not any(secret in combined_output for secret in (pat_canary,))
+    credential_dirs_after = {
+        path
+        for path in Path("/tmp").glob("deep-research-docker-credentials.*")
+        if path.is_dir()
+    }
+    assert not credential_dirs_after - credential_dirs_before
 
 
-def test_azure_build_uses_process_username_without_reading_dotenv_credentials(tmp_path):
+def test_azure_build_complete_process_credentials_bypass_root_dotenv(tmp_path):
     fixture, argv_log = _install_azure_script_fixture(tmp_path, "build.sh")
-    login_capture = fixture / "login-pat"
+    login_args = fixture / "login-args"
+    login_stdin = fixture / "login-stdin"
     (fixture / "scripts/container_runtime.sh").write_text(
         'select_container_runtime() { CONTAINER_RUNTIME="fake"; }\n'
         "ensure_container_runtime_ready() { :; }\n"
-        f"container_runtime_login() {{ cat > '{login_capture}'; return 73; }}\n",
+        "container_runtime_login() {\n"
+        f"  printf '%s\\n' \"$1\" \"$2\" > '{login_args}'\n"
+        f"  cat > '{login_stdin}'\n"
+        "}\n",
         encoding="utf-8",
     )
     (fixture / ".env.docker").write_text("OTHER=value\n", encoding="utf-8")
+    malformed_canary = "malformed-root-dotenv-canary"
     (fixture / ".env").write_text(
-        "DOCKER_HUB_USERNAME=fallback-user\nDOCKER_HUB_PAT=fallback-pat\n",
+        f"if true; then DOCKER_HUB_PAT={malformed_canary}; fi\n",
         encoding="utf-8",
     )
+    process_pat = "private-process-pat-canary"
+    credential_dirs_before = {
+        path
+        for path in Path("/tmp").glob("deep-research-docker-credentials.*")
+        if path.is_dir()
+    }
     env = os.environ.copy()
     env.update(
         {
             "PATH": f"{fixture / 'bin'}:{env['PATH']}",
             "FAKE_AZ_ARGV_LOG": str(argv_log),
             "FAKE_ENV_ROW": f"{ENVIRONMENT_ID}\t{DEFAULT_DOMAIN}\tSucceeded\n",
-            "DOCKER_HUB_USERNAME": "exported-user",
-            "DOCKER_HUB_PAT": "exported-pat",
+            "DOCKER_HUB_USERNAME": "jerryshao2013",
+            "DOCKER_HUB_PAT": process_pat,
         }
     )
 
@@ -1219,11 +1252,125 @@ def test_azure_build_uses_process_username_without_reading_dotenv_credentials(tm
     )
 
     assert result.returncode == 64
-    assert not login_capture.exists()
-    assert "exported-user" in result.stdout
-    assert "fallback-user" not in result.stdout + result.stderr
-    for canary in ("exported-pat", "fallback-pat"):
-        assert canary not in result.stdout + result.stderr
+    assert login_args.exists()
+    assert login_args.read_text(encoding="utf-8").splitlines() == [
+        "jerryshao2013",
+        "docker.io",
+    ]
+    assert login_stdin.exists()
+    stdin_matches_pat = login_stdin.read_text(encoding="utf-8") == process_pat
+    assert stdin_matches_pat
+    combined_output = result.stdout + result.stderr
+    assert malformed_canary not in combined_output
+    assert not any(secret in combined_output for secret in (process_pat,))
+    credential_dirs_after = {
+        path
+        for path in Path("/tmp").glob("deep-research-docker-credentials.*")
+        if path.is_dir()
+    }
+    assert not credential_dirs_after - credential_dirs_before
+
+
+def test_azure_build_process_username_loads_missing_root_dotenv_pat(tmp_path):
+    fixture, argv_log = _install_azure_script_fixture(tmp_path, "build.sh")
+    login_args = fixture / "login-args"
+    login_stdin = fixture / "login-stdin"
+    (fixture / "scripts/container_runtime.sh").write_text(
+        'select_container_runtime() { CONTAINER_RUNTIME="fake"; }\n'
+        "ensure_container_runtime_ready() { :; }\n"
+        "container_runtime_login() {\n"
+        f"  printf '%s\\n' \"$1\" \"$2\" > '{login_args}'\n"
+        f"  cat > '{login_stdin}'\n"
+        "  return 73\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    (fixture / ".env.docker").write_text("OTHER=value\n", encoding="utf-8")
+    file_pat = "private-file-pat-canary"
+    (fixture / ".env").write_text(
+        "DOCKER_HUB_USERNAME=different-file-user\n"
+        f"DOCKER_HUB_PAT='{file_pat}'\n",
+        encoding="utf-8",
+    )
+    credential_dirs_before = {
+        path
+        for path in Path("/tmp").glob("deep-research-docker-credentials.*")
+        if path.is_dir()
+    }
+    env = os.environ.copy()
+    env.pop("DOCKER_HUB_PAT", None)
+    env.update(
+        {
+            "PATH": f"{fixture / 'bin'}:{env['PATH']}",
+            "FAKE_AZ_ARGV_LOG": str(argv_log),
+            "FAKE_ENV_ROW": f"{ENVIRONMENT_ID}\t{DEFAULT_DOMAIN}\tSucceeded\n",
+            "DOCKER_HUB_USERNAME": "jerryshao2013",
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", "-x", "build.sh"],
+        cwd=fixture,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 73
+    assert login_args.exists()
+    assert login_args.read_text(encoding="utf-8").splitlines() == [
+        "jerryshao2013",
+        "docker.io",
+    ]
+    assert login_stdin.exists()
+    stdin_matches_pat = login_stdin.read_text(encoding="utf-8") == file_pat
+    assert stdin_matches_pat
+    combined_output = result.stdout + result.stderr
+    assert "different-file-user" not in combined_output
+    assert not any(secret in combined_output for secret in (file_pat,))
+    credential_dirs_after = {
+        path
+        for path in Path("/tmp").glob("deep-research-docker-credentials.*")
+        if path.is_dir()
+    }
+    assert not credential_dirs_after - credential_dirs_before
+
+
+def test_azure_build_username_without_pat_skips_login(tmp_path):
+    fixture, argv_log = _install_azure_script_fixture(tmp_path, "build.sh")
+    login_marker = fixture / "login-called"
+    (fixture / "scripts/container_runtime.sh").write_text(
+        'select_container_runtime() { CONTAINER_RUNTIME="fake"; }\n'
+        "ensure_container_runtime_ready() { :; }\n"
+        f"container_runtime_login() {{ touch '{login_marker}'; }}\n",
+        encoding="utf-8",
+    )
+    (fixture / ".env.docker").write_text("OTHER=value\n", encoding="utf-8")
+    (fixture / ".env").write_text(
+        "DOCKER_HUB_USERNAME=different-file-user\n", encoding="utf-8"
+    )
+    env = os.environ.copy()
+    env.pop("DOCKER_HUB_PAT", None)
+    env.update(
+        {
+            "PATH": f"{fixture / 'bin'}:{env['PATH']}",
+            "FAKE_AZ_ARGV_LOG": str(argv_log),
+            "FAKE_ENV_ROW": f"{ENVIRONMENT_ID}\t{DEFAULT_DOMAIN}\tSucceeded\n",
+            "DOCKER_HUB_USERNAME": "jerryshao2013",
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", "build.sh"],
+        cwd=fixture,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 64
+    assert not login_marker.exists()
+    assert "relying on existing registry credentials" in result.stdout.lower()
 
 
 def test_azure_deploy_first_resolution_blocks_before_any_mutation(tmp_path):

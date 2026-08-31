@@ -122,6 +122,7 @@ TOTAL_START_TIME=$(date +%s)
 STEP_TIMES=()
 BUILD_CONTEXT_DIR=""
 DOCKER_CREDENTIAL_DIR=""
+DOCKER_PAT_FILE=""
 BUILD_TRANSACTION_ARMED=false
 CONFIG_BACKUP=""
 EXPECTED_CONFIG=""
@@ -280,53 +281,47 @@ OLD_UMASK=$(umask)
 umask 077
 DOCKER_CREDENTIAL_DIR="$(mktemp -d "/tmp/deep-research-docker-credentials.XXXXXX")"
 umask "$OLD_UMASK"
+DOCKER_PAT_FILE="$DOCKER_CREDENTIAL_DIR/docker-hub.pat"
 fail() {
   echo "Error: $*" >&2
   exit 1
 }
 
-dotenv_fail() {
-  local file="$1"
-  local line_number="$2"
-  local message="$3"
-  fail "$file line $line_number: $message"
-}
+CREDENTIAL_XTRACE_WAS_ENABLED=false
+case "$-" in
+  *x*)
+    CREDENTIAL_XTRACE_WAS_ENABLED=true
+    set +x
+    ;;
+esac
+if [ -n "${DOCKER_HUB_PAT:-}" ]; then
+  (umask 077; printf '%s' "$DOCKER_HUB_PAT" >"$DOCKER_PAT_FILE")
+fi
+unset DOCKER_HUB_PAT
 
-load_docker_hub_username() {
-  local env_path="$SCRIPT_DIR/.env"
-  [ -f "$env_path" ] || return 0
-
-  local line_number=0
-  local line value
-  local found=false
-  while IFS= read -r line || [ -n "$line" ]; do
-    line_number=$((line_number + 1))
-    line="${line%$'\r'}"
-    case "$line" in
-      DOCKER_HUB_USERNAME=*)
-        [ "$found" = false ] || dotenv_fail "$env_path" "$line_number" "duplicate DOCKER_HUB_USERNAME."
-        found=true
-        value="${line#*=}"
-        case "$value" in
-          \"*)
-            case "$value" in
-              \"*\") value="${value#\"}"; value="${value%\"}" ;;
-              *) dotenv_fail "$env_path" "$line_number" "unmatched DOCKER_HUB_USERNAME quote." ;;
-            esac
-            ;;
-          \'*)
-            case "$value" in
-              \'*\') value="${value#\'}"; value="${value%\'}" ;;
-              *) dotenv_fail "$env_path" "$line_number" "unmatched DOCKER_HUB_USERNAME quote." ;;
-            esac
-            ;;
-          *\"*|*\'*) dotenv_fail "$env_path" "$line_number" "unmatched DOCKER_HUB_USERNAME quote." ;;
-        esac
-        DOCKER_HUB_USERNAME="$value"
-        ;;
-    esac
-  done < "$env_path"
-}
+DOCKER_CREDENTIAL_ARGS=()
+if [ -z "${DOCKER_HUB_USERNAME:-}" ]; then
+  DOCKER_CREDENTIAL_ARGS+=(--username)
+fi
+if [ ! -s "$DOCKER_PAT_FILE" ]; then
+  DOCKER_CREDENTIAL_ARGS+=(--pat-file "$DOCKER_PAT_FILE")
+fi
+if [ "${#DOCKER_CREDENTIAL_ARGS[@]}" -gt 0 ] && [ -f "$SCRIPT_DIR/.env" ]; then
+  LOADED_DOCKER_HUB_USERNAME="$(
+    python3 "$SCRIPT_DIR/scripts/load_docker_credentials.py" \
+      --input "$SCRIPT_DIR/.env" \
+      "${DOCKER_CREDENTIAL_ARGS[@]}"
+  )"
+  if [ -z "${DOCKER_HUB_USERNAME:-}" ] && [ -n "$LOADED_DOCKER_HUB_USERNAME" ]; then
+    DOCKER_HUB_USERNAME="$LOADED_DOCKER_HUB_USERNAME"
+  fi
+  unset LOADED_DOCKER_HUB_USERNAME
+fi
+unset DOCKER_CREDENTIAL_ARGS
+if [ "$CREDENTIAL_XTRACE_WAS_ENABLED" = true ]; then
+  set -x
+fi
+unset CREDENTIAL_XTRACE_WAS_ENABLED
 
 python3 "$SCRIPT_DIR/scripts/sanitize_passkey_dotenv.py" --input "$SCRIPT_DIR/.env.docker" --check
 RESOLVER_STDOUT="$DOCKER_CREDENTIAL_DIR/resolver.stdout"
@@ -413,9 +408,6 @@ end_step
 
 # 4. Check Docker Hub Username
 start_step "Docker Hub Setup"
-if [ -z "${DOCKER_HUB_USERNAME:-}" ]; then
-  load_docker_hub_username
-fi
 APPROVED_DOCKER_HUB_USERNAME="jerryshao2013"
 if [ -n "${DOCKER_HUB_USERNAME-}" ] && [ "$DOCKER_HUB_USERNAME" != "$APPROVED_DOCKER_HUB_USERNAME" ]; then
   fail "DOCKER_HUB_USERNAME must be exactly '$APPROVED_DOCKER_HUB_USERNAME'."
@@ -426,7 +418,15 @@ if [ -z "${DOCKER_HUB_USERNAME:-}" ]; then
   exit 1
 fi
 echo "✅ Using Docker Hub user: $DOCKER_HUB_USERNAME"
-echo "Relying on ambient Docker credentials."
+if [ -s "$DOCKER_PAT_FILE" ]; then
+  echo "Logging in to Docker Hub with configured credentials."
+  container_runtime_login "$DOCKER_HUB_USERNAME" docker.io <"$DOCKER_PAT_FILE"
+else
+  echo "No Docker Hub PAT configured; relying on existing registry credentials."
+fi
+rm -rf -- "$DOCKER_CREDENTIAL_DIR"
+DOCKER_CREDENTIAL_DIR=""
+DOCKER_PAT_FILE=""
 end_step
 
 # 5. Increment API version
