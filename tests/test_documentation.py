@@ -140,9 +140,37 @@ def _github_slugs(markdown: str) -> set[str]:
     return slugs
 
 
+def _strip_fenced_code_blocks(markdown: str) -> str:
+    lines: list[str] = []
+    fence_character = ""
+    fence_length = 0
+    for line in markdown.splitlines():
+        fence = FENCE_RE.match(line)
+        if fence_character:
+            if fence:
+                marker, suffix = fence.groups()
+                if (
+                    marker[0] == fence_character
+                    and len(marker) >= fence_length
+                    and not suffix.strip()
+                ):
+                    fence_character = ""
+                    fence_length = 0
+            continue
+        if fence:
+            marker, info = fence.groups()
+            if marker[0] == "~" or "`" not in info:
+                fence_character = marker[0]
+                fence_length = len(marker)
+                continue
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def _local_link_targets(path: Path) -> list[tuple[Path, str]]:
     targets: list[tuple[Path, str]] = []
-    for raw in LINK_RE.findall(path.read_text(encoding="utf-8")):
+    content = _strip_fenced_code_blocks(path.read_text(encoding="utf-8"))
+    for raw in LINK_RE.findall(content):
         target = raw.strip().strip("<>").split(maxsplit=1)[0]
         parsed = urlsplit(target)
         if parsed.scheme in EXTERNAL_SCHEMES:

@@ -68,16 +68,15 @@ from research_agent.document_context import (
     configure_document_tools,
     has_document_context,
 )
-from research_agent.report_catalog import (
-    archive_report_to_state,
-    get_archived_reports,
-)
 from research_agent.logger_utils import setup_logger
 from research_agent.model_call_guard import (
     ModelCallGuardMiddleware,
     ModelCallTimeoutError,
 )
 from research_agent.model_factory import create_memory_saver, get_configured_model
+from research_agent.report_catalog import (
+    archive_report_to_state,
+)
 from research_agent.research_subagent import (
     RESEARCH_WORKFLOW_INSTRUCTIONS,
     RESEARCHER_INSTRUCTIONS,

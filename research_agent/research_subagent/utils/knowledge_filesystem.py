@@ -13,15 +13,19 @@ import re
 from pathlib import Path
 from typing import Annotated
 
-from deepagents.backends.utils import file_data_to_string, create_file_data
+from deepagents.backends.utils import create_file_data, file_data_to_string
 from dotenv import load_dotenv
 from langgraph._internal._constants import CONFIG_KEY_SEND
 from langgraph.config import get_config
 from langgraph.prebuilt import InjectedState
 
 from research_agent.logger_utils import setup_logger
-from research_agent.research_subagent.utils.content_extractors import extract_supported_document
-from research_agent.research_subagent.utils.text_search import load_or_build_search_index
+from research_agent.research_subagent.utils.content_extractors import (
+    extract_supported_document,
+)
+from research_agent.research_subagent.utils.text_search import (
+    load_or_build_search_index,
+)
 
 # Load environment variables
 load_dotenv()
@@ -394,7 +398,7 @@ def ls_impl(
 
             if dir_files:
                 return "\n".join(sorted(dir_files))
-        except Exception as e:
+        except Exception:
             pass  # Fall through to local filesystem
 
     # Try 2: Use local filesystem
@@ -419,7 +423,7 @@ def glob_impl(
         pattern: str,
         state: Annotated[dict, InjectedState] = None
 ) -> str:
-    """Implementation of glob pattern matching with fallback support.
+    """Match glob patterns against virtual or local filesystem with fallback support.
 
     Tries to match against the virtual filesystem in state first, then falls back
     to the local filesystem if not available.
@@ -453,7 +457,7 @@ def glob_impl(
 
             if matched_files:
                 return "\n".join(sorted(matched_files))
-        except Exception as e:
+        except Exception:
             pass  # Fall through to local filesystem
 
     # Try 2: Use local filesystem
@@ -525,7 +529,7 @@ def read_file_impl(
         file_path: str,
         state: Annotated[dict, InjectedState] = None
 ) -> str:
-    """Implementation of file reading with fallback support.
+    """Read file contents with fallback support across virtual and local filesystems.
 
     Tries to read from the virtual filesystem in state first (DeepAgents backend),
     then falls back to the local filesystem if not available.
@@ -823,8 +827,10 @@ def read_docs_folder_impl(
                 "(only the configured doc_folder is permitted).")
             folder = allowed_root
 
-    if not folder.exists(): return f"Error: Folder '{folder}' does not exist."
-    if not folder.is_dir(): return f"Error: '{folder}' is not a directory."
+    if not folder.exists():
+        return f"Error: Folder '{folder}' does not exist."
+    if not folder.is_dir():
+        return f"Error: '{folder}' is not a directory."
 
     specific_set = set(specific_files) if specific_files else None
 
@@ -854,7 +860,8 @@ def read_docs_folder_impl(
             sample_size = min(MAX_FILES_TO_READ, total_files, max_files_by_size)
             auto_sample = [f.name for f in random.sample(supported_files, sample_size)]
             preview_list = "\n".join(f"- {f.name} ({f.lstat().st_size / 1024:.1f} KB)" for f in supported_files[:60])
-            if total_files > 60: preview_list += f"\n... and {total_files - 60} more files (not shown)."
+            if total_files > 60:
+                preview_list += f"\n... and {total_files - 60} more files (not shown)."
             auto_sample_str = ", ".join(f'"{n}"' for n in auto_sample)
             return (
                 f"TOOL RESULT — folder too large to read all at once: {total_files} files, {total_size_mb:.1f} MB (limits: {MAX_FILES_TO_READ} files / {MAX_TOTAL_SIZE_MB} MB).\n\n"
@@ -895,8 +902,10 @@ def read_docs_folder_impl(
             extracted_text.append(f"--- Error reading {file_path.name}: {exc} ---\n")
 
     summary_lines = [f"Processed {len(processed_files)}/{len(files_to_process)} supported file(s) from {folder}."]
-    if processed_files: summary_lines.append(f"Files processed: {', '.join(processed_files)}")
-    if failed_files: summary_lines.append(f"Files failed: {', '.join(failed_files)}")
+    if processed_files:
+        summary_lines.append(f"Files processed: {', '.join(processed_files)}")
+    if failed_files:
+        summary_lines.append(f"Files failed: {', '.join(failed_files)}")
     summary_lines.append(
         "\nIMPORTANT: Use ONLY the file paths listed above. Do NOT reference "
         "filenames from the user's prompt if they differ from the actual files "

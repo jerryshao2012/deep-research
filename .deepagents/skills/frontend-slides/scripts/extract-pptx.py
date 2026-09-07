@@ -12,12 +12,12 @@ Requires: pip install python-pptx
 import json
 import os
 import sys
+
 from pptx import Presentation
 
 
 def extract_pptx(file_path, output_dir="."):
-    """
-    Extract all content from a PowerPoint file.
+    """Extract all content from a PowerPoint file.
     Returns a list of slide data dicts with text, images, and notes.
     """
     prs = Presentation(file_path)

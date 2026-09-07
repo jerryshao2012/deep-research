@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 def test_upload_api():
     """Test the upload API endpoints."""
     from fastapi.testclient import TestClient
+
     from webapp import app
     from webapp import config as _cfg
     API_KEY = _cfg.API_KEY
@@ -36,7 +37,7 @@ def test_upload_api():
         files=[("files", ("dummy.txt", b"x", "text/plain"))],
     )
     assert response.status_code == 401, "Should reject requests without API key"
-    print(f"   ✅ Correctly rejected with 401")
+    print("   ✅ Correctly rejected with 401")
 
     # Test 3: Upload with wrong API key (should fail)
     print("\n3. Testing upload with wrong API key (should fail)...")
@@ -47,13 +48,13 @@ def test_upload_api():
         files=[("files", ("dummy.txt", b"x", "text/plain"))],
     )
     assert response.status_code == 401, "Should reject requests with wrong API key"
-    print(f"   ✅ Correctly rejected with 401")
+    print("   ✅ Correctly rejected with 401")
 
     # Test 4: Storage info without API key (should fail)
     print("\n4. Testing /storage/info without API key (should fail)...")
     response = client.get("/storage/info")
     assert response.status_code == 401, "Should reject storage info without API key"
-    print(f"   ✅ Correctly rejected with 401")
+    print("   ✅ Correctly rejected with 401")
 
     # Test 5: Storage info with API key (should succeed)
     print("\n5. Testing /storage/info with API key...")
@@ -98,7 +99,7 @@ def test_upload_api():
 
         # Clean up
         uploaded_path.unlink()
-        print(f"   ✅ Cleaned up test file")
+        print("   ✅ Cleaned up test file")
 
     finally:
         # Clean up test file if it still exists

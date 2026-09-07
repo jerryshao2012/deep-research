@@ -19,11 +19,11 @@ import logging
 import math
 import pickle
 import re
-
 from collections import defaultdict
+from pathlib import Path
+
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -231,6 +231,7 @@ class BM25SearchIndex:
     """Enhanced BM25 with stemming, bigrams, and pseudo-relevance feedback."""
 
     def __init__(self, *, prf: bool = True) -> None:
+        """Initialize the BM25 search index."""
         self._documents: list[Document] = []
         self._doc_tfs: list[dict[str, int]] = []
         self._doc_lens: list[int] = []
@@ -240,9 +241,11 @@ class BM25SearchIndex:
 
     @property
     def documents(self) -> list[Document]:
+        """Return list of indexed documents."""
         return self._documents
 
     def add_documents(self, documents: list[Document]) -> None:
+        """Add documents to the BM25 index and compute term frequencies and IDF."""
         total_tokens = sum(self._doc_lens)
         for doc in documents:
             self._documents.append(doc)
@@ -267,6 +270,7 @@ class BM25SearchIndex:
     def search(
             self, query: str, k: int = 5, *, use_prf: bool | None = None
     ) -> list[tuple[Document, float]]:
+        """Search the BM25 index for the most relevant documents."""
         if use_prf is None:
             use_prf = self._prf_enabled
         query_terms = _tokenize(query)
@@ -379,6 +383,7 @@ class BM25SearchIndex:
             return None
 
     def __len__(self) -> int:
+        """Return the number of indexed documents."""
         return len(self._documents)
 
 
@@ -400,16 +405,19 @@ class HybridSearchIndex:
     """
 
     def __init__(self, bm25: BM25SearchIndex, faiss_store=None) -> None:
+        """Initialize the hybrid search index with BM25 and optional FAISS store."""
         self.bm25 = bm25
         self._faiss = faiss_store  # FAISS vectorstore or None
         self._faiss_doc_map: dict[int, Document] = {}  # faiss internal id → Document
 
     @property
     def documents(self) -> list[Document]:
+        """Return list of indexed documents from BM25 index."""
         return self.bm25.documents
 
     @property
     def has_faiss(self) -> bool:
+        """Return True if FAISS vector store is available."""
         return self._faiss is not None
 
     def search(self, query: str, k: int = 5) -> list[tuple[Document, float]]:
@@ -523,7 +531,7 @@ class HybridSearchIndex:
             if not isinstance(bm25, BM25SearchIndex):
                 # The loaded object is not the expected type, indicating corruption or wrong save format.
                 return None
-        except (IOError, EOFError, pickle.UnpicklingError) as e:
+        except (OSError, EOFError, pickle.UnpicklingError) as e:
             logger.warning(f"Failed to load BM25 index from {bm25_path}: {e}")
             # Cannot proceed without a valid BM25 component.
             return None
@@ -552,6 +560,7 @@ class HybridSearchIndex:
         return cls(bm25, faiss_store)
 
     def __len__(self) -> int:
+        """Return the number of indexed documents in the hybrid index."""
         return len(self.bm25)
 
 

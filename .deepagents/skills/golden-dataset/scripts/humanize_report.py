@@ -7,9 +7,9 @@ final report in a more natural, human tone.
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
-import sys
 from langchain_core.messages import HumanMessage, SystemMessage
 
 # Add project root to path for retry_utils and utils imports

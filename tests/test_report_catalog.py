@@ -1,6 +1,7 @@
 """Unit and integration tests for report catalog and multi-topic archival."""
 
 import json
+
 from deepagents.backends.utils import create_file_data, file_data_to_string
 
 from research_agent.report_catalog import (

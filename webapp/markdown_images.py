@@ -263,6 +263,7 @@ def _validate_image(filename: str, content_type: str | None, data: bytes) -> str
 
 
 def is_pdf_upload(filename: str, content_type: str | None = None) -> bool:
+    """Check if the given filename represents a valid PDF upload."""
     if "/" in filename or "\\" in filename:
         return False
     return Path(filename).suffix.lower() == ".pdf"

@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Mapping
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any, TypedDict
 
 from deepagents.backends.utils import create_file_data, file_data_to_string
@@ -192,7 +192,7 @@ def archive_report_to_state(
     record: ReportRecord = {
         "index": index,
         "run_id": resolved_run_id,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
         "topic": topic_title,
         "slug": slug,
         "report_path": archived_report_path,

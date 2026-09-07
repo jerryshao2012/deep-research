@@ -1734,7 +1734,9 @@ async def _execute_run(run_id: str, thread_id: str) -> None:
 
         # Initialize per-thread cited_response tracking for the middleware
         existing_reports = [k for k in existing_files if k.startswith("/cited_response")]
-        from research_agent.research_subagent.utils.knowledge_filesystem import _thread_existing_cited_responses
+        from research_agent.research_subagent.utils.knowledge_filesystem import (
+            _thread_existing_cited_responses,
+        )
         _thread_existing_cited_responses[str(thread_id)] = existing_reports
 
         latest_values.setdefault("files", existing_files)
@@ -1887,16 +1889,20 @@ async def _execute_run(run_id: str, thread_id: str) -> None:
         existing_reports_result = result.get("existing_reports")
         if not existing_reports_result:
             existing_reports_result = _thread_existing_cited_responses.get(str(thread_id), [])
-        from research_agent.research_subagent.utils.knowledge_filesystem import get_active_cited_response_path
+        from research_agent.research_subagent.utils.knowledge_filesystem import (
+            get_active_cited_response_path,
+        )
         active_report_path = get_active_cited_response_path(files, existing_reports_result)
 
         if active_report_path in files:
-            from deepagents.backends.utils import file_data_to_string, create_file_data
+            from deepagents.backends.utils import create_file_data, file_data_to_string
             report_data = files[active_report_path]
             report_text = file_data_to_string(report_data)
             if os.getenv("DEEP_RESEARCH_VALIDATE_CITATIONS") == "1":
+                from research_agent.research_subagent.utils.citation_validator import (
+                    validate_web_citations,
+                )
                 from thread_wiki.service import _extract_citations
-                from research_agent.research_subagent.utils.citation_validator import validate_web_citations
 
                 citations = _extract_citations(report_text)
                 web_citations = [c for c in citations if c.kind == "web"]
@@ -1961,8 +1967,8 @@ async def _execute_run(run_id: str, thread_id: str) -> None:
 
         # Collect state metadata
         from research_agent.research_subagent.utils.knowledge_filesystem import (
-            _thread_wiki_query_complete,
             _thread_existing_cited_responses,
+            _thread_wiki_query_complete,
         )
         wiki_query_complete = result.get("wiki_query_complete")
         if not wiki_query_complete and str(thread_id) in _thread_wiki_query_complete:
@@ -2355,7 +2361,9 @@ async def stream_run(
     db.update_thread(thread_id, messages, existing_values)
 
     # Initialize per-thread cited_response tracking for the middleware
-    from research_agent.research_subagent.utils.knowledge_filesystem import _thread_existing_cited_responses
+    from research_agent.research_subagent.utils.knowledge_filesystem import (
+        _thread_existing_cited_responses,
+    )
     existing_reports = [k for k in existing_files if k.startswith("/cited_response")]
     _thread_existing_cited_responses[str(thread_id)] = existing_reports
 

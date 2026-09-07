@@ -6,8 +6,8 @@ from collections.abc import Mapping
 from typing import Annotated, Any, Literal
 
 from pydantic import (
-    BeforeValidator,
     BaseModel,
+    BeforeValidator,
     ConfigDict,
     Field,
     field_validator,

@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 from datetime import UTC, datetime
 from typing import Any
 
 from research_agent import db_sql
+
+logger = logging.getLogger(__name__)
 
 _sqlite_lock = threading.Lock()
 _sqlite_conn = None
@@ -153,7 +156,7 @@ def _init_sqlite() -> None:
                 conn.execute(db_sql.ALTER_THREADS_ADD_UPDATED_AT)
                 conn.execute(db_sql.UPDATE_THREADS_SET_UPDATED_AT)
     except Exception as exc:
-        print(f"⚠️ SQLite database initialization warning (locking on CIFS network mount?): {exc}")
+        logger.warning("SQLite database initialization warning (locking on CIFS network mount?): %s", exc)
         if "state_updated_at" not in thread_cols:
             conn.execute(db_sql.ALTER_THREADS_ADD_STATE_UPDATED_AT)
         if "metadata" not in thread_cols:

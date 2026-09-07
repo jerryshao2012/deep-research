@@ -20,7 +20,7 @@ def read_pckl_file(file_path: str) -> None:
             data = pickle.load(f)
 
         print(f"Type: {type(data).__name__}")
-        print(f"\nContents:")
+        print("\nContents:")
         print("-" * 80)
 
         # Handle different data types

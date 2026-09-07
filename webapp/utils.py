@@ -11,7 +11,6 @@ from pathlib import Path, PurePosixPath
 
 from fastapi import HTTPException, status
 
-
 # ── Path / filename safety ────────────────────────────────────────────────────
 
 def safe_relative_folder(folder: str) -> PurePosixPath:

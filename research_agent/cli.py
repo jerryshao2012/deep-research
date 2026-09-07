@@ -655,7 +655,7 @@ def main():
 
     subject = args.subject
     if not subject and args.subject_file and os.path.exists(args.subject_file):
-        with open(args.subject_file, "r", encoding="utf-8") as handle:
+        with open(args.subject_file, encoding="utf-8") as handle:
             subject = handle.read().strip()
 
     instruction = subject

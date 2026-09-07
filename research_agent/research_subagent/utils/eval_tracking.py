@@ -11,7 +11,7 @@ import hashlib
 import json
 import os
 import subprocess
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -30,7 +30,7 @@ _TOOL_FAILURE_PREFIXES = (
 
 def utc_now_iso() -> str:
     """Return current UTC timestamp in ISO8601 format."""
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def build_manifest(

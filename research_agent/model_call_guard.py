@@ -12,6 +12,7 @@ import logging
 import math
 import os
 import queue
+import sys
 import threading
 import time
 import uuid
@@ -3169,23 +3170,23 @@ def _validated_provider_fields(
             fields.pop(name, None)
         http_client = getattr(model, "http_client", None)
         http_async_client = getattr(model, "http_async_client", None)
-        if not isinstance(http_client, httpx.Client):
+        if not isinstance(http_client, _httpx_sync_client_types()):
             http_client = getattr(getattr(model, "root_client", None), "_client", None)
-        if not isinstance(http_async_client, httpx.AsyncClient):
+        if not isinstance(http_async_client, _httpx_async_client_types()):
             http_async_client = getattr(
                 getattr(model, "root_async_client", None),
                 "_client",
                 None,
             )
-        fresh_http_client: httpx.Client | None = None
+        fresh_http_client: Any = None
         state_clients = tuple(
             client
             for client in (http_client, http_async_client)
-            if isinstance(client, (httpx.Client, httpx.AsyncClient))
+            if isinstance(client, _httpx_all_client_types())
         )
         forbidden_state_ids = _httpx_client_state_identity_ids(*state_clients)
         claimed_state_ids: set[int] = set()
-        if clone_http_transports and isinstance(http_client, httpx.Client):
+        if clone_http_transports and isinstance(http_client, _httpx_sync_client_types()):
             fresh_http_client = _fresh_httpx_client_after_fork(
                 http_client,
                 policy,
@@ -3195,7 +3196,7 @@ def _validated_provider_fields(
                 claimed_state_ids=claimed_state_ids,
             )
             fields["http_client"] = fresh_http_client
-        if clone_http_transports and isinstance(http_async_client, httpx.AsyncClient):
+        if clone_http_transports and isinstance(http_async_client, _httpx_async_client_types()):
             try:
                 fields["http_async_client"] = _fresh_httpx_async_client_after_fork(
                     http_async_client,
@@ -3230,7 +3231,7 @@ def _unwrapped_httpx_transport(transport: Any) -> Any:
     return transport
 
 
-def _resolved_httpx_proxy(pool: Any) -> httpx.Proxy | None:
+def _resolved_httpx_proxy(pool: Any, *, proxy_cls: Any = None) -> Any:
     """Recover proxy settings already resolved before a process fork."""
     proxy_url = getattr(pool, "_proxy_url", None)
     if proxy_url is None:
@@ -3241,7 +3242,13 @@ def _resolved_httpx_proxy(pool: Any) -> httpx.Proxy | None:
             value.decode("ascii") if isinstance(value, bytes) else value
             for value in proxy_auth
         )
-    return httpx.Proxy(
+    if proxy_cls is None:
+        proxy_cls = (
+            getattr(sys.modules.get("httpx2"), "Proxy", httpx.Proxy)
+            if "httpx2" in type(pool).__module__
+            else httpx.Proxy
+        )
+    return proxy_cls(
         bytes(proxy_url).decode("ascii"),
         auth=proxy_auth,
         headers=getattr(pool, "_proxy_headers", None),
@@ -3249,9 +3256,15 @@ def _resolved_httpx_proxy(pool: Any) -> httpx.Proxy | None:
     )
 
 
-def _httpx_limits_from_pool(pool: Any) -> httpx.Limits:
+def _httpx_limits_from_pool(pool: Any, *, limits_cls: Any = None) -> Any:
     """Copy connection bounds without carrying inherited pool locks."""
-    return httpx.Limits(
+    if limits_cls is None:
+        limits_cls = (
+            getattr(sys.modules.get("httpx2"), "Limits", httpx.Limits)
+            if "httpx2" in type(pool).__module__
+            else httpx.Limits
+        )
+    return limits_cls(
         max_connections=getattr(pool, "_max_connections", None),
         max_keepalive_connections=getattr(
             pool,
@@ -3272,18 +3285,32 @@ def _fresh_httpx_transport_after_fork(
     """Recreate standard transports or use an explicit model clone capability."""
     transport = _unwrapped_httpx_transport(transport)
     expected_type = httpx.AsyncHTTPTransport if asynchronous else httpx.HTTPTransport
-    if type(transport) is expected_type:
+    httpx2_mod = sys.modules.get("httpx2")
+    httpx2_type = (
+        (httpx2_mod.AsyncHTTPTransport if asynchronous else httpx2_mod.HTTPTransport)
+        if httpx2_mod is not None
+        else None
+    )
+    if type(transport) is expected_type or (httpx2_type is not None and type(transport) is httpx2_type):
         pool = transport._pool
-        transport_class = (
-            httpx.AsyncHTTPTransport if asynchronous else httpx.HTTPTransport
+        transport_class = type(transport)
+        limits_cls = (
+            getattr(httpx2_mod, "Limits", httpx.Limits)
+            if httpx2_mod is not None and "httpx2" in type(transport).__module__
+            else httpx.Limits
+        )
+        proxy_cls = (
+            getattr(httpx2_mod, "Proxy", httpx.Proxy)
+            if httpx2_mod is not None and "httpx2" in type(transport).__module__
+            else httpx.Proxy
         )
         return transport_class(
             verify=getattr(pool, "_ssl_context", True),
             trust_env=False,
             http1=getattr(pool, "_http1", True),
             http2=getattr(pool, "_http2", False),
-            limits=_httpx_limits_from_pool(pool),
-            proxy=_resolved_httpx_proxy(pool),
+            limits=_httpx_limits_from_pool(pool, limits_cls=limits_cls),
+            proxy=_resolved_httpx_proxy(pool, proxy_cls=proxy_cls),
             uds=getattr(pool, "_uds", None),
             local_address=getattr(pool, "_local_address", None),
             retries=getattr(pool, "_retries", 0),
@@ -3328,24 +3355,59 @@ def _fresh_httpx_mounts_after_fork(
     return mounts
 
 
+def _httpx_sync_client_types() -> tuple[type, ...]:
+    types: list[type] = [httpx.Client]
+    httpx2_mod = sys.modules.get("httpx2")
+    if httpx2_mod is not None:
+        c = getattr(httpx2_mod, "Client", None)
+        if isinstance(c, type):
+            types.append(c)
+    return tuple(types)
+
+
+def _httpx_async_client_types() -> tuple[type, ...]:
+    types: list[type] = [httpx.AsyncClient]
+    httpx2_mod = sys.modules.get("httpx2")
+    if httpx2_mod is not None:
+        c = getattr(httpx2_mod, "AsyncClient", None)
+        if isinstance(c, type):
+            types.append(c)
+    return tuple(types)
+
+
+def _httpx_all_client_types() -> tuple[type, ...]:
+    return _httpx_sync_client_types() + _httpx_async_client_types()
+
+
+def _is_standard_event_hook(hook: Any) -> bool:
+    mod = getattr(hook, "__module__", "") or ""
+    name = getattr(hook, "__name__", "") or ""
+    return "openai.lib.azure" in mod and "strip_azure_api_key_on_redirect" in name
+
+
 def _httpx_client_state_identity_ids(
-    *clients: httpx.Client | httpx.AsyncClient,
+    *clients: Any,
 ) -> set[int]:
     """Collect every caller-owned auth and callback identity before cloning."""
     identities: set[int] = set()
     for client in clients:
-        if client._auth is not None:
-            identities.add(id(client._auth))
+        if client is None:
+            continue
+        auth = getattr(client, "_auth", None)
+        if auth is not None:
+            identities.add(id(auth))
+        event_hooks = getattr(client, "event_hooks", {})
         identities.update(
             id(hook)
-            for hooks in client.event_hooks.values()
+            for hooks in event_hooks.values()
             for hook in hooks
+            if not _is_standard_event_hook(hook)
         )
     return identities
 
 
 def _fresh_httpx_client_state(
-    client: httpx.Client | httpx.AsyncClient,
+    client: Any,
     *,
     asynchronous: bool,
     owner: BaseChatModel | None,
@@ -3354,15 +3416,19 @@ def _fresh_httpx_client_state(
     claimed_state_ids: set[int] | None = None,
 ) -> tuple[Any, dict[str, list[Callable[..., Any]]]]:
     """Clone auth/hooks or fail closed before crossing loop/process ownership."""
-    auth = client._auth
+    auth = getattr(client, "_auth", None)
     event_hooks = {
         name: list(hooks)
-        for name, hooks in client.event_hooks.items()
+        for name, hooks in getattr(client, "event_hooks", {}).items()
     }
-    has_hooks = any(event_hooks.values())
-    if auth is None and not has_hooks:
+    has_custom_hooks = any(
+        not _is_standard_event_hook(hook)
+        for hooks in event_hooks.values()
+        for hook in hooks
+    )
+    if auth is None and not has_custom_hooks:
         return None, event_hooks
-    if type(auth) is httpx.BasicAuth and not has_hooks:
+    if type(auth) is httpx.BasicAuth and not has_custom_hooks:
         cloned_auth = copy.copy(auth)
         cloned_hooks = event_hooks
     else:
@@ -3396,12 +3462,14 @@ def _fresh_httpx_client_state(
         id(hook)
         for hooks in event_hooks.values()
         for hook in hooks
+        if not _is_standard_event_hook(hook)
     }
     valid_hooks = set(cloned_hooks) == set(event_hooks)
     for name, hooks in event_hooks.items():
         replacements = cloned_hooks.get(name, [])
         if len(replacements) != len(hooks) or any(
-            id(replacement) in original_hook_ids or not callable(replacement)
+            (id(replacement) in original_hook_ids and not _is_standard_event_hook(replacement))
+            or not callable(replacement)
             for replacement in replacements
         ):
             valid_hooks = False
@@ -3412,6 +3480,7 @@ def _fresh_httpx_client_state(
             id(hook)
             for hooks in cloned_hooks.values()
             for hook in hooks
+            if not _is_standard_event_hook(hook)
         ]
     )
     forbidden = (
@@ -3437,14 +3506,14 @@ def _fresh_httpx_client_state(
 
 
 def _fresh_httpx_client_after_fork(
-    client: httpx.Client,
+    client: Any,
     policy: ModelCallPolicy,
     *,
     owner: BaseChatModel | None = None,
     metadata: ModelRuntimeMetadata | None = None,
     forbidden_state_ids: set[int] | None = None,
     claimed_state_ids: set[int] | None = None,
-) -> httpx.Client:
+) -> Any:
     """Clone stable client settings around a new process-local transport."""
     auth, event_hooks = _fresh_httpx_client_state(
         client,
@@ -3460,7 +3529,16 @@ def _fresh_httpx_client_after_fork(
         owner=owner,
         metadata=metadata,
     )
-    return httpx.Client(
+    httpx2_mod = sys.modules.get("httpx2")
+    is_httpx2 = httpx2_mod is not None and isinstance(
+        client, getattr(httpx2_mod, "Client", ())
+    )
+    client_cls = (
+        getattr(httpx2_mod, "Client", httpx.Client)
+        if is_httpx2
+        else httpx.Client
+    )
+    return client_cls(
         auth=auth,
         params=client.params,
         headers=client.headers,
@@ -3478,21 +3556,21 @@ def _fresh_httpx_client_after_fork(
         follow_redirects=client.follow_redirects,
         max_redirects=client.max_redirects,
         event_hooks=event_hooks,
-        base_url=client.base_url,
+        base_url=str(client.base_url) if client.base_url else "",
         transport=transport,
         default_encoding=client._default_encoding,
     )
 
 
 def _fresh_httpx_async_client_after_fork(
-    client: httpx.AsyncClient,
+    client: Any,
     policy: ModelCallPolicy,
     *,
     owner: BaseChatModel | None = None,
     metadata: ModelRuntimeMetadata | None = None,
     forbidden_state_ids: set[int] | None = None,
     claimed_state_ids: set[int] | None = None,
-) -> httpx.AsyncClient:
+) -> Any:
     """Clone stable async settings around a new process-local transport."""
     auth, event_hooks = _fresh_httpx_client_state(
         client,
@@ -3508,7 +3586,16 @@ def _fresh_httpx_async_client_after_fork(
         owner=owner,
         metadata=metadata,
     )
-    return httpx.AsyncClient(
+    httpx2_mod = sys.modules.get("httpx2")
+    is_httpx2 = httpx2_mod is not None and isinstance(
+        client, getattr(httpx2_mod, "AsyncClient", ())
+    )
+    client_cls = (
+        getattr(httpx2_mod, "AsyncClient", httpx.AsyncClient)
+        if is_httpx2
+        else httpx.AsyncClient
+    )
+    return client_cls(
         auth=auth,
         params=client.params,
         headers=client.headers,
@@ -3526,7 +3613,7 @@ def _fresh_httpx_async_client_after_fork(
         follow_redirects=client.follow_redirects,
         max_redirects=client.max_redirects,
         event_hooks=event_hooks,
-        base_url=client.base_url,
+        base_url=str(client.base_url) if client.base_url else "",
         transport=transport,
         default_encoding=client._default_encoding,
     )
@@ -3702,24 +3789,24 @@ def _provider_fields_after_fork(model: BaseChatModel) -> dict[str, Any]:
         )
         sync_client = (
             root_sync_client
-            if isinstance(root_sync_client, httpx.Client)
+            if isinstance(root_sync_client, _httpx_sync_client_types())
             else getattr(model, "http_client", None)
         )
         async_client = (
             root_async_client
-            if isinstance(root_async_client, httpx.AsyncClient)
+            if isinstance(root_async_client, _httpx_async_client_types())
             else getattr(model, "http_async_client", None)
         )
         state_clients = tuple(
             client
             for client in (sync_client, async_client)
-            if isinstance(client, (httpx.Client, httpx.AsyncClient))
+            if isinstance(client, _httpx_all_client_types())
         )
         forbidden_state_ids = _httpx_client_state_identity_ids(*state_clients)
         claimed_state_ids: set[int] = set()
         fields.pop("http_client", None)
         fields.pop("http_async_client", None)
-        fresh_sync_client: httpx.Client | None = None
+        fresh_sync_client: Any = None
         if "http_client" in model_fields:
             fresh_sync_client = (
                 _fresh_httpx_client_after_fork(
@@ -3730,7 +3817,7 @@ def _provider_fields_after_fork(model: BaseChatModel) -> dict[str, Any]:
                     forbidden_state_ids=forbidden_state_ids,
                     claimed_state_ids=claimed_state_ids,
                 )
-                if isinstance(sync_client, httpx.Client)
+                if isinstance(sync_client, _httpx_sync_client_types())
                 else httpx.Client(
                     timeout=policy.timeout_seconds,
                     trust_env=False,
@@ -3748,7 +3835,7 @@ def _provider_fields_after_fork(model: BaseChatModel) -> dict[str, Any]:
                         forbidden_state_ids=forbidden_state_ids,
                         claimed_state_ids=claimed_state_ids,
                     )
-                    if isinstance(async_client, httpx.AsyncClient)
+                    if isinstance(async_client, _httpx_async_client_types())
                     else httpx.AsyncClient(
                         timeout=policy.timeout_seconds,
                         trust_env=False,
@@ -3772,6 +3859,76 @@ def _provider_fields_after_fork(model: BaseChatModel) -> dict[str, Any]:
     return fields
 
 
+def _adapt_anthropic_client(client: Any, target_cls: type, *, asynchronous: bool) -> Any:
+    if isinstance(client, target_cls):
+        return client
+    base_url = str(client.base_url) if getattr(client, "base_url", None) else ""
+    timeout = getattr(client, "timeout", None)
+    timeout_val = float(getattr(timeout, "read", 60.0) or 60.0) if timeout is not None else 60.0
+    trust_env = getattr(client, "_trust_env", False)
+    follow_redirects = getattr(client, "follow_redirects", True)
+    max_redirects = getattr(client, "max_redirects", 20)
+    raw_mounts = getattr(client, "_mounts", {})
+    clean_mounts = {
+        (k.pattern if hasattr(k, "pattern") else str(k)): v
+        for k, v in raw_mounts.items()
+    }
+
+    if asynchronous:
+        class _AsyncAdapter(target_cls):  # type: ignore[valid-type,misc]
+            def __init__(self, wrapped: Any) -> None:
+                self._wrapped = wrapped
+                super().__init__(
+                    base_url=base_url,
+                    timeout=timeout_val,
+                    trust_env=trust_env,
+                    follow_redirects=follow_redirects,
+                    max_redirects=max_redirects,
+                    mounts=clean_mounts,
+                )
+                self._trust_env = trust_env
+                self._mounts = getattr(self, "_mounts", clean_mounts)
+
+            async def aclose(self) -> None:
+                try:
+                    await super().aclose()
+                finally:
+                    if hasattr(self._wrapped, "aclose"):
+                        await self._wrapped.aclose()
+
+            def close(self) -> None:
+                try:
+                    super().close()
+                finally:
+                    if hasattr(self._wrapped, "close"):
+                        self._wrapped.close()
+
+        return _AsyncAdapter(client)
+    else:
+        class _SyncAdapter(target_cls):  # type: ignore[valid-type,misc]
+            def __init__(self, wrapped: Any) -> None:
+                self._wrapped = wrapped
+                super().__init__(
+                    base_url=base_url,
+                    timeout=timeout_val,
+                    trust_env=trust_env,
+                    follow_redirects=follow_redirects,
+                    max_redirects=max_redirects,
+                    mounts=clean_mounts,
+                )
+                self._trust_env = trust_env
+                self._mounts = getattr(self, "_mounts", clean_mounts)
+
+            def close(self) -> None:
+                try:
+                    super().close()
+                finally:
+                    if hasattr(self._wrapped, "close"):
+                        self._wrapped.close()
+
+        return _SyncAdapter(client)
+
+
 def _install_fork_safe_anthropic_clients(
     source: BaseChatModel,
     target: BaseChatModel,
@@ -3779,6 +3936,10 @@ def _install_fork_safe_anthropic_clients(
 ) -> None:
     """Preload process-local Anthropic clients without environment proxies."""
     import anthropic  # noqa: PLC0415
+
+    anthropic_http = getattr(anthropic._base_client, "httpx2", httpx)
+    anthropic_client_cls = getattr(anthropic_http, "Client", httpx.Client)
+    anthropic_async_client_cls = getattr(anthropic_http, "AsyncClient", httpx.AsyncClient)
 
     client_params = dict(target._client_params)
     http_client_params: dict[str, Any] = {
@@ -3793,13 +3954,20 @@ def _install_fork_safe_anthropic_clients(
     source_async_client = source.__dict__.get("_async_client")
     source_http_client = getattr(source_client, "_client", None)
     source_http_async_client = getattr(source_async_client, "_client", None)
+    recognized_client_types = (httpx.Client, httpx.AsyncClient)
+    if anthropic_http is not httpx:
+        recognized_client_types = recognized_client_types + (
+            anthropic_client_cls,
+            anthropic_async_client_cls,
+        )
     state_clients = tuple(
         client
         for client in (source_http_client, source_http_async_client)
-        if isinstance(client, (httpx.Client, httpx.AsyncClient))
+        if isinstance(client, recognized_client_types)
     )
     forbidden_state_ids = _httpx_client_state_identity_ids(*state_clients)
     claimed_state_ids: set[int] = set()
+    is_sync = isinstance(source_http_client, (httpx.Client, anthropic_client_cls))
     http_client = (
         _fresh_httpx_client_after_fork(
             source_http_client,
@@ -3809,10 +3977,11 @@ def _install_fork_safe_anthropic_clients(
             forbidden_state_ids=forbidden_state_ids,
             claimed_state_ids=claimed_state_ids,
         )
-        if isinstance(source_http_client, httpx.Client)
-        else httpx.Client(**http_client_params)
+        if is_sync
+        else anthropic_client_cls(**http_client_params)
     )
     try:
+        is_async = isinstance(source_http_async_client, (httpx.AsyncClient, anthropic_async_client_cls))
         http_async_client = (
             _fresh_httpx_async_client_after_fork(
                 source_http_async_client,
@@ -3822,8 +3991,8 @@ def _install_fork_safe_anthropic_clients(
                 forbidden_state_ids=forbidden_state_ids,
                 claimed_state_ids=claimed_state_ids,
             )
-            if isinstance(source_http_async_client, httpx.AsyncClient)
-            else httpx.AsyncClient(**http_client_params)
+            if is_async
+            else anthropic_async_client_cls(**http_client_params)
         )
     except BaseException:
         try:
@@ -3831,6 +4000,12 @@ def _install_fork_safe_anthropic_clients(
         except Exception:
             pass
         raise
+    http_client = _adapt_anthropic_client(
+        http_client, anthropic_client_cls, asynchronous=False
+    )
+    http_async_client = _adapt_anthropic_client(
+        http_async_client, anthropic_async_client_cls, asynchronous=True
+    )
     target.__dict__["_client"] = anthropic.Anthropic(
         **client_params,
         http_client=http_client,

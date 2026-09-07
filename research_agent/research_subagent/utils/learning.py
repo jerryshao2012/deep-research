@@ -12,10 +12,9 @@ from __future__ import annotations
 
 import logging
 import statistics
-from datetime import datetime, timedelta, timezone
-from typing import Any
-
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 from research_agent.research_subagent.utils.eval_tracking import load_jsonl
 
@@ -50,7 +49,7 @@ def analyze_eval_trends(
         ``EVAL_LOG_QUESTIONS`` was enabled), ``experiments`` (A/B test results
         when experiment_id is present).
     """
-    cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
+    cutoff = datetime.now(UTC) - timedelta(days=window_days)
 
     # Collect all records within the window.
     records: list[dict[str, Any]] = []

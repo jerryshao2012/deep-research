@@ -1,5 +1,4 @@
-"""
-Golden dataset evaluation helpers.
+"""Golden dataset evaluation helpers.
 
 Use `Evaluation process` in https://github.com/microsoft/promptflow-resource-hub/blob/main/sample_gallery/golden_dataset/copilot-golden-dataset-creation-guidance.md.
 """
@@ -9,12 +8,12 @@ from __future__ import annotations
 import csv
 import json
 import re
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 
 import pandas as pd
-import sys
 import yaml
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage

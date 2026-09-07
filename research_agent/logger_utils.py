@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Optional
 
 from dotenv import load_dotenv
 
@@ -13,12 +12,11 @@ load_dotenv()
 
 
 def setup_logger(
-        name: Optional[str] = None,
-        level: Optional[str] = None,
-        format_string: Optional[str] = None,
+        name: str | None = None,
+        level: str | None = None,
+        format_string: str | None = None,
 ) -> logging.Logger:
-    """
-    Setup and configure a logger with centralized configuration.
+    """Set up and configure a logger with centralized configuration.
     
     Args:
         name: Logger name (typically __name__ of the calling module)
@@ -58,8 +56,7 @@ def setup_logger(
 
 
 def get_log_level_from_env(default: str = "INFO") -> int:
-    """
-    Get numeric log level from environment variable.
+    """Get numeric log level from environment variable.
     
     Args:
         default: Default level string if env var not set

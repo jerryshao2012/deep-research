@@ -121,7 +121,7 @@ def build_instruction(
 ) -> str:
     """Build the user instruction sent to the agent."""
     if not subject and subject_file and os.path.exists(subject_file):
-        with open(subject_file, "r", encoding="utf-8") as handle:
+        with open(subject_file, encoding="utf-8") as handle:
             subject = handle.read().strip()
 
     instruction = f"Research the following subject: {subject}"

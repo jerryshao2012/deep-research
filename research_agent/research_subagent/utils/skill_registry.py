@@ -396,6 +396,7 @@ class SkillRegistry:
         return len(self._skills)
 
     def __repr__(self) -> str:
+        """Return developer-friendly string representation of the registry."""
         return f"SkillRegistry(num_skills={self.num_skills}, dirs={self.skills_dirs})"
 
     def _extract_schema_block(self, body: str, path: Path) -> tuple[str, dict[str, Any] | None]:

@@ -1,9 +1,9 @@
 """Tests for documents upload API endpoints."""
 
+from conftest import TEST_API_KEY
 from fastapi.testclient import TestClient
 
 import webapp
-from conftest import TEST_API_KEY
 
 _AUTH_HEADERS = {"X-API-Key": TEST_API_KEY}
 

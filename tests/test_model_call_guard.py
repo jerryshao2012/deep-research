@@ -4905,13 +4905,41 @@ def _openai_provider_cases():
 
 
 def _timeout_components(timeout: Any) -> list[float]:
-    if isinstance(timeout, httpx.Timeout):
-        values = [timeout.connect, timeout.read, timeout.write, timeout.pool]
-    elif isinstance(timeout, tuple):
-        values = list(timeout)
-    else:
-        values = [timeout]
-    return [float(value) for value in values if value is not None]
+    if timeout is None:
+        return []
+    if isinstance(timeout, (int, float)):
+        return [float(timeout)]
+    if isinstance(timeout, httpx.Timeout) or (
+        hasattr(timeout, "connect") and hasattr(timeout, "read")
+    ):
+        values = [
+            getattr(timeout, "connect", None),
+            getattr(timeout, "read", None),
+            getattr(timeout, "write", None),
+            getattr(timeout, "pool", None),
+        ]
+        results: list[float] = []
+        for v in values:
+            if v is not None:
+                results.extend(_timeout_components(v))
+        return results
+    if isinstance(timeout, (tuple, list)):
+        results = []
+        for v in timeout:
+            if v is not None:
+                results.extend(_timeout_components(v))
+        return results
+    if hasattr(timeout, "as_dict") and callable(timeout.as_dict):
+        results = []
+        for v in timeout.as_dict().values():
+            if v is not None:
+                results.extend(_timeout_components(v))
+        return results
+    try:
+        return [float(timeout)]
+    except (TypeError, ValueError):
+        return []
+
 
 
 @pytest.mark.parametrize(

@@ -1,3 +1,5 @@
+"""Thread migration utilities from sqlite to LangGraph checkpointer."""
+
 import json
 import os
 import sqlite3
@@ -61,7 +63,7 @@ async def migrate_threads_to_checkpointer() -> None:
                         if_exists="do_nothing",
                     )
                     print(f"   ✅ Registered thread in checkpointer: {thread_id}")
-                except Exception as e:
+                except Exception:
                     # Fallback to raising if conflict behavior mismatch
                     try:
                         await Threads.put(

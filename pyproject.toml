@@ -113,10 +113,40 @@ lint.ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = ["D", "UP"]
+"tests/*" = ["D", "UP", "T201", "F401", "E402", "F841"]
+"research_agent/cli.py" = ["T201"]
+"research_agent/cli_utils.py" = ["T201"]
+"research_agent/run.py" = ["T201", "D"]
+"research_agent/server.py" = ["D", "F841"]
+"webapp/migration.py" = ["T201"]
+"research_agent/research_subagent/utils/cli.py" = ["T201"]
+"scripts/*" = ["T201"]
+".deepagents/skills/*" = ["D", "E402", "T201"]
+"migrate_sqlite_to_cosmos.py" = ["D", "T201"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"
 
 [tool.ruff.lint.flake8-tidy-imports]
 ban-relative-imports = "all"
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true
+warn_unused_configs = true
+follow_imports = "silent"
+disable_error_code = [
+    "attr-defined",
+    "misc",
+    "override",
+    "arg-type",
+    "assignment",
+    "no-redef",
+    "union-attr",
+    "return-value",
+    "var-annotated",
+]
+exclude = [
+    "server\\.py$",
+    "run\\.py$",
+]

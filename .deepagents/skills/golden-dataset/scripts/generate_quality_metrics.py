@@ -5,9 +5,8 @@ from __future__ import annotations
 
 import argparse
 import csv
-from pathlib import Path
-
 import sys
+from pathlib import Path
 
 # Add project root to path for retry_utils and utils imports
 _sys_path_root = Path(__file__).resolve().parent.parent.parent.parent.parent

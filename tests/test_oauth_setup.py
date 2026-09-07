@@ -36,15 +36,16 @@ def test_oauth_handler():
 
     try:
         from webapp.oauth_handler import (
-            google,
-            github,
-            user_manager,
             get_oauth_login_url,
+            github,
+            google,
+            user_manager,
         )
         print("✓ OAuth handler module imported successfully")
 
         # Test URL generation
         import asyncio
+
         from starlette.requests import Request
 
         def make_dummy_request():
@@ -76,7 +77,7 @@ def test_auth_module():
     print("\nTesting auth module...")
 
     try:
-        from research_agent.auth import authenticate, auth
+        from research_agent.auth import auth, authenticate
         print("✓ Auth module imported successfully")
         print(f"✓ Auth instance created: {auth}")
         return True
@@ -137,7 +138,7 @@ def test_session_management():
         # Validate the session
         validated = user_manager.validate_session(token)
         if validated:
-            print(f"✓ Session validated successfully")
+            print("✓ Session validated successfully")
             print(f"  - Identity: {validated['identity']}")
             print(f"  - Email: {validated['email']}")
             print(f"  - Provider: {validated['provider']}")
@@ -167,8 +168,8 @@ def test_logout_and_cleanup():
     print("\nTesting logout and cleanup...")
 
     try:
-        from webapp.oauth_handler import user_manager, handle_logout
         from research_agent.auth import _logged_oauth_users
+        from webapp.oauth_handler import handle_logout, user_manager
 
         # Create a test session
         test_user = {
@@ -179,7 +180,7 @@ def test_logout_and_cleanup():
         }
 
         token = user_manager.create_session(test_user, "google")
-        print(f"✓ Session created for logout test")
+        print("✓ Session created for logout test")
 
         # Simulate first authentication (adds to _logged_oauth_users)
         _logged_oauth_users.add(test_user["identity"])
@@ -205,7 +206,7 @@ def test_logout_and_cleanup():
         # Clean up _logged_oauth_users (simulating what webapp.py does)
         if identity in _logged_oauth_users:
             _logged_oauth_users.discard(identity)
-            print(f"✓ User removed from _logged_oauth_users")
+            print("✓ User removed from _logged_oauth_users")
             print(f"  - Tracked users count: {len(_logged_oauth_users)}")
 
         # Verify user is no longer tracked

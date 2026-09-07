@@ -15,11 +15,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from datetime import UTC, datetime
-from pathlib import Path
-
 import sys
 import time
+from datetime import UTC, datetime
+from pathlib import Path
 
 # Add project root to path so we can import the eval-tracking module and
 # the retry_utils / utils helpers that the scoring scripts need.
@@ -34,7 +33,6 @@ from golden_dataset_metrics import (
     score_dataset_file,
 )
 from humanize_report import humanize_report
-
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
