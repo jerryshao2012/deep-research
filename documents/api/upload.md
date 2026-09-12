@@ -16,7 +16,7 @@ Bind to `0.0.0.0` only inside a container or on a trusted network.
 
 - A configured static API key is accepted only in `X-API-Key`.
 - An authenticated OAuth session may be presented in `X-API-Key` or as `Authorization: Bearer <session-token>`.
-- Static-key selection is `UPLOAD_API_KEY`, then `LANGCHAIN_API_KEY`, then a process-local generated key. A generated key changes on restart and is unsuitable for shared or durable environments.
+- Static-key selection is `UPLOAD_API_KEY`, then `LANGSMITH_API_KEY`, then a process-local generated key. A generated key changes on restart and is unsuitable for shared or durable environments.
 
 See [Authentication](../guides/authentication.md) for OAuth sessions, production controls, and key rotation.
 

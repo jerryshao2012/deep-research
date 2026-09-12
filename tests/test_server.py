@@ -1047,7 +1047,7 @@ def test_404_for_missing_run(client):
 
 def test_authentication_required(client, monkeypatch):
     monkeypatch.setenv("ALLOW_ALL_THREADS", "false")
-    monkeypatch.setenv("LANGCHAIN_API_KEY", "secret-key")
+    monkeypatch.setenv("LANGSMITH_API_KEY", "secret-key")
 
     # Missing headers
     resp = client.post("/threads")
@@ -1067,7 +1067,7 @@ def test_authentication_required(client, monkeypatch):
 
 def test_thread_ownership(client, monkeypatch):
     monkeypatch.setenv("ALLOW_ALL_THREADS", "false")
-    monkeypatch.setenv("LANGCHAIN_API_KEY", "secret-key")
+    monkeypatch.setenv("LANGSMITH_API_KEY", "secret-key")
 
     # Set up mock OAuth session validation
     from webapp.oauth_handler import user_manager

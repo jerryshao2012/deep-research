@@ -91,7 +91,7 @@ Deployment guides: [Azure](documents/deployment/azure/README.md), [AWS](document
 
 - [research_agent/model_factory.py](research_agent/model_factory.py) creates provider-specific LangChain chat and embedding models from environment variables. It supports Azure OpenAI with managed identity, Anthropic, Google Gemini, and Ollama.
 - [research_agent/db.py](research_agent/db.py) abstracts SQLite for development, PostgreSQL for production, and Cosmos DB for Azure production. It stores thread and run state.
-- [research_agent/auth.py](research_agent/auth.py) authenticates Agent Protocol requests with `LANGCHAIN_API_KEY` or OAuth session tokens. `langgraph.json` registers it as the auth module.
+- [research_agent/auth.py](research_agent/auth.py) authenticates Agent Protocol requests with `LANGSMITH_API_KEY` or OAuth session tokens. `langgraph.json` registers it as the auth module.
 - [research_agent/retry_utils.py](research_agent/retry_utils.py) tracks TPM/RPM quotas and applies exponential backoff to rate limits.
 - [research_agent/s3_storage.py](research_agent/s3_storage.py) provides S3-compatible document persistence.
 
@@ -260,7 +260,7 @@ export EXPERIMENT_ID=prompt-v2                 # Optional experiment identifier
 export EXPERIMENT_VARIANT=treatment            # Optional variant label (control/treatment)
 
 # Tracing & Monitoring
-export LANGCHAIN_API_KEY=...                   # LangSmith (optional)
+export LANGSMITH_API_KEY=...                   # LangSmith (optional)
 export ENABLE_EVAL_TRACKING=true               # Evaluation tracking (default: true)
 export EVAL_LOG_QUESTIONS=false                # Log user questions to eval history (default: false)
 
@@ -285,8 +285,8 @@ source ./secrets.sh                            # Load sensitive keys (not in git
 uv run python -m research_agent.cli "Your query" -v
 
 # Use LangSmith tracing
-export LANGCHAIN_API_KEY=<key>
-export LANGCHAIN_TRACING_V2=true
+export LANGSMITH_API_KEY=<key>
+export LANGSMITH_TRACING=true
 uv run python -m research_agent.cli "Your query"
 # Then view at https://smith.langchain.com
 ```

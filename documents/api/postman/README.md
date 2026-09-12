@@ -30,7 +30,7 @@ Keep secrets in Postman environment values rather than collection examples or ve
 
 ## Authentication
 
-Collection uses `X-API-Key: {{api_key}}`. Static upload-key precedence is `UPLOAD_API_KEY`, then `LANGCHAIN_API_KEY`, then a process-local generated key. `/health` is unauthenticated; protected requests require the configured credential. See [authentication guide](../../guides/authentication.md) for OAuth and production behavior.
+Collection uses `X-API-Key: {{api_key}}`. Static upload-key precedence is `UPLOAD_API_KEY`, then `LANGSMITH_API_KEY`, then a process-local generated key. `/health` is unauthenticated; protected requests require the configured credential. See [authentication guide](../../guides/authentication.md) for OAuth and production behavior.
 
 ## Sensitive storage response
 

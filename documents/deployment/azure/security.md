@@ -133,7 +133,7 @@ Do not confuse application outbound verification with Container Apps inbound HTT
 
 Infrastructure identity does not authenticate API callers. Before exposing external ingress:
 
-- configure stable `UPLOAD_API_KEY` and `LANGCHAIN_API_KEY` values according to each API surface;
+- configure stable `UPLOAD_API_KEY` and `LANGSMITH_API_KEY` values according to each API surface;
 - use deployment-derived `FRONTEND_URLS` as sole exact frontend-origin list with `PASSKEY_DERIVE_FROM_FRONTEND_URLS=true` and explicit `PASSKEY_ENABLED=true`;
 - configure OAuth callback URLs from the deployed public origin;
 - use a stable `OAUTH_SECRET_KEY` for signed sessions;

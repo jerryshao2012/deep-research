@@ -114,7 +114,7 @@ Start the standalone documents upload service:
 uv run python -m uvicorn webapp:app --host 127.0.0.1 --port 8000
 ```
 
-This command serves the API on loopback at `http://localhost:8000`; use `--host 0.0.0.0` only for a container or intentional trusted-network exposure. Protected routes always enforce authentication: set `UPLOAD_API_KEY` for a stable explicit key; otherwise the server uses `LANGCHAIN_API_KEY`, then generates a process-local key. Follow the [Document Upload API guide](../api/upload.md) for request examples and the endpoint reference.
+This command serves the API on loopback at `http://localhost:8000`; use `--host 0.0.0.0` only for a container or intentional trusted-network exposure. Protected routes always enforce authentication: set `UPLOAD_API_KEY` for a stable explicit key; otherwise the server uses `LANGSMITH_API_KEY`, then generates a process-local key. Follow the [Document Upload API guide](../api/upload.md) for request examples and the endpoint reference.
 
 After staging documents, point `--doc-folder` at their folder for a CLI task, or consume them through a supported LangGraph workflow. Uploads under a thread folder can also feed a per-thread knowledge base; see the [Thread Wiki API guide](../api/wiki.md) for ingestion, query, and repository-import workflows.
 

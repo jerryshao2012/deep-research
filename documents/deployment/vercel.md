@@ -68,7 +68,7 @@ Follow [Configuration](../guides/configuration.md) for runtime settings and [Aut
 The old guide named `NEXT_PUBLIC_AGENT_URL`, `NEXT_PUBLIC_UPLOAD_API_KEY`, `NEXT_PUBLIC_ENABLE_EVAL`, and `NEXT_PUBLIC_SITE_TITLE`, but this backend repository cannot verify that a current UI consumes those names. Use the UI's source and documentation as authority.
 
 > [!WARNING]
-> Never place `UPLOAD_API_KEY`, `LANGCHAIN_API_KEY`, provider keys, OAuth client secrets, or master credentials in `NEXT_PUBLIC_*`, `VITE_*`, or any other browser-bundled variable. A public variable is visible to every visitor.
+> Never place `UPLOAD_API_KEY`, `LANGSMITH_API_KEY`, provider keys, OAuth client secrets, or master credentials in `NEXT_PUBLIC_*`, `VITE_*`, or any other browser-bundled variable. A public variable is visible to every visitor.
 
 ## Deploy with Vercel CLI
 

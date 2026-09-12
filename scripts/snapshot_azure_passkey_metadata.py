@@ -16,7 +16,7 @@ from urllib.parse import urlsplit
 
 SECRET_NAMES = (
     "TAVILY-API-KEY",
-    "LANGCHAIN-API-KEY",
+    "LANGSMITH-API-KEY",
     "UPLOAD-API-KEY",
     "STORAGE-ACCOUNT-NAME",
     "STORAGE-ACCOUNT-KEY",

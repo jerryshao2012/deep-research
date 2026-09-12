@@ -94,7 +94,7 @@ def authenticate_credential(credential: str) -> Auth.types.MinimalUserDict:
     else:
         # Session validation failed - clean up logged users tracking if session was expired
         # Check if this credential was previously a valid session (by checking if it's not an API key)
-        expected_key = os.environ.get("LANGCHAIN_API_KEY") or os.environ.get(
+        expected_key = os.environ.get("LANGSMITH_API_KEY") or os.environ.get(
             "UPLOAD_API_KEY"
         )
         if expected_key and credential != expected_key:
@@ -106,14 +106,14 @@ def authenticate_credential(credential: str) -> Auth.types.MinimalUserDict:
             )
 
     # If not a valid session token, try API key authentication
-    expected_key = os.environ.get("LANGCHAIN_API_KEY") or os.environ.get(
+    expected_key = os.environ.get("LANGSMITH_API_KEY") or os.environ.get(
         "UPLOAD_API_KEY"
     )
 
     if not expected_key:
         raise HTTPException(
             status_code=500,
-            detail="Server configuration error: LANGCHAIN_API_KEY not set.",
+            detail="Server configuration error: LANGSMITH_API_KEY not set.",
         )
 
     if credential != expected_key:

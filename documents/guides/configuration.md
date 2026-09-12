@@ -126,7 +126,7 @@ These variables control server-style operational tracking. Golden-dataset baseli
 | Variable | Runtime default | Purpose |
 | --- | --- | --- |
 | `UPLOAD_API_KEY` | unset | Preferred stable key for protected custom webapp routes. |
-| `LANGCHAIN_API_KEY` | unset | LangGraph key and custom-webapp fallback. |
+| `LANGSMITH_API_KEY` | unset | LangGraph key and custom-webapp fallback. |
 | `UPLOAD_HOST` | `0.0.0.0` | Host used by the package's internal launcher; explicit Uvicorn arguments take precedence. |
 | `UPLOAD_PORT` | `8000` | Port used by the package's internal launcher. |
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | unset | Google OAuth client credentials. |
@@ -134,7 +134,7 @@ These variables control server-style operational tracking. Golden-dataset baseli
 | `FRONTEND_URLS` | unset | Comma-separated frontend redirect allowlist prepended to built-in origins. |
 | `OAUTH_SECRET_KEY` | process-local random value | Session-cookie signing secret; a stable 32-4096 byte secret is mandatory when passkeys are enabled and recommended for every deployment. |
 
-Authentication key precedence differs by surface. LangGraph resolves `LANGCHAIN_API_KEY` then `UPLOAD_API_KEY` and fails configuration if neither is set; protected custom webapp routes resolve `UPLOAD_API_KEY`, then `LANGCHAIN_API_KEY`, then generate a process-local key. See [Authentication](authentication.md) before exposing either service.
+Authentication key precedence differs by surface. LangGraph resolves `LANGSMITH_API_KEY` then `UPLOAD_API_KEY` and fails configuration if neither is set; protected custom webapp routes resolve `UPLOAD_API_KEY`, then `LANGSMITH_API_KEY`, then generate a process-local key. See [Authentication](authentication.md) before exposing either service.
 
 Auth persistence defaults to `DB_TYPE=sqlite` and an in-memory `SQLITE_DB_PATH` when unset. Use `AUTH_STORE_TYPE` to override the auth backend independently; supported values are SQLite, PostgreSQL, and Cosmos DB. Passkeys require durable configuration.
 

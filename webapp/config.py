@@ -45,7 +45,7 @@ API_VERSION: str = "1.8.139"
 # ── Authentication ────────────────────────────────────────────────────────────
 
 API_KEY: str = os.environ.get("UPLOAD_API_KEY") or os.environ.get(
-    "LANGCHAIN_API_KEY", ""
+    "LANGSMITH_API_KEY", ""
 )
 
 if not API_KEY:

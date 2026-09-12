@@ -59,7 +59,7 @@ Therefore:
 Before deployment, create the configured Secrets Manager JSON secret through an approved secure workflow. `deploy-aws.sh` maps these exact JSON keys into App Runner runtime secrets:
 
 - `TAVILY-API-KEY`
-- `LANGCHAIN-API-KEY`
+- `LANGSMITH-API-KEY`
 - `UPLOAD-API-KEY`
 - `AWS-BEARER-TOKEN-BEDROCK`
 - `AWS-BEDROCK-ENDPOINT`

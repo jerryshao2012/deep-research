@@ -181,7 +181,7 @@ az monitor metrics list-definitions \
 
 Current deployment script uses existing environment log configuration and does not create Log Analytics or Application Insights resources. Verify workspace ownership, access, retention, and cost controls. Environment creation and approved workspace association are administrator-owned bootstrap work.
 
-LangSmith tracing is enabled in generated configuration, but usable traces still require a valid `LANGCHAIN_API_KEY`, reachable endpoint, and intended project. Confirm only the variable references and inspect the LangSmith project; never print the key.
+LangSmith tracing is enabled in generated configuration, but usable traces still require a valid `LANGSMITH_API_KEY`, reachable endpoint, and intended project. Confirm only the variable references and inspect the LangSmith project; never print the key.
 
 Operational evaluation metrics are written to `output/eval_history/server_runs.jsonl` and synchronized through Blob behavior. See [Evaluation](../../guides/evaluation.md) for metric semantics and [Storage](storage.md) for durability limits.
 

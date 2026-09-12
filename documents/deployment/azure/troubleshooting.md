@@ -407,7 +407,7 @@ Current deployment uses existing Container Apps environment log destination. Com
 az containerapp show \
   --name "$AGENT_NAME" \
   --resource-group "$RESOURCE_GROUP" \
-  --query "properties.template.containers[0].env[?name=='LANGCHAIN_TRACING_V2' || name=='LANGSMITH_ENDPOINT' || name=='LANGCHAIN_PROJECT' || name=='LANGCHAIN_API_KEY']"
+  --query "properties.template.containers[0].env[?name=='LANGSMITH_TRACING' || name=='LANGSMITH_ENDPOINT' || name=='LANGSMITH_PROJECT' || name=='LANGSMITH_API_KEY']"
 
 az containerapp exec \
   --name "$AGENT_NAME" \

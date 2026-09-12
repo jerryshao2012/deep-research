@@ -468,9 +468,9 @@ cat > "$SOURCE_CONFIG_FILE" <<EOF
       "RuntimeEnvironmentVariables": {
         "VERIFY_SSL": "false",
         "LOG_LEVEL": "INFO",
-        "LANGCHAIN_TRACING_V2": "true",
+        "LANGSMITH_TRACING": "true",
         "LANGSMITH_ENDPOINT": "https://api.smith.langchain.com",
-        "LANGCHAIN_PROJECT": "deep-research-production",
+        "LANGSMITH_PROJECT": "deep-research-production",
         "ENABLE_EVAL_TRACKING": "true",
         "MODEL_TPM": "120000",
         "MODEL_RPM": "500",
@@ -507,7 +507,7 @@ cat > "$SOURCE_CONFIG_FILE" <<EOF
       },
       "RuntimeEnvironmentSecrets": {
         "TAVILY_API_KEY": "${SECRET_ARN}:TAVILY-API-KEY::",
-        "LANGCHAIN_API_KEY": "${SECRET_ARN}:LANGCHAIN-API-KEY::",
+        "LANGSMITH_API_KEY": "${SECRET_ARN}:LANGSMITH-API-KEY::",
         "UPLOAD_API_KEY": "${SECRET_ARN}:UPLOAD-API-KEY::",
         "AWS_BEARER_TOKEN_BEDROCK": "${SECRET_ARN}:AWS-BEARER-TOKEN-BEDROCK::",
         "AWS_BEDROCK_ENDPOINT": "${SECRET_ARN}:AWS-BEDROCK-ENDPOINT::",

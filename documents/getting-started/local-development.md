@@ -40,7 +40,7 @@ Run the standalone FastAPI application:
 uv run python -m uvicorn webapp:app --host 127.0.0.1 --port 8000
 ```
 
-This command listens on loopback at `127.0.0.1:8000`. Use `--host 0.0.0.0` only for a container or intentional trusted-network exposure. Protected routes always enforce authentication: set `UPLOAD_API_KEY` in `.env` for a stable explicit key; otherwise the server uses `LANGCHAIN_API_KEY`, then generates a process-local key. Change `--port` when needed.
+This command listens on loopback at `127.0.0.1:8000`. Use `--host 0.0.0.0` only for a container or intentional trusted-network exposure. Protected routes always enforce authentication: set `UPLOAD_API_KEY` in `.env` for a stable explicit key; otherwise the server uses `LANGSMITH_API_KEY`, then generates a process-local key. Change `--port` when needed.
 
 ```dotenv
 UPLOAD_API_KEY=your_generated_key_here

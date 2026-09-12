@@ -59,10 +59,10 @@ export TAVILY_API_KEY=your_tavily_api_key_here            # ✅ Required for web
 export ANTHROPIC_API_KEY=your_anthropic_api_key_here      # For Claude model
 export GOOGLE_API_KEY=your_google_api_key_here            # For Gemini model ([get one here](https://ai.google.dev/gemini-api/docs))
 export TAVILY_API_KEY=your_tavily_api_key_here            # Required for web search ([get one here](https://www.tavily.com/)) with a generous free tier
-export LANGCHAIN_TRACING_V2=true                          # Enable LangSmith tracing
+export LANGSMITH_TRACING=true                             # Enable LangSmith tracing
 export LANGSMITH_ENDPOINT=https://api.smith.langchain.com # LangSmith endpoint
-export LANGCHAIN_API_KEY=your_langsmith_api_key_here      # [LangSmith API key](https://smith.langchain.com/settings) (free to sign up)
-export LANGCHAIN_PROJECT=deep-research-deepagents         # The project name to log traces to
+export LANGSMITH_API_KEY=your_langsmith_api_key_here      # [LangSmith API key](https://smith.langchain.com/settings) (free to sign up)
+export LANGSMITH_PROJECT=deep-research-deepagents         # The project name to log traces to
 
 # Research Agent Configuration
 # Maximum number of concurrent research units (sub-agents) that can run simultaneously
@@ -380,12 +380,12 @@ The LangGraph server and the Document Upload API are secured with API key authen
 
 When running `langgraph dev`, the server is protected by a custom authentication handler. All API requests must include a valid API key in the headers.
 
-- **Environment Variable**: `LANGCHAIN_API_KEY`
+- **Environment Variable**: `LANGSMITH_API_KEY`
 - **Supported Headers**: 
   - `x-api-key: your_key` (recommended)
   - `Authorization: Bearer your_key`
 
-If `LANGCHAIN_API_KEY` is not set, the server will fallback to using `UPLOAD_API_KEY` for authentication.
+If `LANGSMITH_API_KEY` is not set, the server will fallback to using `UPLOAD_API_KEY` for authentication.
 
 ### Document Upload API Authentication
 
@@ -395,7 +395,7 @@ The custom document upload service in `webapp.py` is also secured.
 - **Supported Header**: `X-API-Key: your_key`
 
 > [!TIP]
-> For a seamless experience, you can set both `LANGCHAIN_API_KEY` and `UPLOAD_API_KEY` to the same secure value in your `.env` file.
+> For a seamless experience, you can set both `LANGSMITH_API_KEY` and `UPLOAD_API_KEY` to the same secure value in your `.env` file.
 
 ---
 

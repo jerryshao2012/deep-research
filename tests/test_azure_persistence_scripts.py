@@ -2129,7 +2129,7 @@ elif args[:2] == ["containerapp", "show"] and "--query" in args and args[args.in
 elif args[:2] == ["containerapp", "show"] and "--output" in args and args[args.index("--output") + 1] == "json":
     required = [
         ("tavily-api-key", "TAVILY-API-KEY"),
-        ("langchain-api-key", "LANGCHAIN-API-KEY"),
+        ("langsmith-api-key", "LANGSMITH-API-KEY"),
         ("upload-api-key", "UPLOAD-API-KEY"),
         ("storage-account-name", "STORAGE-ACCOUNT-NAME"),
         ("storage-account-key", "STORAGE-ACCOUNT-KEY"),
@@ -2166,7 +2166,7 @@ elif args[:2] == ["containerapp", "show"] and "--output" in args and args[args.i
 elif args[:3] == ["containerapp", "secret", "list"]:
     required = [
         ("tavily-api-key", "TAVILY-API-KEY"),
-        ("langchain-api-key", "LANGCHAIN-API-KEY"),
+        ("langsmith-api-key", "LANGSMITH-API-KEY"),
         ("upload-api-key", "UPLOAD-API-KEY"),
         ("storage-account-name", "STORAGE-ACCOUNT-NAME"),
         ("storage-account-key", "STORAGE-ACCOUNT-KEY"),
@@ -2282,7 +2282,7 @@ sys.stdout.write('{"version":"9.8.7","status":"ok"}\\n')
     ]
     assert {call[call.index("--name") + 1] for call in secret_calls} == {
         "TAVILY-API-KEY",
-        "LANGCHAIN-API-KEY",
+        "LANGSMITH-API-KEY",
         "UPLOAD-API-KEY",
         "STORAGE-ACCOUNT-NAME",
         "STORAGE-ACCOUNT-KEY",

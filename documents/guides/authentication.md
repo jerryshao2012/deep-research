@@ -23,7 +23,7 @@ API-key and OAuth-session authentication can operate together. Passkeys are disa
 Protected document upload, document management, storage, skill, and related webapp routes always authenticate. At process startup, their static key resolves in this order:
 
 1. `UPLOAD_API_KEY`;
-2. `LANGCHAIN_API_KEY`;
+2. `LANGSMITH_API_KEY`;
 3. a randomly generated process-local key.
 
 The generated fallback is logged as a warning, changes on restart, and is unsuitable for clients or multiple replicas. Set `UPLOAD_API_KEY` explicitly in production.
@@ -41,7 +41,7 @@ Protected custom routes also accept an OAuth session token in `X-API-Key` or `Au
 
 LangGraph resolves its static key separately:
 
-1. `LANGCHAIN_API_KEY`;
+1. `LANGSMITH_API_KEY`;
 2. `UPLOAD_API_KEY`.
 
 It does not generate a fallback. A request may send a valid API key or OAuth session token in `x-api-key`, or in `Authorization: Bearer`; if neither static key is configured and the credential is not a valid session, authentication fails with a server-configuration error.
@@ -309,7 +309,7 @@ For Google, configure both frontend JavaScript origins and backend redirect URIs
 
 ### Protected route returns 401 after restart
 
-If no stable `UPLOAD_API_KEY` or fallback `LANGCHAIN_API_KEY` was configured, the custom webapp generated a new process-local key. Set an explicit key and update the client.
+If no stable `UPLOAD_API_KEY` or fallback `LANGSMITH_API_KEY` was configured, the custom webapp generated a new process-local key. Set an explicit key and update the client.
 
 ### Sessions disappear or replicas disagree
 

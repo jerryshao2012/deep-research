@@ -407,7 +407,7 @@ with open(app_path, encoding="utf-8") as stream:
     app = json.load(stream)
 required = {
     "tavily-api-key": "TAVILY-API-KEY",
-    "langchain-api-key": "LANGCHAIN-API-KEY",
+    "langsmith-api-key": "LANGSMITH-API-KEY",
     "upload-api-key": "UPLOAD-API-KEY",
     "storage-account-name": "STORAGE-ACCOUNT-NAME",
     "storage-account-key": "STORAGE-ACCOUNT-KEY",
@@ -565,7 +565,7 @@ fi
 
 REQUIRED_KEYVAULT_SECRETS=(
   "TAVILY-API-KEY"
-  "LANGCHAIN-API-KEY"
+  "LANGSMITH-API-KEY"
   "UPLOAD-API-KEY"
   "STORAGE-ACCOUNT-NAME"
   "STORAGE-ACCOUNT-KEY"

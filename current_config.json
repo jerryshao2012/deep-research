@@ -17,8 +17,8 @@
                         "EVAL_HISTORY_FILE": "/deps/deep_research/output/eval_history/server_runs.jsonl",
                         "GRAPH_RECURSION_LIMIT": "200",
                         "INPUT_FOLDER": "/deps/deep_research/input",
-                        "LANGCHAIN_PROJECT": "deep-research-production",
-                        "LANGCHAIN_TRACING_V2": "true",
+                        "LANGSMITH_PROJECT": "deep-research-production",
+                        "LANGSMITH_TRACING": "true",
                         "LANGSMITH_ENDPOINT": "https://api.smith.langchain.com",
                         "LOG_LEVEL": "INFO",
                         "MAX_CONCURRENT_RESEARCH_UNITS": "3",
@@ -41,7 +41,7 @@
                     "RuntimeEnvironmentSecrets": {
                         "AWS_BEARER_TOKEN_BEDROCK": "arn:aws:secretsmanager:us-east-1:668864905269:secret:kv-deep-agents-0312-FRpNXc:AWS-BEARER-TOKEN-BEDROCK::",
                         "AWS_BEDROCK_ENDPOINT": "arn:aws:secretsmanager:us-east-1:668864905269:secret:kv-deep-agents-0312-FRpNXc:AWS-BEDROCK-ENDPOINT::",
-                        "LANGCHAIN_API_KEY": "arn:aws:secretsmanager:us-east-1:668864905269:secret:kv-deep-agents-0312-FRpNXc:LANGCHAIN-API-KEY::",
+                        "LANGSMITH_API_KEY": "arn:aws:secretsmanager:us-east-1:668864905269:secret:kv-deep-agents-0312-FRpNXc:LANGSMITH-API-KEY::",
                         "MODEL_NAME": "arn:aws:secretsmanager:us-east-1:668864905269:secret:kv-deep-agents-0312-FRpNXc:MODEL-NAME::",
                         "TAVILY_API_KEY": "arn:aws:secretsmanager:us-east-1:668864905269:secret:kv-deep-agents-0312-FRpNXc:TAVILY-API-KEY::",
                         "UPLOAD_API_KEY": "arn:aws:secretsmanager:us-east-1:668864905269:secret:kv-deep-agents-0312-FRpNXc:UPLOAD-API-KEY::"

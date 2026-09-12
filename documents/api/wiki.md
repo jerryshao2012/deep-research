@@ -14,7 +14,7 @@ uv run python -m uvicorn webapp:app --host 127.0.0.1 --port 8000
 
 All Thread Wiki routes are protected by delegated LangGraph authentication. Present a valid configured API key or OAuth session in `x-api-key`, or as `Authorization: Bearer <credential>`. When both headers are present, the `x-api-key` credential takes precedence.
 
-Static-key selection is `LANGCHAIN_API_KEY`, then `UPLOAD_API_KEY`. Wiki routes have no generated-key fallback: if neither configured key nor a valid OAuth session is available, authentication fails. See [Authentication](../guides/authentication.md) for session behavior and production configuration.
+Static-key selection is `LANGSMITH_API_KEY`, then `UPLOAD_API_KEY`. Wiki routes have no generated-key fallback: if neither configured key nor a valid OAuth session is available, authentication fails. See [Authentication](../guides/authentication.md) for session behavior and production configuration.
 
 Authentication gates these routes, but handlers do not currently enforce per-thread ownership. Deployments with multiple users must add authorization at a trusted gateway or application boundary.
 
